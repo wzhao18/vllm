@@ -340,6 +340,7 @@ def _launch_forward(
     gate_roll=False,
     partial_tma=True,
     srow=None,
+    compile_only=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -418,6 +419,8 @@ def _launch_forward(
         state_rows=srow is not None,
         partial_tma=partial_tma,
     )
+    if compile_only:
+        return None
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
         qf,
@@ -685,6 +688,7 @@ def fwd(
     cu_seqlens=None,
     plan=None,
     srow=None,
+    compile_only=False,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -742,4 +746,37 @@ def fwd(
         gate_roll=not fixed,
         partial_tma=not fixed,
         srow=srow,
+        compile_only=compile_only,
     )
+
+
+def warm_compile(H: int, dev: torch.device, lower_bound: float) -> None:
+    """Compile (or load from the CuTe cache) every kernel variant fwd() can
+    launch for H heads: single or packed sequences, full or partial chunks,
+    with or without split chain pieces, in-place state rows or gathered
+    states. Runs fwd()'s own flag derivation on small dummies and stops
+    before the launch, so serving steps never compile."""
+    T = 2 * C_TOK
+    bf = torch.bfloat16
+    q = torch.zeros(1, T, H, D, dtype=bf, device=dev)
+    beta = torch.zeros(1, T, H, dtype=bf, device=dev)
+    A_log = torch.zeros(H, dtype=torch.float32, device=dev)
+    dt_bias = torch.zeros(H, D, dtype=torch.float32, device=dev)
+    for nseq in (1, 2):
+        offs = [0, T] if nseq == 1 else [0, C_TOK, T]
+        cu32 = torch.tensor(offs, dtype=torch.int32, device=dev)
+        state = torch.zeros(nseq, H, D, D, dtype=torch.float32, device=dev)
+        srow = torch.zeros(2 * nseq * H, dtype=torch.int64, device=dev)
+        idx = torch.zeros(nseq * H + 1, dtype=torch.int32, device=dev)
+        mid = torch.zeros(1, D, D, dtype=torch.float32, device=dev)
+        mfl = torch.zeros(1, dtype=torch.int32, device=dev)
+        for full_chunks in (False, True):
+            for has_split in (False, True):
+                plan = (cu32, idx, idx, idx, idx, idx, idx, nseq * H, mid, mfl)
+                plan += (has_split, full_chunks)
+                for rows in (None, srow):
+                    fwd(q, q, q, q, beta, D**-0.5, q, A_log, dt_bias,
+                        lower_bound, initial_state=state, final_state=state,
+                        cu_seqlens=cu32, plan=plan, srow=rows,
+                        compile_only=True)
+

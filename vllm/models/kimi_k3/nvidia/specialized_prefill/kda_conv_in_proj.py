@@ -62,9 +62,11 @@ class PrefillKdaConvInProj:
         self.p = layer.local_projection_size
         self._gemm = None
 
-    def prepare(self) -> None:
+    def prepare(self, max_num_seqs: int) -> None:
         """After weight loading, before any forward: views of the q|k|v and
-        g|f_a|beta rows and their F8_128x4 scales; compile the fused GEMM."""
+        g|f_a|beta rows and their F8_128x4 scales; compile the fused GEMM and
+        every conv fix-up variant of a step of up to ``max_num_seqs``
+        sequences."""
         if self._gemm is not None:
             return
         from .sm107_gemm.kda_conv_gemm import KdaConvGemm
@@ -90,6 +92,15 @@ class PrefillKdaConvInProj:
         init = torch.zeros(1, dtype=torch.bool, device=dev)
         st = torch.zeros((1, nq, 3), dtype=torch.bfloat16, device=dev)
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
+        from .sm107_gemm import conv_fixup
+
+        conv_fixup.warm(
+            self.p,
+            self.conv_w,
+            self.layer.get_state_dtype()[0],
+            max_num_seqs,
+            NULL_BLOCK_ID,
+        )
 
     def fused(self, qa):
         """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for an

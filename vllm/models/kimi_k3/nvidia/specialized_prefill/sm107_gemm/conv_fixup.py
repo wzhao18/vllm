@@ -10,6 +10,8 @@ Arithmetic is the stock Triton conv's (FP32 FMA chain from +0, oldest tap
 first; ``acc / (1 + exp(-acc))``), so outputs and state stay bit for bit.
 """
 
+from functools import partial
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -167,7 +169,12 @@ def _fixup_blocks(
                      part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
 
 
-@triton.jit
+#: Per-step counts and the deployment's state / index strides are runtime
+#: values (no ==1 / %16 specialization): one compile per (BG, SP2) covers every
+#: serving step, and ``warm`` compiles those at load.
+@triton.jit(
+    do_not_specialize=["M", "NB", "S", "NBG", "st_s0", "st_s1", "ci_s0"]
+)
 def _conv_fixup_all_kernel(
     out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
     M, N, P, NB, S, NBG, st_s0, st_s1, st_s2, ci_s0, null_id,
@@ -205,7 +212,10 @@ def conv_fixup(
     has_init: torch.Tensor,
     part_dim: int,
     null_block_id: int | None,
+    compile_only: bool = False,
 ) -> None:
+    """``compile_only``: compile (or load) this launch's kernel variant, launch
+    nothing."""
     _, m, p = out.shape
     n = 3 * p
     nb = (m + 127) // 128
@@ -216,7 +226,11 @@ def conv_fixup(
     sp2 = triton.next_power_of_2(nseq + 1)
     bg = FIXUP_BG or (8 if nb >= 96 else 4)
     nbg = (nb + bg - 1) // bg
-    _conv_fixup_all_kernel[(nbg + nseq, n // block)](
+    grid = (nbg + nseq, n // block)
+    launch = _conv_fixup_all_kernel[grid]
+    if compile_only:
+        launch = partial(_conv_fixup_all_kernel.warmup, grid=grid)
+    launch(
         out, side, norms if norms is not None else out, conv_w, conv_state, qsl,
         lines, has_init, m, n, p, nb, nseq, nbg,
         conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
@@ -224,3 +238,40 @@ def conv_fixup(
         HAS_NULL=null_block_id is not None, WITH_NORMS=norms is not None,
         BLOCK=block, BG=bg, SP2=sp2, num_warps=4,
     )  # fmt: skip
+
+
+def warm(
+    p: int,
+    conv_w: torch.Tensor,
+    conv_dtype: torch.dtype,
+    max_num_seqs: int,
+    null_block_id: int | None,
+) -> None:
+    """Compile every ``_conv_fixup_all_kernel`` variant a prefill step of
+    1..``max_num_seqs`` sequences can launch for planes of ``p`` columns: the
+    block-group size (4 below 96 row blocks, 8 from 96) times the sequence
+    scan width SP2. Row, block and sequence counts are not specialized, so no
+    serving step compiles. Small stand-in tensors in the serving layouts
+    (conv state as the KV cache holds it); nothing launches."""
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        is_conv_state_dim_first,
+    )
+
+    dev = conv_w.device
+    nq = 3 * p
+    if is_conv_state_dim_first():
+        st = torch.empty((1, nq, 3), dtype=conv_dtype, device=dev)
+    else:
+        st = torch.empty((1, 3, nq), dtype=conv_dtype, device=dev).transpose(-1, -2)
+    out = torch.empty((3, 1, p), dtype=torch.bfloat16, device=dev)
+    side = torch.empty((1, nq), dtype=torch.bfloat16, device=dev)
+    sp2s = {triton.next_power_of_2(s + 1) for s in range(1, max(max_num_seqs, 1) + 1)}
+    for sp2 in sorted(sp2s):
+        nseq = sp2 - 1
+        qsl = torch.zeros(nseq + 1, dtype=torch.int32, device=dev)
+        lines = torch.zeros(nseq, dtype=torch.int32, device=dev)
+        init = torch.zeros(nseq, dtype=torch.bool, device=dev)
+        for rows in (128, 96 * 128):  # BG 4 / BG 8
+            o = out.expand(3, rows, p)
+            conv_fixup(o, side, None, conv_w, st, qsl, lines, init, p,
+                       null_block_id, compile_only=True)  # fmt: skip

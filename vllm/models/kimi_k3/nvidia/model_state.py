@@ -255,13 +255,10 @@ class KimiK3ModelState(MambaHybridModelState):
     ):
         if not self._step_prep_checked and not for_capture:
             self._step_prep = self._build_step_prep(attn_groups, kv_cache_config)
-            # Rubin (the sampled / greedy verification paths are built): compile the
-            # fused step prep now rather than at the first steady decode step.
-            if (
-                self._step_prep is not None
-                and self._io is not None
-                and self.language_model.verify_logits is not None
-            ):
+            # Compile the fused step prep now rather than at the first steady
+            # decode step (decode and prefill workers alike: a prefill worker's
+            # spec-decode steps launch it too).
+            if self._step_prep is not None and self._io is not None:
                 self._run_step_prep(input_batch, *self._io, compile_only=True)
         deferred, self._deferred = self._deferred, None
         if deferred is not None:
