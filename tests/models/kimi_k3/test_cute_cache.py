@@ -225,7 +225,7 @@ def _capsule(address):
 class _DslTensor:
     """Stand-in for cute.runtime._Tensor: a DLPack capsule plus the DSL cache key."""
 
-    __module__ = "cutlass.cute.runtime"
+    __module__, __qualname__ = "cutlass.cute.runtime", "_Tensor"
 
     def __init__(self, address, layout):
         self._dlpack_data, self._layout = _capsule(address), layout

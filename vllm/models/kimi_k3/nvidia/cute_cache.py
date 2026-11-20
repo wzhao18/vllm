@@ -102,12 +102,15 @@ class _Uncacheable(Exception):
 
 
 _IR_VALUES = ("OpResult", "BlockArgument", "Value")
+# Runtime arguments over real memory (from_dlpack, make_ptr). Not _FakeTensor: its DSL
+# key holds id()s of its SymInts, and its attributes fingerprint as they are.
+_DSL_RUNTIME_ARGS = ("cutlass.cute.runtime._Tensor", "cutlass.cute.runtime._Pointer")
 
 
 def _dsl_runtime_arg(t: type) -> bool:
-    return isinstance(getattr(t, "__cache_key__", None), property) and (
-        t.__module__ or ""
-    ).startswith("cutlass.")
+    return _qual(t) in _DSL_RUNTIME_ARGS and isinstance(
+        getattr(t, "__cache_key__", None), property
+    )
 
 
 @dataclass
