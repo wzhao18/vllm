@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_device_capability((10, 7)), reason="sm_107 only"
@@ -66,14 +67,18 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0):
     ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, PART)
     gemm = KdaConvGemm(wq, ws, cw, PART, tactic=tactic)
     st = state0.clone()
-    out, _ = gemm(xq, xs, st, qsl, lines, has_init)
+    out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID)
     torch.cuda.synchronize()
     tot = int(qsl[-1])
-    assert torch.equal(out[:, :tot], ref[:, :tot])
+    # qkv_conv leaves the rows of null-block sequences (padding) unwritten.
+    keep = torch.ones(tot, dtype=torch.bool, device=dev)
+    for i in (lines == NULL_BLOCK_ID).nonzero().flatten().tolist():
+        keep[int(qsl[i]) : int(qsl[i + 1])] = False
+    assert torch.equal(out[:, :tot][:, keep], ref[:, :tot][:, keep])
     assert torch.equal(st, st_ref)
     if deep:
         # Tiny nonzero outputs only come from the exact path's band.
-        y = ref[:, :tot].float()
+        y = ref[:, :tot][:, keep].float()
         assert bool(((y != 0) & (y.abs() < 1e-30)).any())
 
 
