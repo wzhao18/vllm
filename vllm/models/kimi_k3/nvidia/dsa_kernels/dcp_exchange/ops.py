@@ -90,6 +90,9 @@ def topk_prepass_min(cluster: int, rows: int, resident: int) -> int:
     return per_cta * cluster
 
 
+_EP32DIAG: dict = {}
+
+
 def _load_ext():
     global _EXT
     if _EXT is not None:
@@ -380,6 +383,10 @@ class DcpExchange:
         stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
+        if stats is None:  # DIAG (not for landing): counters read by the EP32 emulator
+            stats = _EP32DIAG.get(logits.device)
+            if stats is None:
+                stats = _EP32DIAG[logits.device] = torch.zeros(16, dtype=torch.int32, device=logits.device)
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,

@@ -581,6 +581,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
       if (tid == 0) s_sat = 0u;
       recand = X2 < th;
+      if (recand && p.stats && tid == 0) atomicAdd(&p.stats[15], 1);  // DIAG
       if (recand) {
         // the round-1 buffers (rx, slots, message, window) overwrote the row's first groups:
         // copy those again; the candidate pass below then starts at X2
@@ -1201,6 +1202,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           X2 = min(t2 >= 1 ? t2 : LB, 65536 - kV2Win);
           c2 = t2 >= 1 ? t2 - X2 : min(max((LB + min(UB, LB + kV2Win - 1)) / 2 - X2, 0), kV2Win - 1);
           V2STAT(3);
+          if (p.stats && tid == 0) {  // DIAG: why the round left the row, and how wide [LB, UB] is
+            atomicAdd(&p.stats[8 + 3 * rnd + (tier == 2 ? 0 : 1)], 1);
+            if (UB - LB >= kV2Win) atomicAdd(&p.stats[10 + 3 * rnd], 1);
+          }
           __syncthreads();  // S (hist) is reused by the next round
           continue;
         }
@@ -1212,6 +1217,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // rows still unresolved after the rounds (or beyond the round-2 slots): the complete
       // body at the next epoch, the same rows on every rank (the tier comes from the words)
       if (tier != 1) {
+        if (p.stats && tid == 0) atomicAdd(&p.stats[14], 1);  // DIAG
         __syncthreads();
         return 1 + ep;
       }
