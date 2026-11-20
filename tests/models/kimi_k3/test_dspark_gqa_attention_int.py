@@ -638,6 +638,30 @@ def test_window_umma_variants_match_stock(shape, monkeypatch):
         del ours, stock, exact
 
 
+@pytest.mark.parametrize("shape", [(1, -2, 6, 0), (1, -2, 5, 4)])
+def test_window_kol_matches_stock(shape, monkeypatch):
+    """GqaWindowKol (keys on the TMEM lanes; key groups -2) at TP4 q3, batches up to
+    96: cache bytes identical to stock's, rows within BF16 noise."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+
+    monkeypatch.setitem(ga.GQA_WINDOW, (4, 3), ((0, shape),))
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(57)
+    layers = make_layers(4, gen)
+    batches = tuple(b for b in BATCHES if b <= 96)
+    state = install(layers, 3, batches)
+    for B in batches:
+        ours, stock, exact, lengths, differ = run_case(
+            state, layers, "rows", B, 3, gen, seed=5700 + B
+        )
+        label = f"kol {shape} B{B}"
+        assert differ == 0, f"{label}: {differ} cache elements differ from stock"
+        check_rows(ours, stock, exact, B, 3, label)
+        del ours, stock, exact
+
+
 STREAM = (0, -1, 6, 0)  # GqaWindowStream's launch shape (key groups -1)
 
 

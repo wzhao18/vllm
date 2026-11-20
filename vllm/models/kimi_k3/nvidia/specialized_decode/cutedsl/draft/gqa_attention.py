@@ -63,6 +63,8 @@ from .gqa_window_stream import (
     smem_bytes,
     unit_slots,
 )
+from . import gqa_window_kol
+from .gqa_window_kol import compile_window_kol, kv_map_kol
 from .gqa_window_umma import KB, compile_window_umma, kv_map_5d, umma_smem
 
 logger = init_logger(__name__)
@@ -95,6 +97,9 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 # its 97 KB / 256-column CTAs exceed one wave).
 # The TP8 rows (prefill instances, which run the stock drafter) and TP4 k7 (no
 # deployment) take shapes measured at the same CTA counts.
+# Tensor map of a launch shape's kernel by key groups (descriptor byte offset): 0
+# GqaWindowUmma and -1 GqaWindowStream {64, 64, 2} boxes, -2 GqaWindowKol {64, 64, 1}
+MAP_OFFSET = {0: 128, -1: 128, -2: 256}
 GQA_WINDOW = {
     (1, 7): ((4, (16, 4, 2, 0)), (8, (16, 2, 3, 0)), (16, (8, 4, 3, 0)), (32, (4, 4, 4, 0)),
              (0, (2, 4, 4, 0))),
@@ -221,7 +226,7 @@ class GqaAttentionState:
         """GqaWindowStream's partials [units, pieces, rows x 66] FP32 and per-unit
         counters (zero; each launch's last pieces reset theirs) for the batches it
         serves (launch shapes with key groups -1)."""
-        batches = [b for b, s in self.shapes.items() if s is not None and s[1] < 0]
+        batches = [b for b, s in self.shapes.items() if s is not None and s[1] == -1]
         self.pmax, self.partials, self.counters = 1, None, None
         # die split (launch shapes ahead 1): the resident grid, and the KV heads' home
         # dies (bit h: die of KV head h) of a die-localized cache layout
@@ -319,9 +324,11 @@ class GqaAttentionState:
             blocks,
             cache.stride(0),
             head_stride,
-            # (+ the 5-D map GqaWindowUmma loads a stage with, at descriptor + 128)
+            # (+ the 5-D maps GqaWindowUmma / GqaWindowStream and GqaWindowKol load
+            # a stage with, at descriptor + MAP_OFFSET[key groups])
             tensor_maps(
-                [spec] + ([kv_map_5d(cache, self.kv_heads, head_stride)]
+                [spec] + ([kv_map_5d(cache, self.kv_heads, head_stride),
+                           kv_map_kol(cache, self.kv_heads, head_stride)]
                           if page % KB == 0 else []),
                 self.device,
             ),  # fmt: skip
@@ -342,6 +349,17 @@ class GqaAttentionState:
 
     def window(self, page, shape):
         splits, kgroups, ring, ahead = shape
+        if kgroups == -2:  # GqaWindowKol (tcgen05, keys on the TMEM lanes)
+            if page % KB:
+                raise ValueError(
+                    f"GqaWindowKol launch shape {shape} on {page}-token pages"
+                )
+            return compile_window_kol(
+                GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
+                self.max_position, self.device.index,
+                round_norm=window_options().get("round_norm", False),
+                o_layout=gqa_window_kol.O_LAYOUT, l2ahead=ahead,
+            )  # fmt: skip
         if kgroups < 0:  # GqaWindowStream: the persistent stream over every SM
             if page % KB or page < 2 * KB:
                 raise ValueError(
@@ -474,7 +492,7 @@ class GqaAttentionState:
         cache = attention.kv_cache
         out = qkv.new_empty((rows, self.heads * HEAD))
         extra = ()
-        if shape[1] < 0:
+        if shape[1] == -1:
             extra = (Int64(self.partials.data_ptr()), Int64(self.counters.data_ptr()))
         if shape[1] == 0 and shape[3] & 1:
             ones = bin(self.head_dies or 0).count("1")
@@ -484,7 +502,7 @@ class GqaAttentionState:
                     f"GqaWindowUmma die split: {rows // self.q} requests exceed one "
                     "unit per CTA of the resident grid"
                 )
-        if shape[1] <= 0 and shape[3] & 1:
+        if shape[1] in (0, -1) and shape[3] & 1:
             if self.head_dies is None:
                 raise RuntimeError(
                     "GqaWindowStream die split: no KV head -> die map for the cache"
@@ -501,7 +519,7 @@ class GqaAttentionState:
             to_cute(layer.q_norm.weight.data),
             to_cute(layer.k_norm.weight.data),
             dynamic_view(out),
-            Int64(bound.descriptor.data_ptr() + (128 if shape[1] <= 0 else 0)),
+            Int64(bound.descriptor.data_ptr() + MAP_OFFSET.get(shape[1], 0)),
             Int64(cache.data_ptr()),
             Int64(bound.block_stride),
             Int64(bound.head_stride),
