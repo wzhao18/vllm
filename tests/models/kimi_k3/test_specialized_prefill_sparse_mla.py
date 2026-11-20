@@ -228,3 +228,60 @@ def test_two_short_tokens_per_cta(kernel):
     rel = (out.float() - ref).norm(dim=-1)[nz] / ref.norm(dim=-1)[nz].clamp(min=1e-6)
     assert rel.mean().item() < 0.02, rel.mean().item()
     assert (out[~nz].float() == 0).all()
+
+
+def test_backend_prefill_takes_logical_topk():
+    """FLASHINFER_MLA_SPARSE hands prefill-sized calls the indexer's request-relative
+    top-k (the kernel's gather does the block-table remap): bit for bit the stock remap
+    followed by the physical-slot kernel, with other layers' pages between blocks."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import sparse_mla as psm
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseImpl,
+    )
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        flat_kv_row_view,
+        triton_convert_req_index_to_global_index,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(4)
+    block_size, blocks, width, t = 64, 700, 2048, psm.MIN_ROWS
+    ctx_blocks = [300, 100, 280]
+    paged = torch.randn(blocks, 2 * block_size, ROW, device="cuda", generator=g)
+    kv_cache = (paged * 0.8).to(E4M3)[:, :block_size]
+    bt = torch.zeros((len(ctx_blocks), 320), dtype=torch.int32, device="cuda")
+    perm = torch.randperm(blocks, device="cuda", generator=g).to(torch.int32)
+    start = 0
+    for r, nb in enumerate(ctx_blocks):
+        bt[r, :nb] = perm[start:start + nb]
+        start += nb
+    req_ids = (torch.arange(t, device="cuda") % len(ctx_blocks)).to(torch.int32)
+    ctx = torch.tensor(ctx_blocks, device="cuda")[req_ids.long()] * block_size
+    topk = (torch.rand((t, width), device="cuda", generator=g) * ctx[:, None]).int()
+    short = torch.arange(t, device="cuda") % 7 == 0
+    tail = torch.arange(width, device="cuda")[None, :] >= 1000
+    topk = torch.where(short[:, None] & tail, -1, topk).contiguous()
+    q8 = (torch.randn(t, H, ROW, device="cuda", generator=g) * 0.8).to(E4M3)
+    scale, out_scale = 192**-0.5 * 3.0, 1.3
+
+    impl = object.__new__(FlashInferMLASparseImpl)
+    impl._prefill_sparse_mla = psm
+    impl.need_to_return_lse_for_decode = False
+    impl.index_group = None
+    impl.topk_indices_buffer = topk
+    impl.bmm1_scale, impl.bmm2_scale = scale, out_scale
+    impl._fused_query = None
+    impl._prepare_mqa_kernel = lambda layer, device: None
+    meta = SimpleNamespace(block_size=block_size, req_id_per_token=req_ids,
+                           block_table=bt)
+    out, lse = impl.forward_mqa(q8, kv_cache, meta, layer=None)
+
+    kv_rows, stride = flat_kv_row_view(kv_cache, block_size)
+    slots, counts = triton_convert_req_index_to_global_index(
+        req_ids, bt, topk, BLOCK_SIZE=block_size, BLOCK_STRIDE_ROWS=stride,
+        NUM_TOPK_TOKENS=width, return_valid_counts=True)
+    ref = psm.sparse_mla_prefill(q8, kv_rows, 64, slots, counts, scale, out_scale)
+    torch.cuda.synchronize()
+    assert lse is None
+    assert torch.equal(out, ref)
