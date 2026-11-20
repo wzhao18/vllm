@@ -135,6 +135,9 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_lp as prefill_attn_res_lp,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_resid as prefill_attn_res_resid,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -561,6 +564,31 @@ class KimiMLP(nn.Module):
         return mxfp8_act.situ_and_mul_quantize_auto(
             gate_up, self.act_fn.beta, self.act_fn.linear_beta
         )
+
+    def resid_capable(self) -> bool:
+        """``forward_resid`` can run: the MXFP8 activation and an
+        attn_res_resid GEMM for down_proj (prefill AttnRes dataflow C)."""
+        return (
+            not self.shard_sequence_parallel
+            and self._act_mxfp8_ok()
+            and prefill_attn_res_resid.supported(self.down_proj)
+        )
+
+    def forward_resid(self, x, prefix: torch.Tensor) -> torch.Tensor:
+        """``prefix <- bf16(prefix + forward(x))`` in place, the down_proj
+        adding its BF16 output into ``prefix`` in its GEMM store
+        (specialized_prefill.attn_res_resid). Returns ``prefix``."""
+        situ = self._prefill_situ
+        qa = situ.fused(x) if situ is not None else None
+        if qa is None:
+            gate_up, _ = self.gate_up_proj(x)
+            if situ is not None:
+                gate_up = situ.deinterleave(gate_up)
+            qa = self._act_mxfp8(gate_up)
+        gemm = prefill_attn_res_resid.gemm_for(self.down_proj)
+        if qa is None or gemm is None:
+            raise RuntimeError("shared expert: no MXFP8 down_proj input for the AttnRes prefix")
+        return gemm.add_into(qa, prefix)
 
     def forward(self, x):
         if self.shard_sequence_parallel:
@@ -1301,11 +1329,36 @@ class KimiMoE(nn.Module):
             and not self._shared_mxfp8_input()
         )
 
+    def resid_capable(self) -> bool:
+        """``forward(resid_prefix=...)`` can run (prefill AttnRes dataflow C):
+        MegaMoE with the shared expert's down_proj on an attn_res_resid GEMM
+        and the BF16 latent up-projection's beta-add epilogue."""
+        cap = getattr(self, "_resid_capable", None)
+        if cap is None:
+            t = self.routed_output_transform
+            cap = self._resid_capable = (
+                not self.moe_token_shard
+                and self.use_mega_moe
+                and getattr(self, "_packed_moe", None) is None
+                and isinstance(self.shared_experts, KimiMLP)
+                and self.shared_experts.resid_capable()
+                and t is not None
+                and not t._norm_mxfp8()
+                and isinstance(t.up_proj.quant_method, UnquantizedLinearMethod)
+            )
+        return cap
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         shared_mxfp8_input: QuantizedActivation | None = None,
+        resid_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """resid_prefix (prefill AttnRes dataflow C): the AttnRes prefix the
+        layer output is added into. The shared expert's down_proj adds its
+        output into it in its GEMM store and the latent up-projection
+        beta-adds the routed output (the stock P + (S + R) reassociated as
+        (P + S) + R: the same roundings); returns the prefix."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.moe_token_shard:
@@ -1339,7 +1392,12 @@ class KimiMoE(nn.Module):
             start.record()
             with torch.cuda.stream(prefill_shared):
                 start.wait()
-                shared_output = self.shared_experts(shared_input)
+                if resid_prefix is not None:
+                    shared_output = self.shared_experts.forward_resid(
+                        shared_input, resid_prefix
+                    )
+                else:
+                    shared_output = self.shared_experts(shared_input)
                 done.record()
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected.
@@ -1352,6 +1410,15 @@ class KimiMoE(nn.Module):
             final_hidden_states = self._routed_experts(
                 routed_hidden_states, router_output, topk_ids
             )
+            final_hidden_states = self.routed_output_transform(
+                final_hidden_states, residual=shared_output
+            )
+        elif self.use_mega_moe and resid_prefix is not None:
+            assert self.routed_output_transform is not None
+            final_hidden_states = self._routed_experts(
+                routed_hidden_states, router_output, topk_ids
+            )
+            shared_output = self.shared_experts.forward_resid(shared_input, resid_prefix)
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
@@ -1590,11 +1657,49 @@ class KimiDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        resid_prefix: tuple[torch.Tensor, bool] | None = None,
     ) -> torch.Tensor:
+        if resid_prefix is not None:
+            return self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                resid_prefix=resid_prefix,
+            )
         return self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
         )
+
+    def _resid_producers(
+        self, prefix_sum: torch.Tensor | None, residual: torch.Tensor | None
+    ) -> tuple[bool, bool]:
+        """(attention, mlp): which of this layer's output producers add into
+        the die-local AttnRes prefix in their GEMM store (prefill dataflow C,
+        specialized_prefill.attn_res_resid). Only while ``prefix_sum`` is the
+        die-local prefix buffer of an attn_res_lp forward."""
+        caps = getattr(self, "_resid_caps", None)
+        if caps is None:
+            attn = (
+                self.use_attn_res
+                and not self.use_sequence_parallel
+                and isinstance(self.self_attn, KimiK3DeltaAttention)
+                and self.self_attn.resid_capable()
+            )
+            mlp = (
+                self.use_attn_res
+                and not self.use_sequence_parallel
+                and isinstance(self.mlp, KimiMoE)
+                and self.mlp.resid_capable()
+            )
+            caps = self._resid_caps = (attn, mlp)
+        if not (caps[0] or caps[1]) or prefix_sum is None or residual is None:
+            return False, False
+        if not (
+            prefill_attn_res_lp.active(residual, prefix_sum)
+            and prefill_attn_res_dielocal.is_prefix(prefix_sum, residual)
+        ):
+            return False, False
+        return caps
 
     def _pre_attn_norm(
         self,
@@ -1694,8 +1799,17 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = hidden_states[: positions.shape[0]]
             M = hidden_states.shape[0]
 
+        # Prefill dataflow C: the KDA o_proj / MoE shared down_proj add their
+        # outputs into the die-local AttnRes prefix (attn_res_resid), and the
+        # AttnRes calls after them read the prefix alone.
+        resid_attn, resid_mlp = self._resid_producers(prefix_sum, residual)
+
         # Attention.
-        hidden_states = self._run_self_attn(positions, hidden_states)
+        hidden_states = self._run_self_attn(
+            positions,
+            hidden_states,
+            (prefix_sum, not self.is_block_write_layer) if resid_attn else None,
+        )
 
         # GEMM-RS returns the local sequence shard; standard O-proj preserves M.
         if self.use_sequence_parallel and hidden_states.shape[0] == M:
@@ -1710,8 +1824,15 @@ class KimiDecoderLayer(nn.Module):
                     hidden_states = hidden_states.clone()
                 prefix_sum = hidden_states
             hidden_states, shared_mxfp8, prefix_sum = self._attn_res_mxfp8(
-                prefix_sum, hidden_states, residual, pre=False
+                prefix_sum, hidden_states, residual, pre=False, attn_resid=resid_attn
             )
+            if resid_mlp:
+                self.mlp(
+                    hidden_states,
+                    shared_mxfp8_input=shared_mxfp8,
+                    resid_prefix=prefix_sum,
+                )
+                return None, prefix_sum, residual
             hidden_states = self.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
             return hidden_states, prefix_sum, residual
 
@@ -1762,9 +1883,11 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor,
         pre: bool,
+        attn_resid: bool = False,
     ):
         """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
-        the MXFP8 output (BF16 output only after attention)."""
+        the MXFP8 output (BF16 output only after attention). ``attn_resid``:
+        the attention output is already in the prefix (dataflow C)."""
         if prefill_attn_res_lp.active(residual, prefix_sum):
             prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
             new_prefix = prefix_sum if prefix_out is None else prefix_out
@@ -1774,7 +1897,9 @@ class KimiDecoderLayer(nn.Module):
                 widx = self.block_write_idx if self.is_block_write_layer else -1
                 onw = self.input_layernorm
             else:
-                delta = None if self.is_block_write_layer else hidden_states
+                delta = (
+                    None if self.is_block_write_layer or attn_resid else hidden_states
+                )
                 num_blocks = self.prev_valid_blocks + self.is_block_write_layer
                 widx = -1
                 onw = self.post_attention_layernorm
@@ -2053,7 +2178,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         """Return the AttnRes stream after ``layer_idx``."""
         prefix = prefix_sum if pending_mlp_out is None else prefix_sum + pending_mlp_out
         if not (self._aux_attn_res_stream and self.use_attn_res):
-            return prefix
+            # Dataflow C (no pending output): the prefix buffer itself is
+            # updated in place by the next layers' producers.
+            return prefix.clone() if pending_mlp_out is None else prefix
 
         if layer_idx + 1 < self.end_layer:
             consumer = self.layers[layer_idx + 1]
@@ -2190,14 +2317,18 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
                 aux_hidden_states.append(aux_hidden_state)
 
-        assert hidden_states is not None
+        assert hidden_states is not None or prefix_sum is not None
         assert residual is not None
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
             if prefix_sum is not None:
-                hidden_states = hidden_states + prefix_sum
+                hidden_states = (
+                    prefix_sum.clone()
+                    if hidden_states is None
+                    else hidden_states + prefix_sum
+                )
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,

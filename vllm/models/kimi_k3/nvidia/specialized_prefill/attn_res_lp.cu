@@ -795,7 +795,10 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.sm_die = sm_die.has_value() ? sm_die->data_ptr<int8_t>() : nullptr;
   a.claim = claim.data_ptr<int>();
   a.stamps = stamps.has_value() ? reinterpret_cast<long long*>(stamps->data_ptr()) : nullptr;
-  a.write_prefix = delta.has_value() || widx >= 0 || prefix_dst.has_value();
+  // The prefix changes only with a delta or a new destination; a block-write
+  // call without a delta (dataflow C: the producers added the delta) leaves
+  // the in-place prefix as is (its value is the block row it writes).
+  a.write_prefix = delta.has_value() || prefix_dst.has_value();
   const bool hd = delta.has_value(), no = onw.has_value();
   const bool wb = out.has_value(), qu = q.has_value();
   auto st = c10::cuda::getCurrentCUDAStream().stream();

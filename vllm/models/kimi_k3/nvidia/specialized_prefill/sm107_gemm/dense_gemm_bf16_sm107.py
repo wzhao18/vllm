@@ -514,8 +514,15 @@ class PersistentDenseGemmKernel:
         tma_tensor_c = None
         if cutlass.const_expr(self.use_tma_store):
             epi_smem_layout = cute.select(self.c_smem_layout_staged, mode=[0, 1])
+            # c_store_reduce: the TMA store adds the BF16 tile into C in L2
+            # (cp.reduce.async.bulk.tensor .add): C <- bf16(C + bf16(acc)).
             tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(), c, epi_smem_layout, self.epi_tile
+                cpasync.CopyReduceBulkTensorTileS2GOp()
+                if getattr(self, "c_store_reduce", False)
+                else cpasync.CopyBulkTensorTileS2GOp(),
+                c,
+                epi_smem_layout,
+                self.epi_tile,
             )
 
         # Compute grid size

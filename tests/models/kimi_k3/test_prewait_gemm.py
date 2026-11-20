@@ -35,3 +35,23 @@ def test_prewait_gemm_matches_torch(t, n, out_dtype):
     out2 = torch.empty_like(out)
     pg.gemm(out2, x, packed, n)
     assert torch.equal(out, out2)
+
+
+@pytest.mark.parametrize("t,ns", [(32, 8), (64, 7), (96, 6)])
+@pytest.mark.parametrize("pace", [0, 1440])
+def test_prewait_gemm_coresident_bitwise(t, ns, pace):
+    """The co-resident form (8 warps, <= 64 registers) with burst or paced pre-wait weight
+    issue gives the same bits as the 1-CTA-per-SM form (same K order, same split-K sum)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode import prewait_gemm as pg
+
+    torch.manual_seed(t)
+    n, k = 4480, 7168
+    x = torch.randn(t, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    packed = pg.pack_weight(w)
+    ref = torch.empty(t, n, device="cuda", dtype=torch.float32)
+    pg.gemm(ref, x, packed, n, (4, 1, 6, 6, 3, 0, 0))
+    out = torch.full_like(ref, float("nan"))
+    pg.gemm(out, x, packed, n, (4, 1, ns, 2, 1, pace, 1))
+    assert torch.equal(out, ref)
+    torch.testing.assert_close(out, x.float() @ w.float().t(), atol=1e-3, rtol=1e-4)

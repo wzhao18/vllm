@@ -206,6 +206,29 @@ def test_exchange_attaches_to_impls_that_read_counts():
     assert not decode._reads_counts(object.__new__(FlashMLASparseImpl))
 
 
+def test_attach_raises_for_impls_that_skip_counts():
+    """No silent stock fallback: wiring the exchange to a DSA layer whose sparse MLA
+    impl does not read the DCP counts raises at load (it used to warn and keep the
+    stock top-k); a two-level candidate layer keeps the stock top-k by design."""
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+
+    def attention(candidate_blocks):
+        indexer = SimpleNamespace(
+            k_cache=SimpleNamespace(prefix="model.layers.3.self_attn"),
+            candidate_blocks=candidate_blocks,
+        )
+        layer = SimpleNamespace(impl=object.__new__(FlashMLASparseImpl))
+        return SimpleNamespace(
+            dsa_indexer=indexer, mla_attn=SimpleNamespace(mla_attn=layer)
+        )
+
+    dcpx = SimpleNamespace(layers={}, indexers={})
+    with pytest.raises(RuntimeError, match="does not read dcp_local_topk_counts"):
+        decode.DcpxDecode.attach(dcpx, attention(None))
+    decode.DcpxDecode.attach(dcpx, attention(4))
+    assert dcpx.layers == {} and dcpx.indexers == {}
+
+
 def test_stable_sources_copy_once(tmp_path):
     """The shared digest-named build compiles a copy written once: a checkout whose
     unchanged source is newer than the last build must not trigger a rebuild."""

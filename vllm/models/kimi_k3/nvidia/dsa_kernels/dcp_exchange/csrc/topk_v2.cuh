@@ -1865,17 +1865,33 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 // SMEM of one row (both kernels), the mbarrier, then the PDL wait
 #define V2_KERNEL_PROLOGUE(T)                                                                   __shared__ __align__(16) uint32_t hist[kCoarseBins];                                       __shared__ __align__(16) uint32_t cpos[kV2Cand];                                           __shared__ __align__(16) uint16_t ckey[kV2Cand];                                           __shared__ __align__(128) uint4 srow[V2Cfg<T>::kNR * (T)];                                        __shared__ __align__(8) uint64_t s_bar;                                                    __shared__ uint32_t warp_sums[64];                                                         __shared__ int s_i[16];                                                                    __shared__ uint32_t s_u[16];                                                               __shared__ unsigned long long s_pref;                                                      __shared__ long long s_dbg[32];                                                            const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};        if (threadIdx.x == 0) {                                                                      mbar_init(&s_bar, kV2Cp);                                                                  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");                     }                                                                                          __syncthreads();                                                                           uint32_t bar_phase = 0;                                                                    asm volatile("griddepcontrol.wait;" ::: "memory");
 
+// The complete body of a row the hot body left (the same rows on every rank: the tier
+// comes from the exchanged words), at the next epoch, in the same CTA and out of line so
+// the hot row body keeps its code layout. Replaces the separate redo kernel launch (~1.0-1.5
+// us per call in-step even when no row needs it).
+template <int T>
+__device__ __noinline__ void v2_complete(const V2Params p, const V2Sm sm, const int row, const int ep,
+                                         uint32_t* bar_phase) {
+  uint32_t ph = *bar_phase;
+  v2_row<false, T>(p, sm, row, ep, ph);
+  *bar_phase = ph;
+}
+
 // The common case: one compact row body (PDL: the prologue overlaps the logits kernel's
-// tail; every global read follows the wait). Rows that need the complete body are left
-// to topk_v2_redo_kernel, launched right after: a call into the complete body from here
-// (out of line) cost ~2 us per call (stack frame, CTA start), the complete body inline
-// ~8 us in-step (instruction fetch).
+// tail; every global read follows the wait); a row that needs the complete body runs it
+// right away (v2_complete; the inline complete body measured ~8 us in-step: instruction fetch).
 template <int T>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(T)
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
-    if (threadIdx.x == 0) p.redo[row] = r;
+    // per shape: the 1024-thread variant (r1/r8) keeps topk_v2_redo_kernel (its in-CTA call
+    // measured +0.5 us/call at r8 in-step, x1k2), the 512-thread one runs it in the CTA
+    if constexpr (T < 1024) {
+      if (K31_RARE(r)) v2_complete<T>(p, sm, row, r == 510 ? 0 : r, &bar_phase);
+    } else {
+      if (threadIdx.x == 0) p.redo[row] = r;
+    }
   }
 }
 

@@ -73,6 +73,9 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
     compile_state_commit,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_resid,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     kda as specialized_prefill_kda,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
@@ -1011,9 +1014,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self,
         hidden_states: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
+        resid_prefix: tuple[torch.Tensor, bool] | None = None,
     ) -> torch.Tensor:
         # A QuantizedActivation is in_proj's MXFP8 input written by the
         # prefill AttnRes (specialized_prefill.attn_res_mxfp8).
+        # resid_prefix (prefill AttnRes dataflow C, attn_res_resid): (prefix,
+        # add): the o_proj adds its output into the AttnRes prefix (add) or
+        # stores it as the new prefix, and returns the prefix.
         qa = hidden_states if isinstance(hidden_states, QuantizedActivation) else None
         act_dtype = qa.orig_dtype if qa is not None else hidden_states.dtype
         act_device = qa.data.device if qa is not None else hidden_states.device
@@ -1096,6 +1103,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
             o_mxfp8=o_mxfp8,
         )
+        if resid_prefix is not None:
+            gemm = attn_res_resid.gemm_for(self.o_proj)
+            if o_mxfp8 is None or gemm is None:
+                raise RuntimeError(
+                    "KDA o_proj: the AttnRes prefix producer needs the MXFP8 o_proj "
+                    "input and an attn_res_resid GEMM"
+                )
+            prefix, add = resid_prefix
+            qa = o_mxfp8.activation()
+            if add:
+                return gemm.add_into(qa, prefix)
+            return gemm.store_into(qa, prefix)
         if o_mxfp8 is not None:
             return self.o_proj(o_mxfp8.activation())[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
@@ -1193,6 +1212,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             spec_query_len=self.spec_query_len,
             out=out,
         )
+
+    def resid_capable(self) -> bool:
+        """The o_proj can add its output into the prefill AttnRes prefix
+        (forward(resid_prefix=...), specialized_prefill.attn_res_resid)."""
+        cap = getattr(self, "_resid_capable", None)
+        if cap is None:
+            from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
+
+            cap = self._resid_capable = (
+                self.gemm_rs_ar is None
+                and takes_mxfp8_activation(self.o_proj)
+                and attn_res_resid.supported(self.o_proj)
+            )
+        return cap
 
     def _o_norm_mxfp8(self, core_attn_out: torch.Tensor, g2: torch.Tensor) -> bool:
         if self._o_norm_mxfp8_ok is None:
