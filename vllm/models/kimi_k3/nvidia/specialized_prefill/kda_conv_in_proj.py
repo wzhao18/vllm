@@ -92,8 +92,9 @@ class PrefillKdaConvInProj:
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
 
     def fused(self, qa):
-        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for a
-        prefill-only batch of at least ``MIN_ROWS`` rows, else None."""
+        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for an
+        eager prefill-only batch of at least ``MIN_ROWS`` rows that exports no
+        prefill checkpoint, else None (stock in_proj + conv)."""
         gemm = self._gemm
         assert gemm is not None, "PrefillKdaConvInProj.prepare() not run"
         rows = qa.data.shape[0]
@@ -115,6 +116,11 @@ class PrefillKdaConvInProj:
             or m.num_prefills == 0
             or m.num_decodes != 0
             or m.num_spec_decodes != 0
+            # A prefill checkpoint (prefix-cache snapshot) stores the raw
+            # q|k|v inputs before its offset as the conv state; the fused GEMM
+            # never materializes them (the checkpoint exporter would read the
+            # convolved planes as raw rows: wrong state, out-of-bounds rows).
+            or m.checkpoint is not None
         ):
             return None
         from vllm.model_executor.layers.mamba.mamba_utils import (
