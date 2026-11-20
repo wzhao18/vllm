@@ -143,7 +143,12 @@ class Fp4IndexLogits:
         reqs = rows // q
         lens = row_lens.reshape(rows)
         assert lens.dtype == torch.int32 and lens.is_contiguous()
-        w = self.weights[:rows]
+        self.prepare(head_w, lens, rows, reqs)
+        return self.launch(query, q_scale, kv_cache, block_table, max_len, rows, reqs)
+
+    def prepare(self, head_w, lens, rows, reqs):
+        """The per-request lengths, the CTA schedule and the FP32 head weights."""
+        q, w = self.q, self.weights[:rows]
         n_w = rows * HEADS
         block_w = 4096
         grid = (1 + triton.cdiv(n_w, block_w),)
@@ -152,6 +157,9 @@ class Fp4IndexLogits:
             Q=q, NUM_SMS=self.num_sms, SPLIT=SPLIT_KV,
             BLOCK_B=max(16, triton.next_power_of_2(reqs)),
             BLOCK_C=triton.next_power_of_2(self.num_sms + 1), BLOCK_W=block_w)
+
+    def launch(self, query, q_scale, kv_cache, block_table, max_len, rows, reqs):
+        q, w = self.q, self.weights[:rows]
         width = triton.cdiv(max_len, STORE) * STORE
         pitch = triton.cdiv(width, 512) * 512  # DeepSelect: 1 KiB BF16 row stride
         out = torch.empty(rows, pitch, dtype=torch.bfloat16, device=query.device)

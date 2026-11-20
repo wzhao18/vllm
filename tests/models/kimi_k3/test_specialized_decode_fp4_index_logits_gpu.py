@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 PAGE, ROW, HEADS, DIM = 64, 68, 32, 128
 
 
-def _case(reqs, q, ctx, dcp_rank, world=4, seed=0):
+def _case(reqs, q, ctx, dcp_rank, world=4, seed=0, lo=None):
     from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
     from vllm.utils.deep_gemm import (
         fp8_fp4_paged_mqa_logits,
@@ -30,7 +30,7 @@ def _case(reqs, q, ctx, dcp_rank, world=4, seed=0):
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     dev, rows = "cuda", reqs * q
-    glob = torch.randint(ctx // 2, ctx, (reqs,), device=dev, generator=g)
+    glob = torch.randint(ctx // 2 if lo is None else lo, ctx, (reqs,), device=dev, generator=g)
     glob = glob[:, None] + torch.arange(q, device=dev)[None, :]  # verify rows L..L+q-1
     lens = ((glob - dcp_rank + world - 1) // world).clamp(min=0).int().reshape(rows)
     pages = -(-(ctx + q + world) // world // PAGE) + 1  # fixed per (ctx, q): graph test
