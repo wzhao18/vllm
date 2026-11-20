@@ -50,15 +50,28 @@ from ..common.primitives import (
 from .sparse_mla import (
     SDESC_SW128,
     fence_mbar_init,
+    globaltimer,
     ld_shared_u32,
     mbar_arrive,
     mbar_arrive_tx,
     mbar_init,
     mbar_wait,
+    st_global_u64,
     tc_commit,
     tc_fence_after,
     tc_fence_before,
 )
+
+# Bench probe (benchmarks/kernels/k31_vr/bench_dattn_dcpv.py): the address of a
+# [CTAs, 16] u64 globaltimer buffer the "proj" tcgen05 DcpValue stamps its phases
+# into when compiled while it is nonzero (0, the default: no stamping code).
+STAMP_ADDR = 0
+# Bench probe ablation bits (0, the default: production code): 1 no projection
+# (no TMA loads or MMAs; stale value rows pushed), 2 no push and no merge,
+# 4 no merge, 8 merge without value polls, 16 merge without LSE polls,
+# 32 every LSE read as 0, 128 (+256) a 64 (256) ns sleep between polls, 512
+# SMs // H * H CTAs.
+KNOBS = 0
 
 LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends
 # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.
@@ -86,6 +99,10 @@ TC_OUT = 128 * 128 * 2
 # Its epilogue warps (warp % 4 = TMEM lane quadrant), clear of the TMA and MMA
 # issuers (warps 0 and 1), which run ahead into the next unit.
 TC_EPI = 4
+# The tcgen05 DcpValue's merge: threads per (row, owner head) item, each merging
+# MERGE_CHUNKS logical 16 B chunks of the 128-value row.
+MERGE_LANES = 8
+MERGE_CHUNKS = 128 * 2 // 16 // MERGE_LANES
 # kind::f16: FP32 D, BF16 A and B (K-major), N = 128, M = 128
 TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
 
@@ -147,6 +164,16 @@ def _bulk_read_wait1():
 @asm()
 def _bulk_wait0():
     return "cp.async.bulk.wait_group 0;", "~{memory}", ()
+
+
+@asm()
+def _nanosleep64():
+    return "nanosleep.u32 64;", "~{memory}", ()
+
+
+@asm()
+def _nanosleep256():
+    return "nanosleep.u32 256;", "~{memory}", ()
 
 
 @asm()
@@ -305,6 +332,8 @@ class DcpValue:
         already projected (the stock W_UV bmm over the gathered heads), so the
         projecting CTAs only push them."""
         self.heads, self.size, self.batch = heads, size, batch
+        self.stamp_addr = STAMP_ADDR
+        self.knobs = KNOBS
         assert partials in FORMATS, partials
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
@@ -331,8 +360,10 @@ class DcpValue:
             if self.tc:
                 self.mtiles = -(-batch // 128)
                 self.units = size * heads * self.mtiles
-                self.grid = (heads, max(1, sms // heads), 1)
-                self.merge_tiles = -(-tiles // self.grid[1])
+                ctas = sms if KNOBS & 512 == 0 else sms // heads * heads
+                self.grid = (ctas, 1, 1)
+                # (row, owner head) merge items per CTA, MERGE_LANES threads each
+                self.items = -(-batch * heads // ctas)
                 return
             merge = min(tiles, max(1, (sms - size * heads) // heads))
             self.grid = (heads, size + merge, 1)
@@ -480,23 +511,22 @@ class DcpValue:
 
     @cute.kernel
     def kernel_tc(self, args, am: tensormap.GridMap, bm: tensormap.GridMap):
-        """"proj" above PROJ_ROWS rows: CTA c = y H + head projects units c, c + G,
-        .. (unit u: gathered head u % (DCP H), rows 128 (u // (DCP H)) ..) on
-        tcgen05 and pushes each unit's value rows to the head's owner in one bulk
-        copy (the rows are contiguous there, rows with nothing to merge carry the
-        sentinel) and its LSEs, then merges tiles y, y + grid[1], .. of head
-        ``head``. Warp 0 issues the TMA ring and warp 1 the MMAs into two TMEM
+        """"proj" above PROJ_ROWS rows: CTA c of G (one per SM) projects units c,
+        c + G, .. (unit u: gathered head u % (DCP H), rows 128 (u // (DCP H)) ..)
+        on tcgen05 and pushes each unit's value rows to the head's owner in one
+        bulk copy (the rows are contiguous there, rows with nothing to merge carry
+        the sentinel) and its LSEs, then merges its share of the (row, owner head)
+        items (merge_items). Warp 0 issues the TMA ring and warp 1 the MMAs into two TMEM
         accumulators, both running ahead of the epilogue warps TC_EPI.. TC_EPI + 3
         (thread = row), which stage a unit's BF16 rows in one of two buffers while
         the previous unit's push is in flight."""
         rows_lse, lens, box, _, peers, lpeers, mailbox = args[1:8]
         parity, rank = args[12], args[13]
         H, D, B = self.heads, self.size, self.batch
-        G: cutlass.Constexpr = H * self.grid[1]
+        G: cutlass.Constexpr = self.grid[0]
         DH: cutlass.Constexpr = D * H
         cap = box.shape[2]
         smem = cutlass.utils.SmemAllocator()
-        scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
         ring = Uint32(smem.allocate_array(
             Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
         ).toint())
@@ -506,10 +536,9 @@ class DcpValue:
         acc_free = acc_full + Uint32(16)  # [2]
         slot_addr = acc_free + Uint32(16)
         tid, _, _ = cute.arch.thread_idx()
-        head, y, _ = cute.arch.block_idx()
+        c, _, _ = cute.arch.block_idx()
         lane = tid % 32
         warp = cute.arch.make_warp_uniform(tid // 32)
-        c = y * H + head
         if tid == 0:
             for st in cutlass.range_constexpr(TC_STAGES):
                 mbar_init(bars + Uint32(8 * st), Uint32(1))
@@ -519,6 +548,7 @@ class DcpValue:
                 mbar_init(acc_free + Uint32(8 * b), Uint32(128))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
+        self.mark(c, 0, tid)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
         cute.arch.griddepcontrol_wait()
@@ -528,22 +558,24 @@ class DcpValue:
         cute.arch.sync_threads()
         tc_fence_after()
         taddr = ld_shared_u32(slot_addr)
-        if warp == 0:
-            if lane == 0:
-                kc = Int32(0)
-                for u in range(c, self.units, G):
-                    gh = u % DH
-                    t0 = (u // DH) * 128
-                    for k in cutlass.range_constexpr(8):
-                        st = (kc + k) % TC_STAGES
-                        ph = ((kc + k) // TC_STAGES) & 1
-                        full = bars + Uint32(8) * Uint32(st)
-                        mbar_wait(bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
-                        mbar_arrive_tx(full, Uint32(TC_STAGE))
-                        dst = ring + Uint32(TC_STAGE) * Uint32(st)
-                        _tma3d(dst, tm_a, full, 64 * k, gh, t0)
-                        _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
-                    kc = kc + 8
+        self.mark(c, 1, tid)
+        if cutlass.const_expr(self.knobs & 1 == 0):
+            if warp == 0:
+                if lane == 0:
+                    kc = Int32(0)
+                    for u in range(c, self.units, G):
+                        gh = u % DH
+                        t0 = (u // DH) * 128
+                        for k in cutlass.range_constexpr(8):
+                            st = (kc + k) % TC_STAGES
+                            ph = ((kc + k) // TC_STAGES) & 1
+                            full = bars + Uint32(8) * Uint32(st)
+                            mbar_wait(bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
+                            mbar_arrive_tx(full, Uint32(TC_STAGE))
+                            dst = ring + Uint32(TC_STAGE) * Uint32(st)
+                            _tma3d(dst, tm_a, full, 64 * k, gh, t0)
+                            _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
+                        kc = kc + 8
         if warp == 1:
             if lane == 0:
                 kc = Int32(0)
@@ -553,19 +585,25 @@ class DcpValue:
                     mbar_wait(acc_free + Uint32(8) * Uint32(b), ((j >> 1) & 1) ^ 1)
                     tc_fence_after()
                     acc = taddr + Uint32(128) * Uint32(b)
-                    for k in cutlass.range_constexpr(8):
-                        st = (kc + k) % TC_STAGES
-                        ph = ((kc + k) // TC_STAGES) & 1
-                        mbar_wait(bars + Uint32(8) * Uint32(st), ph)
-                        tc_fence_after()
-                        src = ring + Uint32(TC_STAGE) * Uint32(st)
-                        for kk in cutlass.range_constexpr(4):
-                            ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
-                            bd = Uint64(SDESC_SW128) | Uint64(
-                                (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
-                            _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
-                                     Uint32(1 if k + kk > 0 else 0))
-                        tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
+                    if cutlass.const_expr(self.knobs & 1 == 0):
+                        for k in cutlass.range_constexpr(8):
+                            st = (kc + k) % TC_STAGES
+                            ph = ((kc + k) // TC_STAGES) & 1
+                            mbar_wait(bars + Uint32(8) * Uint32(st), ph)
+                            tc_fence_after()
+                            if j == 0:
+                                if cutlass.const_expr(k == 0):
+                                    self.mark(c, 6, lane)
+                                if cutlass.const_expr(k == 7):
+                                    self.mark(c, 7, lane)
+                            src = ring + Uint32(TC_STAGE) * Uint32(st)
+                            for kk in cutlass.range_constexpr(4):
+                                ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
+                                bd = Uint64(SDESC_SW128) | Uint64(
+                                    (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
+                                _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
+                                         Uint32(1 if k + kk > 0 else 0))
+                            tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
                     tc_commit(acc_full + Uint32(8) * Uint32(b))
                     kc = kc + 8
                     j = j + 1
@@ -590,6 +628,7 @@ class DcpValue:
                 _epi_sync()
                 mbar_wait(acc_full + Uint32(8) * Uint32(b), (j >> 1) & 1)
                 tc_fence_after()
+                self.mark(c, 2 + 2 * j, row)
                 out = outs + Uint32(TC_OUT) * Uint32(b) + Uint32(256) * Uint32(row)
                 swz = row % 8  # chunk ^ (t % 8): conflict-free rows, as the mailbox
                 acc = taddr + Uint32(128) * Uint32(b) + quad
@@ -606,20 +645,24 @@ class DcpValue:
                         _st_shared4(out + chunk * Uint32(16), *words)
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(b))  # TMEM read
-                if live:
-                    lse_at = lpeers[owner] + Int64(base + t) * 4
-                    store_relaxed(lse_at, (float_bits(lse),))
+                if cutlass.const_expr(self.knobs & 2 == 0):
+                    if live:
+                        lse_at = lpeers[owner] + Int64(base + t) * 4
+                        store_relaxed(lse_at, (float_bits(lse),))
                 _fence_async_shared()
                 _epi_sync()
-                if row == 0:
-                    n = B - t0
-                    if n > 128:
-                        n = 128
-                    _bulk_push(peers[owner] + Int64(base + t0) * 256,
-                               outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                if cutlass.const_expr(self.knobs & 2 == 0):
+                    if row == 0:
+                        n = B - t0
+                        if n > 128:
+                            n = 128
+                        _bulk_push(peers[owner] + Int64(base + t0) * 256,
+                                   outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                self.mark(c, 3 + 2 * j, row)
                 j = j + 1
             if row == 0:
                 _bulk_wait0()
+            self.mark(c, 8, row)
         cute.arch.sync_threads()
         # Free TMEM before the dependents launch: a dependent CTA placed on this SM
         # while the merge spins may require TMEM column 0 (exclusive allocators).
@@ -628,41 +671,79 @@ class DcpValue:
             _tmem_free256(taddr)
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
-        self.merge_rows(args, scales, tid, y)
+        if cutlass.const_expr(self.knobs & 6 == 0):
+            self.merge_items(args, tid, c)
+        if cutlass.const_expr(self.stamp_addr != 0):
+            cute.arch.sync_threads()
+        self.mark(c, 10, tid)
 
     @cute.jit
-    def merge_rows(self, args, scales, tid, y):
-        """merge_projected over every row of tiles y, y + grid[1], .. at once (one
-        LSE poll round, one value poll round per 512 row chunks instead of a
-        dependent chain per 16-row tile): slot r = 16 j + i is row 16 (y + j
-        grid[1]) + i. Same arithmetic: the source weights exp2(lse - max) times
-        the IEEE reciprocal of their butterfly sum, the FP32 merge in source order,
+    def backoff(self):
+        """Bench probe (KNOBS 128 / 384): sleep between polls."""
+        if cutlass.const_expr(self.knobs & 128 != 0):
+            if cutlass.const_expr(self.knobs & 256 != 0):
+                _nanosleep256()
+            else:
+                _nanosleep64()
+
+    @cute.jit
+    def mark(self, c, slot, who):
+        """Bench probe: thread ``who`` == 0 stamps globaltimer into slot ``slot`` of
+        CTA ``c`` (STAMP_ADDR; slots past 15 are dropped)."""
+        if cutlass.const_expr(self.stamp_addr != 0):
+            if (who == 0) & (slot < 16):
+                at_ = Int64(self.stamp_addr) + (Int64(c) * 16 + Int64(slot)) * 8
+                st_global_u64(at_, globaltimer())
+
+    @cute.jit
+    def merge_items(self, args, tid, c):
+        """merge_projected over items c * items .. + items - 1 (item i: row
+        i % B of owner head i // B), MERGE_LANES threads each (thread k: logical
+        16 B chunks MERGE_CHUNKS k ..), no CTA-wide phase: every load of an item
+        (gate, the DCP sources' value chunks and LSEs) issues before its first
+        poll, lanes 0 .. DCP - 1 poll the sources' LSEs and the item's lanes
+        exchange them by shuffles. The source weights exp2(lse - max) times the
+        IEEE reciprocal of their butterfly sum, the FP32 merge in source order,
         one BF16 rounding, the gate."""
-        lbox, gate, totals, output = args[4], args[9], args[10], args[11]
-        box = args[3]
-        D, B = self.size, self.batch
-        head, _, _ = cute.arch.block_idx()
-        R: cutlass.Constexpr = 16 * self.merge_tiles
-        step: cutlass.Constexpr = self.grid[1]
-        for i in range(tid, R * D, 512):  # LSE polls (re-armed as read)
-            r, s = i // D, i % D
-            t = (y + (r // 16) * step) * 16 + r % 16
-            lse = Float32(EMPTY_LSE)
-            if t < B:
-                source = at(lbox, s, head, t)
+        box, lbox = args[3], args[4]
+        gate, totals, output = args[9], args[10], args[11]
+        H, D, B = self.heads, self.size, self.batch
+        L: cutlass.Constexpr = MERGE_LANES
+        C: cutlass.Constexpr = MERGE_CHUNKS
+        # whole warps (the shuffles), every lane of an item in one warp
+        span: cutlass.Constexpr = -(-self.items * L // 32) * 32
+        lane = tid % L
+        for j in range(tid, span, 512):
+            i = c * self.items + j // L
+            valid = (j // L < self.items) & (i < B * H)
+            if not valid:
+                i = Int32(0)
+            head, t = i // B, i % B
+            swz = t % 8
+            col = head * 128 + 8 * C * lane
+            gates = [load_words(at(gate, t, col + 8 * q), count=4, mutable=True)
+                     for q in range(C)]
+            active = totals[t // self.q] > 0
+            sources = [[at(box, s, head, t, 8 * ((C * lane + q) ^ swz))
+                        for q in range(C)] for s in range(D)]
+            loads = [[load_volatile(sources[s][q], count=4) for q in range(C)]
+                     for s in range(D)]
+            mine = Float32(EMPTY_LSE)
+            if valid & (lane < D):
+                source = at(lbox, lane, head, t)
                 word = load_volatile(source)[0]
                 while word == Uint32(LSE_SENT):
+                    self.backoff()
                     word = load_volatile(source)[0]
                 store_words(source, (Uint32(LSE_SENT),))
-                lse = bits_float(word)
-            scales[r, s] = lse
-        cute.arch.sync_threads()
-        if tid < R:
-            lses = [scales[tid, s] for s in range(D)]
+                mine = bits_float(word)
+            base = (tid % 32) - lane
+            lses = [cute.arch.shuffle_sync(mine, base + s) for s in range(D)]
+            self.mark(c, 9, tid)
             top = lses[0]
             for s in cutlass.range_constexpr(1, D):
                 top = max(top, lses[s])
-            top = max(top, Float32(EMPTY_LSE))  # (warp lanes past DCP)
+            top = max(top, Float32(EMPTY_LSE))
             weights = []
             for s in cutlass.range_constexpr(D):
                 w = Float32(0)
@@ -671,45 +752,34 @@ class DcpValue:
                 weights.append(w)
             sums = weights + [Float32(0)] * ((1 << (D - 1).bit_length()) - D)
             for _ in cutlass.range_constexpr((len(sums) - 1).bit_length()):
-                # warp_sum's butterfly order (lane 0)
                 half = len(sums) // 2
                 sums = [sums[k] + sums[k + half] for k in range(half)]
             total = sums[0]
             inverse = Float32(0)
             if total > 0:
                 inverse = div_rn(Float32(1), total)
+            merged = [zeros(8, Float32) for _ in range(C)]
             for s in cutlass.range_constexpr(D):
-                scale = weights[s] * inverse
-                if lses[s] <= Float32(EMPTY_LSE):
-                    scale = Float32(-1)  # no value row: neither polled nor re-armed
-                scales[tid, s] = scale
-        cute.arch.sync_threads()
-        for i in range(tid, R * 16, 512):
-            r, chunk = i // 16, i % 16
-            t = (y + (r // 16) * step) * 16 + r % 16
-            if t < B:
-                merged = zeros(8, Float32)
-                swz = chunk ^ (t % 8)
-                sources = [at(box, s, head, t, 8 * swz) for s in range(D)]
-                loads = [load_volatile(source, count=4) for source in sources]
-                for k in cutlass.range_constexpr(D):
-                    w = scales[r, k]
-                    if w >= Float32(0):
-                        self.poll_pair(sources[k], loads[k], w, merged)
-                col = head * 128 + 8 * chunk
-                gates = load_words(at(gate, t, col), count=4, mutable=True)
-                words = []
-                for e in cutlass.range_constexpr(4):
-                    # Padded rows may hold a NaN gate; keep inactive rows zero.
-                    lo, hi = Float32(0), Float32(0)
-                    if totals[t // self.q] > 0:
-                        g = unpack_bf16(gates[e])
-                        lo, hi = (
-                            Float32(BFloat16(merged[2 * e + k])) * sigmoid(g[k], False)
-                            for k in range(2)
-                        )
-                    words.append(bf16x2(lo, hi))
-                store_words(at(output, t, col), tuple(words))
+                if valid & (lses[s] > Float32(EMPTY_LSE)):
+                    w = weights[s] * inverse
+                    for q in cutlass.range_constexpr(C):
+                        self.poll_pair(sources[s][q], loads[s][q], w, merged[q])
+            self.mark(c, 11, tid)
+            if valid:
+                for q in cutlass.range_constexpr(C):
+                    words = []
+                    for e in cutlass.range_constexpr(4):
+                        # Padded rows may hold a NaN gate; keep inactive rows zero.
+                        lo, hi = Float32(0), Float32(0)
+                        if active:
+                            g = unpack_bf16(gates[q][e])
+                            lo, hi = (
+                                Float32(BFloat16(merged[q][2 * e + k]))
+                                * sigmoid(g[k], False)
+                                for k in range(2)
+                            )
+                        words.append(bf16x2(lo, hi))
+                    store_words(at(output, t, col + 8 * q), tuple(words))
 
     @cute.jit
     def push_values(self, args, gh, tid):
@@ -1015,6 +1085,7 @@ class DcpValue:
         """Polls a BF16 partial chunk (8 values) until published, re-arms it and adds
         it, weighted by ``w``, to ``merged``."""
         while not published(words):
+            self.backoff()
             words = load_volatile(source, count=4)
         store_words(source, (Uint32(PAIR_SENT),) * 4)
         for e in cutlass.range_constexpr(4):
