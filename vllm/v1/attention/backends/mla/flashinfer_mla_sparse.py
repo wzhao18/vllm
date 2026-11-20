@@ -1071,6 +1071,15 @@ def _finish_dcp_partials(
     )
 
 
+def _joined_query(q: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    if not isinstance(q, tuple):
+        return q
+    ql_nope, q_pe = q
+    if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+        return ql_nope
+    return torch.cat(q, dim=-1)
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -1549,6 +1558,69 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             return num_heads
         return trtllm_gen_query_heads(num_heads)
 
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+        *,
+        row_offset: int = 0,
+        num_step_rows: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Prefill-sized calls of the specialized prefill kernel take the indexer's
+        # request-relative top-k: the kernel's gather does the block-table remap.
+        num_tokens = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
+        block_size = attn_metadata.block_size
+        psm = self._prefill_sparse_mla
+        if (
+            psm is None
+            or row_offset != 0
+            or self.need_to_return_lse_for_decode
+            or not self._runs_prefill_sparse_mla(num_tokens)
+            or isinstance(self.index_group, HiSparseMLAIndexGroup)
+            or block_size & (block_size - 1)
+        ):
+            return super().forward_mqa(
+                q,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                layer,
+                row_offset=row_offset,
+                num_step_rows=num_step_rows,
+            )
+        assert self.topk_indices_buffer is not None
+        q = self._prefill_sparse_mla_query(q)
+        self._prepare_mqa_kernel(layer, q.device)
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        kv_rows, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache.view(q.dtype), block_size
+        )
+        out = psm.sparse_mla_prefill_logical(
+            q,
+            kv_rows,
+            self.topk_indices_buffer[:num_tokens],
+            attn_metadata.req_id_per_token[:num_tokens],
+            attn_metadata.block_table,
+            block_size,
+            block_stride_rows,
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+        self._fused_query = None
+        return out, None
+
+    def _prefill_sparse_mla_query(
+        self, q: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        psm = self._prefill_sparse_mla
+        assert psm is not None
+        q = _joined_query(q)
+        assert q.dtype == torch.float8_e4m3fn, q.dtype
+        if q.shape[1] != psm.H or not q.is_contiguous():
+            q = q[:, : psm.H].contiguous()
+        return q
+
     def _forward_mqa_kernel(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1563,12 +1635,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if return_lse is None:
             return_lse = self.need_to_return_lse_for_decode
-        if isinstance(q, tuple):
-            ql_nope, q_pe = q
-            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
-                q = ql_nope
-            else:
-                q = torch.cat(q, dim=-1)
+        q = _joined_query(q)
 
         if self.use_prims_ts:
             return self._forward_prims_ts(
@@ -1582,9 +1649,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         if not return_lse and self._runs_prefill_sparse_mla(q.shape[0]):
             psm = self._prefill_sparse_mla
-            assert psm is not None and q.dtype == torch.float8_e4m3fn, q.dtype
-            if q.shape[1] != psm.H or not q.is_contiguous():
-                q = q[:, : psm.H].contiguous()
+            assert psm is not None
+            q = self._prefill_sparse_mla_query(q)
             kv_rows, _ = flat_kv_row_view(kv_cache.view(q.dtype), block_size)
             # Physical slots are flat rows of kv_rows (block stride included).
             out = psm.sparse_mla_prefill(
