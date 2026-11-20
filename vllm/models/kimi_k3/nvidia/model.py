@@ -2472,13 +2472,18 @@ class KimiLinearForCausalLM(
         )
         fused_conv = 0
         for module in self.model.modules() if prefill_worker else ():
-            if isinstance(module, KimiK3DeltaAttention) and kda_conv_in_proj.supported(
-                module
-            ):
-                conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
-                conv_in_proj.prepare()
-                module._prefill_conv_in_proj = conv_in_proj
-                fused_conv += 1
+            if not isinstance(module, KimiK3DeltaAttention):
+                continue
+            reason = kda_conv_in_proj.unsupported_reason(module)
+            if reason is not None:
+                logger.info_once(
+                    "Kimi K3: prefill KDA in_proj keeps the separate conv: %s", reason
+                )
+                continue
+            conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
+            conv_in_proj.prepare()
+            module._prefill_conv_in_proj = conv_in_proj
+            fused_conv += 1
         if fused_conv:
             logger.info_once(
                 "Kimi K3: %d prefill KDA layers run the q|k|v in_proj GEMM with the "

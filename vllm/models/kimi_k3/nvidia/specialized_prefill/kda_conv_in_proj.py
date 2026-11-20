@@ -23,31 +23,39 @@ MIN_ROWS = 2048
 TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "")
 
 
-def supported(layer) -> bool:
-    """SM107, online-MXFP8 in_proj with K-major [N, K] rows, FP32 conv
-    weights, 256-multiple planes."""
+def _qkv_rows(lin) -> torch.Tensor:
+    """The online-MXFP8 in_proj weight as K-major [N, K] FP8 rows."""
+    from vllm.models.kimi_k3.nvidia.mxfp8 import _kernel_layout
+
+    w = lin.weight.data
+    return w.t() if _kernel_layout(lin) == "kn" else w
+
+
+def unsupported_reason(layer) -> str | None:
+    """None when the layer can run the fused GEMM: SM107, online-MXFP8 in_proj
+    with K-major [N, K] rows (either kernel layout), FP32 width-4 conv
+    weights, 256-multiple planes; else why not."""
     from vllm.platforms import current_platform
 
     if not current_platform.is_device_capability((10, 7)):
-        return False
+        return "not SM107"
     from vllm.models.kimi_k3.nvidia.mxfp8 import _kernel_layout, is_mxfp8_linear
 
     lin = layer.in_proj_qkvgfab
-    if not is_mxfp8_linear(lin) or _kernel_layout(lin) != "nk":
-        return False
+    if not is_mxfp8_linear(lin) or _kernel_layout(lin) is None:
+        return "in_proj is not an online-MXFP8 [N, K] / [K, N] linear"
+    if not _qkv_rows(lin).is_contiguous():
+        return "in_proj rows are not K-major"
     w = layer.conv1d.weight
-    p = layer.local_projection_size
-    return (
-        w.dtype == torch.float32
-        and w.shape[-1] == 4
-        and p % 256 == 0
-        and lin.input_size_per_partition % 128 == 0
-        and lin.weight.data.is_contiguous()
-    )
+    if w.dtype != torch.float32 or w.shape[-1] != 4:
+        return f"conv weight {w.dtype} {tuple(w.shape)} (FP32 width 4 only)"
+    if layer.local_projection_size % 256 or lin.input_size_per_partition % 128:
+        return "plane / K size"
+    return None
 
 
 class PrefillKdaConvInProj:
-    """Fused q|k|v in_proj + conv of one KDA layer (``supported(layer)``)."""
+    """Fused q|k|v in_proj + conv of one KDA layer (``unsupported_reason`` None)."""
 
     def __init__(self, layer) -> None:
         self.layer = layer
@@ -62,7 +70,7 @@ class PrefillKdaConvInProj:
         from .sm107_gemm.kda_conv_gemm import KdaConvGemm
 
         lin = self.layer.in_proj_qkvgfab
-        w = lin.weight.data
+        w = _qkv_rows(lin)
         n, k = w.shape
         nq = 3 * self.p
         # F8_128x4 scales are 128-row blocks of K / 32 bytes: q|k|v (a whole
