@@ -60,6 +60,10 @@ def main():
               f"{med(land)}) | softmax after S: bar_red_or {med(smt[0])}, P-buf wait {med(smt[1])}, "
               f"P math {med(smt[2])}, fence+O-ready {med(smt[3])} | PV issue {med(pvi)}", flush=True)
         print(f"  rt all {rt}", flush=True)
+        # round 6: b split at the softmax's slot 25 (S tcgen05.ld + wait::ld done)
+        b1 = d([sm(u, 1) for u in rows], [s[u, 25] for u in rows])
+        b2 = d([s[u, 25] for u in rows], [sm(u, 2) for u in rows])
+        print(f"  b = S load {med(b1)} {b1} + fence/arrive {med(b2)} {b2}", flush=True)
         # round 5: PV warp waits for subtile u (slots 7 -> 15 QKI(u + 2), 15 -> 18 O-ready(u))
         # and the softmax latency S-full observed -> O-ready arrived (slot 1 -> 6)
         pq = d([s[u, 7] for u in rows], [s[u, 15] for u in rows])
