@@ -55,6 +55,7 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 # Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
 # FC1, under the dispatch ("early").
 RUBIN_FUSED_SHARED_L2_POSITION = "early"
+_LU2_DIAG = bool(__import__("os").environ.get("DMS_LU2_DUMP"))  # DIAGNOSTIC ONLY
 
 
 def compile_cache_key(
@@ -680,6 +681,10 @@ class RubinMegaMoeSession:
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
+        if _LU2_DIAG and not torch.cuda.is_current_stream_capturing():  # DIAGNOSTIC ONLY (never lands)
+            from ..specialized_decode.cutedsl.gemm.wide import _diag_dump
+
+            _diag_dump()
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
     def release(self) -> None:

@@ -865,6 +865,46 @@ def permute_gate_up(weight):
     return torch.cat((g, u), dim=1).reshape(n, k).contiguous()
 
 
+# DIAGNOSTIC ONLY (D-MOE-STREAM r6 lu2 timeline, never lands): DMS_LU2_DUMP=<prefix> dumps every prepared
+# plan's stamp region (the last call's per-CTA %globaltimer stamps) at process exit.
+_DIAG_PLANS = []
+
+
+def _diag_register(gemm, rows, n_pad, split, flags):
+    import os
+
+    prefix = os.environ.get("DMS_LU2_DUMP")
+    if not prefix:
+        return
+    _DIAG_PLANS.append((gemm, rows, n_pad, split, flags))
+    if len(_DIAG_PLANS) == 1:
+        print(f"lu2diag registered (prefix {prefix})", flush=True)
+
+
+_DIAG_COUNT = [0]
+_DIAG_T = [0.0]
+
+
+def _diag_dump():
+    """Eager (non-capturing) calls only: every plan's stamps hold its last graph replay."""
+    import os
+
+    out = []
+    for g, r, npad, sp, fl in _DIAG_PLANS:
+        out.append({"n": g.n, "k": g.k, "rows": r, "n_pad": npad, "split": sp, "flags": fl.cpu()})
+    import time
+
+    rank = str(torch.cuda.current_device())
+    now = time.time()
+    if now - _DIAG_T[0] < 1.0:  # once per eager pass: the first eager launch after >= 1 s of graph replays
+        return
+    _DIAG_T[0] = now
+    _DIAG_COUNT[0] += 1
+    path = f"{os.environ['DMS_LU2_DUMP']}.r{rank}.c{_DIAG_COUNT[0]:03d}.pt"
+    print(f"lu2diag dump {len(out)} plans -> {path}", flush=True)
+    torch.save(out, path)
+
+
 class PreparedWide:
     """``WideGemm`` per prepared row count on one weight (``silu``: a gate_up weight
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
@@ -917,6 +957,7 @@ class PreparedWide:
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
             self.kernels[rows] = _COMPILED[key]
             self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags))
+            _diag_register(self, rows, n_pad, split, flags)
         self.w = w
         return self
 
