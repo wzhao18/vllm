@@ -26,7 +26,7 @@ import torch
 _CPP_SRC = r"""
 #include <torch/extension.h>
 void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& wp, int64_t n, int64_t C, int64_t KB,
-                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr);
+                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr, int64_t nt, int64_t nsx);
 """
 
 _CUDA_SRC = r"""
@@ -40,6 +40,7 @@ struct P {
   int N, K, T, C, KB, NS, NW, RT, nst, pdl, xlanes, out32;
   unsigned WB, XB, SB, recv_off, idesc, nm, tcols;
   long long pace;  // clocks between a weight warp's pre-wait stages (0: issue them at once)
+  int NSX;         // activation ring stages (TMEM-staged form)
 };
 
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -322,6 +323,354 @@ __global__ void __launch_bounds__(CR ? 256 : 512, CR ? 4 : 1) wsg_k(const __grid
   if (warp == 4) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tbase), "r"(p.tcols) : "memory");
 }
 
+__device__ __forceinline__ void tcp_e(uint32_t taddr, uint64_t d) {  // smem (descriptor) -> TMEM, 128 lanes x 8 columns
+  asm volatile("{.reg .pred P; elect.sync _|P, 0xffffffff; @P tcgen05.cp.cta_group::1.128x256b [%0], %1;}" :: "r"(taddr), "l"(d) : "memory");
+}
+__device__ __forceinline__ void mma_ta_e(uint32_t d, uint32_t a, uint64_t b, unsigned id, unsigned acc) {  // A from TMEM
+  asm volatile("{.reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, Q;}"
+               :: "r"(d), "r"(a), "l"(b), "r"(id), "r"(acc) : "memory");
+}
+
+// TMEM-staged co-resident form: separate weight (NS x 16 KiB) and activation (NSX x T x 128 B) rings; the first NT
+// weight stages are copied from their ring slot into tensor memory (tcgen05.cp) as they land, before the PDL wait, so
+// NT + NS weight stages are on chip when the predecessor ends; their MMAs read A from tensor memory (same K order and
+// FP32 accumulation as the shared-memory form). Warps: 0-3 epilogue, 4 TMEM + MMA, 5 activations, 6-7 weights.
+template <int T, int CC, int NT>
+__global__ void __launch_bounds__(256, 4) wst_k(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__ wp,
+                                                void* __restrict__ yv, const P p) {
+  constexpr unsigned WB = 16384, XB = T * 128;
+  constexpr int ACOL = T <= 32 ? 32 : T <= 64 ? 64 : 128;  // accumulator columns; A stages follow
+  static_assert(T <= 128 && ACOL + 32 * NT <= 512 && CC > 1, "wst_k: TMEM / split");
+  constexpr int rpr = (128 + CC - 1) / CC, RS = T + 4;
+  extern __shared__ __align__(1024) uint8_t smraw[];
+  uint8_t* sm = (uint8_t*)(((uintptr_t)smraw + 1023) & ~(uintptr_t)1023);
+  uint8_t* xr = sm + (size_t)p.NS * WB;
+  __shared__ __align__(8) uint64_t wfull[16], wempty[16], xfull[16], xempty[16], accf, dep, rbar;
+  __shared__ uint32_t tbase;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const unsigned cx = crank();
+  const int rt = blockIdx.y;
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < p.NS; ++s) { mb_init(sa(&wfull[s]), 1); mb_init(sa(&wempty[s]), 1); }
+    for (int s = 0; s < p.NSX; ++s) { mb_init(sa(&xfull[s]), 1); mb_init(sa(&xempty[s]), 1); }
+    mb_init(sa(&accf), 1);
+    mb_init(sa(&dep), 1);
+    mb_init(sa(&rbar), 1);
+    mb_expect(sa(&rbar), (unsigned)((CC - 1) * rpr * RS * 4));
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  cl_arrive();
+  const int kb0 = cx * (p.K / 64 / CC);
+  if (warp >= 5 + p.xlanes) {  // weight producers: never wait on the predecessor (paced until it ends)
+    const int wi = warp - 5 - p.xlanes;
+    const uint8_t* src = wp + ((size_t)rt * (p.K / 64) + kb0) * WB;
+    const long long t0 = p.pace ? __shfl_sync(0xffffffffu, clk(), 0) : 0;
+    bool free_issue = p.pace == 0;
+    for (int i = wi; i < p.nst; i += p.NW) {
+      const int s = i % p.NS;
+      if (i >= p.NS) mb_wait(sa(&wempty[s]), ((i / p.NS) - 1) & 1);
+      while (!free_issue) {
+        const unsigned d = mb_done(sa(&dep)) ? 1u : 0u;
+        const unsigned go = __shfl_sync(0xffffffffu, d | (clk() >= t0 + (long long)i * p.pace ? 2u : 0u), 0);
+        if (go) { free_issue = go & 1u; break; }
+        __nanosleep(64);
+      }
+      bulk_e(uni(sa(sm + (size_t)s * WB)), src + (size_t)i * WB, WB, uni(sa(&wfull[s])));
+    }
+  } else if (warp >= 5) {  // activation producers after the dependency wait
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (warp == 5 && lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&dep)) : "memory");
+    for (int i = warp - 5; i < p.nst; i += p.xlanes) {
+      const int s = i % p.NSX;
+      if (i >= p.NSX) mb_wait(sa(&xempty[s]), ((i / p.NSX) - 1) & 1);
+      tma3d_e(uni(sa(xr + (size_t)s * XB)), &xmap, 0, 0, kb0 + i, uni(sa(&xfull[s])), XB);
+    }
+  } else if (warp == 4) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(sa(&tbase)), "r"(512) : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    asm volatile("tcgen05.fence::before_thread_sync;");
+    __syncwarp();
+    asm volatile("bar.arrive 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = uni(*(volatile uint32_t*)&tbase);
+    for (int j = 0; j < NT; ++j) {  // pre-wait: weight stage j -> TMEM columns ACOL + 32 j (frees its ring slot)
+      const int s = j % p.NS;
+      mb_wait(sa(&wfull[s]), (j / p.NS) & 1);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      const uint32_t wb = uni(sa(sm + (size_t)s * WB));
+#pragma unroll
+      for (int k = 0; k < 4; ++k) tcp_e(tm + ACOL + 32 * j + 8 * k, sdesc(wb + 32 * k));
+      commit_e(uni(sa(&wempty[s])));
+    }
+    for (int i = 0; i < p.nst; ++i) {
+      const int sx = i % p.NSX, s = i % p.NS;
+      mb_wait(sa(&xfull[sx]), (i / p.NSX) & 1);
+      if (i >= NT) mb_wait(sa(&wfull[s]), (i / p.NS) & 1);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      const uint64_t bd = sdesc(uni(sa(xr + (size_t)sx * XB)));
+      if (i < NT) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+          mma_ta_e(tm, tm + ACOL + 32 * i + 8 * k, bd + (uint64_t)((k * 32) >> 4), p.idesc, (i > 0 || k > 0) ? 1u : 0u);
+      } else {
+        const uint64_t ad = sdesc(uni(sa(sm + (size_t)s * WB)));
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+          mma_e(tm, ad + (uint64_t)((k * 32) >> 4), bd + (uint64_t)((k * 32) >> 4), p.idesc, (i > 0 || k > 0) ? 1u : 0u);
+      }
+      commit_e(uni(sa(&xempty[sx])));
+      if (i >= NT) commit_e(uni(sa(&wempty[s])));
+    }
+    commit_e(uni(sa(&accf)));
+  }
+  // ---- epilogue: stage partial rows, one bulk DSMEM copy per warp to the rows' owner, rank-ordered sum ----
+  float* recv = (float*)(sm + p.recv_off);  // [C - 1 peers][rpr][RS]
+  float* stg = (float*)sm;                  // [C dst][rpr][RS] (aliases the drained rings)
+  if (warp < 4) {
+    asm volatile("bar.sync 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = tbase;
+    mb_wait(sa(&accf), 0);
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    if (p.pdl && threadIdx.x == 0) asm volatile("griddepcontrol.launch_dependents;");
+    const int r = warp * 32 + lane;
+    const uint32_t ta = tm + ((uint32_t)(warp * 32) << 16);
+    const unsigned d = r / rpr; const int jr = r % rpr;
+    float* mine = stg + ((size_t)d * rpr + jr) * RS;
+#pragma unroll 1
+    for (int c0 = 0; c0 < T; c0 += 16) {
+      float v[16];
+      ld8nw(ta + c0, v); ld8nw(ta + c0 + 8, v + 8);
+      asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#pragma unroll
+      for (int q = 0; q < 16; q += 4) *(float4*)&mine[c0 + q] = make_float4(v[q], v[q + 1], v[q + 2], v[q + 3]);
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncwarp();
+    cl_wait();
+    if (d != cx && lane == 0) {
+      const int j0 = (warp * 32) % rpr;
+      const unsigned idx = cx < d ? cx : cx - 1;
+      uint32_t dr, br;
+      asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(dr) : "r"(sa(recv + ((size_t)idx * rpr + j0) * RS)), "r"(d));
+      asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(br) : "r"(sa(&rbar)), "r"(d));
+      asm volatile("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                   :: "r"(dr), "r"(sa(stg + ((size_t)d * rpr + j0) * RS)), "r"((unsigned)(32 * RS * 4)), "r"(br) : "memory");
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+    asm volatile("bar.sync 2, 128;" ::: "memory");
+    mb_wait(sa(&rbar), 0);
+    constexpr int G = T / 4;
+#pragma unroll
+    for (int e = threadIdx.x; e < rpr * G; e += 128) {
+      const int jr2 = e % rpr, g = e / rpr;
+      const int lr = cx * rpr + jr2, row = rt * 128 + lr;
+      if (lr >= 128) continue;
+      float4 a;
+#pragma unroll
+      for (int src = 0; src < CC; ++src) {
+        const float* part = src == (int)cx ? stg + (size_t)cx * rpr * RS : recv + (size_t)(src < (int)cx ? src : src - 1) * rpr * RS;
+        const float4 b = *(const float4*)&part[(size_t)jr2 * RS + 4 * g];
+        if (src == 0) a = b;
+        else { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; }
+      }
+      if (row < p.N) {
+        stout(yv, (size_t)(4 * g) * p.N + row, a.x, p.out32);
+        stout(yv, (size_t)(4 * g + 1) * p.N + row, a.y, p.out32);
+        stout(yv, (size_t)(4 * g + 2) * p.N + row, a.z, p.out32);
+        stout(yv, (size_t)(4 * g + 3) * p.N + row, a.w, p.out32);
+      }
+    }
+    if (lane == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+  } else {
+    cl_wait();
+  }
+  asm volatile("tcgen05.fence::before_thread_sync;");
+  __syncthreads();
+  if (warp == 4) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tbase), "r"(512) : "memory");
+}
+
+// Full pre-wait weight residency: split-K over a 6-CTA cluster (35 x 6 = 210 CTAs, one per SM beside the
+// predecessor); a CTA's whole weight slice (18-19 K-blocks) is on chip before the PDL wait: its last NT K-blocks in
+// tensor memory (copied through pool slots with tcgen05.cp), its first nsw K-blocks in pool slots. After the wait the
+// pool becomes the activation ring: each MMA frees its activation slot and (first nsw K-blocks) its weight slot, so the
+// activation loads in flight grow from P - nsw to P. The (slot, use) schedule of every load is computed once per CTA.
+// MMAs run in K order (A from the pool, then from TMEM), the 6 partials are summed in rank order by their owner.
+template <int T, int NT>
+__global__ void __launch_bounds__(256, 4) wsf_k(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__ wp,
+                                                void* __restrict__ yv, const P p) {
+  constexpr int CC = 6, MAXP = 16, MAXS = 24;
+  constexpr unsigned WB = 16384, XB = T * 128;
+  constexpr int ACOL = T <= 32 ? 32 : T <= 64 ? 64 : 128;
+  static_assert(T <= 128 && ACOL + 32 * NT <= 512 && XB <= WB, "wsf_k: TMEM / slot");
+  constexpr int RPR = (128 + CC - 1) / CC, RS = T + 4;  // owner rows (the last owner has 128 - 5 * RPR)
+  extern __shared__ __align__(1024) uint8_t smraw[];
+  uint8_t* sm = (uint8_t*)(((uintptr_t)smraw + 1023) & ~(uintptr_t)1023);
+  __shared__ __align__(8) uint64_t full[MAXP], empty[MAXP], accf, dep, rbar;
+  __shared__ uint32_t tbase;
+  __shared__ uint8_t tm_slot[MAXS], tm_use[MAXS], rs_use[MAXS], x_slot[MAXS], x_use[MAXS];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int cx = (int)crank();
+  const int rt = blockIdx.y;
+  const int kbt = p.K / 64, kbase = kbt / CC, kext = kbt % CC;
+  const int nst = kbase + (cx < kext ? 1 : 0), kb0 = cx * kbase + min(cx, kext), nsw = nst - NT;
+  const int np = p.NS;
+  const int rows_me = min(RPR, 128 - cx * RPR);
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < np; ++s) { mb_init(sa(&full[s]), 1); mb_init(sa(&empty[s]), 1); }
+    mb_init(sa(&accf), 1);
+    mb_init(sa(&dep), 1);
+    mb_init(sa(&rbar), 1);
+    mb_expect(sa(&rbar), (unsigned)((CC - 1) * rows_me * RS * 4));
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    uint8_t use[MAXP], q[2 * MAXS + MAXP];
+    for (int s = 0; s < np; ++s) use[s] = 0;
+    for (int j = 0; j < NT; ++j) { const int s = j % np; tm_slot[j] = (uint8_t)s; tm_use[j] = use[s]++; }
+    for (int m = 0; m < nsw; ++m) rs_use[m] = use[m]++;
+    int qh = 0, qt = 0;
+    for (int s = nsw; s < np; ++s) q[qt++] = (uint8_t)s;
+    for (int k = 0; k < nst; ++k) {  // activation k takes the slot freed earliest (by the MMA that frees it)
+      const int s = q[qh++];
+      x_slot[k] = (uint8_t)s; x_use[k] = use[s]++;
+      q[qt++] = (uint8_t)s;
+      if (k < nsw) q[qt++] = (uint8_t)k;
+    }
+  }
+  __syncthreads();
+  cl_arrive();
+  const uint8_t* wsrc = wp + ((size_t)rt * kbt + kb0) * WB;
+  if (warp >= 6) {  // warp 6: TMEM-bound weight K-blocks nsw.., warp 7: pool-resident K-blocks 0..nsw-1
+    const bool tmw = warp == 6;
+    const int n = tmw ? NT : nsw;
+    const long long t0 = p.pace ? __shfl_sync(0xffffffffu, clk(), 0) : 0;
+    bool free_issue = p.pace == 0;
+    for (int i = 0; i < n; ++i) {
+      const int s = tmw ? tm_slot[i] : i, u = tmw ? tm_use[i] : rs_use[i];
+      if (u >= 1) mb_wait(sa(&empty[s]), (u - 1) & 1);
+      while (!free_issue) {
+        const unsigned d = mb_done(sa(&dep)) ? 1u : 0u;
+        const unsigned go = __shfl_sync(0xffffffffu, d | (clk() >= t0 + (long long)i * p.pace ? 2u : 0u), 0);
+        if (go) { free_issue = go & 1u; break; }
+        __nanosleep(64);
+      }
+      bulk_e(uni(sa(sm + (size_t)s * WB)), wsrc + (size_t)(tmw ? nsw + i : i) * WB, WB, uni(sa(&full[s])));
+    }
+  } else if (warp == 5) {  // activations after the dependency wait, into the slot schedule
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&dep)) : "memory");
+    for (int k = 0; k < nst; ++k) {
+      const int s = x_slot[k], u = x_use[k];
+      if (u >= 1) mb_wait(sa(&empty[s]), (u - 1) & 1);
+      tma3d_e(uni(sa(sm + (size_t)s * WB)), &xmap, 0, 0, kb0 + k, uni(sa(&full[s])), XB);
+    }
+  } else if (warp == 4) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(sa(&tbase)), "r"(512) : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    asm volatile("tcgen05.fence::before_thread_sync;");
+    __syncwarp();
+    asm volatile("bar.arrive 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = uni(*(volatile uint32_t*)&tbase);
+    for (int j = 0; j < NT; ++j) {  // pre-wait: K-block nsw + j -> TMEM columns ACOL + 32 j
+      const int s = tm_slot[j];
+      mb_wait(sa(&full[s]), tm_use[j] & 1);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      const uint32_t wb = uni(sa(sm + (size_t)s * WB));
+#pragma unroll
+      for (int k = 0; k < 4; ++k) tcp_e(tm + ACOL + 32 * j + 8 * k, sdesc(wb + 32 * k));
+      commit_e(uni(sa(&empty[s])));
+    }
+    for (int k = 0; k < nst; ++k) {
+      const int sx = x_slot[k];
+      mb_wait(sa(&full[sx]), x_use[k] & 1);
+      if (k < nsw) mb_wait(sa(&full[k]), rs_use[k] & 1);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      const uint64_t bd = sdesc(uni(sa(sm + (size_t)sx * WB)));
+      if (k >= nsw) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          mma_ta_e(tm, tm + ACOL + 32 * (k - nsw) + 8 * q, bd + (uint64_t)((q * 32) >> 4), p.idesc, (k > 0 || q > 0) ? 1u : 0u);
+      } else {
+        const uint64_t ad = sdesc(uni(sa(sm + (size_t)k * WB)));
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          mma_e(tm, ad + (uint64_t)((q * 32) >> 4), bd + (uint64_t)((q * 32) >> 4), p.idesc, (k > 0 || q > 0) ? 1u : 0u);
+      }
+      commit_e(uni(sa(&empty[sx])));
+      if (k < nsw) commit_e(uni(sa(&empty[k])));
+    }
+    commit_e(uni(sa(&accf)));
+  }
+  // ---- epilogue: stage rows, bulk DSMEM copy per (warp, owner) segment, rank-ordered sum by the owner ----
+  float* recv = (float*)(sm + p.recv_off);  // [C - 1 peers][RPR][RS]
+  float* stg = (float*)sm;                  // [C owners][RPR][RS] (aliases the drained pool)
+  if (warp < 4) {
+    asm volatile("bar.sync 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = tbase;
+    mb_wait(sa(&accf), 0);
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    if (p.pdl && threadIdx.x == 0) asm volatile("griddepcontrol.launch_dependents;");
+    const int r = warp * 32 + lane;
+    const uint32_t ta = tm + ((uint32_t)(warp * 32) << 16);
+    float* mine = stg + ((size_t)(r / RPR) * RPR + r % RPR) * RS;
+#pragma unroll 1
+    for (int c0 = 0; c0 < T; c0 += 16) {
+      float v[16];
+      ld8nw(ta + c0, v); ld8nw(ta + c0 + 8, v + 8);
+      asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#pragma unroll
+      for (int q = 0; q < 16; q += 4) *(float4*)&mine[c0 + q] = make_float4(v[q], v[q + 1], v[q + 2], v[q + 3]);
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncwarp();
+    cl_wait();
+    if (lane == 0) {
+      for (int o = (warp * 32) / RPR; o <= (warp * 32 + 31) / RPR && o < CC; ++o) {
+        if (o == cx) continue;
+        const int r0 = max(warp * 32, o * RPR), r1 = min(warp * 32 + 32, min(o * RPR + RPR, 128));
+        if (r1 <= r0) continue;
+        const int jr0 = r0 - o * RPR;
+        const unsigned idx = cx < o ? cx : cx - 1;
+        uint32_t dr, br;
+        asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(dr) : "r"(sa(recv + ((size_t)idx * RPR + jr0) * RS)), "r"(o));
+        asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(br) : "r"(sa(&rbar)), "r"(o));
+        asm volatile("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     :: "r"(dr), "r"(sa(stg + ((size_t)o * RPR + jr0) * RS)), "r"((unsigned)((r1 - r0) * RS * 4)), "r"(br) : "memory");
+      }
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+    asm volatile("bar.sync 2, 128;" ::: "memory");
+    mb_wait(sa(&rbar), 0);
+    constexpr int G = T / 4;
+    for (int e = threadIdx.x; e < rows_me * G; e += 128) {
+      const int jr = e % rows_me, g = e / rows_me;
+      const int row = rt * 128 + cx * RPR + jr;
+      float4 a;
+#pragma unroll
+      for (int src = 0; src < CC; ++src) {
+        const float* part = src == cx ? stg + (size_t)cx * RPR * RS : recv + (size_t)(src < cx ? src : src - 1) * RPR * RS;
+        const float4 b = *(const float4*)&part[(size_t)jr * RS + 4 * g];
+        if (src == 0) a = b;
+        else { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; }
+      }
+      if (row < p.N) {
+        stout(yv, (size_t)(4 * g) * p.N + row, a.x, p.out32);
+        stout(yv, (size_t)(4 * g + 1) * p.N + row, a.y, p.out32);
+        stout(yv, (size_t)(4 * g + 2) * p.N + row, a.z, p.out32);
+        stout(yv, (size_t)(4 * g + 3) * p.N + row, a.w, p.out32);
+      }
+    }
+    if (lane == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+  } else {
+    cl_wait();
+  }
+  asm volatile("tcgen05.fence::before_thread_sync;");
+  __syncthreads();
+  if (warp == 4) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tbase), "r"(512) : "memory");
+}
+
 
 namespace {
 typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
@@ -338,7 +687,15 @@ EncodeFn encode_fn() {
   return f;
 }
 typedef void (*KF)(CUtensorMap, const uint8_t*, void*, P);
-KF pick(int T, int KB, int C, int CR) {
+KF pick(int T, int KB, int C, int CR, int NT) {
+  if (CR == 2) {  // full pre-wait weight residency, 6-CTA split-K cluster
+    if (KB != 1 || C != 6) return nullptr;
+    return T == 96 && NT == 12 ? wsf_k<96, 12> : T == 64 && NT == 14 ? wsf_k<64, 14> : T == 32 && NT == 15 ? wsf_k<32, 15> : nullptr;
+  }
+  if (NT) {
+    if (KB != 1 || C != 4 || !CR) return nullptr;
+    return T == 96 && NT == 12 ? wst_k<96, 4, 12> : T == 64 && NT == 14 ? wst_k<64, 4, 14> : T == 32 && NT == 15 ? wst_k<32, 4, 15> : nullptr;
+  }
   if (CR) {
 #define R_(t) if (T == t && KB == 1 && C == 4) return wsg_k<t, 1, 4, 1>;
     R_(32) R_(64) R_(96)
@@ -358,7 +715,7 @@ constexpr size_t kCoresSmem = 215 * 1024;
 
 // out[T, N] (bf16 or fp32) = x[T, K] (bf16) @ W[N, K]^T with W pre-packed by pack_weight (SW128 tile image).
 void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& wp, int64_t n, int64_t C, int64_t KB,
-                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr) {
+                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr, int64_t nt, int64_t nsx) {
   const int T = (int)x.size(0), K = (int)x.size(1), N = (int)n;
   TORCH_CHECK(x.is_contiguous() && x.scalar_type() == at::kBFloat16, "prewait_gemm: x bf16 contiguous");
   TORCH_CHECK(out.is_contiguous() && out.size(0) == T && out.size(1) == N, "prewait_gemm: out shape");
@@ -366,8 +723,9 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   TORCH_CHECK(o32 || out.scalar_type() == at::kBFloat16, "prewait_gemm: out bf16/fp32");
   const int RT = (N + 127) / 128;
   TORCH_CHECK(wp.numel() * wp.element_size() == (int64_t)RT * 128 * K * 2, "prewait_gemm: packed weight size");
-  TORCH_CHECK(K % (64 * C * KB) == 0 && NW <= NS && XL <= NS && NS <= 8, "prewait_gemm: config");
-  KF kf = pick(T, (int)KB, (int)C, (int)cr);
+  TORCH_CHECK((cr == 2 ? K % 64 == 0 && K / 64 / C > nt : K % (64 * C * KB) == 0) && NW <= NS && XL <= NS && NS <= (nt ? 16 : 8), "prewait_gemm: config");
+  TORCH_CHECK(!nt || cr == 2 || (NW + XL == 3 && nsx >= 2 && nsx <= 16 && nt < K / 64 / C), "prewait_gemm: TMEM-staged config");
+  KF kf = pick(T, (int)KB, (int)C, (int)cr, (int)nt);
   TORCH_CHECK(kf, "prewait_gemm: no kernel for T=", T, " KB=", KB, " C=", C, " co-resident=", cr);
   TORCH_CHECK(pace >= 0, "prewait_gemm: pace");
   P p = {};
@@ -375,12 +733,13 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   p.nst = K / 64 / (int)C / (int)KB; p.pdl = 1; p.xlanes = (int)XL; p.out32 = o32; p.pace = pace;
   p.nm = (T + 255) / 256;
   p.WB = KB * 16384; p.XB = KB * T * 128; p.SB = p.WB + p.XB;
-  p.recv_off = NS * p.SB;
+  p.recv_off = cr == 2 ? NS * p.WB : nt ? NS * p.WB + nsx * p.XB : NS * p.SB; p.NSX = (int)nsx;
+  TORCH_CHECK(cr != 2 || (NS > K / 64 / C + 1 - nt && NS <= 16), "prewait_gemm: full-residency pool too small");
   p.idesc = (1u << 4) | (1u << 7) | (1u << 10) | ((unsigned)((T / p.nm) >> 3) << 17) | ((unsigned)(128 >> 4) << 24);
   unsigned tc = 32; while (tc < (unsigned)T) tc <<= 1; p.tcols = tc;
   const size_t rbytes = C > 1 ? (size_t)(cr ? C - 1 : C) * (T + 4) * ((128 + C - 1) / C) * 4 : 0;
-  TORCH_CHECK(!cr || (size_t)NS * p.SB >= (size_t)C * (T + 4) * ((128 + C - 1) / C) * 4, "prewait_gemm: staging > ring");
-  const size_t smem = (size_t)NS * p.SB + rbytes + 1024;
+  TORCH_CHECK(!cr || (size_t)p.recv_off >= (size_t)C * (T + 4) * ((128 + C - 1) / C) * 4, "prewait_gemm: staging > ring");
+  const size_t smem = (size_t)p.recv_off + rbytes + 1024;
   int dev; cudaGetDevice(&dev);
   int optin; cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(smem <= (size_t)optin - 1024, "prewait_gemm: smem ", smem);
@@ -440,6 +799,13 @@ _lock = threading.Lock()
 # memory, so the CTAs land beside SpReduceAttnRes (launched with the full shared-memory
 # carve-out) and stage NS weight stages before the reduce ends.
 CONFIGS = {32: (4, 2, 5, 4, 2, 0, 0), 64: (4, 1, 7, 2, 1, 1440, 1), 96: (4, 1, 6, 2, 1, 1440, 1)}
+# TMEM-staged co-resident form (NT weight stages copied to tensor memory before the PDL wait, NSX
+# activation stages): (C, KB, NS, NW, XL, PACE, CR, NT, NSX).
+TMEM_CONFIGS = {32: (4, 1, 8, 2, 1, 960, 1, 15, 8), 64: (4, 1, 6, 2, 1, 960, 1, 14, 8),
+                96: (4, 1, 6, 2, 1, 960, 1, 12, 6)}
+# Full pre-wait weight residency (CR 2): 6-CTA split-K cluster (210 CTAs), NT K-blocks per CTA in TMEM, the rest in a
+# pool of NS 16 KiB slots that turns into the activation ring after the PDL wait.
+FULL_CONFIGS = {32: (6, 1, 12, 2, 1, 0, 2, 15, 0), 64: (6, 1, 11, 2, 1, 0, 2, 14, 0), 96: (6, 1, 10, 2, 1, 0, 2, 12, 0)}
 
 
 def _module():
@@ -498,6 +864,7 @@ def pack_weight(w: torch.Tensor) -> torch.Tensor:
 def gemm(out: torch.Tensor, x: torch.Tensor, packed: torch.Tensor, n: int,
          config: tuple | None = None) -> torch.Tensor:
     """out[T, n] = x @ W^T for the W ``packed`` came from (``pack_weight``)."""
-    c, kb, ns, nw, xl, pace, cr = config or CONFIGS[x.shape[0]]
-    _module().prewait_gemm(out, x, packed, n, c, kb, ns, nw, xl, pace, cr)
+    cfg = tuple(config or CONFIGS[x.shape[0]])
+    c, kb, ns, nw, xl, pace, cr, nt, nsx = cfg + (0, 0)[: 9 - len(cfg)]
+    _module().prewait_gemm(out, x, packed, n, c, kb, ns, nw, xl, pace, cr, nt, nsx)
     return out
