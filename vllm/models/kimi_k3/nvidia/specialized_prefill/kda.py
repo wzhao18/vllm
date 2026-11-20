@@ -119,7 +119,7 @@ def persistent_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -127,10 +127,17 @@ def persistent_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    f_a: torch.Tensor | None = None,
+    f_b_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
-    (sequence, head) chain pieces once per batch)."""
+    (sequence, head) chain pieces once per batch).
+
+    With ``f_a`` ([T, 128] BF16, any row stride) and ``f_b_weight`` (the
+    f_b_proj weight, [H * 128, 128] BF16) the kernel forms the gate input
+    g1 = f_a @ f_b_weight^T itself (one tcgen05 MMA per chunk, FP32
+    accumulate, BF16 round as the stock projection) and ``g`` may be None."""
     from .kda_persistent import forward as kp
 
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
@@ -148,7 +155,7 @@ def persistent_prefill(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
-        g.contiguous(),
+        g.contiguous() if g is not None else None,
         beta.reshape(1, T, H).contiguous(),
         D**-0.5,
         out,
@@ -159,6 +166,8 @@ def persistent_prefill(
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         plan=plan,
+        fa=f_a,
+        wfb=f_b_weight,
     )
     return out, final_state
 

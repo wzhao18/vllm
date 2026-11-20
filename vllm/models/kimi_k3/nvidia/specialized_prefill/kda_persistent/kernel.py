@@ -141,6 +141,9 @@ MB_FIN = 60
 MB_OEMPTY = 65
 MB_BRAW = 66
 MB_GRAM = 71
+MB_G1 = 76
+MB_WFULL = 81
+MB_WDONE = 83
 
 
 def _exp2f(x):
@@ -153,7 +156,7 @@ def _tanhf(x):
 
 @cute.struct
 class PkdStorage:
-    mbar: cute.struct.MemRange[cutlass.Int64, 76]
+    mbar: cute.struct.MemRange[cutlass.Int64, 85]
     tmem_holding: cutlass.Int32
 
 
@@ -164,12 +167,17 @@ def _pkd(
     mma_4a: cute.TiledMma,
     mma_4b: cute.TiledMma,
     mma_g: cute.TiledMma,
+    mma_f: cute.TiledMma,
     tma_q: cute.CopyAtom,
     mQ: cute.Tensor,
     tma_k: cute.CopyAtom,
     mK: cute.Tensor,
     tma_g: cute.CopyAtom,
     mG: cute.Tensor,
+    tma_fa: cute.CopyAtom,
+    mFA: cute.Tensor,
+    tma_w: cute.CopyAtom,
+    mW: cute.Tensor,
     tma_b: cute.CopyAtom,
     mB: cute.Tensor,
     tma_v: cute.CopyAtom,
@@ -210,6 +218,7 @@ def _pkd(
     lay_inv: cute.ComposedLayout,
     lay_ft: cute.ComposedLayout,
     lay_v: cute.ComposedLayout,
+    lay_w: cute.ComposedLayout,
     H_: cutlass.Constexpr[int],
     TPROBE_: cutlass.Constexpr[int] = 0,
     GATE2_: cutlass.Constexpr[int] = 0,
@@ -232,6 +241,8 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    FAG_: cutlass.Constexpr[int] = 0,
+    FAGP_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -246,6 +257,13 @@ def _pkd(
     arena = smem.allocate_tensor(
         cutlass.Int8, cute.make_layout((STAGES * STAGE_BYTES,)), 1024
     )
+    if cutlass.const_expr(FAG_ == 1):
+        # gate-input weight W_fb[head] (M=128 channels x K=128 rank), one
+        # buffer per chain parity (warp 11 refills it, instances release it)
+        s_w = smem.allocate_tensor(
+            cutlass.BFloat16, lay_w.outer, 1024, swizzle=lay_w.inner
+        )
+        a_w = mma_f.make_fragment_A(s_w)
     s_out = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((2 * C * D,)), 1024)
     s_gt5 = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((D, STAGES), stride=(1, D)), 16
@@ -449,6 +467,12 @@ def _pkd(
                 cute.arch.mbarrier_init(mb + MB_GRAM + i, 1)
             cute.arch.mbarrier_init(mb + MB_INP, 8)
             cute.arch.mbarrier_init(mb + MB_OEMPTY, 4)
+            if cutlass.const_expr(FAG_ == 1):
+                for i in cutlass.range_constexpr(STAGES):
+                    cute.arch.mbarrier_init(mb + MB_G1 + i, 1)
+                for j in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(mb + MB_WFULL + j, 1)
+                    cute.arch.mbarrier_init(mb + MB_WDONE + j, STAGES)
         cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
@@ -1416,6 +1440,34 @@ def _pkd(
             cute.arch.warpgroup_reg_dealloc(24)
         else:
             cute.arch.warpgroup_reg_dealloc(32)
+        if cutlass.const_expr(FAG_ == 1):
+            if warp == 11:
+                thr_fw = mma_f.get_slice(0)
+                g_w = cute.local_tile(mW, (BM, D), (None, None, None))
+                w_d, w_s = cpasync.tma_partition(
+                    tma_w,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(s_w, 0, 3),
+                    cute.group_modes(thr_fw.partition_A(g_w), 0, 3),
+                )
+                for kx in cutlass.range(k1 - k0):
+                    chain_w = cute.arch.make_warp_uniform(schain[k0 + kx])
+                    wb = kx & 1
+                    if kx >= 2:
+                        cute.arch.mbarrier_wait(
+                            mb + MB_WDONE + wb, ((kx - 2) >> 1) & 1
+                        )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mb + MB_WFULL + wb, D * D * 2
+                        )
+                    cute.copy(
+                        tma_w,
+                        w_s[(None, chain_w % H_, 0, 0)],
+                        w_d[(None, wb)],
+                        tma_bar_ptr=mb + MB_WFULL + wb,
+                    )
         if cutlass.const_expr(GRAM_W9_ != 0):
             if warp == 9:
                 # The prep instances publish their complete Qd/Kd/Ki image
@@ -1717,6 +1769,41 @@ def _pkd(
             tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32
         )
         gram_ld = tcgen05.make_tmem_copy(gram_atom, t_gram)
+        if cutlass.const_expr(FAG_ == 1):
+            # g1^T [128 channels, 32 tokens] reuses the instance's Gram
+            # window (consumed by the gate scan before the Gram MMA).
+            t_g1 = cute.make_tensor(
+                cute.recast_ptr(p_g64 + inst * (C // 2), dtype=cutlass.Float32),
+                acc32_base.layout,
+            )
+            b_fa = mma_f.make_fragment_B(t_bqd)
+            mma_t16 = cute.make_tiled_mma(
+                tcgen05.MmaF16BF16Op(
+                    cutlass.BFloat16,
+                    cutlass.Float32,
+                    (BM, 16, 16),
+                    tcgen05.CtaGroup.ONE,
+                    tcgen05.OperandSource.SMEM,
+                    tcgen05.OperandMajorMode.K,
+                    tcgen05.OperandMajorMode.K,
+                )
+            )
+            thr_t16 = mma_t16.get_slice(0)
+            g16_base = thr_t16.make_fragment_C(mma_t16.partition_shape_C((BM, 16)))
+            g1_atom = cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition.x16), cutlass.Float32
+            )
+            t_g1w0 = cute.make_tensor(
+                cute.recast_ptr(p_g64 + inst * (C // 2), dtype=cutlass.Float32),
+                g16_base.layout,
+            )
+            g1_ld = tcgen05.make_tmem_copy(g1_atom, t_g1w0)
+            g1_thr = g1_ld.get_slice(ptl)
+            g1_id = g1_thr.partition_D(
+                thr_t16.partition_C(cute.make_identity_tensor((BM, 16)))
+            )
+            r_g1 = cute.make_rmem_tensor(g1_id.shape, cutlass.Float32)
+            pp_g1 = cutlass.Int32(0)
         gm_thr = gram_ld.get_slice(ptl)
         gram_id = gm_thr.partition_D(
             thr_gm.partition_C(cute.make_identity_tensor((2 * C, C)))
@@ -1785,6 +1872,18 @@ def _pkd(
                     cute.group_modes(f_b, 0, 2),
                     cute.group_modes(gB, 0, 2),
                 )
+            if cutlass.const_expr(FAG_ == 1):
+                gFA = cute.flat_divide(
+                    cute.domain_offset((bos, 0, 0), mFA), (C, 1, D)
+                )
+                wbuf = kx & 1
+                wpar = (kx >> 1) & 1
+                if kx > 0:
+                    if plw == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(
+                                mb + MB_WDONE + ((kx - 1) & 1)
+                            )
             ea = cute.math.exp(a_log[hidx], fastmath=True)
             ea2c = 0.5 * ea
             dtbc = ea2c * cutlass.Float32(dt_bias[hidx, ptl])
@@ -1856,35 +1955,93 @@ def _pkd(
                     # other warps next read the stage after GRAW/QKRAW, which
                     # complete only after this warp's TMA.  Fewer pollers keep
                     # the SYNCS-wake retry loop off the shared issue slots.
-                    if tma:
+                    if cutlass.const_expr(FAG_ == 1 and (FAGP_ & 8) == 0):
                         if plw == 0:
                             cute.arch.mbarrier_wait(mb + MB_RFREE + inst, pp_rfree)
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive_and_expect_tx(
                                     mb + MB_GRAW + inst, C * D * 2
                                 )
-                            f_g = cute.make_tensor(
+                            f_fa = cute.make_tensor(
                                 cute.recast_ptr(
                                     ar0 + (OFF_QD + inst * STAGE_BYTES),
+                                    lay_qd.inner,
                                     dtype=cutlass.BFloat16,
                                 ),
                                 cute.make_layout(
-                                    (C, 1, (64, 2)), stride=(64, 0, (1, 4096))
+                                    (C, 1, (16, 4, 2)), stride=(64, 0, (1, 16, 4096))
                                 ),
                             )
-                            g_d, g_s = cpasync.tma_partition(
-                                tma_g,
+                            fa_d, fa_s = cpasync.tma_partition(
+                                tma_fa,
                                 0,
                                 cute.make_layout(1),
-                                cute.group_modes(f_g, 0, 3),
-                                cute.group_modes(gG, 0, 3),
+                                cute.group_modes(f_fa, 0, 3),
+                                cute.group_modes(gFA, 0, 3),
                             )
-                            cute.copy(
-                                tma_g,
-                                g_s[(None, ci, hidx, 0)],
-                                g_d,
-                                tma_bar_ptr=mb + MB_GRAW + inst,
-                            )
+                            if cutlass.const_expr((FAGP_ & 16) == 0):
+                                cute.copy(
+                                    tma_fa,
+                                    fa_s[(None, ci, 0, 0)],
+                                    fa_d,
+                                    tma_bar_ptr=mb + MB_GRAW + inst,
+                                )
+                            else:
+                                f_gp = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        ar0 + (OFF_QD + inst * STAGE_BYTES),
+                                        dtype=cutlass.BFloat16,
+                                    ),
+                                    cute.make_layout(
+                                        (C, 1, (64, 2)), stride=(64, 0, (1, 4096))
+                                    ),
+                                )
+                                gp_d, gp_s = cpasync.tma_partition(
+                                    tma_g,
+                                    0,
+                                    cute.make_layout(1),
+                                    cute.group_modes(f_gp, 0, 3),
+                                    cute.group_modes(gG, 0, 3),
+                                )
+                                cute.copy(
+                                    tma_g,
+                                    gp_s[(None, ci, hidx, 0)],
+                                    gp_d,
+                                    tma_bar_ptr=mb + MB_GRAW + inst,
+                                )
+                    if tma:
+                        if plw == 0:
+                            if cutlass.const_expr(FAG_ == 0 or (FAGP_ & 8) != 0):
+                                cute.arch.mbarrier_wait(
+                                    mb + MB_RFREE + inst, pp_rfree
+                                )
+                            if cutlass.const_expr(FAG_ == 0 or (FAGP_ & 8) != 0):
+                                with cute.arch.elect_one():
+                                    cute.arch.mbarrier_arrive_and_expect_tx(
+                                        mb + MB_GRAW + inst, C * D * 2
+                                    )
+                                f_g = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        ar0 + (OFF_QD + inst * STAGE_BYTES),
+                                        dtype=cutlass.BFloat16,
+                                    ),
+                                    cute.make_layout(
+                                        (C, 1, (64, 2)), stride=(64, 0, (1, 4096))
+                                    ),
+                                )
+                                g_d, g_s = cpasync.tma_partition(
+                                    tma_g,
+                                    0,
+                                    cute.make_layout(1),
+                                    cute.group_modes(f_g, 0, 3),
+                                    cute.group_modes(gG, 0, 3),
+                                )
+                                cute.copy(
+                                    tma_g,
+                                    g_s[(None, ci, hidx, 0)],
+                                    g_d,
+                                    tma_bar_ptr=mb + MB_GRAW + inst,
+                                )
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive_and_expect_tx(
                                     mb + MB_QKRAW + inst, 2 * C * D * 2
@@ -1929,7 +2086,7 @@ def _pkd(
                                 else:
                                     bx = cutlass.Float32(beta[r0 + lane, hidx])
                                 btv = 0.5 + 0.5 * _tanhf(0.5 * bx)
-                        if cutlass.const_expr(QK_ROWPAIR_ == 8):
+                        if cutlass.const_expr(QK_ROWPAIR_ == 8 and (FAG_ == 0 or (FAGP_ & 8) != 0)):
                             cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                             early_gv0 = cutlass.Float32(v_graw[0, ptl, inst])
                             early_gate0 = lb2h * _tanhf(ea2c * early_gv0 + dtbc) + lb2h
@@ -1989,70 +2146,131 @@ def _pkd(
                         # store-gate / reload / walker phase pair (~256 fewer
                         # L1 wavefronts per chunk on the ~86%-busy LSU pipe).
                         # v99 note kept out: TMAs stay full-chunk-gated here.
-                        if cutlass.const_expr((not static_full) or (QK_ROWPAIR_ != 8)):
-                            if tma:
-                                cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                         accg = cutlass.Float32(0.0)
-                        if tma:
-                            if cutlass.const_expr(GATE_ROLL_ == 1):
-                                for rp in cutlass.range(C // 8):
-                                    rw0 = rp * 8
-                                    for u in cutlass.range_constexpr(8):
-                                        g8[u] = cutlass.Float32(
-                                            v_graw[rw0 + u, ptl, inst]
+                        if cutlass.const_expr(FAG_ == 1 and (FAGP_ & 8) == 0):
+                            if plw == 1:
+                                if cutlass.const_expr((FAGP_ & 2) == 0):
+                                    cute.arch.mbarrier_wait(mb + MB_WFULL + wbuf, wpar)
+                                cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
+                                if cutlass.const_expr((FAGP_ & 1) == 0 and (FAGP_ & 64) != 0):
+                                    for kb in cutlass.range(D // 16, unroll=1):
+                                        mma_f.set(tcgen05.Field.ACCUMULATE, kb != 0)
+                                        cute.gemm(
+                                            mma_f,
+                                            t_g1,
+                                            a_w[None, None, kb, wbuf],
+                                            b_fa[None, None, kb, inst],
+                                            t_g1,
                                         )
-                                    g8.store(g8.load() * ea2c + dtbc)
-                                    for u in cutlass.range_constexpr(8):
-                                        g8[u] = _tanhf(g8[u])
-                                    g8.store(g8.load() * lb2h + lb2h)
-                                    if cutlass.const_expr(may_be_partial):
-                                        if cc < C:
-                                            for u in cutlass.range_constexpr(8):
-                                                if rw0 + u >= cc:
-                                                    g8[u] = cutlass.Float32(0.0)
-                                    for u in cutlass.range_constexpr(8):
-                                        accg += g8[u]
-                                        v_gcs[rw0 + u, ptl, inst] = accg
-                            else:
-                                for rp in cutlass.range_constexpr(C // 16):
-                                    rw0 = rp * 16
-                                    for u in cutlass.range_constexpr(8):
-                                        g8[u] = cutlass.Float32(
-                                            v_graw[rw0 + u, ptl, inst]
+                                if cutlass.const_expr((FAGP_ & 1) == 0 and (FAGP_ & 64) == 0):
+                                    mma_f.set(tcgen05.Field.ACCUMULATE, False)
+                                    for kb in cutlass.range_constexpr(D // 16):
+                                        cute.gemm(
+                                            mma_f,
+                                            t_g1,
+                                            a_w[None, None, kb, wbuf],
+                                            b_fa[None, None, kb, inst],
+                                            t_g1,
                                         )
-                                        rf8[u] = cutlass.Float32(
-                                            v_graw[rw0 + 8 + u, ptl, inst]
-                                        )
-                                    g8.store(g8.load() * ea2c + dtbc)
-                                    rf8.store(rf8.load() * ea2c + dtbc)
-                                    for u in cutlass.range_constexpr(8):
-                                        g8[u] = _tanhf(g8[u])
-                                        rf8[u] = _tanhf(rf8[u])
-                                    g8.store(g8.load() * lb2h + lb2h)
-                                    rf8.store(rf8.load() * lb2h + lb2h)
-                                    if cutlass.const_expr(
-                                        static_full and (QK_ROWPAIR_ == 8)
-                                    ):
-                                        g8[0] = early_gate0 if rp == 0 else g8[0]
-                                    if cutlass.const_expr(may_be_partial):
-                                        if cc < C:
-                                            for u in cutlass.range_constexpr(8):
-                                                if rw0 + u >= cc:
-                                                    g8[u] = cutlass.Float32(0.0)
-                                                if rw0 + 8 + u >= cc:
-                                                    rf8[u] = cutlass.Float32(0.0)
-                                    for u in cutlass.range_constexpr(8):
-                                        accg += g8[u]
-                                        v_gcs[rw0 + u, ptl, inst] = accg
-                                    for u in cutlass.range_constexpr(8):
-                                        accg += rf8[u]
-                                        v_gcs[rw0 + 8 + u, ptl, inst] = accg
+                                        mma_f.set(tcgen05.Field.ACCUMULATE, True)
+                                    with cute.arch.elect_one():
+                                        tcgen05.commit(mb + MB_G1 + inst)
+                                else:
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive(mb + MB_G1 + inst)
+                            cute.arch.mbarrier_wait(mb + MB_G1 + inst, pp_g1)
+                            for rp in cutlass.range(C // 16, unroll=1 if (FAGP_ & 32) else 2):
+                                t_g1w = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        p_g64 + inst * (C // 2) + rp * 8,
+                                        dtype=cutlass.Float32,
+                                    ),
+                                    g16_base.layout,
+                                )
+                                if cutlass.const_expr((FAGP_ & 4) == 0):
+                                    cute.copy(g1_ld, g1_thr.partition_S(t_g1w), r_g1)
+                                    cute.arch.fence_view_async_tmem_load()
+                                else:
+                                    r_g1.fill(0.25)
+                                # stock g1 is the BF16 f_b_proj output
+                                r_g1.store(
+                                    r_g1.load().to(cutlass.BFloat16).to(cutlass.Float32)
+                                )
+                                r_g1.store(r_g1.load() * ea2c + dtbc)
+                                for u in cutlass.range_constexpr(16):
+                                    r_g1[u] = _tanhf(r_g1[u])
+                                r_g1.store(r_g1.load() * lb2h + lb2h)
+                                if cutlass.const_expr(may_be_partial or (PARTIAL_TMA_ == 0)):
+                                    for u in cutlass.range_constexpr(16):
+                                        if rp * 16 + u >= cc:
+                                            r_g1[u] = cutlass.Float32(0.0)
+                                for u in cutlass.range_constexpr(16):
+                                    accg += r_g1[u]
+                                    v_gcs[rp * 16 + u, ptl, inst] = accg
                         else:
-                            for rw in cutlass.range_constexpr(C):
-                                if rw < cc:
-                                    gv = cutlass.Float32(g[r0 + rw, hidx, ptl])
-                                    accg += lb2h * _tanhf(ea2c * gv + dtbc) + lb2h
-                                v_gcs[rw, ptl, inst] = accg
+                            if cutlass.const_expr((not static_full) or (QK_ROWPAIR_ != 8)):
+                                if tma:
+                                    cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
+                            if tma:
+                                if cutlass.const_expr(GATE_ROLL_ == 1):
+                                    for rp in cutlass.range(C // 8):
+                                        rw0 = rp * 8
+                                        for u in cutlass.range_constexpr(8):
+                                            g8[u] = cutlass.Float32(
+                                                v_graw[rw0 + u, ptl, inst]
+                                            )
+                                        g8.store(g8.load() * ea2c + dtbc)
+                                        for u in cutlass.range_constexpr(8):
+                                            g8[u] = _tanhf(g8[u])
+                                        g8.store(g8.load() * lb2h + lb2h)
+                                        if cutlass.const_expr(may_be_partial):
+                                            if cc < C:
+                                                for u in cutlass.range_constexpr(8):
+                                                    if rw0 + u >= cc:
+                                                        g8[u] = cutlass.Float32(0.0)
+                                        for u in cutlass.range_constexpr(8):
+                                            accg += g8[u]
+                                            v_gcs[rw0 + u, ptl, inst] = accg
+                                else:
+                                    for rp in cutlass.range_constexpr(C // 16):
+                                        rw0 = rp * 16
+                                        for u in cutlass.range_constexpr(8):
+                                            g8[u] = cutlass.Float32(
+                                                v_graw[rw0 + u, ptl, inst]
+                                            )
+                                            rf8[u] = cutlass.Float32(
+                                                v_graw[rw0 + 8 + u, ptl, inst]
+                                            )
+                                        g8.store(g8.load() * ea2c + dtbc)
+                                        rf8.store(rf8.load() * ea2c + dtbc)
+                                        for u in cutlass.range_constexpr(8):
+                                            g8[u] = _tanhf(g8[u])
+                                            rf8[u] = _tanhf(rf8[u])
+                                        g8.store(g8.load() * lb2h + lb2h)
+                                        rf8.store(rf8.load() * lb2h + lb2h)
+                                        if cutlass.const_expr(
+                                            static_full and (QK_ROWPAIR_ == 8)
+                                        ):
+                                            g8[0] = early_gate0 if rp == 0 else g8[0]
+                                        if cutlass.const_expr(may_be_partial):
+                                            if cc < C:
+                                                for u in cutlass.range_constexpr(8):
+                                                    if rw0 + u >= cc:
+                                                        g8[u] = cutlass.Float32(0.0)
+                                                    if rw0 + 8 + u >= cc:
+                                                        rf8[u] = cutlass.Float32(0.0)
+                                        for u in cutlass.range_constexpr(8):
+                                            accg += g8[u]
+                                            v_gcs[rw0 + u, ptl, inst] = accg
+                                        for u in cutlass.range_constexpr(8):
+                                            accg += rf8[u]
+                                            v_gcs[rw0 + 8 + u, ptl, inst] = accg
+                            else:
+                                for rw in cutlass.range_constexpr(C):
+                                    if rw < cc:
+                                        gv = cutlass.Float32(g[r0 + rw, hidx, ptl])
+                                        accg += lb2h * _tanhf(ea2c * gv + dtbc) + lb2h
+                                    v_gcs[rw, ptl, inst] = accg
                         if (ci == 0) & (simp < -1) & (accg >= -50.0):
                             failure_ptr = cute.make_ptr(
                                 cutlass.Int32,
@@ -2397,9 +2615,15 @@ def _pkd(
                     # parities must advance 1:1 with actual completions or the
                     # NEXT chain in this persistent slot waits a stale phase
                     # (RFREE/SFREE are compute-armed every chunk -> uncond.)
-                    if tma:
+                    if cutlass.const_expr(FAG_ == 1 and (FAGP_ & 8) == 0):
                         pp_graw ^= 1
-                        pp_qkraw ^= 1
+                        pp_g1 ^= 1
+                        if tma:
+                            pp_qkraw ^= 1
+                    else:
+                        if tma:
+                            pp_graw ^= 1
+                            pp_qkraw ^= 1
 
     cute.arch.sync_threads()
     tmem.free(tmem_ptr)
@@ -2411,6 +2635,8 @@ def _launch_pkd(
     k: cute.Tensor,
     v: cute.Tensor,
     g: cute.Tensor,
+    fa: cute.Tensor,
+    wfb: cute.Tensor,
     beta: cute.Tensor,
     a_log: cute.Tensor,
     dt_bias: cute.Tensor,
@@ -2462,6 +2688,8 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    FAG_: cutlass.Constexpr[int] = 0,
+    FAGP_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2586,6 +2814,31 @@ def _launch_pkd(
     tma_g, mG = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(), g, lg_qk, (C, 1, D)
     )
+    # gate input g1^T[128 ch, 32 tok] = W_fb[head] @ f_a[chunk]^T (SS, fp32 acc)
+    mma_f = cute.make_tiled_mma(
+        tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            (BM, C, 16),
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+        )
+    )
+    lay_w = sm100_utils.make_smem_layout_a(mma_f, (BM, C, D), cutlass.BFloat16, 2)
+    vmnk_f = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma_f.thr_id.shape,))
+    tma_w, mW = cute.nvgpu.make_tiled_tma_atom_A(
+        sm100_utils.cluster_shape_to_tma_atom_A((1, 1), mma_f.thr_id),
+        wfb,
+        cute.slice_(lay_w, (None, None, None, 0)),
+        (BM, C, D),
+        mma_f,
+        vmnk_f.shape,
+    )
+    tma_fa, mFA = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), fa, l3k_k, (C, 1, D)
+    )
     lb_raw = cute.make_layout((C, 8), stride=(8, 1))
     tma_b, mB = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(), beta, lb_raw, (C, 8)
@@ -2618,12 +2871,17 @@ def _launch_pkd(
         mma_4a,
         mma_4b,
         mma_g,
+        mma_f,
         tma_q,
         mQ,
         tma_k,
         mK,
         tma_g,
         mG,
+        tma_fa,
+        mFA,
+        tma_w,
+        mW,
         tma_b,
         mB,
         tma_v,
@@ -2664,6 +2922,7 @@ def _launch_pkd(
         lay_inv,
         lay_ft,
         lay_v,
+        lay_w,
         H_,
         TPROBE_,
         GATE2_,
@@ -2686,6 +2945,8 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        FAG_,
+        FAGP_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),

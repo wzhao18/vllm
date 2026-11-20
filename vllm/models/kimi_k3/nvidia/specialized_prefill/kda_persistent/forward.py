@@ -70,6 +70,7 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    fag: bool = False,
 ):
     key = (
         dev.index,
@@ -97,6 +98,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        fag,
         tuple(sorted(_DEV.items())),
     )
     entry = _COMPILED.get(key)
@@ -154,6 +156,18 @@ def _get_compiled(
                 qkv_fake(),
                 qkv_fake(),
                 mk(g),
+                cute.runtime.make_fake_tensor(
+                    cutlass.BFloat16,
+                    shape=(cute.sym_int(), 1, D),
+                    stride=(cute.sym_int64(divisibility=8), D, 1),
+                    assumed_align=16,
+                ),
+                cute.runtime.make_fake_tensor(
+                    cutlass.BFloat16,
+                    shape=(H * D, D, 1),
+                    stride=(D, 1, H * D * D),
+                    assumed_align=16,
+                ),
                 mk(beta, 4),
                 from_dlpack(alog, assumed_align=16),
                 from_dlpack(dtb, assumed_align=16),
@@ -205,6 +219,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                FAG_=1 if fag else 0,
                 **_DEV,
                 options="--enable-tvm-ffi --opt-level 3",
             )
@@ -257,6 +272,30 @@ def _tprobe_buf(G: int, dev: torch.device):
     return tensor
 
 
+_DUMMY_FA: dict = {}
+
+
+def _dummy_fa(dev, H):
+    key = (dev.index, H)
+    t = _DUMMY_FA.get(key)
+    if t is None:
+        t = (
+            torch.zeros(C32, 1, D, dtype=torch.bfloat16, device=dev),
+            torch.zeros(H * D, D, 1, dtype=torch.bfloat16, device=dev),
+        )
+        _DUMMY_FA[key] = t
+    return t
+
+
+def _dummy_g(dev, H):
+    key = (dev.index, H, "g")
+    t = _DUMMY_FA.get(key)
+    if t is None:
+        t = torch.zeros(C32, H, D, dtype=torch.bfloat16, device=dev)
+        _DUMMY_FA[key] = t
+    return t
+
+
 @torch.no_grad()
 def _launch_forward(
     q,
@@ -292,6 +331,8 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    fa=None,
+    wfb=None,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -299,7 +340,19 @@ def _launch_forward(
     qf = q.view(T * B, H, D)
     kf = k.view(T * B, H, D)
     vf = v.view(T * B, H, D)
-    gf = g.view(T * B, H, D)
+    fag = fa is not None
+    if fag:
+        # gate input from f_a [T, 128] (row stride of the in_proj output)
+        # and the f_b_proj weight [H*128, 128]: g1 is formed in the kernel.
+        assert wfb is not None and wfb.shape == (H * D, D)
+        assert fa.dim() == 2 and fa.shape[1] == D and fa.stride(1) == 1
+        assert fa.dtype == torch.bfloat16 and wfb.dtype == torch.bfloat16
+        fa_t = fa.unsqueeze(1)
+        wfb_t = wfb.contiguous().unsqueeze(2)
+        gf = g.view(T * B, H, D) if g is not None else _dummy_g(dev, H)
+    else:
+        gf = g.view(T * B, H, D)
+        fa_t, wfb_t = _dummy_fa(dev, H)
     bf_ = beta.view(T * B, H)
     of = out.view(T * B, H, D)
 
@@ -363,6 +416,7 @@ def _launch_forward(
         cluster_size=cluster_size,
         gate_roll=gate_roll,
         partial_tma=partial_tma,
+        fag=fag,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
@@ -370,6 +424,8 @@ def _launch_forward(
         kf,
         vf,
         gf,
+        fa_t,
+        wfb_t,
         bf_,
         A_log,
         dt_bias.view(H, D),
@@ -627,6 +683,8 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    fa=None,
+    wfb=None,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -683,4 +741,6 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        fa=fa,
+        wfb=wfb,
     )
