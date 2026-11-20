@@ -93,6 +93,21 @@ def _ldg_v4_if(address, pred):
     return code, "=f,=f,=f,=f,l,r", (Int64(address), Int32(pred))
 
 
+def owned_block(t, ks, total, nd, jf, jl, me, nu, single):
+    """[lo, hi) of the unit pairs (index jj * 4 + up_id, nu of them) range jf + me
+    reduces of tile t: ranges that also reduce a neighbouring tile (the first one if it
+    started in the previous tile, the last one if it runs into the next) weigh 1, the
+    others 2, so every range reduces about the same number of units in all. ``single``:
+    the tile's only range (c == 1) owns all."""
+    c = jl - jf + 1
+    b0 = (jf * total // nd < t * ks) * 1
+    b1 = ((jl + 1) * total // nd > (t + 1) * ks) * 1
+    w = 2 * c - b0 - b1
+    lo_w = 2 * me - b0 * (me > 0)
+    hi_w = lo_w + 2 - b0 * (me == 0) - b1 * (me == c - 1)
+    return (lo_w * nu + w - 1) // w, (hi_w * nu + w - 1) // w
+
+
 def ring_bytes(rows, x_stages, smem):
     """(weight stages, ring bytes) left by the silu hand-off and ``x_stages``."""
     n_mma, chunks = mma_columns(rows)
@@ -142,8 +157,20 @@ class WideMlp:
             for tot, ks in zip(self.total, self.ks)
         ]
         self.cmax = tuple(max(c) for c in counts)
-        # most units one warp reduces per tile (unit u belongs to range u mod c)
-        self.kmax = tuple(-(-self.nch // min(c)) for c in counts)
+        # most units one warp reduces per tile (balanced blocks, see owned_block)
+        nu = 4 * self.nch
+        kmax = []
+        for tot, ks in zip(self.total, self.ks):
+            most = 0
+            for p in pairs:
+                for t, (jf, c) in enumerate(tile_ranges(tot, p, ks)):
+                    for me in range(c):
+                        lo, hi = (0, nu) if c == 1 else owned_block(
+                            t, ks, tot, p, jf, jf + c - 1, me, nu, False)
+                        for up in range(4):
+                            most = max(most, (hi - up + 3) // 4 - (lo - up + 3) // 4)
+            kmax.append(max(most, 1))
+        self.kmax = tuple(kmax)
         self.ahead = ahead  # partials in flight per reduction
         self.cta_bytes = 8 * self.nch * UNIT
         strides = []
@@ -607,10 +634,22 @@ class WideMlp:
                 # every load is issued before any store (a store would order the next
                 # unit's loads behind it: one L2 round trip per unit), one partial
                 # ahead of the K-order sums
-                j0 = (me + c - (up_id * nch) % c) % c
+                nu = 4 * nch
+                b0 = Int32(jf * total // nd < t * ks)
+                b1 = Int32((jl + 1) * total // nd > (t + 1) * ks)
+                wsum = 2 * c - b0 - b1
+                lo_w = 2 * me - b0 * Int32(me > 0)
+                hi_w = lo_w + 2 - b0 * Int32(me == 0) - b1 * Int32(me == c - 1)
+                lo = Int32(0)
+                hi = Int32(nu)
+                if c > 1:
+                    lo = (lo_w * nu + wsum - 1) // wsum
+                    hi = (hi_w * nu + wsum - 1) // wsum
+                ja = (lo - up_id + 3) // 4
+                jb = (hi - up_id + 3) // 4
                 kmax = self.kmax[ph]
-                okk = [Int32(j0 + k * c < nch) for k in range(kmax)]
-                offs = [Int64((j0 + k * c) * UNIT) for k in range(kmax)]
+                okk = [Int32(ja + k < jb) for k in range(kmax)]
+                offs = [Int64((ja + k) * UNIT) for k in range(kmax)]
 
                 def loads(i):
                     return [
@@ -635,8 +674,8 @@ class WideMlp:
                             if si == 0:
                                 _st_u64(stamp + (16 + 2 * ph) * 8, _now())
                 for k in cutlass.range_constexpr(kmax):
-                    jj = j0 + k * c
-                    if jj < nch:
+                    jj = ja + k
+                    if jj < jb:
                         # tokens of this 16-column unit are consecutive (units never
                         # straddle an MMA chunk or a CTA half of one)
                         col0 = first_col + jj * CHUNK
