@@ -71,7 +71,7 @@ ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
 # slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
 # (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step).
-PREWAIT_ROWS = (64,)
+PREWAIT_ROWS = (64, 96)
 # Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
 # token-wide 2-CTA GEMM (``gemm.wide``, ``partials``) with K split over the given
 # number of CTA pairs and leaves FP32 split partials: the next layer's SP all-gather

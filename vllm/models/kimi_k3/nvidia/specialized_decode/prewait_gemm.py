@@ -346,7 +346,7 @@ _lock = threading.Lock()
 
 # Per-T launch config (C split-K CTAs per cluster, KB 64-wide K blocks per stage, NS stages,
 # NW weight-producer warps, XL activation-producer warps), measured on VR200 (GEMM-EX2 run9).
-CONFIGS = {32: (4, 2, 5, 4, 2), 64: (4, 1, 7, 7, 1)}
+CONFIGS = {32: (4, 2, 5, 4, 2), 64: (4, 1, 7, 7, 1), 96: (4, 1, 6, 6, 3)}
 
 
 def _module():
