@@ -108,8 +108,10 @@ def main():
         has_init = torch.tensor([False, True, False], device="cuda")
         state0 = torch.randn(5, n, 4, device="cuda").to(torch.bfloat16).float()[:, :, :3]
         gs = {}
-        for arm, flag in arms:
-            tac = ((512, 256), cl, 256, *RASTER[cl], 0, 0, flag)
+        for spec in arms:
+            arm, flag = spec[0], spec[1]
+            rz = (int(spec[2]), spec[3]) if len(spec) > 3 else RASTER[cl]
+            tac = ((512, 256), cl, 256, *rz, 0, 0, flag)
             g = KdaConvGemm(wq, ws, cw, p, tactic=tac)
             st = state0.clone()
             g(xq, xs, st, qsl, lines, has_init)
@@ -117,7 +119,8 @@ def main():
             gs[arm] = (g, st)
         ncta = torch.cuda.get_device_properties(0).multi_processor_count
         for rnd in range(args.rounds):
-            for arm, flag in arms:
+            for spec in arms:
+                arm, flag = spec[0], spec[1]
                 g, st = gs[arm]
 
                 def f_arm():

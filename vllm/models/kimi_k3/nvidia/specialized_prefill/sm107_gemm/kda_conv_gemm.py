@@ -62,7 +62,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
         self.conv_scalar_silu = "sc" in flags
         self.conv_math_smsp23 = "c23" in flags
-        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 3 if "flp" in flags else 0
+        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 3 if "flp" in flags else 4 if "l2p" in flags else 0
         self.conv_stamp = "stamp" in flags
         self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(

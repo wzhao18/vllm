@@ -1300,6 +1300,12 @@ def _t2_chunk(
         pb = out_addr + tl * 131072 + line * 128 + Int64(rcl % 2) * 64 + ((gcol % 32) // 2) * 4
         for fi in cutlass.range_constexpr(16):
             stg_u32_all(pb + fi * 128, ys[fi])
+    elif cutlass.const_expr(probe == 4):
+        # Microbench probe: same stores folded into a 16 MiB L2-resident window
+        # (same NoC bytes, no HBM write traffic).
+        for fi in cutlass.range_constexpr(16):
+            off = (obase + fi * p_dim * 2 - out_addr) % Int64(1 << 24)
+            stg_u32_all(out_addr + off, ys[fi])
     elif b2i(gm <= _D_EXACT) * b2i(r0 + 16 <= row_end) != 0:
         for fi in cutlass.range_constexpr(16):
             stg_u32_all(obase + fi * p_dim * 2, ys[fi])
