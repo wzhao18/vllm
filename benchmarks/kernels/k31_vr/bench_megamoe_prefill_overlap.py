@@ -226,7 +226,7 @@ def main():
             main.wait_stream(side)
 
         fns = {"moe": moe_calls, "shared": shared, "serial": serial, "overlap": overlap}
-        ref = fp = None
+        ref = fp = pos = None
         for mode in modes:
             if cap is not None and mode == "shared":
                 continue
@@ -243,6 +243,9 @@ def main():
             torch.cuda.synchronize()
             if mode in ("moe", "serial", "overlap"):
                 fp = out.float().abs().sum().item()
+                # position-sensitive: a permutation of output elements changes it
+                flat = out.float().flatten()
+                pos = (flat * (torch.arange(flat.numel(), device=flat.device) % 1009 + 1)).sum().item()
                 ref = fp if ref is None else ref
             res = measure(graph.replay, args.samples, args.replays, group)
             prof = None
@@ -273,7 +276,8 @@ def main():
                 "tokens": T, "capacity": C,
                 "subcalls": nsub, "world": world, "routing": args.routing,
                 "num_experts": problem.num_experts,
-                "out_abs_sum": fp if mode != "shared" else None, **res,
+                "out_abs_sum": fp if mode != "shared" else None,
+                "out_pos_sum": pos if mode != "shared" else None, **res,
                 "kernels_us": prof,
             }
             rows.append(row)
