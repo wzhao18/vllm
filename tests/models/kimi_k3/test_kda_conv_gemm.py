@@ -178,10 +178,21 @@ def test_fused_in_proj_never_captured(monkeypatch):
     with pytest.raises(StopIteration):
         fused.fused(qa)
     assert calls == [False]
-    # A step that exports a prefill checkpoint needs the raw q|k|v rows (stock).
-    md.checkpoint = object()
+    # A step that exports a prefill checkpoint: the fused GEMM also saves the
+    # raw q|k|v rows the exporter stores (its epilogue's checkpoint halo) ...
+    fused.p = 256
+    md.checkpoint = SimpleNamespace(
+        checkpoint_offsets=torch.tensor([16], dtype=torch.int32, device=dev),
+        offsets=[16],
+    )
+    _gemm.supports_checkpoint_halo = True
+    with pytest.raises(StopIteration):
+        fused.fused(qa)
+    assert calls == [False, False]
+    # ... unless the GEMM variant cannot (stock in_proj + conv).
+    _gemm.supports_checkpoint_halo = False
     assert fused.fused(qa) is None
-    assert calls == [False]
+    assert calls == [False, False]
 
 
 @pytest.mark.parametrize("dim_first", [True, False])
@@ -223,3 +234,105 @@ def test_conv_fixup_warm_covers_serving_steps(monkeypatch, dim_first):
                                       qsl, lines, init, PART, NULL_BLOCK_ID,
                                       compile_only=True)  # fmt: skip
         assert variants() == warmed
+
+
+def _run_checkpoint(
+    seqlens, offsets, m, tactic=None, seed=0, host_offsets=True, part=PART, k=K
+):
+    """Prefix-hit-shaped prefill steps exporting checkpoints: the fused GEMM's
+    halo rows + the stock exporter store bit for bit the conv state the stock
+    path (in_proj, qkv_conv, exporter on the in_proj output) stores."""
+    from vllm.model_executor.layers.mamba.checkpoint import (
+        MambaPrefillCheckpointExporter,
+        MambaPrefillCheckpointMetadata,
+    )
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        KdaConvGemm,
+    )
+
+    dev = torch.device("cuda")
+    n = 3 * part
+    xq, xs, wq, ws = _operands(m, n, k, dev, seed)
+    proj = torch._scaled_mm(
+        xq, wq.t(),
+        scale_a=xs.view(torch.float8_e8m0fnu), scale_b=ws.view(torch.float8_e8m0fnu),
+        out_dtype=torch.bfloat16,
+    )  # fmt: skip
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    cw = (torch.randn(n, 4, device=dev, generator=g) * 0.5).contiguous()
+    qsl = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32,
+                       device=dev)  # fmt: skip
+    nseq = len(seqlens)
+    # Cache rows other than the null block (sequence lines must be real rows).
+    slots = torch.randperm(3 * nseq + 2, device=dev, generator=g).to(torch.int32)
+    slots = slots[slots != NULL_BLOCK_ID]
+    lines, ck_slots = slots[:nseq], slots[nseq : 2 * nseq].clone()
+    ck_slots[nseq // 2] = NULL_BLOCK_ID  # a checkpoint without a cache block
+    # Prefix hits (resumed state) mixed with fresh sequences.
+    has_init = torch.arange(nseq, device=dev) % 3 != 0
+    state0 = torch.randn(3 * nseq + 2, n, 4, device=dev, generator=g)
+    state0 = state0.to(torch.bfloat16)[:, :, :3]
+    ckpt = MambaPrefillCheckpointMetadata(
+        torch.tensor(offsets, dtype=torch.int32, device=dev),
+        ck_slots,
+        offsets=list(offsets) if host_offsets else None,
+    )
+    exporter = MambaPrefillCheckpointExporter(state_len=3)
+
+    st_ref = state0.clone()
+    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, part)
+    exporter.export(ckpt, raw_qkv=proj[:m], conv_state=st_ref, cu_seqlens=qsl)
+
+    gemm = KdaConvGemm(wq, ws, cw, part, tactic=tactic)
+    assert gemm.supports_checkpoint_halo
+    st = state0.clone()
+    halo = torch.full((nseq, 3, n), float("nan"), dtype=torch.bfloat16, device=dev)
+    out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID,
+                  checkpoint_offsets=ckpt.checkpoint_offsets, halo=halo)  # fmt: skip
+    kda_conv_in_proj._HALO_QSL[:] = [None, None]
+    rows = kda_conv_in_proj.CheckpointRows(
+        halo.view(3 * nseq, n), kda_conv_in_proj._halo_qsl(ckpt)
+    )
+    exporter.export(ckpt, raw_qkv=rows.raw, conv_state=st, cu_seqlens=rows.qsl)
+    torch.cuda.synchronize()
+    tot = int(qsl[-1])
+    assert torch.equal(out[:, :tot], ref[:, :tot])
+    # Every conv state row: sequence lines and checkpoint slots, bitwise.
+    assert torch.equal(st.view(torch.int16), st_ref.view(torch.int16))
+    for s, off in enumerate(offsets):
+        if off >= 3:
+            r = int(qsl[s]) + off
+            assert torch.equal(halo[s].view(torch.int16), proj[r - 3 : r].view(torch.int16))
+
+
+# Checkpoint offsets per sequence (0 = none, < 3 = no conv window): mid-chunk
+# multiples of 16, at the chunk end, windows across 128-row block edges and
+# sequence-start fix-up rows, offset 3 (window = the first rows).
+@pytest.mark.parametrize(
+    "seqlens,offsets,m",
+    [
+        ([1365] * 3, [1024, 1365, 0], 4096),
+        ([700, 300, 64, 900, 37], [640, 16, 64, 128, 32], 2048),
+        ([1, 2, 3, 125, 128, 3, 256, 600, 5], [1, 2, 3, 112, 128, 0, 16, 512, 5], 1300),
+        ([127, 1, 128, 129, 2], [3, 0, 48, 129, 2], 512),
+    ],
+)
+def test_kda_conv_gemm_checkpoint_bitwise(seqlens, offsets, m):
+    _run_checkpoint(seqlens, offsets, m)
+
+
+def test_kda_conv_gemm_checkpoint_device_offsets():
+    # Checkpoint metadata without host offsets: halo starts built on device.
+    _run_checkpoint([700, 300, 64, 900, 37], [640, 16, 64, 128, 32], 2048,
+                    host_offsets=False, seed=5)  # fmt: skip
+
+
+def test_kda_conv_gemm_checkpoint_prod_tactic():
+    # The deployed fused in_proj tactic (512x256 tile, 2x4 cluster) at the
+    # deployed K3.1 plane and K sizes, an F16K prefix-hit step.
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+
+    _run_checkpoint([2000, 1000, 5000, 192, 8000], [1984, 1000, 4096, 176, 7680],
+                    16384, tactic=TACTIC, seed=7, part=12288, k=7168)  # fmt: skip

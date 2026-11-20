@@ -169,11 +169,15 @@ def _fixup_blocks(
                      part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
 
 
-#: Per-step counts and the deployment's state / index strides are runtime
-#: values (no ==1 / %16 specialization): one compile per (BG, SP2) covers every
-#: serving step, and ``warm`` compiles those at load.
+# Per-step counts, the deployment's state / index strides and the metadata
+# pointers are runtime values (no ==1 / %16 / 16-byte-alignment
+# specialization): one compile per (BG, SP2) covers every serving step, and
+# ``warm`` compiles those at load.
 @triton.jit(
-    do_not_specialize=["M", "NB", "S", "NBG", "st_s0", "st_s1", "ci_s0"]
+    do_not_specialize=[
+        "qsl_ptr", "ci_ptr", "init_ptr", "M", "NB", "S", "NBG", "st_s0", "st_s1",
+        "ci_s0",
+    ]
 )
 def _conv_fixup_all_kernel(
     out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
@@ -213,9 +217,10 @@ def conv_fixup(
     part_dim: int,
     null_block_id: int | None,
     compile_only: bool = False,
+    bg: int | None = None,
 ) -> None:
     """``compile_only``: compile (or load) this launch's kernel variant, launch
-    nothing."""
+    nothing. ``bg``: block rows per block program (default by size)."""
     _, m, p = out.shape
     n = 3 * p
     nb = (m + 127) // 128
@@ -223,8 +228,9 @@ def conv_fixup(
     block = FIXUP_BLOCK if p % FIXUP_BLOCK == 0 else 256
     # FP32 or BF16 conv state (stock: bf16 inputs shifted in, exact either way).
     assert p % block == 0 and conv_state.dtype in (torch.float32, torch.bfloat16)
-    sp2 = triton.next_power_of_2(nseq + 1)
-    bg = FIXUP_BG or (8 if nb >= 96 else 4)
+    # One sequence-table width for every batch of up to 63 sequences.
+    sp2 = max(64, triton.next_power_of_2(nseq + 1))
+    bg = bg or FIXUP_BG or (8 if nb >= 96 else 4)
     nbg = (nb + bg - 1) // bg
     grid = (nbg + nseq, n // block)
     launch = _conv_fixup_all_kernel[grid]
