@@ -498,9 +498,17 @@ class TopkReduce:
                 shared_term,
                 producer_done,
             )
+            # The rows poll for most of this grid's life, and its dependent (the sdec latent
+            # up-projection) loads its weights before its griddepcontrol.wait: with the full
+            # shared-memory carve-out on these SMs its CTAs can become resident beside the
+            # polling ones instead of after them (this grid itself needs < 1 KiB).
             if cutlass.const_expr(split == 1):
                 kernel.launch(
-                    grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream, use_pdl=True
+                    grid=[reduced_output.shape[0], 1, 1],
+                    block=[norm_threads, 1, 1],
+                    stream=stream,
+                    use_pdl=True,
+                    preferred_smem_carveout=100,
                 )
             else:
                 kernel.launch(
@@ -509,6 +517,7 @@ class TopkReduce:
                     cluster=[split, 1, 1],
                     stream=stream,
                     use_pdl=True,
+                    preferred_smem_carveout=100,
                 )
             return
 
