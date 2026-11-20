@@ -518,6 +518,8 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         own = self._die
         if cutlass.const_expr(fc2 == 1):
             shared_id, work_id_worker = self._claim_die_half(work_id_worker, own, 1)
+            if shared_id < Int32(0):
+                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own, 1)
             if shared_id >= Int32(0):
                 work_tile = self._decode_shared_tile(shared_id, 1)
             else:
