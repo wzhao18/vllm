@@ -305,6 +305,22 @@ def publish2(p0, p1, r, thr, tw):
         Int64(p0), Int64(p1), Uint32(r), Uint32(thr), Uint32(tw)), (Int64, Int64)
 
 
+@asm(Int32)
+def try_wait_hint(barrier, phase):
+    """CTA-scope parity probe with a suspend-time hint: a waiting warp sleeps in
+    the barrier unit instead of re-issuing the probe and its loop branch."""
+    code = "{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 "
+    code += "p,[$1],$2,0x2000; selp.u32 $0,1,0,p; }"
+    return code, "=r,r,r,~{memory}", (barrier, Int32(phase))
+
+
+@cute.jit
+def mbar_wait(barrier, phase):
+    done = try_wait_hint(barrier, phase)
+    while done == 0:
+        done = try_wait_hint(barrier, phase)
+
+
 @cute.jit
 def wg_sync(wg):
     cute.arch.barrier(barrier_id=2 + wg, number_of_threads=128)
@@ -787,7 +803,7 @@ class IndexerScore:
             ntok = items[item, 1]
             ntiles = items[item, 3]
             qs = jq % Q_STAGES
-            cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
+            mbar_wait(q_full + qs, (jq // Q_STAGES) & 1)
             end0 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a) * 4))
             end1 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a + 1) * 4))
             row0 = token0 + tok_a
@@ -892,7 +908,7 @@ class IndexerScore:
                 if lane == 0:
                     cute.arch.mbarrier_arrive(acc_empty + GROUPS * st)
             return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
-        cute.arch.mbarrier_wait(acc_full, ph)
+        mbar_wait(acc_full, ph)
         h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
         h0n = h0
         for st in cutlass.range_constexpr(ACC_STAGES):
@@ -908,7 +924,7 @@ class IndexerScore:
             if lane == 0:
                 cute.arch.mbarrier_arrive(acc_empty + GROUPS * st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
-                cute.arch.mbarrier_wait(acc_full + GROUPS * (st + 1), ph)
+                mbar_wait(acc_full + GROUPS * (st + 1), ph)
                 h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
             if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
