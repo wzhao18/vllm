@@ -25,7 +25,7 @@ def _cfg(backend=KIMI_K3_MEGA_MOE):
     return SimpleNamespace(kernel_config=SimpleNamespace(moe_backend=backend))
 
 
-def _policy(mnbt=16384, tp=1, sp=False, shard=False, backend=KIMI_K3_MEGA_MOE):
+def _policy(mnbt=2 * C, tp=1, sp=False, shard=False, backend=KIMI_K3_MEGA_MOE):
     return P.prefill_moe_policy(
         _cfg(backend), tp_size=tp, sequence_parallel=sp, token_shard=shard,
         max_num_tokens=mnbt,
@@ -34,8 +34,8 @@ def _policy(mnbt=16384, tp=1, sp=False, shard=False, backend=KIMI_K3_MEGA_MOE):
 
 def test_policy_applies_to_tp1_prefill_batches_only():
     p = _policy()
-    assert p == P.PrefillMoEPolicy(capacity=C, max_num_tokens=16384) and p.subcalls
-    assert _policy(mnbt=32768).capacity == C
+    assert p == P.PrefillMoEPolicy(capacity=C, max_num_tokens=2 * C) and p.subcalls
+    assert _policy(mnbt=4 * C).capacity == C
     for kw in (
         dict(mnbt=C), dict(tp=4), dict(sp=True), dict(shard=True),
         dict(backend="deep_gemm_mega_moe"),
@@ -46,11 +46,11 @@ def test_policy_applies_to_tp1_prefill_batches_only():
 @pytest.mark.parametrize(
     ("counts", "plan"),
     [
-        ([16384] * 4, (2, (C, C))),
-        ([16384, 9000, 0, 100], (2, (4121, 2250))),
+        ([2 * C] * 4, (2, (C, C))),
+        ([2 * C, C + 808, 0, 100], (2, ((2 * C + 100 + 3) // 4, (C + 808 + 3) // 4))),
         ([5000, 5000], (1, (5000,))),
         ([0, 0], (1, (0,))),
-        ([24577], (4, (C, C, C, 1))),
+        ([3 * C + 1], (4, (C, C, C, 1))),
     ],
 )
 def test_subcall_plan_is_ep_uniform(counts, plan):

@@ -35,11 +35,13 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-# MegaMoE sub-call capacity (tokens per rank) of a prefill worker: the largest
-# capacity with tuned VR knob records (EP16 NVFP4 i8192 phase-interleave N256), and
-# the FlashInfer SM107 MegaMoE per-token optimum (EP16 NVFP4: 1254 us at 8192 vs
-# 2649 us at 16384 per call).
-PREFILL_MOE_SUBCALL_TOKENS = 8192
+# MegaMoE sub-call capacity (tokens per rank) of a prefill worker. An F16K forward
+# runs ONE launch per layer (the router, dispatch ramp and combine tail are paid once
+# instead of twice; the i8192 knob record serves the 16384 bucket). Measured on VR200
+# (dedup W2S kernel, EP16 per-rank shape on EP4: 56 experts/GPU, top-16, NVFP4,
+# 16384 tokens/rank, bitwise identical outputs): 2 x 8192 1777-1799 us vs 1 x 16384
+# 1662-1720 us; 3 x 8192 2825 vs 1 x 24576 2540 us.
+PREFILL_MOE_SUBCALL_TOKENS = 16384
 
 
 @dataclasses.dataclass(frozen=True)
