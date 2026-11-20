@@ -77,7 +77,87 @@ def parse_args():
     p.add_argument("--replays", type=int, default=3)
     p.add_argument("--profile-dir", default=None)
     p.add_argument("--json", default=None)
+    p.add_argument(
+        "--energy-seconds", type=float, default=0.0,
+        help="after timing, replay back to back for ~this long (same count on every rank) and report "
+        "NVML energy per replay (total and above the idle power measured just before), the SM clock "
+        "p50 and the share of samples with a power-cap clock event",
+    )
     return p.parse_args()
+
+
+def energy_loop(fn, est_us, seconds, group):
+    import threading
+    import time
+
+    import pynvml
+
+    pynvml.nvmlInit()
+    dev = torch.cuda.current_device()
+    handle = pynvml.nvmlDeviceGetHandleByUUID(
+        "GPU-" + str(torch.cuda.get_device_properties(dev).uuid)
+    )
+    reasons_fn = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None) or (
+        pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
+    )
+    # SW power cap 0x4, HW slowdown 0x8, HW power brake 0x80
+    cap_mask = 0x4 | 0x8 | 0x80
+    clocks, capped = [], []
+    stop = threading.Event()
+
+    def sample():
+        while not stop.is_set():
+            clocks.append(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+            capped.append(1 if reasons_fn(handle) & cap_mask else 0)
+            time.sleep(0.01)
+
+    def energy_j():
+        return pynvml.nvmlDeviceGetTotalEnergyConsumption(handle) / 1000.0
+
+    n = max(1, int(seconds * 1e6 / est_us))
+    torch.cuda.synchronize()
+    if group is not None:
+        dist.barrier(group)
+    e0, t0 = energy_j(), time.time()
+    time.sleep(0.5)
+    p_idle = (energy_j() - e0) / (time.time() - t0)
+    if group is not None:
+        dist.barrier(group)
+    thread = threading.Thread(target=sample, daemon=True)
+    thread.start()
+    e1, t1 = energy_j(), time.time()
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
+    e2, t2 = energy_j(), time.time()
+    stop.set()
+    thread.join()
+    busy = clocks[len(clocks) // 10:] or clocks
+    vals = torch.tensor(
+        [
+            (e2 - e1) / n,
+            ((e2 - e1) - p_idle * (t2 - t1)) / n,
+            (e2 - e1) / (t2 - t1),
+            p_idle,
+            (t2 - t1) * 1e6 / n,
+            float(statistics.median(busy)) if busy else 0.0,
+            sum(capped) / max(len(capped), 1),
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    if group is not None:
+        gathered = [torch.empty_like(vals) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(gathered, vals, group=group)
+        per_rank = torch.stack(gathered)
+    else:
+        per_rank = vals[None]
+    mean = per_rank.mean(0).tolist()
+    keys = ("j_per_replay", "dyn_j_per_replay", "p_avg_w", "p_idle_w", "us_per_replay", "sm_mhz_p50", "cap_share")
+    out = {f"energy_{k}": round(v, 4) for k, v in zip(keys, mean)}
+    out["energy_replays"] = n
+    out["energy_dyn_j_per_replay_max"] = round(per_rank[:, 1].max().item(), 4)
+    return out
 
 
 def measure(fn, samples, replays, group):
@@ -248,6 +328,8 @@ def main():
                 pos = (flat * (torch.arange(flat.numel(), device=flat.device) % 1009 + 1)).sum().item()
                 ref = fp if ref is None else ref
             res = measure(graph.replay, args.samples, args.replays, group)
+            if args.energy_seconds > 0:
+                res.update(energy_loop(graph.replay, res["p50_us"], args.energy_seconds, group))
             prof = None
             if args.profile_dir and mode in ("moe", "overlap"):
                 # every rank replays (the MegaMoE is collective); rank 0 records
