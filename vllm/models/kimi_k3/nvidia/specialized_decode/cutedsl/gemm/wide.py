@@ -877,9 +877,12 @@ def _diag_register(gemm, rows, n_pad, split, flags):
     if not prefix:
         return
     _DIAG_PLANS.append((gemm, rows, n_pad, split, flags))
+    if len(_DIAG_PLANS) == 1:
+        print(f"lu2diag registered (prefix {prefix})", flush=True)
 
 
 _DIAG_COUNT = [0]
+_DIAG_T = [0.0]
 
 
 def _diag_dump():
@@ -889,10 +892,17 @@ def _diag_dump():
     out = []
     for g, r, npad, sp, fl in _DIAG_PLANS:
         out.append({"n": g.n, "k": g.k, "rows": r, "n_pad": npad, "split": sp, "flags": fl.cpu()})
-    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", str(torch.cuda.current_device())))
+    import time
+
+    rank = str(torch.cuda.current_device())
+    now = time.time()
+    if now - _DIAG_T[0] < 1.0:  # once per eager pass: the first eager launch after >= 1 s of graph replays
+        return
+    _DIAG_T[0] = now
     _DIAG_COUNT[0] += 1
-    if _DIAG_COUNT[0] % 23 == 1:  # once per eager pass (23 MoE layers)
-        torch.save(out, f"{os.environ['DMS_LU2_DUMP']}.r{rank}.c{_DIAG_COUNT[0]:05d}.pt")
+    path = f"{os.environ['DMS_LU2_DUMP']}.r{rank}.c{_DIAG_COUNT[0]:03d}.pt"
+    print(f"lu2diag dump {len(out)} plans -> {path}", flush=True)
+    torch.save(out, path)
 
 
 class PreparedWide:
@@ -967,8 +977,6 @@ class PreparedWide:
 
     def run(self, x, out):
         rows = x.shape[0]
-        if _DIAG_PLANS and not torch.cuda.is_current_stream_capturing():
-            _diag_dump()
         _, _, ws, flags = self.state[rows]
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         y = out.view(-1, out.shape[-1])  # partials: [split, T, N] -> [split * T, N]
