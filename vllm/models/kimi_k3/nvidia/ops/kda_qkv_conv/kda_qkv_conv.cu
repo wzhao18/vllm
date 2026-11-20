@@ -291,7 +291,7 @@ __device__ __noinline__ void begin_seq(const __nv_bfloat16* __restrict__ x, int6
     for (int i = 0; i < kVec; ++i) state_st(st + i * st_s1 + j * st_s2, ns[j][i]);
 }
 
-constexpr int kStages = 4;  // ring slots per CTA (4 x 4 rows x NC x 512 B)
+constexpr int kStages = 8;  // ring slots per CTA (8 x 4 rows x NC x 512 B): >= 96 KiB in flight per SM
 
 // Registers capped at 128 per thread (3-4 CTAs per SM): measured best over 96-170 at the VR200 shapes.
 template <int NC>
@@ -331,17 +331,16 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
   }
   __syncthreads();
 
-  if (warp == NC) {  // producer
-    if (lane == 0) {
-      const __nv_bfloat16* src = p.x + static_cast<int64_t>(r_begin) * p.ldx + cta_col;
+  if (warp == NC) {  // producer: lane i issues row i of each slot (bulk ops from one thread complete serially)
+    if (lane < kRowsPerSlot) {
+      const __nv_bfloat16* src = p.x + static_cast<int64_t>(r_begin + lane) * p.ldx + cta_col;
       for (int k = 0; k < nslots; ++k) {
         const int s = k % STAGES;
         if (k >= STAGES) mbar_wait(&empty[s], ((k / STAGES) - 1) & 1);
         const int rows = min(kRowsPerSlot, nrows - k * kRowsPerSlot);
-        mbar_expect_tx(&full[s], rows * kCtaRowBytes);
-#pragma unroll
-        for (int i = 0; i < kRowsPerSlot; ++i)
-          if (i < rows) bulk_load(ring + s * kSlotBytes + i * kCtaRowBytes, src + i * p.ldx, kCtaRowBytes, &full[s]);
+        if (lane == 0) mbar_expect_tx(&full[s], rows * kCtaRowBytes);
+        __syncwarp((1u << kRowsPerSlot) - 1);
+        if (lane < rows) bulk_load(ring + s * kSlotBytes + lane * kCtaRowBytes, src, kCtaRowBytes, &full[s]);
         src += kRowsPerSlot * p.ldx;
       }
     }
