@@ -24,6 +24,8 @@ from pathlib import Path
 
 import torch
 
+from vllm.models.kimi_k3.nvidia.dsa_kernels import stable_sources
+
 _EXT = None
 LOG2E = math.log2(math.e)
 _ERR = {1: "q mailbox poll timeout"}
@@ -40,15 +42,21 @@ def load_ext():
     srcs = [csrc / "dsa_core.cu"]
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
-    digest = hashlib.sha1(b"".join(s.read_bytes() for s in srcs)).hexdigest()[:10]
+    # the .cu / .cuh files of csrc (stable_sources copies exactly these)
+    files = [f for f in sorted(csrc.iterdir()) if f.suffix in (".cu", ".cuh")]
+    digest = hashlib.sha1(b"".join(f.read_bytes() for f in files)).hexdigest()[:10]
     # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DSAC_BUILD_DIR")
+    sources = [str(s) for s in srcs]
     if build:
-        build = str(Path(build) / digest)
+        # "-s": compiled from the digest-keyed source copy (a different ninja
+        # command than builds from the checkout path, which must not share a dir)
+        build = str(Path(build) / f"{digest}-s")
         Path(build).mkdir(parents=True, exist_ok=True)
+        sources = stable_sources(build, srcs)
     _EXT = load(
         name=f"k31_dsa_core_sm{arch}_{digest}",
-        sources=[str(s) for s in srcs],
+        sources=sources,
         extra_cuda_cflags=[
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",

@@ -49,7 +49,8 @@ KDA_PITCH = 4 * HEADS * 128 + 128 + HEADS + 8  # [q | k | v | g | f_a | beta | p
 KINDS = ("kda", "kda", "dsa", "kda", "dsa", "kda", "kda")
 SPECIALIZED = {"ag", "dsa_in", "dsa", "kda_in", "kda", "oproj_rs", "moe_dense"}
 SPECIALIZED |= {"sp_boundary", "final_gather"}  # fused AttnRes + SP AG / RS, final AG
-DECLARED = {"embed", "attn_res", "moe", "dense", "lm_head"}
+SPECIALIZED |= {"dense"}  # the layer-0 dense MLP (SpDenseMlp) at <= 128 shard rows
+DECLARED = {"embed", "attn_res", "moe", "lm_head"}
 DECLARED |= {"sampler", "drafter", "verify"}
 
 
@@ -113,8 +114,9 @@ class Fakes:
                 assert 0 < col < self.width and width < self.width, (col, width)
                 self.pushes.append((rows, col))
 
-        def boundary(decoder, comm, block, rows, mlp=None):
+        def boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
+            assert delta_parts == (), delta_parts  # stand-in MLPs have no split partials
             assert (mlp is None) == (decoder.layer_idx == 0), decoder.layer_idx
             fakes.events.add("SpBoundary", decoder.layer_idx, block.parity)
             return SimpleNamespace(layer=decoder.layer_idx, comm=comm)
@@ -185,14 +187,26 @@ class Fakes:
                 assert mlp.use_mega_moe and ctx.sequence_parallel
                 assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
                 gaps = fakes.gaps.get("moe_dense", ())
-                self.parts = {}
+                self.providers = {}
                 for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
-                    self.parts[f] = Provider(rows, gaps)
-                    self.parts[f].family = f
+                    self.providers[f] = Provider(rows, gaps)
+                    self.providers[f].family = f
+                self.parts = {}  # SpMlp.parts: no latent up split-partial rows
                 fakes.events.add("SpMlp", index)
 
             def choices(self, n):
-                return {f: p.choice(n) for f, p in self.parts.items()}
+                return {f: p.choice(n) for f, p in self.providers.items()}
+
+        class Dense(Provider):
+            family = "dense"
+
+            def __init__(self, mlp, rows, device, index):
+                assert index == 0 and not mlp.use_mega_moe, index
+                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                super().__init__(rows, fakes.gaps.get("dense", ()))
+
+            def serves(self, n):
+                return n in self.rows
 
         def tactics(family, n, k, rows, ctx):
             assert ctx.sequence_parallel and ctx.tp == TP, ctx
@@ -224,6 +238,7 @@ class Fakes:
             SpKdaCore=KdaCore,
             SpOproj=Oproj,
             SpMlp=Mlp,
+            SpDenseMlp=Dense,
             sp_projection_tactics=tactics,
             sp_dsa_box=box,
             sp_dsa_scratch=scratch,

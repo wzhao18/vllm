@@ -60,7 +60,7 @@ def test_pre_bitwise_kda_in():
         out = torch.empty(r, N, device=DEVICE, dtype=torch.bfloat16)
         proj.run(x, out)
         assert torch.equal(out, scaled_mm(xq, xs, wq, sw)), r
-        tactic, _ = pre_tactic(N, K, r)
+        tactic, _, _ = pre_tactic(N, K, r)
         plain = Mxfp8PreGemm(N, K, r, tactic, use_pdl=False, prewait=0, device=DEVICE)
         again = torch.empty_like(out)
         plain(xq, xs, wq, sw, again)
@@ -95,6 +95,6 @@ def test_pre_graph_chain():
 
 def test_pre_rejects():
     with pytest.raises(ValueError):
-        Mxfp8PreGemm(N, K, 128, ((256, 192), (2, 1), True, 256), device=DEVICE)
+        Mxfp8PreGemm(N, K, 128, ((256, 96), (2, 1), True, 256), device=DEVICE)
     with pytest.raises(ValueError):
         Mxfp8PreGemm(N, 256, 128, ((128, 64), (1, 1), False, 128), prewait=8, device=DEVICE)

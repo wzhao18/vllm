@@ -203,6 +203,7 @@ def test_hetero_dcp_blocks_match_global_chunks(num_chunks, local_num_computed_bl
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     for d_rank in range(16):
         d_chunks = _owner_chunks(d_rank, 16, num_chunks)
         if len(d_chunks) <= local_num_computed_blocks:
@@ -250,18 +251,23 @@ def _kda_spec(tp: int, heads: int = 96, head_dim: int = 128, num_spec: int = 7):
     )
 
 
-@pytest.mark.parametrize("d_rank", range(16))
-def test_kda_state_slices_tp8_to_tp16(ds_conv_layout, d_rank):
+@pytest.mark.parametrize(
+    "p_tp,d_tp,d_rank",
+    [(8, 16, r) for r in range(16)] + [(1, 4, r) for r in range(4)],
+)
+def test_kda_state_slices_hetero_tp(ds_conv_layout, p_tp, d_tp, d_rank):
     """The decoder rank's conv sub-projections ([Q|K|V], DS layout) and recurrent
     heads, read as byte ranges from the prefiller rank owning its heads, equal
     the state the decoder rank itself would hold (Kimi K3: 96 heads x 128, conv
-    width 4, 7 speculative columns)."""
+    width 4, 7 speculative columns). TP8 -> TP16, and DEP16 (TP1) -> D3-32
+    (TP4)."""
     from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
         derive_mamba_conv_split,
     )
 
     heads, hd, rows = 96, 128, 10
-    p_rank, j = d_rank // 2, d_rank % 2
+    tp_ratio = d_tp // p_tp
+    p_rank, j = d_rank // tp_ratio, d_rank % tp_ratio
 
     def conv_ids(tp, rank):  # (proj, global channel, column) ids, DS layout
         n = heads * hd // tp
@@ -277,22 +283,22 @@ def test_kda_state_slices_tp8_to_tp16(ds_conv_layout, d_rank):
         n = heads // tp
         return np.arange(rank * n * hd * hd, (rank + 1) * n * hd * hd)
 
-    d_split = derive_mamba_conv_split(_kda_spec(16), local_tp=16)
-    p_split = derive_mamba_conv_split(_kda_spec(8), local_tp=8)
-    assert d_split.local_proj_dims == (768, 768, 768)
-    assert p_split.local_proj_dims == (1536, 1536, 1536)
+    d_split = derive_mamba_conv_split(_kda_spec(d_tp), local_tp=d_tp)
+    p_split = derive_mamba_conv_split(_kda_spec(p_tp), local_tp=p_tp)
+    assert d_split.local_proj_dims == (heads * hd // d_tp,) * 3
+    assert p_split.local_proj_dims == (heads * hd // p_tp,) * 3
 
     # One P page: conv state, then the recurrent state (element = 2 bytes).
-    p_page = np.concatenate([conv_ids(8, p_rank), ssm_ids(8, p_rank)])
+    p_page = np.concatenate([conv_ids(p_tp, p_rank), ssm_ids(p_tp, p_rank)])
     got = [
         p_page[off // 2 : (off + size) // 2]
-        for off, size in d_split.remote_conv_offsets(j, tp_ratio=2)
+        for off, size in d_split.remote_conv_offsets(j, tp_ratio=tp_ratio)
     ]
     conv_size_remote, ssm_read = p_split.ssm_sizes[0], d_split.ssm_sizes[1]
     start = (conv_size_remote + j * ssm_read) // 2
     got.append(p_page[start : start + ssm_read // 2])
-    assert np.array_equal(np.concatenate(got[:-1]), conv_ids(16, d_rank))
-    assert np.array_equal(got[-1], ssm_ids(16, d_rank))
+    assert np.array_equal(np.concatenate(got[:-1]), conv_ids(d_tp, d_rank))
+    assert np.array_equal(got[-1], ssm_ids(d_tp, d_rank))
 
 
 def _worker_stub(
@@ -304,6 +310,7 @@ def _worker_stub(
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w.block_size = block // phys
     w._physical_blocks_per_logical_kv_block = phys
     w.vllm_config = SimpleNamespace(
@@ -356,7 +363,7 @@ def test_validate_hybrid_hetero_dcp_accepts(worker_kwargs, meta_kwargs):
         ({"pair": True}, {"interleave": 1}),
         (PAIR, {"interleave": None}),
         ({**PAIR, "mode": "push"}, {"interleave": 1}),
-        (PAIR, {"interleave": 1, "dcp": 4}),
+        (PAIR, {"interleave": 1, "dcp": 3}),
         ({"interleave": 16, "pair": True}, {"interleave": 16}),
         ({"block": 512, "phys": 8, "interleave": 1}, {}),
         # Pair mode moves half-blocks of equal per-rank blocks, without PCP.
@@ -369,7 +376,7 @@ def test_validate_hybrid_hetero_dcp_accepts(worker_kwargs, meta_kwargs):
         "decoder-at-block-interleave",
         "peer-without-interleave",
         "push-mode",
-        "dcp-ratio-not-2",
+        "dcp-ratio-not-pow2",
         "interleave-neither-1-nor-block",
         "with-block-size-mismatch",
         "pair-with-block-size-mismatch",
@@ -381,6 +388,31 @@ def test_validate_hybrid_hetero_dcp_interleave_mismatch_is_fatal(
 ):
     """Any other interleave combination needs a different mapping, so it stops
     the decoder (NixlPeerConfigMismatch) even alongside non-fatal problems."""
+    with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave_size"):
+        _validate_hybrid(worker_kwargs, meta_kwargs)
+
+
+# The production pairing DEP16 prefill (TP1, DCP1) -> D3-32 decode (TP4 = DCP4,
+# interleave 1): staged pair mode at ratio 4 once the per-rank blocks match.
+DEP16_TO_DCP4 = {"block": 4096, "tp": 4, "dcp": 4, **PAIR}
+
+
+def test_validate_hybrid_hetero_dcp_accepts_dcp1_to_dcp4_staged():
+    _validate_hybrid(DEP16_TO_DCP4, {"block": 4096, "interleave": 1, "dcp": 1})
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs",
+    [
+        # Unpinned P block (16384 at TP1) against D's 4096: not a pair peer.
+        (DEP16_TO_DCP4, {"block": 16384, "interleave": 1, "dcp": 1}),
+        # Ratio 3 is not a power of two.
+        ({"block": 4096, "tp": 12, "dcp": 12, **PAIR},
+         {"block": 4096, "interleave": 1, "dcp": 4}),
+    ],
+    ids=["dep16-unpinned-block", "ratio-3"],
+)
+def test_validate_hybrid_hetero_dcp_rejects_unstageable(worker_kwargs, meta_kwargs):
     with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave_size"):
         _validate_hybrid(worker_kwargs, meta_kwargs)
 
@@ -832,6 +864,7 @@ def _geometry_check(local, remote):
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w._mamba_state_geometry = local
     meta = SimpleNamespace(engine_id="remote", mamba_state_geometry=remote)
     w._validate_mamba_state_geometry(meta)
@@ -946,3 +979,33 @@ def test_select_ucx_net_devices_plus_separator(monkeypatch):
     import os
 
     assert os.environ["UCX_NET_DEVICES"] == "c:1,d:1"
+
+
+@pytest.mark.parametrize(
+    "net_devices,explicit,expected",
+    [("mlx5_0:1", None, "off"), ("mlx5_0:1", "auto", "auto"), (None, None, None)],
+)
+def test_ucx_gpu_nic_assignment_off_with_device_list(
+    monkeypatch, net_devices, explicit, expected
+):
+    """A per-rank NIC list must not be re-split among all visible GPUs by UCX:
+    that left GPU-memory ranks without lanes (3-5 GB/s instead of 32 per
+    reader, 0.1 GB/s between two such ranks). Explicit settings win."""
+    import os
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    for var, val in (
+        ("UCX_NET_DEVICES", net_devices),
+        ("UCX_GPU_NIC_ASSIGNMENT_MODE", explicit),
+    ):
+        monkeypatch.setenv(var, "restore-on-undo")
+        if val is None:
+            monkeypatch.delenv(var)
+        else:
+            monkeypatch.setenv(var, val)
+    monkeypatch.setenv("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
+    NixlConnectorWorker._set_ucx_env_defaults()
+    assert os.environ.get("UCX_GPU_NIC_ASSIGNMENT_MODE") == expected

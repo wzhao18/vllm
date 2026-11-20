@@ -1098,6 +1098,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # ShardQ under DCP only: TP-only steps keep the head-sharded path
     # (Inferact/mum#66 also turns TP ShardQ on for this backend).
     supports_dcp_shardq: ClassVar[bool] = True
+    # forward_mqa sends every call that returns the LSE (all DCP decode) to
+    # SparseMLACommonImpl.forward_mqa, which reads dcp_local_topk_counts; only
+    # prefill-sized calls take the specialized prefill kernel.
+    dcp_decode_reads_topk_counts: ClassVar[bool] = True
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
     # for query and kv_cache (mixed bf16+fp8 is not supported).
@@ -1208,6 +1212,32 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 vllm_config, self.use_shardq
             )
 
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        skip_scale: bool = False,
+    ) -> None:
+        # Kimi K3.1 specialized prefill: the same FP8 insert at HBM rate
+        if self._prefill_sparse_mla is not None and kv_cache.numel() > 0:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
+
+            k_pe2 = k_pe.squeeze(1)
+            slots = slot_mapping.flatten()
+            if kv_insert.applicable(
+                kv_c_normed, k_pe2, kv_cache, slots, kv_cache_dtype, skip_scale
+            ):
+                kv_insert.insert(kv_c_normed, k_pe2, kv_cache, slots)
+                return
+        super().do_kv_cache_update(
+            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale,
+            skip_scale,
+        )
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,
@@ -1254,6 +1284,18 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             return None
         self._fused_query = padded
         return padded[:, :num_heads]
+
+    def uk_query_fp8(
+        self, q: torch.Tensor, w_uk_t: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The FP8 query [T, H, L + R] of a prefill-sized call of the specialized
+        prefill sparse MLA (W_UK absorption, RoPE concat and static quant in one
+        GEMM pass), or None to let the layer run its bmm / concat / quant."""
+        if not self._runs_prefill_sparse_mla(q.shape[0]):
+            return None
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import uk_query
+
+        return uk_query.fused_query(q, w_uk_t, q_scale)
 
     def _runs_prefill_sparse_mla(self, num_rows: int) -> bool:
         psm = getattr(self, "_prefill_sparse_mla", None)
