@@ -119,7 +119,7 @@ def _situ_pair_ptx(a_pow: int, clamp_up: bool) -> str:
     return "{\n" + regs + "\n".join(body) + "\n}"
 
 
-def _situ_pair_packed_ptx(a_pow: int, clamp_up: bool) -> str:
+def _situ_pair_packed_ptx(a_pow: int, clamp_up: bool, probe: int = 0) -> str:
     """``_situ_pair_ptx`` on gate/up values already rounded to BF16 and packed
     (bf16x2, element 0 in the low half). Operands: $0 bf16x2 result, $1 max
     |result|; $2 gate, $3 up bf16x2; $4 k_b, $5 k_a, $6 k_c, $7 bb."""
@@ -127,7 +127,20 @@ def _situ_pair_packed_ptx(a_pow: int, clamp_up: bool) -> str:
     src = src.replace("cvt.rn.bf16x2.f32 gp, $3, $2;", "mov.b32 gp, $2;")
     src = src.replace("cvt.rn.bf16x2.f32 up, $5, $4;", "mov.b32 up, $3;")
     remap = {"$6": "$4", "$7": "$5", "$8": "$6", "$9": "$7"}
-    return re.sub(r"\$[6-9]", lambda m: remap[m.group(0)], src)
+    src = re.sub(r"\$[6-9]", lambda m: remap[m.group(0)], src)
+    if probe == 1:
+        # Microbench probe only (wrong values): MUFU ops -> FMUL.
+        src = re.sub(r"(ex2|rcp)\.approx\.ftz\.f32 (\w+), (\w+);", r"mul.rn.f32 \2, \3, 0f3F000000;", src)
+    return src
+
+
+@dsl_user_op
+def warp_yield(*, loc=None, ip=None) -> None:
+    """``nanosleep 0``: lets the scheduler pick another warp (MMA/TMA)."""
+    llvm.inline_asm(
+        None, [], "nanosleep.u32 0;", "", has_side_effects=True,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
 
 
 @dsl_user_op
@@ -140,6 +153,7 @@ def situ_pair_packed(
     bb: Float32,
     a_pow: int,
     clamp_up: bool,
+    probe: int = 0,
     *,
     loc=None,
     ip=None,
@@ -149,7 +163,7 @@ def situ_pair_packed(
         llvm.StructType.get_literal([T.i32(), T.f32()]),
         [Uint32(gp).ir_value(loc=loc, ip=ip), Uint32(up).ir_value(loc=loc, ip=ip)]
         + [Float32(v).ir_value(loc=loc, ip=ip) for v in (k_b, k_a, k_c, bb)],
-        _situ_pair_packed_ptx(a_pow, clamp_up),
+        _situ_pair_packed_ptx(a_pow, clamp_up, probe),
         "=r,=f,r,r,f,f,f,f",
         has_side_effects=False,
         is_align_stack=False,
@@ -430,6 +444,7 @@ def epilogue_situ_mxfp8_drain(
     acc_consumer_state: pipeline.PipelineState,
     acc_pipeline: pipeline.PipelineAsync,
     skel: Constexpr = 0,
+    yield_mode: Constexpr = 0,
 ) -> pipeline.PipelineState:
     """Drain-and-release form of ``epilogue_situ_mxfp8`` for the 1-stage
     B-reuse tile (8 epilogue warps; warp group g owns M block g): every thread
@@ -490,7 +505,7 @@ def epilogue_situ_mxfp8_drain(
                 rQ32[0] = acc
                 cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
         return acc_consumer_state
-    for ni in cutlass.range_constexpr(half):
+    for ni in cutlass.range_constexpr(half // 2 if skel == 4 else half):
         rG = frags[ni]
         rU = frags[ni + half]
         row = tTR_cQ[(None, None, None, g, ni)][0][0]
@@ -503,7 +518,7 @@ def epilogue_situ_mxfp8_drain(
             for p in cutlass.range_constexpr(16):
                 h, am = situ_pair_packed(
                     rG[vi * 16 + p], rU[vi * 16 + p],
-                    k_b, k_a, k_c, bb, a_pow, clamp_up,
+                    k_b, k_a, k_c, bb, a_pow, clamp_up, 1 if skel == 3 else 0,
                 )  # fmt: skip
                 hs.append(h)
                 amax = fmax_f32(amax, am)
@@ -513,7 +528,11 @@ def epilogue_situ_mxfp8_drain(
                 rQ32[vi * 8 + q] = e4m3x4_of_bf16x4(hs[2 * q], hs[2 * q + 1], inv)
             if row < (m_rows + 127) // 128 * 128:
                 sf_frg[0, vi] = e.to(cutlass.Uint8)
-        if cutlass.const_expr(skel == 2):
+            if cutlass.const_expr(yield_mode == 1):
+                warp_yield()
+        if cutlass.const_expr(yield_mode == 2):
+            warp_yield()
+        if cutlass.const_expr(skel >= 2):
             if m_rows < 0:
                 cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
         elif row < m_rows:
