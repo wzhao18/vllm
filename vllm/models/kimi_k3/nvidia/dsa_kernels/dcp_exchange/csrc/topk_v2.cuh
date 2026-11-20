@@ -913,16 +913,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     };
     send(msg, words, r1row + (int64_t)p.rank * kV2Msg);
     if (tid == 0) { s_tau = -1; s_need = 0; s_q = 0; s_gs = -1; s_tier = 0; }
-    // in the round's shadow: the KV slot of every (position-sorted) candidate (and, hot
-    // kernel, the tie-cut ranks zeroed)
+    // in the round's shadow: the KV slot of every (position-sorted) candidate
     if (fast && regp)
       for (int c = tid; c < nc; c += kV2T) cslot[c] = slot_of((int)cpos[c]);
-    if constexpr (kFast) {
-      for (int i = tid; i < kV2Band; i += kV2T) reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win)[i] = 0;
-      // tier 1 selects at most the nc candidates: the padding past them goes out now
-      if (fast && regp)
-        for (int i = nc + tid; i < K; i += kV2T) orow[i] = -1;
-    }
     V2DBG(28);
     for (int i = tid; i < W * (kV2Msg / 4); i += kV2T) {
       const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
@@ -935,8 +928,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 
     // ---- resolve. tier: 1 resolved (quota s_q), 2 tie round, 3 radix (id cut s_gs),
     // 4 every valid key, 5 cut from the bands. Every thread derives the tier from the
-    // exchanged words; three barriers in the common case (two in the hot kernel).
-    int tier;
+    // exchanged words; three barriers in the common case.
     {
       __shared__ int s_tc[kV2MaxW], s_toff[kV2MaxW], s_tok[kV2MaxW];
       int mx = 0, mn = 1 << 30, sat = 0;
@@ -1028,10 +1020,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           // ties lie below this rank's tie i; only this rank's ties are ranked.
           const int m = s_tc[p.rank];
           int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
-          if constexpr (!kFast) {  // the hot kernel zeroes rk in the round's shadow
-            if (tid < m) rk[tid] = 0;
-            __syncthreads();
-          }
+          if (tid < m) rk[tid] = 0;
+          __syncthreads();
           V2DBG(29);
           const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
           for (int it = tid; it < m * W; it += kV2T) {
@@ -1056,8 +1046,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
     __syncthreads();
-    tier = s_tier;
     V2DBG(5);
+    int tier = s_tier;
     if constexpr (kFast) {
       // The common case (tier 1 from round 1) writes and ends the row right here: the hot
       // path stays one contiguous code region. Jumping over the rare tiers' code to a shared
@@ -1091,7 +1081,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         const int count = min(K, gtt + qq);
         if (tid == 0 && (gtt + qq > K || nties < qq)) spin_fail(p.err, 40);
-        for (int i = count + tid; i < min(K, nc); i += kV2T) orow[i] = -1;  // past nc: padded in the round's shadow
+        for (int i = count + tid; i < K; i += kV2T) orow[i] = -1;
         if (tid == 0) {
           p.out_count[row] = count;
           p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
