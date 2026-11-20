@@ -206,7 +206,7 @@ class SplitKTmemGemm64(SplitKGemm):
 
     def __init__(
         self, *, tactic: SplitKTactic, k: int, stamps: bool = False, alone: bool = True,
-        owners: int = OWNERS,
+        owners: int = OWNERS, max_smem: int = BESIDE_SMEM,
     ):  # fmt: skip
         super().__init__(tactic=tactic)
         assert tactic.mma_m == 128 and tactic.mma_n in N_TILES, "M128 N64-N128"
@@ -249,7 +249,7 @@ class SplitKTmemGemm64(SplitKGemm):
         self.smem_bytes = (used + 2048 + 1023) // 1024 * 1024
         if alone:  # ``alone`` False: few CTAs, beside small-smem predecessors
             self.smem_bytes = max(self.smem_bytes, ALONE_SMEM)
-        assert self.smem_bytes <= BESIDE_SMEM  # the in-projections beside an AttnRes
+        assert self.smem_bytes <= max_smem  # default: the in-projections beside an AttnRes
 
     @cute.experimental.jit
     def __call__(

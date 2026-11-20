@@ -37,6 +37,11 @@ from .splitk_tmem64 import N_TILES, SplitKTmemGemm64, _ld_shared_v4
 
 OWNERS = 2  # 3 K-split ranks per tile: two of them reduce and store 64-row shares
 SPLIT = 3  # 56 tiles x 3 = 168 CTAs: one wave at one CTA per SM
+# After the wait x's K tiles are the only traffic and stream at bytes in flight /
+# L2 latency: x's slots hold (nearly) the whole K slice (4 slots of 12 KB measured
+# ~6.5 us after the wait, ~5 round trips). The kernel runs alone behind the
+# reduce, so it may take most of Rubin's ~328 KB per SM.
+MAX_SMEM = 300 * 1024
 
 
 @asm()
@@ -48,7 +53,7 @@ class LatentUpTmem(SplitKTmemGemm64):
     """``SplitKTmemGemm64`` whose output C is the residual, updated in place."""
 
     def __init__(self, *, tactic: SplitKTactic, k: int):
-        super().__init__(tactic=tactic, k=k, owners=OWNERS)
+        super().__init__(tactic=tactic, k=k, owners=OWNERS, max_smem=MAX_SMEM)
 
     @cute.experimental.jit
     def finish(
@@ -90,10 +95,10 @@ class LatentUpTmem(SplitKTmemGemm64):
 
 def tactic_for(rows):
     """(128, N tile, split, x's slots) for ``rows`` tokens, or None (no tactic)."""
-    if rows <= 64:
-        return (128, 64, SPLIT, 4)
-    if rows <= 96:
-        return (128, 96, SPLIT, 4)
+    if rows <= 64:  # 18 x 8 KB slots (+ 5 A tiles in shared memory): 224 KB
+        return (128, 64, SPLIT, 18)
+    if rows <= 96:  # 16 x 12 KB slots (+ 6 A tiles): 288 KB
+        return (128, 96, SPLIT, 16)
     return None
 
 
