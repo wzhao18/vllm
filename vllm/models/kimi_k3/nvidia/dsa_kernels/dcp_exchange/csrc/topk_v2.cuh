@@ -442,8 +442,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
       // its share of q + 512 keys (8-key groups of adjacent tokens correlate: q + 256 left
-      // fewer than q candidates on ~3 of 1M rows, each costing the DCP group the complete body)
-      const uint32_t want = (q + 512u + kV2SampleStride - 1) / kV2SampleStride;
+      // fewer than q candidates on ~3 of 1M rows, each costing the DCP group the complete body),
+      // and of K + 256: >= K candidates put theta at or below this rank's K-th key, so tau >=
+      // every theta and the CG rounds take every rank-skewed row from the candidates
+      const uint32_t want = (max(q + 512u, (uint32_t)K + 256u) + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
