@@ -155,6 +155,7 @@ def main():
     parser.add_argument("--shape", default="")
     parser.add_argument("--arms", default="stock,fused")
     parser.add_argument("--no-context", action="store_true")
+    parser.add_argument("--head-dies", type=int, default=None)
     parser.add_argument(
         "--localized", action="store_true",
         help="rows layout in die-localized memory: 2 MiB chunks alternate dies, so "
@@ -209,6 +210,8 @@ def run_shape(args, H, q, batches, shape, table, device):
         assert args.layout == "rows" and H == 4 and layer_page * 2 == 4 << 20
         stride = LAYERS * layer_page
         state.head_dies = 0b1100
+    if args.head_dies is not None:  # (die split arms on default memory)
+        state.head_dies = args.head_dies
     width = (G * H + 2 * H) * HEAD
     L = args.ctx + q
     lo = L - q - (WINDOW - 1)

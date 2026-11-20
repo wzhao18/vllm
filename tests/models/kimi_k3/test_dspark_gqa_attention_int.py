@@ -612,6 +612,32 @@ def test_window_umma_redo(monkeypatch):
     check_rows(ours, stock, exact, 96, 3, "umma redo")
 
 
+@pytest.mark.parametrize("shape", [(1, 0, 6, 2), (1, 0, 6, 3)])
+def test_window_umma_variants_match_stock(shape, monkeypatch):
+    """GqaWindowUmma with the separate S issuer warp (ahead bit 1) and the die split
+    (bit 0: resident grid, each CTA one unit of its die; heads 2-3 on die 1) at TP4
+    q3, batches up to 96: cache bytes identical to stock's, rows within BF16 noise."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+
+    monkeypatch.setitem(ga.GQA_WINDOW, (4, 3), ((0, shape),))
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(53)
+    layers = make_layers(4, gen)
+    batches = tuple(b for b in BATCHES if b <= 96)
+    state = install(layers, 3, batches)
+    state.head_dies = 0b1100
+    for B in batches:
+        ours, stock, exact, lengths, differ = run_case(
+            state, layers, "rows", B, 3, gen, seed=5300 + B
+        )
+        label = f"umma {shape} B{B}"
+        assert differ == 0, f"{label}: {differ} cache elements differ from stock"
+        check_rows(ours, stock, exact, B, 3, label)
+        del ours, stock, exact
+
+
 STREAM = (0, -1, 6, 0)  # GqaWindowStream's launch shape (key groups -1)
 
 

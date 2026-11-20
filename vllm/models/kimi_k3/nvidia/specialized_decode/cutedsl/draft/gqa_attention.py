@@ -63,7 +63,7 @@ from .gqa_window_stream import (
     smem_bytes,
     unit_slots,
 )
-from .gqa_window_umma import KB, compile_window_umma, kv_map_5d
+from .gqa_window_umma import KB, compile_window_umma, kv_map_5d, umma_smem
 
 logger = init_logger(__name__)
 
@@ -84,6 +84,10 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 #   (1, 3) TP16 k3: B1-8 3.3-4.4, B16 4.8, B28-38 6.5-6.8, B64 8.5, B128 12.1
 #   (4, 3) TP4 k3 (C512): B1 3.7, B4-8 4.8-6.8, B16 8.6, B32 12.2, B50 14.7,
 #          B64 19.3, B128 32.6
+# TP4 k3 with GqaWindowUmma's S issuer warp (ahead bit 1; 2026-11-20, 1 VR200 GPU, same
+# bench): B24 9.2 vs 12.0, B32 11.3 vs 12.3, B40-52 12.4-13.8 vs 14.5-15.2 (splits 2),
+# B56-64 16.7-17.4 vs 19.2-19.7, B72-96 18.4-21.3 vs 21.1-22.2 (one CTA per unit);
+# B106 23.5 vs 23.1 without it.
 # Key groups 0: GqaWindowUmma (tcgen05, gqa_window_umma; ring stages of 64 keys), which
 # streams the window at near HBM rate once the grid holds two CTAs on most SMs: TP4 k3
 # B96 23.3 vs GqaWindow's best 29.6 (B64 20.4 vs 19.6, B32 12.9 vs 12.3: one CTA per
@@ -106,9 +110,8 @@ GQA_WINDOW = {
     (2, 3): ((4, (8, 4, 3, 0)), (32, (4, 2, 3, 0)), (0, (2, 2, 3, 0))),
     (4, 7): ((8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)),
              (0, (1, 2, 3, 0))),
-    (4, 3): ((2, (16, 4, 2, 8)), (8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)),
-             (52, (2, 4, 3, 0)), (64, (2, 2, 3, 0)), (106, (1, 0, 6, 0)),
-             (0, (1, 2, 3, 0))),
+    (4, 3): ((2, (16, 4, 2, 8)), (8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (52, (2, 0, 6, 2)),
+             (96, (1, 0, 6, 2)), (106, (1, 0, 6, 0)), (0, (1, 2, 3, 0))),
 }  # fmt: skip
 
 
@@ -223,9 +226,13 @@ class GqaAttentionState:
         # die split (launch shapes ahead 1): the resident grid, and the KV heads' home
         # dies (bit h: die of KV head h) of a die-localized cache layout
         self.resident, self.head_dies = None, None
+        if any(s is not None and s[1] == 0 and s[3] & 1 for s in self.shapes.values()):
+            from ..common.resident import ResidentGrid
+
+            self.resident = ResidentGrid(device, 2)
         if not batches:
             return
-        if any(self.shapes[b][3] == 1 for b in batches):
+        if self.resident is None and any(self.shapes[b][3] == 1 for b in batches):
             from ..common.resident import ResidentGrid
 
             self.resident = ResidentGrid(device, 2)
@@ -360,11 +367,22 @@ class GqaAttentionState:
                 raise ValueError(
                     f"GqaWindowUmma launch shape {shape} on {page}-token pages"
                 )
-            return compile_window_umma(
+            # ahead bit 0: die split (resident grid, one unit per CTA on its KV
+            # head's die); bit 1: the separate S issuer warp
+            die_sms = self.resident.die_sms if ahead & 1 else None
+            compiled = compile_window_umma(
                 GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
                 self.max_position, self.device.index,
                 round_norm=window_options().get("round_norm", False), splits=splits,
+                swarp=bool(ahead & 2), die_sms=die_sms,
             )  # fmt: skip
+            if die_sms is not None:
+                self.resident.check(
+                    compiled, 192 if ahead & 2 else 160,
+                    umma_smem(ring, self.q, page, WINDOW, True),
+                    "GqaWindowUmma die split",
+                )  # fmt: skip
+            return compiled
         return compile_window(
             GROUP, self.kv_heads, self.q, page, splits, kgroups, ring, WINDOW, None,
             self.max_position, self.device.index, ahead=ahead, **window_options(),
@@ -458,7 +476,15 @@ class GqaAttentionState:
         extra = ()
         if shape[1] < 0:
             extra = (Int64(self.partials.data_ptr()), Int64(self.counters.data_ptr()))
-        if shape[1] < 0 and shape[3] == 1:
+        if shape[1] == 0 and shape[3] & 1:
+            ones = bin(self.head_dies or 0).count("1")
+            per_die = max(ones, self.kv_heads - ones)
+            if rows // self.q * per_die > 2 * min(self.resident.die_sms):
+                raise ValueError(
+                    f"GqaWindowUmma die split: {rows // self.q} requests exceed one "
+                    "unit per CTA of the resident grid"
+                )
+        if shape[1] <= 0 and shape[3] & 1:
             if self.head_dies is None:
                 raise RuntimeError(
                     "GqaWindowStream die split: no KV head -> die map for the cache"
