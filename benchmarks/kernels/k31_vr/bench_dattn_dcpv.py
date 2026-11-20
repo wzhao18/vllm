@@ -24,7 +24,7 @@ import torch.multiprocessing as mp
 HEADS, Q, CAP = 24, 4, 512
 GATE = HEADS * 128
 PITCH = 2112 + GATE + 128 + 32
-SLOTS = 16
+SLOTS = 32
 
 
 def _port():
@@ -73,6 +73,20 @@ def _worker(rank, size, port, rows, layers, iters, stamps, knobs=0):
     if stamps:
         dcp_value.STAMP_ADDR = stamp.data_ptr()
     dcp_value.KNOBS = knobs
+    if knobs & 4096:  # the resident-merge barrier counters (symmetric)
+        import torch.distributed._symmetric_memory as symm_mem
+
+        from vllm.models.kimi_k3.nvidia.specialized_decode.symm import peer_rendezvous
+
+        bar = symm_mem.empty(4, dtype=torch.int32, device=dev)
+        bar.zero_()
+        handle = peer_rendezvous(bar, group)
+        done = torch.zeros(4, dtype=torch.int32, device=dev)
+        dcp_value.BAR_PEERS = tuple(int(x) for x in handle.buffer_ptrs)
+        dcp_value.BAR_OWN = bar.data_ptr()
+        dcp_value.BAR_DONE = done.data_ptr()
+        torch.accelerator.synchronize()
+        dist.barrier()
     box = sp.sp_dsa_box(group, dev, rank, heads=HEADS, cap=CAP, interleave=1)
     gen = torch.Generator(device=dev).manual_seed(11 + rank)
     w_uv = (torch.randn(HEADS, 128, 512, generator=gen, device=dev) / 16).bfloat16()
@@ -160,6 +174,9 @@ def _worker(rank, size, port, rows, layers, iters, stamps, knobs=0):
             for a_, b_, name in ((1, 3, "alloc>push0"), (1, 8, "alloc>drain"),
                                  (1, 9, "alloc>lse"), (9, 11, "lse>val1"),
                                  (11, 12, "val1>val2"), (9, 10, "lse>end"),
+                                 (16, 17, "seen0>st0"), (18, 19, "seen1>st1"),
+                                 (20, 21, "seen2>st2"), (24, 10, "bar>end"),
+                                 (1, 24, "alloc>bar"), (1, 19, "alloc>st1"),
                                  (1, 10, "alloc>end")):  # fmt: skip
                 ok = have[:, a_] & have[:, b_]
                 if ok.any():
