@@ -396,6 +396,15 @@ class KdaFlow(KdaWS):
                     )  # fmt: skip
                 rec = Int32(-1)
                 slot = Int32(0)
+            # RHEADEC DIAGNOSTIC (never merge): a live item (slot > 0) with no record
+            # row would store its records / corrections at row -1.
+            if rec < 0 and slot > 0:
+                if head == 0:
+                    cute.printf(
+                        "RHEADEC_BAD kind 8 request {} rec {} slot {} accepted {} requests {}",
+                        request, rec, slot, args[17][request], args[10].shape[0] // self.tokens,
+                    )  # fmt: skip
+                slot = Int32(0)
             if rec >= 0:
                 pending = Int32(args[21][rec])
             if pending > self.tokens:
