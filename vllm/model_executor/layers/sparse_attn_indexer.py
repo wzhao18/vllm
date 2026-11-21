@@ -519,10 +519,24 @@ def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor
 
 
 def _decode_topk_backend(topk_backend: str, dcp_world_size: int) -> str:
-    """The configured decode top-k backend, or "auto" for "balanced" and
-    "trtllm_gvr2" under DCP > 1: they are validated at DCP1 only, and their
-    BF16 local logits would feed the DCP top-k merge untested."""
-    if topk_backend in ("balanced", "trtllm_gvr2") and dcp_world_size > 1:
+    """The decode top-k backend for the configured one.
+
+    "trtllm_gvr2" ranks the decode rows with DeepSelect, as it does the prefill
+    rows (``_use_deep_select_prefill``): the 16-bit GVR V2 decode engine emits
+    each row through atomic cursors, so it writes every row in a different
+    order on every call and resolves ties at the top-k cutoff to a different
+    column set. The sparse MLA is order-sensitive, so a P step classified as a
+    decode (at most 1 + num_speculative_tokens new tokens over a cached prefix)
+    was not reproducible (BUG-STRESS-2). DeepSelect selects the same exact top-k
+    with a fixed set and order on every call; it raises on logits it cannot
+    rank (no fallback). The model checks its constraints at load
+    (``warm_prefill_indexer``).
+
+    "balanced" becomes "auto" under DCP > 1: it is validated at DCP1 only, and
+    its BF16 local logits would feed the DCP top-k merge untested."""
+    if topk_backend == "trtllm_gvr2":
+        return "deep_select"
+    if topk_backend == "balanced" and dcp_world_size > 1:
         logger.warning_once(
             "sparse_indexer_topk_backend='%s' is not supported with decode "
             "context parallelism (DCP=%d) in decode; using 'auto'",
@@ -776,14 +790,11 @@ def sparse_attn_indexer(
 
     decode_topk_backend = _decode_topk_backend(topk_backend, dcp_world_size)
 
-    # DeepSelect, the balanced top-k and trtllm_gvr2 rank SM100's BF16 decode
-    # logits directly (DeepSelect also under DCP, whose merge reads them as
-    # well); the other top-k backends read an FP32 copy.
-    fp32_decode_logits = decode_topk_backend not in (
-        "deep_select",
-        "balanced",
-        "trtllm_gvr2",
-    )
+    # DeepSelect (also the decode top-k of "trtllm_gvr2") and the balanced
+    # top-k rank SM100's BF16 decode logits directly (DeepSelect also under
+    # DCP, whose merge reads them as well); the other top-k backends read an
+    # FP32 copy.
+    fp32_decode_logits = decode_topk_backend not in ("deep_select", "balanced")
 
     # assert isinstance(attn_metadata, dict)
     # kv_cache is an empty placeholder until bind_kv_cache runs after memory
@@ -1459,7 +1470,7 @@ def sparse_attn_indexer(
                     next_n,
                     topk_indices,
                     dcp_local_topk,
-                    topk_backend,
+                    decode_topk_backend,
                     fp32_decode_logits,
                     attn_metadata_narrowed.max_seq_len,
                     max_model_len,
