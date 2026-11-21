@@ -272,6 +272,7 @@ def _worker(env: dict[str, str]) -> None:
         initialize_model_parallel(world, 1)
         try:
             group = get_tp_group().device_group
+            cpu_group = get_tp_group().cpu_group
             try:  # (older torch: symmetric memory is enabled per group)
                 from torch.distributed._symmetric_memory import (
                     enable_symm_mem_for_group,
@@ -369,6 +370,9 @@ def _worker(env: dict[str, str]) -> None:
                     assert torch.equal(ours_blocks, blocks), case
                     assert _armed(*boxes), f"{case}: a mailbox left unarmed"
                     _say(rank, "W2 ok", case)
+                    # no rank pushes the next case before every rank looked at its
+                    # mailboxes (the next push lands in the peers' memory)
+                    torch.distributed.barrier(group=cpu_group)
 
             # a captured two-layer step replays its eager bits
             for r in GRAPH_ROWS:
@@ -400,10 +404,16 @@ def _worker(env: dict[str, str]) -> None:
                     for a, b in zip(outs + prefixes, eager + eager_prefix):
                         assert torch.equal(a, b), f"graph R{r}"
                     assert _armed(*boxes), f"graph R{r}: a mailbox left unarmed"
+                    torch.distributed.barrier(group=cpu_group)
             _say(rank, "graph replays ok")
             torch.distributed.barrier(group=group)
-        finally:
-            cleanup_dist_env_and_memory()
+        except BaseException:
+            import traceback
+
+            # (no collective teardown: the other ranks may wait in a mailbox)
+            _say(rank, "FAILED\n" + traceback.format_exc())
+            os._exit(1)
+        cleanup_dist_env_and_memory()
 
 
 def _distributed_run(fn, world_size: int) -> None:
