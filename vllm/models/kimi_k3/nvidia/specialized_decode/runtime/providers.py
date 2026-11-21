@@ -233,7 +233,7 @@ def inproj_note(attention, b):
     batch: the specialized GEMM, or the stock cuBLAS GEMM with its measured reason
     (``PROJECTION_GENERIC`` / ``INPROJ_LT``; NQ-TUNE where none exists), or the
     MXFP8 GEMM's kind (an MXFP8 KDA layer: stock's kernel unless ``MX_TUNED``)."""
-    if attention.mx_in:
+    if getattr(attention, "mx_in", False):
         return f"inproj mxfp8 {attention.projection.engine(b)}"
     if b in attention.projection.fallback.kernels:
         return "inproj splitk"
