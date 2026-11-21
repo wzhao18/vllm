@@ -43,6 +43,7 @@ from ..cutedsl.moe.experts_runtime import (
 )
 from ..cutedsl.moe.front import SharedFront
 from ..cutedsl.moe.front_rows import FrontRows
+from ..cutedsl.moe.nvfp4 import Nvfp4MoE, is_nvfp4_moe, mxfp8_shared_cause
 from ..cutedsl.moe.prepared import (
     WIDE_FRONT,
     MoEScratch,
@@ -345,6 +346,9 @@ class SpecializedDecode:
                 if moe.rows is not None:  # wide batches: the wide tail's output ring
                     consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
+            elif isinstance(moe, Nvfp4MoE):  # every batch: the wide tail's ring
+                consumer.bind_ring_rows(moe.state.rows.out.buffer)
+                self.fused_before[layer.layer_idx] = consumer
             elif layer.layer_idx in self.dense_rings:
                 # Bitwise with the FlashInfer two-shot all-reduce it replaces.
                 ring = self.dense_rings[layer.layer_idx][0].buffer[0]
@@ -421,14 +425,25 @@ class SpecializedDecode:
         tp, rank, device, batches = self.tp, self.rank, self.device, self.batches
         owner = self.group, device, tp, rank
         # Formats first (before any packing): the TP providers read BF16 projections
-        # and MXFP4 routed experts only, and refuse anything else at build.
+        # and MXFP4 routed experts, and the NVFP4 checkpoint's MoE layers (NVFP4
+        # routed experts, MXFP8 shared expert: ``moe.nvfp4.Nvfp4MoE``, which checks
+        # its own formats); they refuse anything else at build.
+        nvfp4 = {d.layer_idx for d in layers if d.is_moe_layer and is_nvfp4_moe(d.mlp)}
         for d in layers:
-            check_bf16_projections(d)
-            if d.is_moe_layer:
+            own = ()
+            if d.layer_idx in nvfp4 and mxfp8_shared_cause(d.mlp.shared_experts) is None:
+                shared = d.mlp.shared_experts
+                own = (shared.gate_up_proj, shared.down_proj)
+            check_bf16_projections(d, own=own)
+            if d.is_moe_layer and d.layer_idx not in nvfp4:
                 mxfp4_experts(d.mlp.experts.routed_experts)
+        # (NVFP4 layers: no packed front; their stock front reads the stock linears)
         packed = {
-            d.layer_idx: pack_front(d.mlp, rank, tp) for d in layers if d.is_moe_layer
+            d.layer_idx: pack_front(d.mlp, rank, tp)
+            for d in layers
+            if d.is_moe_layer and d.layer_idx not in nvfp4
         }
+        self.nvfp4_layers = frozenset(nvfp4)
         for d in layers:  # before the prefetch tables take the weight addresses
             if attention_kind(d.self_attn) == "dsa":
                 pack_dsa_projection(d.self_attn)
@@ -437,9 +452,18 @@ class SpecializedDecode:
         # ``choose`` admits; other wide batches run the stock MoE layer (S4).
         admitted = (m for m in self.wide if moe_choose(Shape(m, self.q), self.context))
         self.moe_batches = moe_batches = (*self.tuned, *admitted)
+        if nvfp4:
+            # NVFP4 layers run every batch on the wide tail (``Nvfp4MoE``): their
+            # batches are every prepared one.
+            if packed:
+                raise Unsupported(
+                    "moe", None, "a model mixing NVFP4 and other MoE layers"
+                )
+            self.moe_batches = moe_batches = self.batches
         state = MoEScratch(
-            tp, device, moe_batches, owner=(self.group, device, tp, rank)
-        )
+            tp, device, moe_batches, owner=(self.group, device, tp, rank),
+            tuned=not nvfp4, rows=bool(nvfp4),
+        )  # fmt: skip
         # Wide MoE batches run ``PreparedMoE.run_rows`` (the tuned providers below).
         tuned_moe = tuple(b for b in moe_batches if b <= PREPARED_MAX)
         wide_moe = tuple(b for b in moe_batches if b > PREPARED_MAX)
@@ -448,8 +472,8 @@ class SpecializedDecode:
         wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
-            MoeTailBox(*owner),
-            list(packed),
+            MoeTailBox(*owner) if packed else None,
+            [d.layer_idx for d in layers if d.is_moe_layer],
         )
         twoshot = TwoShot(*owner)
         front_box = OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
@@ -476,6 +500,20 @@ class SpecializedDecode:
                 self.feed_forward[index] = PreparedDenseMLP(
                     module, prepared, reduce, ring, dense_batches if ring else (),
                     rows=min(self.capacity, GENERIC_ROWS),
+                )  # fmt: skip
+                continue
+            if index in nvfp4:
+                rows = PreparedTailRows(
+                    tp, rank, module.routed_expert_up_proj.weight,
+                    module.routed_expert_norm.weight,
+                    module.routed_expert_norm.variance_epsilon,
+                    moe_batches, state.rows, moe_layers.index(index),
+                    sharded=(self.sharded, self.shard_box),
+                    deferred=deferred_rows(module, moe_batches),
+                )  # fmt: skip
+                self.feed_forward[index] = Nvfp4MoE(
+                    module, state, rows, moe_batches, prefetch=prefetch,
+                    layer_idx=index,
                 )  # fmt: skip
                 continue
             args = (module, packed[index], front_box, state.front, tuned_moe, beta)
@@ -697,7 +735,12 @@ class SpecializedDecode:
             choices["oproj"] = oproj_choose(Shape(b, q), self.context)
         else:
             choices["oproj"] = Choice(stock, note="S3")
-        if any(isinstance(m, PreparedMoE) for m in self.feed_forward.values()):
+        nvfp4 = next(
+            (m for m in self.feed_forward.values() if isinstance(m, Nvfp4MoE)), None
+        )
+        if nvfp4 is not None:
+            choices["moe"] = nvfp4.choice(b)
+        elif any(isinstance(m, PreparedMoE) for m in self.feed_forward.values()):
             if b in self.moe_batches:
                 choices["moe"] = moe_choose(Shape(b, q), self.context)
             else:
@@ -758,6 +801,11 @@ class SpecializedDecode:
             else:
                 note = "grouped"
             choices["moe"] = Choice(path, note=note)
+        nvfp4 = next(
+            (m for m in self.feed_forward.values() if isinstance(m, Nvfp4MoE)), None
+        )
+        if nvfp4 is not None:
+            choices["moe"] = nvfp4.choice(b)
         return choices
 
     def embed_input_ids(self, ids):

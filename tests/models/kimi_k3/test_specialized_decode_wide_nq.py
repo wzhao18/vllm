@@ -589,9 +589,15 @@ def test_decode_feeds_front_rows_single_launch_batches():
 
     (front_rows,) = named("FrontRows")
     assert ast.unparse(front_rows.args[4]) == "wide_engines"
-    (tail_rows,) = named("PreparedTailRows")
-    push = {k.arg: ast.unparse(k.value) for k in tail_rows.keywords}["experts_push"]
-    assert push == "wide_engines"
+    # (the MXFP4 layers' wide tail; the NVFP4 layers' one, ``moe.nvfp4``, takes no
+    # experts push: their stock experts write a plain or unfinalized partial)
+    tails = [
+        {k.arg: ast.unparse(k.value) for k in c.keywords}
+        for c in named("PreparedTailRows")
+    ]
+    assert len(tails) == 2, tails
+    pushing = [t for t in tails if "experts_push" in t]
+    assert len(pushing) == 1 and pushing[0]["experts_push"] == "wide_engines"
     (engines,) = [
         n.value
         for n in ast.walk(tree)

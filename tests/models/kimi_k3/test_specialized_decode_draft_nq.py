@@ -1672,8 +1672,13 @@ def _context_main(rank, world, device, group):
     # shard's split-K projection where a tactic covers the rows (never run here; a
     # stride-0 expand would hand that preparation an out-of-bounds view).
     weight = torch.zeros((hidden, 5 * hidden), dtype=bf16, device=device)
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    # (an unquantized BF16 linear: PreparedContext reads it through bf16_weight)
     model = SimpleNamespace(
-        context_proj=SimpleNamespace(weight=weight),
+        context_proj=SimpleNamespace(
+            weight=weight, quant_method=UnquantizedLinearMethod()
+        ),
         context_norm=SimpleNamespace(weight=gamma, variance_epsilon=CTX_EPS),
     )
     prepared = context.PreparedContext(model, group, world, rank, CONTEXT_ROWS)

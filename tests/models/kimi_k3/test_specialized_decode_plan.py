@@ -839,14 +839,16 @@ def kda_runs(kinds):
 # FP32 state (production): FP32_VERIFY_WIDE, the VR200 kernel bench's measured-best
 # kernel per (q, requests) (kda.prepared's table notes), open-ended above the last row.
 # Since 2026-11-08 the Wide rows run KdaVerifyLoopStock (stock math, persistent);
-# since 2026-11-11 the q4 rows from 41 requests KdaVerifyFeed (FP32_FEED).
+# since 2026-11-11 the q4 rows from 41 requests KdaVerifyFeed (FP32_FEED); since
+# 2026-11-14 (F3a, FP32_SPLIT_Q) KdaSplitStock at its measured geometries at q4 B41-42
+# and q8 B12-15 / B18-22 (bitwise LoopStock: test_fp32_geometries_equal_loopstock).
 FP32_Q4_RUNS = [
     (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
-    (16, 35, "loopstock"), (36, 40, "kdasplit"), (41, 1024, "feed"),
+    (16, 35, "loopstock"), (36, 42, "kdasplit"), (43, 1024, "feed"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
-    (16, 1024, "loopstock"),
+    (1, 15, "kdasplit"), (16, 17, "loopstock"), (18, 22, "kdasplit"),
+    (23, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
 BF16_Q4_RUNS = [
@@ -879,14 +881,19 @@ def test_kda_fp32_policy_picks_the_measured_best():
     """FP32 state at the bench's measured shapes whose pick changed (VR200 kern-kda
     section b, us per layer, verify alone): q4 B35 Wide (one wave; Halves before), B36
     / B40 KdaSplit 13.05 / 13.40 (Halves 14.59 / 16.12), B48 Wide 15.48 (Halves 18.30);
-    q8 B12 Wide 12.09 (KdaSplit 13.40), B48 Wide 25.24 (Halves 27.98). The BF16
-    state keeps Halves at q8 B33-48 and runs Stream3 from q4 B36."""
+    q8 B12 Wide 12.09 (KdaSplit 13.40), B48 Wide 25.24 (Halves 27.98). Since
+    2026-11-14 (F3a, FP32_SPLIT_Q) q4 B41-42 and q8 B12-15 / B18-22 run KdaSplitStock
+    at their measured geometries (q4 B42 13.81 vs Feed 14.28; q8 B12 9.20 vs
+    LoopStock 11.11). The BF16 state keeps Halves at q8 B33-48 and runs Stream3 from
+    q4 B36."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
 
     kind = prepared.verify_kernel
     wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
     picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
-    picks.update({(4, 41): "feed", (4, 48): "feed", (8, 12): wide, (8, 48): wide})
+    picks.update({(4, 41): "kdasplit", (4, 42): "kdasplit", (4, 43): "feed"})
+    picks.update({(4, 48): "feed", (8, 12): "kdasplit", (8, 15): "kdasplit"})
+    picks.update({(8, 16): wide, (8, 18): "kdasplit", (8, 23): wide, (8, 48): wide})
     for (q, b), name in picks.items():
         assert kind(b, q, RUBIN, False) == name, (q, b)
     q4_kinds = {kind(b, 4, RUBIN, False) for b in range(1, 1025)}

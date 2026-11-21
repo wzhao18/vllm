@@ -92,6 +92,7 @@ def _make_runner(
         adaptive_verification=None,
         speculator=None,
         rejection_sampler=None,
+        sampler=None,
         decode_query_len=num_spec_steps + 1,
         is_pooling_model=False,
         is_encoder_decoder=False,

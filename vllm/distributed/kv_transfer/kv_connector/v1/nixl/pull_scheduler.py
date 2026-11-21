@@ -22,7 +22,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_representative_spec_type,
 )
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -160,7 +165,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     # send_notif in _read_blocks to free the memory on the remote node.
 
                     unhashed_local_block_ids: BlockIds = (
-                        blocks.get_unhashed_block_ids_all_groups()
+                        self._unhashed_window_block_ids(
+                            blocks, params.get("remote_num_tokens")
+                        )
                         if num_external_tokens > 0
                         else ()
                     )
@@ -215,6 +222,41 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
 
+    def _unhashed_window_block_ids(
+        self, blocks: "KVCacheBlocks", remote_num_tokens: int | None
+    ) -> list[list[int]]:
+        """The blocks to load (``get_unhashed_block_ids_all_groups``), with each
+        sliding-window group's list ending at the block of the prefiller's last
+        computed token ``remote_num_tokens - 1``.
+
+        The allocation also holds the speculative lookahead slots, which can
+        open one more block past that token. The prefiller drops its lookahead
+        blocks before sending (``get_exchange_clipped_blocks``) and the worker
+        pairs window blocks from the end, so a local list ending one block
+        later shifts every window block by one (K3.1 release GQA draft at the
+        128-token prefix-match unit: prompts of 128 m + 127 tokens).
+        """
+        block_ids = blocks.get_unhashed_block_ids_all_groups()
+        if remote_num_tokens is None:
+            return block_ids
+        groups = self.kv_cache_config.kv_cache_groups
+        trimmed = []
+        for ids, group, spec_group in zip(
+            block_ids, blocks.blocks, groups, strict=True
+        ):
+            spec = spec_group.kv_cache_spec
+            if isinstance(spec, SlidingWindowSpec):
+                # Unhashed blocks are the table's tail: drop those past the end.
+                past_end = len(group) - cdiv(remote_num_tokens, spec.block_size)
+                if past_end > 0:
+                    unhashed_past_end = sum(
+                        block.block_hash is None and not block.is_null
+                        for block in group[len(group) - past_end :]
+                    )
+                    ids = ids[: len(ids) - unhashed_past_end]
+            trimmed.append(ids)
+        return trimmed
+
     def _expand_sub_blocks(self, params: dict[str, Any]) -> None:
         """DCP pair mode: view a prefiller's per-rank blocks, ``X`` times the
         local ones (a packed hybrid block scales with the per-rank KDA state, so
@@ -246,10 +288,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 f"groups, this decoder has {len(groups)}; set the same "
                 "VLLM_PACKED_KV_STATE_GROUPS on both"
             )
+        # KDA states pair by state; slot-packed groups (blocks_per_pool_block >
+        # 1, e.g. the release GQA draft at the prefix-match unit) hold their own
+        # token count per block on both sides: neither is split.
         params["remote_block_ids"] = [
             ids
             if get_representative_spec_type(group.kv_cache_spec)
             in (MambaSpec, CircularBufferSpec)
+            or group.blocks_per_pool_block > 1
             else expand_sub_block_ids(
                 ids,
                 sub_blocks,

@@ -22,7 +22,10 @@ On 2 or 4 ranks (the deployment is TP4; the mailboxes are generic in TP):
   steps of other row counts.
 """
 
+import os
+import sys
 import time
+import traceback
 import zlib
 
 import pytest
@@ -222,13 +225,22 @@ def _worker(env: dict[str, str]) -> None:
                 )
                 error = (outs[p].double() - exact).abs().max().item()
                 assert error <= (2 * world + 1) * scale * 2**-8, ("graph", replay, p)
+            # Every rank has checked this replay's mailboxes before any rank starts
+            # the eager step: its all-gather multicasts rows [0, 81) into every rank's
+            # gather[replay % 2], which a slower rank's _check_armed of the graph's
+            # rows [0, 64) would read (BUG-PSHORT-2: that rank failed, its peers then
+            # polled its all-gather rows forever). Replay 1's eager step also reuses
+            # the graph's last parity: consecutive blocks of one parity need a TP
+            # collective between them (the model's SpFinalGather).
+            dist.barrier()
             _step(
                 comm, oproj, 2000 + replay, rank, world, 324, replay % 2, out,
                 weights, bitwise=_stock_bits(oproj.choice(324).tactic),
             )  # fmt: skip
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
+    except BaseException:
+        _abort()
+    dist.destroy_process_group()
 
 
 VOCAB_SHARD, VOCAB_PAD = 640, 40  # rows per rank; the last rank's padding rows
@@ -282,8 +294,17 @@ def _embed_worker(env: dict[str, str]) -> None:
             assert torch.equal(out.view(torch.int16), want.view(torch.int16)), rows
             _check_armed(comm, 1, rows)
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
+    except BaseException:
+        _abort()
+    dist.destroy_process_group()
+
+
+def _abort() -> None:
+    """A failed rank: print the traceback and exit at once. Its peers may be polling a
+    mailbox it will never fill, and leaving the process group would wait on them."""
+    traceback.print_exc()
+    sys.stderr.flush()
+    os._exit(1)
 
 
 def _distributed_run(fn, world_size: int) -> None:
@@ -302,10 +323,13 @@ def _distributed_run(fn, world_size: int) -> None:
         process = ctx.Process(target=fn, args=(env,))
         processes.append(process)
         process.start()
-    # One deadline for the group: a hung rank fails the test, never CI.
+    # One deadline for the group: a hung rank fails the test, never CI. A failed rank
+    # (non-zero exit, its traceback printed) stops the group at once.
     deadline = time.monotonic() + 300
-    for process in processes:
-        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    while time.monotonic() < deadline and any(p.is_alive() for p in processes):
+        if any(p.exitcode not in (None, 0) for p in processes):
+            break
+        time.sleep(0.2)
     for process in processes:
         if process.is_alive():
             process.kill()
@@ -458,8 +482,9 @@ def _pre_push_worker(env: dict[str, str]) -> None:
                 same = outs[p].view(torch.int16) == stock.view(torch.int16)
                 assert bool(same.all()), ("pre_push replay", replay, p)
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
+    except BaseException:
+        _abort()
+    dist.destroy_process_group()
 
 
 @pytest.mark.skipif(

@@ -123,10 +123,13 @@ def attention_weights(attention):
         *("in_proj_qkvgfab", "fused_qkv_a_g_proj", "fused_qkv_a_proj", "q_proj"),
         *("kv_a_proj_with_mqa", "f_b_proj", "q_b_proj", "g_proj"),
     )
-    weights = [getattr(getattr(attention, n, None), "weight", None) for n in names]
+    # (an MXFP8 linear's E8M0 scales follow its FP8 rows; ranges are in bytes)
+    tensors = ("weight", "weight_scale")
+    linears = [getattr(attention, n, None) for n in names]
+    weights = [getattr(m, t, None) for m in linears for t in tensors]
     weights += [getattr(attention, "W_UK_T", None), getattr(attention, "W_UV", None)]
-    weights = [w for w in weights if isinstance(w, torch.Tensor)]
-    return (*weights, attention.o_proj.weight)
+    weights += [getattr(attention.o_proj, t, None) for t in tensors]
+    return tuple(w for w in weights if isinstance(w, torch.Tensor))
 
 
 class PreparedWeightRanges:
@@ -215,6 +218,13 @@ class PrefetchController:
             if not layer.is_moe_layer:
                 continue
             index, moe, attention = layer.layer_idx, layer.mlp, layer.self_attn
+            if index not in packed:
+                # (NVFP4 MoE layers: no packed front, stock router + latent down and
+                # an MXFP8 shared expert; their MoE weights are not prefetched)
+                if position + 1 < len(layers):
+                    weights = attention_weights(layers[position + 1].self_attn)
+                    self._add_capped("next_attention", index, weights, following)
+                continue
             # The front GEMM reads [router shard; down shard] from the packed copy.
             if front:
                 ranges = urgent((packed[index],), grid=8)

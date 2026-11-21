@@ -296,3 +296,79 @@ def test_dcp_sharded_groups_fit_the_block_table_rows(
                 )
     # The ladder reaches prompts longer than one unsharded block.
     assert longest > 1
+
+
+def _slot_packed_runner(num_blocks: int, slots: int):
+    """The full-scale K3.1 DEP16 prefill server of BUG-STRESS-4 (93 layers, real
+    weights, --prefix-match-unit 128): kv cache group sizes (16384, 16384,
+    16384, 128), 175 pool blocks per rank, MNBT 16384, max-model-len 1M, DSpark
+    k=3. The draft group's 128-token blocks are slots of the block-outermost
+    pool rows (``blocks_per_pool_block``)."""
+    specs = [SimpleNamespace(block_size=16384, dcp_sharded=False)] * 3 + [
+        SimpleNamespace(block_size=128, dcp_sharded=False)
+    ]
+    runner = _runner(
+        num_spec=3,
+        max_num_seqs=32,
+        max_model_len=1048576,
+        num_blocks=num_blocks,
+        kv_cache_specs=specs,
+        budget=16384,
+    )
+    for group, s in zip(runner.kv_cache_config.kv_cache_groups, [1, 1, 1, slots]):
+        group.blocks_per_pool_block = s
+    return runner
+
+
+@pytest.mark.parametrize("slots", [97, 8])
+def test_slot_packed_groups_cost_pool_blocks_not_slots(slots, monkeypatch):
+    """BUG-STRESS-4: the ladder set with 6140 + 8188 prompt chunks held 161
+    draft slots (14328 / 128 + 6144 / 128 + 1) and was charged 161 of the 175
+    pool blocks ('202 KV blocks needed, 175 available'), though 97 slots share
+    one pool block. Every set must run, charge whole pool blocks per request
+    and group, and hand out slot ids inside distinct, non-null pool blocks."""
+    num_blocks = 175
+    runner = _slot_packed_runner(num_blocks, slots)
+    group_slots = [
+        g.blocks_per_pool_block for g in runner.kv_cache_config.kv_cache_groups
+    ]
+    monkeypatch.setattr(warmup.torch.accelerator, "synchronize", lambda: None)
+    ladder = warmup._serving_ladder_shapes(runner)
+    shapes = [(100 + i, s) for i, s in enumerate(ladder)]
+    shapes += [(v, None) for v in range(warmup.NUM_SERVING_WARMUP_VARIANTS + 1)]
+    longest = 0
+    for variant, ladder in shapes:
+        steps: list[SchedulerOutput] = []
+        assert warmup.run_serving_shape_warmup(
+            runner, steps.append, lambda grammar_output: None, variant, ladder=ladder
+        )
+        owner: dict[int, tuple[str, int]] = {}
+        for step in steps[:3]:
+            for req in step.scheduled_new_reqs:
+                longest = max(longest, len(req.prompt_token_ids))
+                for group, ids in enumerate(req.block_ids):
+                    s = group_slots[group]
+                    rows = {i // s for i in ids}
+                    assert 0 not in rows
+                    assert max(rows, default=0) < num_blocks
+                    assert len(set(ids)) == len(ids)
+                    for row in rows:
+                        assert owner.setdefault(row, (req.req_id, group)) == (
+                            req.req_id,
+                            group,
+                        ), f"set {variant}: pool block {row} shared"
+    # The ladder reaches prompts of more than one 16384-token block's worth of
+    # 128-token draft slots.
+    assert longest > 16384
+
+
+def test_slot_packed_pool_blocks_round_up_per_request():
+    runner = _slot_packed_runner(175, 97)
+    blocks = warmup._WarmupBlocks(runner)
+    # 14328 prompt tokens + 3 lookahead: 1 block in each target group, 112
+    # draft slots = 2 pool blocks of 97.
+    assert blocks.counts(14328) == [1, 1, 1, 112]
+    assert blocks.pool_blocks(14328) == 5
+    ids = blocks.alloc(14328)
+    assert ids[3][0] == 4 * 97 and len(ids[3]) == 112
+    assert blocks.next_pool_block == 6

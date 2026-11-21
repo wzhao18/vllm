@@ -349,6 +349,13 @@ class NixlBaseConnectorWorker:
     _head_sharded_draft_regions: set[int] | frozenset[int] = frozenset()
     _head_sharded_draft_groups: set[int] | frozenset[int] = frozenset()
     _dcp_replicated_draft_groups: frozenset[int] = frozenset()
+    # Regions and transfer groups packed as slots of the pool blocks
+    # (KVCacheGroupSpec.blocks_per_pool_block > 1, e.g. K3.1's release GQA
+    # draft at the 128-token prefix-match unit). Their blocks have the group's
+    # own token count, independent of the pool block, so a sub-block peer's
+    # larger pool block does not split them (see _sub_block_remote_meta).
+    _slot_region_indices: frozenset[int] = frozenset()
+    _slot_groups: frozenset[int] = frozenset()
 
     # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT, see kv_fingerprint.py): this
     # rank's log, whose side is P on a producer and D in pair mode, and its
@@ -2345,6 +2352,14 @@ class NixlBaseConnectorWorker:
             == len(self.region_num_blocks)
         )
         self._region_dcp_sharded = region_dcp_sharded
+        self._slot_region_indices = frozenset(
+            i for i, slots in enumerate(region_blocks_per_pool_block) if slots > 1
+        )
+        self._slot_groups = frozenset(
+            g
+            for g, group in enumerate(self.kv_cache_config.transfer_groups)
+            if group.blocks_per_pool_block > 1
+        )
         # Descriptor ids must be region-ordered, matching the remote side.
         self._group_region_indices = [
             [r for r, groups in enumerate(region_groups) if group_id in groups] or None
@@ -2609,13 +2624,24 @@ class NixlBaseConnectorWorker:
             assert heads is not None
             name = self.region_names[r]
             local_heads = heads // self.world_size
-            token_head, rest = divmod(
-                self.block_len_per_layer[r], local_heads * self.block_size
-            )
+            # Tokens per registered page: the drafter layer's own block size
+            # (a sliding-window drafter picks its own, e.g. 128 next to a
+            # 16384-token hybrid attention block), split into physical pages as
+            # the registration splits its page bytes. Not self.block_size,
+            # which is the transfer groups' LCM.
+            spec_block_size = self._layer_specs[name].block_size
+            ratio = self._physical_blocks_per_logical_kv_block
+            tokens, tokens_rest = divmod(spec_block_size, ratio)
+            if tokens_rest or not tokens:
+                raise ValueError(
+                    f"{name}: drafter block of {spec_block_size} tokens is not "
+                    f"{ratio} physical pages"
+                )
+            token_head, rest = divmod(self.block_len_per_layer[r], local_heads * tokens)
             if rest or token_head % 4:
                 raise ValueError(
                     f"{name}: draft page {self.block_len_per_layer[r]} B is not "
-                    f"{local_heads} heads x {self.block_size} tokens"
+                    f"{local_heads} heads x {tokens} tokens"
                 )
             pages = byte_pages(
                 kv_caches[name],
@@ -2623,7 +2649,7 @@ class NixlBaseConnectorWorker:
                 self.block_len_per_layer[r],
                 self.block_stride_per_layer[r],
                 self.region_num_blocks[r],
-            ).view(-1, local_heads, self.block_size, token_head)
+            ).view(-1, local_heads, tokens, token_head)
             window = getattr(self._layer_specs[name], "sliding_window", None)
             drafts[group_of[name]].append(
                 DraftView(name, pages, self.tp_rank * local_heads, heads, window)
@@ -3132,16 +3158,23 @@ class NixlBaseConnectorWorker:
         use_layer_name_routing = bool(self._transfer_layer_region_indices)
         peer = self._sub_block_peers.get(nixl_agent_meta.engine_id)
         sub_blocks = peer.sub_blocks if peer is not None else 1
-        ssm_regions = set(self._ssm_region_indices) if sub_blocks > 1 else set()
+        # KDA state and slot-packed regions are never split (_sub_block_remote_meta).
+        whole_regions = (
+            set(self._ssm_region_indices) | self._slot_region_indices
+            if sub_blocks > 1
+            else set()
+        )
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             local_region = (
                 self._transfer_layer_region_indices[i] if use_layer_name_routing else i
             )
-            if sub_blocks > 1 and local_region not in ssm_regions:
+            if sub_blocks > 1 and local_region not in whole_regions:
                 # Sub-block q of remote block b is the q-th local-block-sized
                 # run of its page (flat id X b + q). A head-sharded draft's
                 # descs here are never read: its heads are not contiguous in a
-                # sub-block, so it is read through _draft_head_dlists.
+                # sub-block, so it is read through _draft_head_dlists. A
+                # slot-packed draft keeps its whole blocks: its head slice is
+                # contiguous, read below like an equal-block peer's.
                 strided_descs.extend(
                     tuple(row)
                     for row in self._block_strided_descs(
@@ -3285,7 +3318,15 @@ class NixlBaseConnectorWorker:
         local per-rank block and X times the blocks (flat id X b + q), and the
         pair-mode read map and staged exchange apply unchanged. The scheduler
         expands P's block ids the same way (``expand_sub_block_ids``). KDA
-        state regions are untouched: they pair by state, sliced by head.
+        state regions are untouched: they pair by state, sliced by head. So are
+        groups packed as slots of the pool blocks (``_slot_region_indices``, the
+        release GQA draft at the prefix-match unit): their blocks hold the
+        group's own token count on both sides, whatever the pool block.
+
+        Raises:
+            RuntimeError: The peer packs other regions as slots than this
+                worker (e.g. a different ``--prefix-match-unit``): their
+                blocks cannot be paired.
         """
         local_block = self.block_size * self._physical_blocks_per_logical_kv_block
         remote_block = meta.block_size * meta.physical_blocks_per_logical_kv_block
@@ -3310,20 +3351,35 @@ class NixlBaseConnectorWorker:
         ):
             return 1
         sub_blocks = remote_block // local_block
-        ssm = set(self._ssm_region_indices)
-        attention = [i for i in range(len(meta.block_lens)) if i not in ssm]
-        if any(meta.block_lens[i] % sub_blocks for i in attention):
-            return 1
         region_num_blocks = meta.region_num_blocks or [meta.num_blocks] * len(
             meta.block_lens
         )
+        # A slot-packed region advertises one block per slot, more than the
+        # pool blocks (KDA states and pool-block attention regions: equal).
+        remote_slots = {
+            i for i, n in enumerate(region_num_blocks) if n != meta.num_blocks
+        }
+        if remote_slots != self._slot_region_indices:
+            differ = sorted(remote_slots ^ self._slot_region_indices)
+            raise RuntimeError(
+                "NIXL DCP pair mode: the prefiller packs KV regions "
+                f"{sorted(remote_slots)} as slots of its pool blocks, this "
+                f"decoder {sorted(self._slot_region_indices)} (differ: "
+                f"{[self.region_names[i] for i in differ]}), so their blocks "
+                "cannot be paired. Use the same --prefix-match-unit and drafter "
+                "on prefill and decode."
+            )
+        whole = set(self._ssm_region_indices) | self._slot_region_indices
+        split = [i for i in range(len(meta.block_lens)) if i not in whole]
+        if any(meta.block_lens[i] % sub_blocks for i in split):
+            return 1
         meta.block_size //= sub_blocks
         meta.block_lens = [
-            n // sub_blocks if i not in ssm else n
+            n // sub_blocks if i not in whole else n
             for i, n in enumerate(meta.block_lens)
         ]
         meta.region_num_blocks = [
-            n * sub_blocks if i not in ssm else n
+            n * sub_blocks if i not in whole else n
             for i, n in enumerate(region_num_blocks)
         ]
         logger.info_once(
@@ -3725,7 +3781,7 @@ class NixlBaseConnectorWorker:
                 remote_agent_name, blocks_data, mem_type=remote_mem_type
             )
         )
-        if engine_id in self._sub_block_peers and self._head_sharded_draft_regions:
+        if engine_id in self._sub_block_peers and self._sub_block_draft_regions():
             self._register_draft_head_dlists(
                 nixl_agent_meta,
                 remote_agent_name,
@@ -3735,6 +3791,12 @@ class NixlBaseConnectorWorker:
             )
 
         return remote_agent_name
+
+    def _sub_block_draft_regions(self) -> list[int]:
+        """The head-sharded draft regions a sub-block peer's pool blocks
+        split, read per head (``_draft_head_dlists``). Slot-packed draft
+        regions keep whole blocks and are read like an equal-block peer's."""
+        return sorted(self._head_sharded_draft_regions - self._slot_region_indices)
 
     def _draft_head_dlists(
         self,
@@ -3782,7 +3844,7 @@ class NixlBaseConnectorWorker:
         local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         local: list[list[np.ndarray]] = [[] for _ in range(local_heads)]
         remote: list[list[np.ndarray]] = [[] for _ in range(local_heads)]
-        for r in sorted(self._head_sharded_draft_regions):
+        for r in self._sub_block_draft_regions():
             chunk = self.block_len_per_layer[r] // local_heads
             # Bytes per token-head: P's page over its heads and tokens.
             token_head, rest = divmod(page_lens[r], remote_heads * remote_block)
@@ -3839,7 +3901,7 @@ class NixlBaseConnectorWorker:
             return
         local, remote = dlists
         engine_id = nixl_agent_meta.engine_id
-        regions = sorted(self._head_sharded_draft_regions)
+        regions = self._sub_block_draft_regions()
         region_num_blocks = nixl_agent_meta.region_num_blocks
         assert region_num_blocks is not None
         if not self._draft_head_src_handles:
