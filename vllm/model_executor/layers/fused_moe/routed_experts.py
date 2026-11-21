@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -369,6 +370,38 @@ class RoutedExperts(PluggableLayer):
         )
         param.copy_(loaded_weight)
 
+    # Largest checkpoint tensor staged whole on the device for a strided TP slice.
+    _MAX_STAGED_TP_SOURCE_BYTES = 256 << 20
+
+    def _stage_strided_tp_source(
+        self,
+        loaded_weight: torch.Tensor,
+        shard_dim: int,
+        expert_data: torch.Tensor,
+    ) -> torch.Tensor:
+        """The checkpoint tensor, moved whole to the parameter's device when this
+        rank's TP slice of it would be strided on the host.
+
+        A TP slice along a non-leading dim (the down projection's input dim, and its
+        block scales) is a strided host view: copying it to the device gathers it on
+        the CPU element run by element run, which dominates loading without EP
+        (~3x the read time per Kimi K3 shard). One contiguous host-to-device copy of
+        the whole tensor and the slice on the device move the same bytes into the
+        parameter (bit-identical), and the full tensor is only a transient.
+        """
+        if (
+            self.moe_config.moe_parallel_config.tp_size == 1
+            or loaded_weight.device.type != "cpu"
+            or expert_data.device.type != "cuda"
+            or loaded_weight.ndim < 2
+            or shard_dim >= loaded_weight.ndim
+            or math.prod(loaded_weight.shape[:shard_dim]) == 1
+            or not loaded_weight.is_contiguous()
+            or loaded_weight.nbytes > self._MAX_STAGED_TP_SOURCE_BYTES
+        ):
+            return loaded_weight
+        return loaded_weight.to(expert_data.device)
+
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -389,6 +422,9 @@ class RoutedExperts(PluggableLayer):
             is_scale: whether padding should use unit scales instead of zero weights.
 
         """
+        loaded_weight = self._stage_strided_tp_source(
+            loaded_weight, shard_dim, expert_data
+        )
         padded_tp = self.moe_config.tp_shard_with_padding
         if padded_tp:
             destination = expert_data

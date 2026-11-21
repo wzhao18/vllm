@@ -1112,6 +1112,183 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+_SAFETENSORS_TORCH_DTYPES: dict[str, torch.dtype] = {
+    name: dtype
+    for name, dtype in (
+        ("BOOL", torch.bool),
+        ("U8", torch.uint8),
+        ("I8", torch.int8),
+        ("I16", torch.int16),
+        ("U16", getattr(torch, "uint16", None)),
+        ("F16", torch.float16),
+        ("BF16", torch.bfloat16),
+        ("I32", torch.int32),
+        ("U32", getattr(torch, "uint32", None)),
+        ("F32", torch.float32),
+        ("F64", torch.float64),
+        ("I64", torch.int64),
+        ("U64", getattr(torch, "uint64", None)),
+        ("F8_E4M3", getattr(torch, "float8_e4m3fn", None)),
+        ("F8_E5M2", getattr(torch, "float8_e5m2", None)),
+        ("F8_E8M0", getattr(torch, "float8_e8m0fnu", None)),
+    )
+    if dtype is not None
+}
+
+
+class _SafetensorsBulkReader:
+    """Reads the tensors of safetensors files with large parallel ``pread`` calls
+    instead of page faults on an mmap.
+
+    ``safe_open(...).get_tensor`` returns a view of a private mmap, so every byte a
+    weight loader touches is faulted in page by page. On a network filesystem that
+    runs at ~1-1.5 GB/s per node, and a tensor-parallel slice along a non-leading
+    dim (e.g. the down projection of every routed expert) touches every page of the
+    tensor on every rank: a 16 GiB Kimi K3 shard then takes ~19 s per shard. Large
+    parallel reads of the same bytes run at >10 GB/s per node.
+
+    The needed tensors (after the EP filter) are coalesced into groups of at most
+    ``GROUP_BYTES`` (small gaps are read through), each group into its own host
+    buffer, so a tensor a loader keeps alive pins at most its group. Groups are read
+    by a thread pool ahead of the consumer (``WINDOW_BYTES`` in flight, across file
+    boundaries). The yielded tensors hold the file's bytes unchanged, so the loaded
+    weights are bit-identical to the mmap path.
+    """
+
+    GROUP_BYTES = 64 << 20
+    GAP_BYTES = 1 << 20
+    PIECE_BYTES = 32 << 20
+    WINDOW_BYTES = 4 << 30
+    NUM_THREADS = 16
+
+    def __init__(self, files: list[str], local_expert_ids: set[int] | None):
+        self._local_expert_ids = local_expert_ids
+        self._files = files
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.NUM_THREADS, thread_name_prefix="st-read"
+        )
+        # Pending groups in read order: (file, fd, group entries, buffer, futures).
+        self._queue: list[tuple] = []
+        self._next_file = 0
+        self._pending_groups: list[tuple[str, int, list]] = []
+        self._in_flight = 0
+
+    @staticmethod
+    def parse_header(path: str) -> tuple[int, dict[str, Any]]:
+        with open(path, "rb") as f:
+            (n,) = np.frombuffer(f.read(8), dtype="<u8")
+            header = json.loads(f.read(int(n)))
+        header.pop("__metadata__", None)
+        return 8 + int(n), header
+
+    def _plan_file(self, path: str) -> list | None:
+        """Groups of (name, dtype, shape, start, end) in file order, or None if a
+        tensor's dtype has no torch equivalent here (read that file through mmap)."""
+        base, header = self.parse_header(path)
+        entries = []
+        for name, info in header.items():
+            if should_skip_weight(name, self._local_expert_ids):
+                continue
+            dtype = _SAFETENSORS_TORCH_DTYPES.get(info["dtype"])
+            if dtype is None:
+                return None
+            start, end = info["data_offsets"]
+            entries.append((name, dtype, info["shape"], base + start, base + end))
+        entries.sort(key=lambda e: e[3])
+        groups: list[list] = []
+        for entry in entries:
+            if groups:
+                last = groups[-1]
+                if (
+                    entry[3] - last[-1][4] <= self.GAP_BYTES
+                    and entry[4] - last[0][3] <= self.GROUP_BYTES
+                ):
+                    last.append(entry)
+                    continue
+            groups.append([entry])
+        return groups
+
+    def _read_piece(self, fd: int, view: memoryview, offset: int) -> None:
+        done = 0
+        while done < len(view):
+            got = os.preadv(fd, [view[done:]], offset + done)
+            if got <= 0:
+                raise OSError(f"short read at offset {offset + done}")
+            done += got
+
+    def _submit_more(self) -> None:
+        while self._in_flight < self.WINDOW_BYTES:
+            if not self._pending_groups:
+                if self._next_file >= len(self._files):
+                    return
+                path = self._files[self._next_file]
+                self._next_file += 1
+                groups = self._plan_file(path)
+                if groups is None:
+                    self._queue.append((path, None, None, None, None))
+                    continue
+                fd = os.open(path, os.O_RDONLY)
+                if not groups:
+                    self._queue.append((path, fd, [], None, []))
+                    continue
+                self._pending_groups = [(path, fd, g) for g in groups]
+                # The last group of the file closes its fd once read.
+            path, fd, group = self._pending_groups.pop(0)
+            start, end = group[0][3], group[-1][4]
+            # Keep each tensor's file alignment (mod 64) so dtype views stay valid.
+            pad = start % 64
+            buffer = torch.empty(pad + end - start, dtype=torch.uint8)
+            view = memoryview(buffer.numpy())[pad:]
+            futures = [
+                self._pool.submit(
+                    self._read_piece,
+                    fd,
+                    view[off : min(off + self.PIECE_BYTES, end - start)],
+                    start + off,
+                )
+                for off in range(0, end - start, self.PIECE_BYTES)
+            ]
+            last = not self._pending_groups
+            self._queue.append((path, fd if last else -1, group, buffer, futures))
+            self._in_flight += end - start
+
+    def tensors(self, path: str) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """The needed tensors of *path*, which must be the next file in order."""
+        while True:
+            self._submit_more()
+            file, fd, group, buffer, futures = self._queue.pop(0)
+            assert file == path, (file, path)
+            if group is None:  # dtype without a torch equivalent: mmap path
+                with safe_open(path, framework="pt") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        if not should_skip_weight(name, self._local_expert_ids):
+                            yield name, f.get_tensor(name)
+                return
+            for future in futures:
+                future.result()
+            if group:
+                start = group[0][3]
+                pad = start % 64
+                self._in_flight -= group[-1][4] - start
+                for name, dtype, shape, s, e in group:
+                    raw = buffer[pad + s - start : pad + e - start]
+                    if (pad + s - start) % dtype.itemsize:
+                        raw = raw.clone()
+                    yield name, raw.view(dtype).reshape(shape)
+                del buffer, raw
+            if fd is not None and fd >= 0:
+                os.close(fd)
+                return
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        for _, fd, *_ in self._queue:
+            if fd is not None and fd >= 0:
+                os.close(fd)
+        for _, fd, _ in self._pending_groups[-1:]:
+            os.close(fd)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1150,18 +1327,15 @@ def safetensors_weights_iterator(
     )
 
     should_prefetch = safetensors_load_strategy == "prefetch"
+    # Default on a network filesystem: bulk parallel reads of the needed tensors
+    # (page faults on an mmap run at ~1 GB/s per node there).
+    bulk_read = safetensors_load_strategy is None and is_net_fs
     if safetensors_load_strategy is None:
-        if is_net_fs and fits_in_ram:
-            should_prefetch = True
-        elif is_net_fs and not fits_in_ram:
-            logger.warning_once(
-                "Network filesystem (%s) detected but checkpoint total size "
-                "(%.2f GiB) exceeds %d%% of available RAM (%.2f GiB). "
-                "Skipping auto-prefetch.",
+        if is_net_fs:
+            logger.info_once(
+                "Network filesystem (%s): reading checkpoint tensors with "
+                "parallel bulk reads.",
                 fs_name,
-                total_bytes / 1024**3,
-                ram_threshold_pct,
-                avail_bytes / 1024**3,
             )
         elif not is_net_fs and fits_in_ram:
             logger.info_once(
@@ -1197,6 +1371,31 @@ def safetensors_weights_iterator(
             block_size=safetensors_prefetch_block_size,
         )
 
+    reader = (
+        _SafetensorsBulkReader(sorted_files, local_expert_ids) if bulk_read else None
+    )
+    try:
+        yield from _safetensors_files_iterator(
+            sorted_files,
+            loading_desc,
+            use_tqdm_on_load,
+            safetensors_load_strategy,
+            local_expert_ids,
+            reader,
+        )
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+def _safetensors_files_iterator(
+    sorted_files: list[str],
+    loading_desc: str,
+    use_tqdm_on_load: bool,
+    safetensors_load_strategy: str | None,
+    local_expert_ids: set[int] | None,
+    reader: _SafetensorsBulkReader | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     leftover_state_dict: dict[str, torch.Tensor] = {}
     for st_file in tqdm(
         sorted_files,
@@ -1204,7 +1403,9 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
-        if safetensors_load_strategy == "eager":
+        if reader is not None:
+            yield from reader.tensors(st_file)
+        elif safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
