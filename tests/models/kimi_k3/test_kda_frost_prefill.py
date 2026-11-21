@@ -224,8 +224,8 @@ def test_persistent_warm_covers_serving_beta_layouts(heads):
         v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
         for beta in (
             torch.randn(1, T, H, device="cuda").to(bf),
-            # a view one element past an aligned base
-            torch.randn(T * H + 1, device="cuda").to(bf)[1:].view(1, T, H),
+            # a view 4 bytes past an aligned base (not a 16-byte multiple)
+            torch.randn(T * H + 2, device="cuda").to(bf)[2:].view(1, T, H),
         ):
             sp_kda.persistent_prefill(
                 q, k, v, g, beta, torch.randn(H, device="cuda") * 0.5,
