@@ -508,14 +508,16 @@ def test_shipped_knobs_resolve():
             C.RubinKnobs.from_dict(entry["knobs"]),
         )
         C.RubinMoeConfig.make(p, bucket, rank=0, world_size=entry["world_size"])
-    with pytest.raises(C.KnobLookupError):
-        C.resolve_knobs(
-            C.SHIPPED_KNOBS,
-            problem=problem,
-            variant="inference",
-            world_size=24,
-            max_tokens=6144,
-        )
+    # No EP24 record: the nearest tuned contract is borrowed, with a warning
+    # (juntian #21: EP sizes that need redundant experts).
+    _, _, warnings = C.resolve_knobs(
+        C.SHIPPED_KNOBS,
+        problem=problem,
+        variant="inference",
+        world_size=24,
+        max_tokens=6144,
+    )
+    assert any("borrowed" in w for w in warnings)
     # EP28 / EP32 decode capacities resolve to the FlashInfer a368c5f66 default-knob
     # records measured at that EP (moe_ep32); N128 up to 64 expected rows per expert.
     for ws in (28, 32):
