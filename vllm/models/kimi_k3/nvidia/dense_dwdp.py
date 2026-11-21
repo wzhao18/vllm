@@ -64,20 +64,20 @@ class DenseDwdp:
                 items.append((p, off))
                 off = aligned(off + p.nbytes)
             plans.append((items, aligned(-(-off // n), chunk)))
-        # slots[(k, m, shard)]: staging memory for member m's shard in slot k (a
-        # mapping covers a whole allocation, so each shard size has its own)
-        slots: dict[tuple[int, int, int], object] = {}
+        # The fabric memory comes from the driver, while the parameters it replaces
+        # were allocated through PyTorch's caching allocator: install one layer at a
+        # time and hand each layer's replaced bytes back to the driver before the
+        # next layer's home shard is created, so the full non-expert copy and the
+        # shards are never held together. The staging slots are created last, from
+        # the memory the replaced layers returned.
+        torch.accelerator.empty_cache()
         exports: dict[str, bytes] = {}
         blobs = []
         for ordinal, (items, shard) in enumerate(plans, start=1):
             rng = edwdp.VaRange(shard * n, device)
             home = edwdp.create(shard, device)
             exports[str(ordinal)] = edwdp.export(home)
-            for m in range(n):
-                key = (ordinal % DEPTH, m, shard)
-                if m != me and key not in slots:
-                    slots[key] = edwdp.create(shard, device)
-                rng.map(m * shard, shard, home if m == me else slots[key])
+            rng.map(me * shard, shard, home)
             blob = rng.tensor()
             lo, hi = me * shard, (me + 1) * shard
             mine = blob[lo:hi]
@@ -90,14 +90,24 @@ class DenseDwdp:
                     )
             for p, off in items:
                 p.data = blob[off : off + p.nbytes].view(p.dtype).view(p.shape)
-            blobs.append((blob, shard))
-        torch.accelerator.empty_cache()
+            blobs.append((rng, blob, shard))
+            torch.accelerator.empty_cache()
+        # slots[(k, m, shard)]: staging memory for member m's shard in slot k (a
+        # mapping covers a whole allocation, so each shard size has its own)
+        slots: dict[tuple[int, int, int], object] = {}
+        for ordinal, (rng, _, shard) in enumerate(blobs, start=1):
+            for m in range(n):
+                if m != me:
+                    key = (ordinal % DEPTH, m, shard)
+                    if key not in slots:
+                        slots[key] = edwdp.create(shard, device)
+                    rng.map(m * shard, shard, slots[key])
 
         store = edwdp.Store("dense", n, me) if x is not None else edwdp.GroupStore(g)
         handles = store.exchange(exports)
         # copies[i]: layer start + i (the first layer is resident: no copies)
         self.copies = [edwdp.Copies([], len(self.streams))]
-        for ordinal, (blob, shard) in enumerate(blobs, start=1):
+        for ordinal, (_, blob, shard) in enumerate(blobs, start=1):
             pairs = []
             for m in range(n):
                 if m != me:

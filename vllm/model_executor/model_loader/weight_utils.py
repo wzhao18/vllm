@@ -45,6 +45,7 @@ from vllm.model_executor.layers.quantization import (
     get_quantization_config,
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
+    LayerExpertIds,
     should_skip_weight,
 )
 from vllm.platforms import current_platform
@@ -1116,7 +1117,7 @@ def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
-    local_expert_ids: set[int] | None = None,
+    local_expert_ids: set[int] | LayerExpertIds | None = None,
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
@@ -1394,7 +1395,7 @@ _ENGRAM_WEIGHT_RE = re.compile(
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
-    local_expert_ids: set[int] | None = None,
+    local_expert_ids: set[int] | LayerExpertIds | None = None,
     *,
     load_engram_on_cpu: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
