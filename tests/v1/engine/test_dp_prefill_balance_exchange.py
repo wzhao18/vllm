@@ -149,7 +149,7 @@ def test_exchange_sets_the_same_cap_on_every_rank():
         for p in ps:
             p.join(timeout=120)
             assert p.exitcode == 0
-        # demands 0 / 4096 / 8192 / 12288: 8K covers 20480 of 24576 tokens.
+        # demands 0 / 4096 / 8192 / 12288: median busy rank 8192.
         expect = choose_step_cap([0, 4096, 8192, 12288], step_cap_ladder(2048, 16384))
         assert expect == 8192
         for rank in range(world_size):

@@ -10,18 +10,16 @@ paced by one rank's long chunk makes every request on every rank wait for it.
 
 Each step the DP ranks exchange their schedulable prompt tokens (see
 ``Scheduler.dp_prefill_demand``) and every rank sets the same token cap for
-its next steps: the smallest ladder value whose step still runs at least
-``STEP_CAP_COVERAGE`` of the tokens a full-budget step would run over the
-group. Light or uneven groups get shorter steps at a bounded loss of work per
-step; a saturated group (every rank with a full budget of work) stays at the
-configured budget.
+its next steps: the smallest ladder value that holds the typical busy rank's
+whole demand, i.e. the median demand over the ranks that have any. The ranks
+with typical work then finish it in one short step; a rank with an outlier
+backlog (a long cold prompt) runs it in several short steps instead of
+setting the step time of the whole group. The median does not follow a few
+outliers (the mean does), and a group where most ranks are saturated stays at
+the configured budget.
 """
 
 from collections.abc import Sequence
-
-# Share of a full-budget step's tokens (summed over the DP group) that a
-# capped step must still run.
-STEP_CAP_COVERAGE = 0.8
 
 
 def step_cap_ladder(floor: int, max_tokens: int) -> list[int]:
@@ -38,11 +36,7 @@ def step_cap_ladder(floor: int, max_tokens: int) -> list[int]:
     return sorted(ladder)
 
 
-def choose_step_cap(
-    demands: Sequence[int],
-    ladder: Sequence[int],
-    coverage: float = STEP_CAP_COVERAGE,
-) -> int | None:
+def choose_step_cap(demands: Sequence[int], ladder: Sequence[int]) -> int | None:
     """Token cap of the next steps for every DP rank of the group, None for
     the configured budget (``ladder[-1]``).
 
@@ -50,9 +44,11 @@ def choose_step_cap(
     smallest cap: the next arrivals start with a short step, after which the
     cap follows their demand.
     """
-    budget = ladder[-1]
-    full = sum(min(d, budget) for d in demands)
+    busy = sorted(d for d in demands if d > 0)
+    if not busy:
+        return ladder[0]
+    typical = busy[len(busy) // 2]
     for cap in ladder[:-1]:
-        if sum(min(d, cap) for d in demands) >= coverage * full:
+        if cap >= typical:
             return cap
     return None
