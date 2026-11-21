@@ -332,11 +332,12 @@ class CacheConfig:
     extra step is a small share of the prefill and a re-prefill would cost
     the most."""
     mamba_internal_snapshot: bool = False
-    """Let a request's first prefill chunk that crosses at most one Mamba block
-    boundary export its prompt-tail checkpoint from inside the step, into a
-    fresh block one column below its initial state, instead of ending a chunk
-    at the checkpoint (and at the block boundary). Small turns then prefill in
-    one step. Requires the V2 model runner and a backend whose cache spec
+    """Let a prefill's last chunk that crosses at most one Mamba block boundary
+    export its prompt-tail checkpoint from inside the step, into a fresh block
+    one column below its initial state, instead of ending a chunk at the
+    checkpoint (and at the block boundary). Small turns, and the last chunk of
+    a chunked prefill that resumes and ends in one block, then run in one
+    step. Requires the V2 model runner and a backend whose cache spec
     declares ``MambaSpec.prefill_snapshot`` (FlashKDA); otherwise it is
     ignored. Only takes effect with prefix caching in "align" mode."""
     mamba_low_priority_snapshot_prompt_len: int = Field(default=0, ge=0)

@@ -1210,6 +1210,9 @@ class GPUModelRunner(
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
+        # Only the V2 runner's Mamba snapshot (CacheConfig.mamba_internal_snapshot)
+        # rewrites block-table columns.
+        assert not scheduler_output.block_table_writes
 
         # Free the cached encoder outputs.
         self._process_encoder_cache_scheduler_output(scheduler_output)

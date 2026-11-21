@@ -106,12 +106,13 @@ class MambaHybridModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
-            # CacheConfig.mamba_internal_snapshot: each request slot's computed
-            # tokens when it was added (-1: none). A batch row whose chunk starts
-            # there is its request's first scheduled chunk, the only kind whose
-            # block table the worker holds in full.
+            # CacheConfig.mamba_internal_snapshot: per request slot, the start of
+            # the chunk whose snapshot column this worker holds fresh (-1: none):
+            # its computed tokens when it was added (the worker received the
+            # whole block table), or the start of a chunk the scheduler rewrote
+            # the column for. Only a batch row starting there may export there.
             self._snapshot = self.cache_config.mamba_internal_snapshot
-            self._first_chunk_start = np.full(self.max_num_reqs, -1, dtype=np.int64)
+            self._snapshot_start = np.full(self.max_num_reqs, -1, dtype=np.int64)
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
@@ -130,7 +131,11 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
-            self._first_chunk_start[req_index] = new_req_data.num_computed_tokens
+            self._snapshot_start[req_index] = new_req_data.num_computed_tokens
+
+    def block_table_rewritten(self, req_index: int, num_computed_tokens: int) -> None:
+        if self._align_mode:
+            self._snapshot_start[req_index] = num_computed_tokens
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -329,7 +334,7 @@ class MambaHybridModelState(DefaultModelState):
                 )
                 first_chunk = np.zeros(num_reqs, dtype=bool)
                 first_chunk[:n] = (
-                    self._first_chunk_start[input_batch.idx_mapping_np[:n]] == starts
+                    self._snapshot_start[input_batch.idx_mapping_np[:n]] == starts
                 )
             for _, builder in aligned_index_builders:
                 if hasattr(builder, "mamba_snapshot_first_chunk"):

@@ -563,7 +563,7 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
-        # CacheConfig.mamba_internal_snapshot: a request's first chunk may also
+        # CacheConfig.mamba_internal_snapshot: a prefill's last chunk may also
         # export its prompt checkpoint when it crosses at most one mamba block
         # boundary, into a fresh block below its initial state. Every mamba
         # group's backend must declare the snapshot column.
@@ -698,13 +698,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
-        first_chunk: bool = False,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
-
-        ``first_chunk``: the request is scheduled from the waiting queue, so
-        the worker receives its whole block table this step (the only case the
-        first-chunk snapshot may serve, CacheConfig.mamba_internal_snapshot).
 
         In "align" cache mode reusable SSM states are materialized at block
         boundaries, plus mandatory early stops (the prompt's partial-tail hash
@@ -778,12 +773,13 @@ class Scheduler(SchedulerInterface):
         )
         if (
             not use_internal_checkpoint
-            and first_chunk
             and getattr(self, "mamba_internal_snapshot", False)
             and end >= prefill_end
         ):
-            # A small turn: the chunk crosses at most one block boundary, so the
-            # checkpoint goes to the snapshot column below the initial state.
+            # The chunk crosses at most one block boundary (a small turn, or the
+            # last chunk of a chunked one), so the checkpoint goes to the
+            # snapshot column below the initial state. A running request's
+            # worker gets that column as a block-table write.
             use_internal_checkpoint = (
                 get_mamba_prefill_snapshot_col(
                     query_start=start,
@@ -812,6 +808,14 @@ class Scheduler(SchedulerInterface):
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
+            elif self.mamba_partial_cache_hit:
+                # A sub-block end, e.g. a budget cut: keep it on the hash grid,
+                # so that the next chunk, starting there, can export the prompt
+                # checkpoint internally (`is_mamba_prefill_checkpoint_valid` and
+                # the snapshot need a hash-aligned query start).
+                grid_end = end // self.hash_block_size * self.hash_block_size
+                if grid_end > start:
+                    end = grid_end
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
@@ -1703,13 +1707,6 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
-                            # Only the snapshot reads it; flag off, the call is
-                            # unchanged.
-                            **(
-                                {"first_chunk": True}
-                                if self.mamba_internal_snapshot
-                                else {}
-                            ),
                         )
                         if num_new_tokens == 0:
                             break
@@ -2106,6 +2103,14 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        block_table_writes = self.kv_cache_manager.take_block_table_writes()
+        # Only a running request places its snapshot as a write (a new one gets
+        # it in its whole table), and a request preempted later in the step had
+        # its write dropped with its blocks.
+        assert all(
+            req_id in num_scheduled_tokens and req_id in cached_reqs_data.req_ids
+            for req_id in block_table_writes
+        ), block_table_writes
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -2144,6 +2149,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            block_table_writes=block_table_writes or None,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,

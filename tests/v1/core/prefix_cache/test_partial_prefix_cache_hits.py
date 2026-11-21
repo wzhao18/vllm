@@ -3105,11 +3105,15 @@ def test_internal_checkpoint_from_mid_block_hit_keeps_initial_state_unpublished(
 
     mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
     initial_state_block = mamba_blocks[(resume - 1) // mamba_block_size]
-    # The initial-state column holds the resumed state@80 (its CoW copy), not
-    # state@128.
-    assert initial_state_block.block_hash is None
+    # The initial-state column holds the resumed state@80 (its CoW copy) until
+    # the export overwrites it with the checkpoint: never state@128, so it is
+    # keyed at the checkpoint only, and offered only as the checkpoint.
+    assert initial_state_block.block_hash_num_tokens == checkpoint
     offloads = drain_boundary_state_offloads(manager).get(replay.request_id, [])
-    assert all(block_id != initial_state_block.block_id for _, block_id, _ in offloads)
+    assert all(
+        block_id != initial_state_block.block_id or tokens == checkpoint
+        for _, block_id, tokens in offloads
+    )
 
     # A request diverging between 128 and the prompt checkpoint resumes at a
     # state that was actually computed there, never at 128.
@@ -3144,15 +3148,18 @@ class _AlignModel:
         self.state: dict[int, int] = {}
         self.tables: dict[str, list[int]] = {}
         self.running_col: dict[str, int] = {}
+        # The chunk start whose snapshot column the worker holds fresh.
+        self.snapshot_start: dict[str, int] = {}
         self.offloads: dict[str, list[int]] = {}
 
-    def split(self, request, start, num_new, local, first):
+    def split(self, request, start, num_new, local):
         stub = SimpleNamespace(
             mamba_block_size=self.block,
             cache_config=SimpleNamespace(
                 block_size=self.block, mamba_extra_tail_checkpoint_min_span=0
             ),
             use_eagle_block_drop=True,
+            num_hash_lookahead_tokens=0,
             max_num_scheduled_tokens=16384,
             scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
             mamba_partial_cache_hit=True,
@@ -3162,9 +3169,7 @@ class _AlignModel:
             mamba_prefill_checkpoint_alignment=16,
             mamba_internal_snapshot=self.snapshot,
         )
-        return Scheduler._mamba_block_aligned_split(
-            stub, request, num_new, local, first_chunk=first
-        )
+        return Scheduler._mamba_block_aligned_split(stub, request, num_new, local)
 
     def step(self, request, budget=1 << 30):
         rid = request.request_id
@@ -3174,7 +3179,7 @@ class _AlignModel:
             blocks, local, _ = self.manager.get_computed_blocks(request)
         start = request.num_computed_tokens + local
         num_new = self.split(
-            request, start, min(request.num_tokens - start, budget), local, first
+            request, start, min(request.num_tokens - start, budget), local
         )
         assert num_new > 0
         new = self.manager.allocate_slots(request, num_new, local, blocks)
@@ -3184,9 +3189,15 @@ class _AlignModel:
         if first:
             self.tables[rid] = [b.block_id for b in mamba]
             prev = (start - 1) // self.block
+            self.snapshot_start[rid] = start
         else:
             self.tables[rid] += new.get_block_ids()[1]
             prev = self.running_col[rid]
+        writes = self.manager.take_block_table_writes()
+        assert set(writes) <= (set() if first else {rid})
+        for _, col, block_id in writes.get(rid, []):
+            self.tables[rid][col] = block_id
+            self.snapshot_start[rid] = start
         table = self.tables[rid]
         for r, offs in self.manager.take_boundary_state_offloads().items():
             self.offloads.setdefault(r, []).extend(t for _, _, t in offs)
@@ -3206,7 +3217,9 @@ class _AlignModel:
             checkpoint_alignment=16,
             drop_eagle_block=True,
             cache_hit_alignment_tokens=self.hash,
-            first_chunk=[first] if self.snapshot else None,
+            first_chunk=(
+                [self.snapshot_start.get(rid) == start] if self.snapshot else None
+            ),
         )
         if offsets[0] and table[cols[0]] != 0:
             self.state[table[cols[0]]] = start + offsets[0]
@@ -3275,10 +3288,11 @@ def test_first_chunk_snapshot_prefills_small_turns_in_one_step(num_spec):
         assert checkpoint in snap.offloads[f"turn{i}"]
 
 
-def test_first_chunk_snapshot_never_serves_a_running_request():
+def test_snapshot_serves_a_running_request():
     """A turn whose first chunk is budget-limited reaches its tail as a running
-    request: it keeps today's split there (the worker's table is append-only),
-    and the cached states stay exact."""
+    request: the manager places the snapshot block below its initial state and
+    rewrites that worker column (the worker's table is append-only), so the
+    tail runs in one step, and the cached states stay exact."""
     # Turn 1 reaches its tail at a block boundary one block short of the end
     # (the snapshot geometry, but running); turn 5 then crosses two boundaries.
     budgets = {1: [300], 5: [1000]}
@@ -3287,9 +3301,12 @@ def test_first_chunk_snapshot_never_serves_a_running_request():
     rows_base = _conversation(base, budgets)
     rows_snap = _conversation(snap, budgets)
     assert [r[:2] for r in rows_base] == [r[:2] for r in rows_snap]
-    for i in budgets:
-        assert rows_snap[i][2] == rows_base[i][2] > 1
+    assert all(s[2] <= b[2] for s, b in zip(rows_snap, rows_base))
+    # Turn 1's tail [5376, 6000) starts at a block boundary and ends in that
+    # block: one step instead of two.
+    assert rows_snap[1][2] == rows_base[1][2] - 1 == 2
     assert snap.stale_blocks() == []
+    assert base.stale_blocks() == []
 
 
 def test_first_chunk_snapshot_block_retires_after_the_step():

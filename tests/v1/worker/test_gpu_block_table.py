@@ -484,3 +484,28 @@ def test_larger_draft_batch_uses_null_kpool_slots(
     else:
         slots = compute_slots()
     assert slots.tolist() == [24, 9, 42, 19, 36, -1, -1, -1]
+
+
+def test_write_block_id_overwrites_one_existing_entry():
+    """SchedulerOutput.block_table_writes: a running request's snapshot column
+    is rewritten in place, next to this step's appends, in one group only; a
+    column the row does not hold yet is refused."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=2,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=device,
+    )
+    block_tables.append_block_ids(0, ([1, 2, 3], [0, 0, 7]), overwrite=True)
+    block_tables.apply_staged_writes()
+    block_tables.append_block_ids(0, ([4], [8]), overwrite=False)
+    block_tables.write_block_id(0, 1, 1, 9)
+    block_tables.apply_staged_writes()
+    torch.accelerator.synchronize()
+    assert block_tables.block_tables[0].gpu[0, :4].tolist() == [1, 2, 3, 4]
+    assert block_tables.block_tables[1].gpu[0, :4].tolist() == [0, 9, 7, 8]
+    assert block_tables.num_blocks.np[:, 0].tolist() == [4, 4]
+    with pytest.raises(RuntimeError, match="outside its 4 blocks"):
+        block_tables.write_block_id(0, 1, 4, 10)

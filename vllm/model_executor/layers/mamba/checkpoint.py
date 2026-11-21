@@ -38,11 +38,12 @@ def compute_mamba_prefill_checkpoints(
     block without writing it leaves the prefix cache serving uninitialized
     state.
 
-    ``first_chunk`` marks rows on their request's first scheduled chunk (the
-    worker received the request's whole block table this step). Only those
-    rows may use the first-chunk snapshot column
-    (CacheConfig.mamba_internal_snapshot): a running request's append-only
-    table can hold a stale block id there.
+    ``first_chunk`` marks the rows whose snapshot column the worker holds
+    fresh: the request's first scheduled chunk (the worker received its whole
+    block table this step), or a chunk whose column the scheduler rewrote
+    (SchedulerOutput.block_table_writes). Only those rows may use the snapshot
+    column (CacheConfig.mamba_internal_snapshot): a running request's
+    append-only table can hold a stale block id there.
 
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and

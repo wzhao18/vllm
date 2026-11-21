@@ -396,6 +396,13 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Single block-table entries of running requests to overwrite after this
+    # step's appends: req_id -> [(kv_cache_group_id, column, block_id), ...].
+    # Mamba "align" places a running request's snapshot block below its initial
+    # state this way (CacheConfig.mamba_internal_snapshot); only the V2 model
+    # runner applies them.
+    block_table_writes: dict[str, list[tuple[int, int, int]]] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 

@@ -1104,7 +1104,7 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
-    # The backend exports a first-chunk prefill snapshot at the column from
+    # The backend exports a prefill snapshot at the column from
     # ``get_mamba_prefill_snapshot_col`` (CacheConfig.mamba_internal_snapshot).
     prefill_snapshot: bool = False
     num_heads: int = 1
@@ -1284,11 +1284,14 @@ def get_mamba_prefill_snapshot_col(
     most one mamba block boundary (CacheConfig.mamba_internal_snapshot). There
     the regular checkpoint column, ``cdiv(query_end, mamba_block_size) - 2``,
     aliases or precedes the initial-state column, so the snapshot goes one
-    column below the initial state instead. On a request's first scheduled
-    chunk every column below the initial state is a null placeholder in both
-    the scheduler's and the worker's block table, so the KV cache manager can
-    place a fresh block there. Running requests must never use this column:
-    their worker block table is append-only and may hold a stale id there.
+    column below the initial state instead. That column is a null placeholder
+    in the scheduler's block table (local hits and external loads pad with
+    nulls; a running request retires the columns below its running state), so
+    the KV cache manager can place a fresh block there. On a request's first
+    scheduled chunk the worker receives the whole table. A running request's
+    worker table is append-only and may hold a stale id in the column, so the
+    worker uses it only after the scheduler rewrites it
+    (SchedulerOutput.block_table_writes).
     """
     if checkpoint_alignment is None:
         return -1
