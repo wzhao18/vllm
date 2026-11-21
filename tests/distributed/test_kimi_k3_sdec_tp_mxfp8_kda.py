@@ -11,7 +11,9 @@ it), checkpoint-format tensors through their weight loaders, 96 KDA heads:
 * ``in_proj_qkvgfab`` (``_KimiGDNMergedColumnParallelLinear``, full-rank gate, f_a
   replicated, TP padding): the TP provider's in-projection (``Mxfp8Projection`` as
   ``providers.Attention`` builds it, every decode row count of the policy seams)
-  equals the stock layer's forward bit for bit; ``check_bf16_projections`` accepts the
+  equals the stock layer's forward bit for bit where it runs stock's kernel (every
+  row of the TP16 [3216, 7168] shard), else (a measured ``MX_TUNED`` kind) within one
+  BF16 rounding; ``check_bf16_projections`` accepts the
   MXFP8 in / o projections of a KDA layer and still refuses any other MXFP8 linear;
 * ``o_proj`` (``RowParallelLinear``, reduce_results): ``oproj.mxfp8.Mxfp8Oproj`` (the
   MXFP8 GEMM, its partial pushed into the BF16 path's mailboxes, the BF16 path's
@@ -251,6 +253,7 @@ def _worker(env: dict[str, str]) -> None:
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
         Mxfp8Projection,
+        mxfp8_tactics,
         stock_kind,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import (
@@ -303,9 +306,18 @@ def _worker(env: dict[str, str]) -> None:
                 want = in_proj(x)[0]
                 got = torch.empty(r, pitch, device=device, dtype=torch.bfloat16)
                 projection.run(x, got)
-                assert projection.engine(r) == stock_kind(pitch, HIDDEN, r)
-                assert torch.equal(got, want), f"in-projection R{r}"
-            _say(rank, "W1 in-projection bitwise at", IN_ROWS)
+                if projection.engine(r) == stock_kind(pitch, HIDDEN, r):
+                    assert torch.equal(got, want), f"in-projection R{r}"
+                else:  # a measured MX_TUNED kind (TP4's [12448, 7168] rows)
+                    tol = want.float().abs().amax(dim=1, keepdim=True) * 2.0**-7
+                    diff = (got.float() - want.float()).abs()
+                    assert (diff <= tol + 1e-3).all(), f"in-projection R{r}"
+            # the TP16 shards (in [3216, 7168], o [7168, 768]) run stock's kernel
+            for n, kk in ((3216, HIDDEN), (HIDDEN, 768)):
+                rows = (*IN_ROWS, 1024, 1536, 2048)
+                tactics = mxfp8_tactics(n, kk, rows)
+                assert all(tactics[r] == stock_kind(n, kk, r) for r in rows)
+            _say(rank, "W1 in-projection vs stock ok at", IN_ROWS)
 
             # W2: the MXFP8 o-projection + exchange + AttnRes vs stock
             prepared.TWOSHOT[world] = TWOSHOT_TABLE
