@@ -392,6 +392,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # when its pull ends, or at once, so its exchange must not run.
             self._pair_plans.pop(request.request_id, None)
             self._pair_ready.pop(request.request_id, None)
+            if request.request_id in self._pair_hidden:
+                # Withheld pull: report it next schedule() so the scheduler
+                # frees the blocks it kept for the unfinished pull.
+                self._pair_release.add(request.request_id)
             if self._fingerprint:
                 self._fingerprint_pulls.pop(request.request_id, None)
                 self._fingerprint_pulls_ready.pop(request.request_id, None)

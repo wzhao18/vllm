@@ -689,6 +689,13 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+
+    def take_deferred_recving(self) -> set[str]:
+        """Scheduler side, at the start of each schedule(): requests whose
+        finished loads this connector withheld from an earlier
+        ``update_connector_output`` and now reports finished. Default: none."""
+        return set()
+
     def request_finished(
         self,
         request: "Request",

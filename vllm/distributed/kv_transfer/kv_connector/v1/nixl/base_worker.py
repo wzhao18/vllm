@@ -94,6 +94,7 @@ from vllm.distributed.nixl_utils import (
     nixl_agent_config,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -334,6 +335,10 @@ class NixlBaseConnectorWorker:
     # finalize_loaded_kv).
     _pair_exchanger: "DcpStagedExchanger | None" = None
     _pair_group: int | None = None
+    # Peer-copy exchanges (one host holds the DCP group): they run on this side
+    # stream, and the next step's forward waits for them on the device.
+    _pair_side: "torch.cuda.Stream | None" = None
+    _pair_side_events: tuple[torch.cuda.Event, ...] = ()
     _pair_consumed: NixlConnectorMetadata | None = None
     # (metadata, event, blocks the exchange rewrites) per exchanging step.
     _pair_events: tuple[
@@ -2744,6 +2749,10 @@ class NixlBaseConnectorWorker:
             )
         # On every rank: checks the partner and logs the buffers and memory.
         exchanger.warm_up()
+        if dcp_pair_exchange.build_peer_copy_swap(
+            exchanger, get_dcp_group().cpu_group
+        ):
+            self._pair_side = torch.cuda.Stream(device=device)
         self._pair_exchanger = exchanger
         self._pair_group = group
         if iterlog.ITERLOG_DIR is not None and device.type == "cuda":
@@ -5050,10 +5059,21 @@ class NixlBaseConnectorWorker:
         """Run this step's DCP pair exchanges, before the model runner zeroes
         new blocks, applies copy-on-write copies and runs the forward. With KV
         fingerprints on, log the pulls that ended right after them."""
+        if self._pair_side_events:
+            # Earlier steps' side-stream exchanges finish before this step's
+            # device work (their requests may be admitted now; an aborted
+            # one's freed blocks may be reused), without a host wait.
+            stream = torch.cuda.current_stream()
+            for event in self._pair_side_events:
+                stream.wait_event(event)
+            self._pair_side_events = ()
         if metadata.reqs_to_pair_exchange:
             self.run_pair_exchanges(metadata)
             self._pair_consumed = metadata
         if metadata.fingerprint_pulls and self._fingerprint_log is not None:
+            # Debug runs: the sums read the exchanged blocks on this stream.
+            for event in self._pair_side_events:
+                torch.cuda.current_stream().wait_event(event)
             self._log_fingerprints(metadata.fingerprint_pulls)
 
     def log_send_fingerprints(self, metadata: NixlConnectorMetadata) -> None:
@@ -5195,20 +5215,26 @@ class NixlBaseConnectorWorker:
                 "exchanger rewrites distinct blocks of transfer group "
                 f"{self._pair_group}."
             )
-        if units:
+        if not units:
+            return
+        side = self._pair_side
+        if side is not None:
+            # After everything queued so far (the pulls' zeroing and receive
+            # post-processing), beside this step's forward.
+            side.wait_stream(torch.cuda.current_stream())
+        with contextlib.nullcontext() if side is None else torch.cuda.stream(side):
             times = self._pair_times
             if times is not None:
                 times.begin()
             exchanger.exchange(units)
             if times is not None:
                 times.end(len(metadata.reqs_to_pair_exchange), len(units))
-            self._pair_events += (
-                (
-                    metadata,
-                    exchanger.record_event(),
-                    frozenset(u.block_id for u in units),
-                ),
-            )
+            event = exchanger.record_event()
+        if side is not None:
+            self._pair_side_events += (event,)
+        self._pair_events += (
+            (metadata, event, frozenset(u.block_id for u in units)),
+        )
 
     def _drain_pair_events(self, metadata: NixlConnectorMetadata) -> None:
         """Wait for the exchanges of earlier steps that this step's READs
