@@ -3,7 +3,7 @@
 """DWDP of Kimi K3's non-expert weights.
 
 Members: every EP rank of the two engines that share experts (e.g. 2 x 4 = 8), or of
-this engine alone with ``VLLM_K3_DWDP=1`` (e.g. DEP8). Per
+this engine alone with ``dwdp="dense"`` (e.g. DEP8). Per
 decoder layer after the first, the parameters of at least ``MIN_BYTES`` that own their
 storage (attention and KDA projections, shared expert, latent projections, router; the
 routed experts live in the MegaMoE) are packed into one byte blob, cut into one
@@ -15,7 +15,7 @@ are views of a packed projection (``pack_projections``) stay resident.
 A layer's shards are copied (one copy-engine read per member, on the expert DWDP
 streams if any) when the layer ``depth - 1`` before it starts; the slot they overwrite
 was last read by a layer that has fully finished, including its shared expert's side
-stream. Installed at load, after the projections are packed (``VLLM_K3_DWDP``).
+stream. Installed at load, after the projections are packed (``ParallelConfig.dwdp``).
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from .megamoe_rubin.symm_arena import aligned
 
 logger = init_logger(__name__)
 
-ENABLED = edwdp.ENABLED or edwdp.LOCAL
 DEPTH = 3  # staging slots: copies start two layers ahead
 MIN_BYTES = 1 << 20
 
@@ -140,7 +139,7 @@ def install(layers: nn.ModuleList, start: int, end: int) -> None:
     """Shard the non-expert weights of ``layers[start:end]`` (the first stays
     resident), at load after the expert DWDP (if any) finalized."""
     global _D
-    if ENABLED and _D is None:
+    if edwdp.dense_enabled() and _D is None:
         _D = DenseDwdp(list(layers[start:end]), start, edwdp.get())
 
 

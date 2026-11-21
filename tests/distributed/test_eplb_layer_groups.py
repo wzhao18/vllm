@@ -69,10 +69,14 @@ def test_grouped_transfer_reaches_target_placement(ep, redundant, budget, monkey
         ]
     )
     load = rng.lognormal(0, 1, (layers, NUM_LOGICAL))
-    if budget:
-        monkeypatch.setenv("VLLM_EPLB_MOVE_BUDGET", str(budget))
     new = DefaultEplbPolicy.rebalance_experts(
-        torch.from_numpy(load), physical, 1, 1, ep, torch.from_numpy(old)
+        torch.from_numpy(load),
+        physical,
+        1,
+        1,
+        ep,
+        torch.from_numpy(old),
+        move_budget=budget or 0,
     ).numpy()
 
     weights = [
@@ -138,17 +142,16 @@ def test_grouped_transfer_reaches_target_placement(ep, redundant, budget, monkey
     [(4, 4, 0.99), (8, 16, 0.99), (12, 4, 0.99), (20, 4, 0.97), (24, 16, 0.97)],
 )
 def test_move_budget_policy(ep, redundant, min_balancedness, monkeypatch):
-    """With VLLM_EPLB_MOVE_BUDGET=32 on K3.1-sized layers (896 experts),
+    """With move_budget=32 on K3.1-sized layers (896 experts),
     including EP sizes that need redundant slots to divide: valid placement,
     at most 32 changed slots per layer, and near-balanced load."""
-    monkeypatch.setenv("VLLM_EPLB_MOVE_BUDGET", "32")
     num_logical, layers = 896, 8
     physical = num_logical + redundant
     rng = np.random.default_rng(ep)
     load = rng.lognormal(0, 1, (layers, num_logical))
     old = np.tile(np.arange(physical) % num_logical, (layers, 1))
     new = DefaultEplbPolicy.rebalance_experts(
-        torch.from_numpy(load), physical, 1, 1, ep, torch.from_numpy(old)
+        torch.from_numpy(load), physical, 1, 1, ep, torch.from_numpy(old), move_budget=32
     ).numpy()
 
     assert new.shape == old.shape
@@ -160,3 +163,17 @@ def test_move_budget_policy(ep, redundant, min_balancedness, monkeypatch):
         [_balancedness(new[layer], load[layer], ep) for layer in range(layers)]
     )
     assert after >= min_balancedness
+
+
+def test_move_budget_defaults_per_communicator():
+    """The move budget is a validated default for the symm_mem async path and
+    unbounded for the other communicators unless set explicitly."""
+    from vllm.config.parallel import EPLBConfig
+
+    assert EPLBConfig(communicator="symm_mem").resolved_move_budget(8) == 32
+    assert EPLBConfig(communicator="symm_mem").resolved_move_budget(24) == 64
+    assert EPLBConfig(communicator="nixl").resolved_move_budget(24) == 0
+    assert EPLBConfig(communicator=None).resolved_move_budget(8) == 0
+    assert EPLBConfig(communicator="nixl", move_budget=16).resolved_move_budget(8) == 16
+    with pytest.raises(ValueError):
+        EPLBConfig(move_budget=-1)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA data parallelism inside the TP group (``VLLM_K3_TP_DSA_DP=1``).
+"""DSA data parallelism inside the TP group (automatic: Kimi K3 DSA, TP > 1, no CP).
 
 Without DCP, every request is owned by one card of its TP group. The DSA layers
 run as under DEP: the owner computes the request's DSA rows with all heads (input
@@ -17,8 +17,12 @@ KV: by default each card has its own DSA KV region (``v1/core/dsa_dp_regions.py`
 and a request's DSA KV lives only in its owner's region, so the TP group keeps one
 copy, as DEP does. Block hashes are not salted, so prefix-cache and Mooncake keys
 do not depend on the owner; the owner is the card holding the longest prefix hit,
-ties broken by queued load. ``VLLM_K3_TP_DSA_DP_KV=0`` keeps replicated DSA KV
-instead, with owner-salted hashes and owners sticky per ``Request.session_id``.
+ties broken by queued load.
+
+Layout policy, not a switch: ``supported`` decides from the config alone (every
+process of an engine agrees), and ``configure`` sets this module's flags in each
+process (engine core: ``apply_dsa_dp_regions``; workers: the model runner) before
+their first use. Layouts with DCP / PCP keep the replicated-DSA path.
 
 Per step, ``prepare_step`` (model runner, after the regular attention metadata)
 builds the DSA groups' metadata and slot mappings for the owned requests only and
@@ -28,7 +32,6 @@ records the owned token rows for the DSA layers' forward.
 from __future__ import annotations
 
 import dataclasses
-import os
 import zlib
 from collections.abc import Iterable
 from typing import Any
@@ -39,24 +42,58 @@ import torch
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.triton_utils import tl, triton
 
-ENABLED = os.environ.get("VLLM_K3_TP_DSA_DP", "0") == "1"
-# Phase 2: per-card DSA KV (v1/core/dsa_dp_regions.py). The DSA groups' blocks of
-# a request live only in its owner card's region, so no card reserves another
-# card's DSA KV.
-KV_ENABLED = ENABLED and os.environ.get("VLLM_K3_TP_DSA_DP_KV", "1") == "1"
+# Set by ``configure`` from the VllmConfig (all False until then).
+ENABLED = False
+# Per-card DSA KV (v1/core/dsa_dp_regions.py). The DSA groups' blocks of a request
+# live only in its owner card's region, so no card reserves another card's DSA KV.
+KV_ENABLED = False
 # DEP-like owner choice over the regions (scheduler ``_assign_dsa_owner_by_prefix``):
 # no owner salt (block hashes and Mooncake keys are owner-independent), owner = the
 # region with the longest prefix hit, ties by queued load. Ignores ``session_id``.
-PREFIX_OWNER = KV_ENABLED and (
-    os.environ.get("VLLM_K3_TP_DSA_DP_PREFIX_OWNER", "1") == "1"
-)
+PREFIX_OWNER = False
 # Output exchange of the DSA layers under SP: symmetric-memory push (push_out)
 # instead of the zero-padded reduce-scatter.
-PUSH = os.environ.get("VLLM_K3_DSADP_PUSH", "1") == "1"
+PUSH = True
 # Input exchange of the DSA layers under SP (needs PUSH): every card pushes the
 # rows of its sequence shard straight to their owner card (push_in) instead of
 # the all-gather of the whole step, of which the owner keeps only its rows.
-SCATTER_IN = ENABLED and PUSH
+SCATTER_IN = False
+
+
+def supported(vllm_config: Any) -> bool:
+    """Whether ``vllm_config`` runs DSA-DP: a Kimi K3 model with DSA layers on
+    CUDA, TP > 1, no decode / prefill context parallelism. Config values only."""
+    from vllm.platforms import current_platform
+
+    pc = vllm_config.parallel_config
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or not current_platform.is_cuda():
+        return False
+    hf = model_config.hf_text_config
+    return (
+        getattr(hf, "dsa_config", None) is not None
+        and callable(getattr(hf, "is_dsa_layer", None))
+        and pc.tensor_parallel_size > 1
+        and pc.decode_context_parallel_size == 1
+        and getattr(pc, "prefill_context_parallel_size", 1) == 1
+    )
+
+
+def configure(vllm_config: Any) -> bool:
+    """Set this process's DSA-DP flags from ``vllm_config`` (idempotent)."""
+    global ENABLED, KV_ENABLED, PREFIX_OWNER, SCATTER_IN
+    on = supported(vllm_config)
+    if on and not ENABLED:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "DSA-DP: TP%d without context parallelism runs the DSA layers "
+            "data-parallel inside the TP group (per-card DSA KV regions).",
+            vllm_config.parallel_config.tensor_parallel_size,
+        )
+    ENABLED = KV_ENABLED = PREFIX_OWNER = on
+    SCATTER_IN = on and PUSH
+    return on
 
 # Attention and indexer KV-cache layer names of the DSA layers (model init).
 DSA_LAYER_NAMES: set[str] = set()
@@ -65,11 +102,11 @@ REQ_OWNER: dict[str, int] = {}
 _LOGGED_PUSH: list[int] = []
 
 
-# Debug profiling (VLLM_K3_DSADP_PROF=1): per-owner token / indexer-cost balance of
-# each step (rank 0) and sampled per-segment GPU times of the decoder layers (every
-# rank), logged every few hundred steps.
-PROF = os.environ.get("VLLM_K3_DSADP_PROF", "0") == "1"
-PROF_EVERY = int(os.environ.get("VLLM_K3_DSADP_PROF_EVERY", "10"))
+# Debug profiling (development only, off; set PROF = True locally): per-owner token
+# / indexer-cost balance of each step (rank 0) and sampled per-segment GPU times of
+# the decoder layers (every rank), logged every few hundred steps.
+PROF = False
+PROF_EVERY = 10
 
 
 class _Prof:
@@ -182,8 +219,8 @@ def rec(evs: list[Any] | None) -> None:
 # the indexer costs as much as the fixed part: fitted on the VR200 TP4 serving step
 # (6 DSA layers: 2.1e-3 ms per token + 1.18e-8 ms per token x context, C0 ~180K).
 # Prompt chunk size under DSA-DP (replaces the long-prefill threshold).
-CHUNK = int(os.environ.get("VLLM_K3_DSADP_CHUNK", "4096"))
-COST_C0 = float(os.environ.get("VLLM_K3_DSADP_COST_C0", "180000"))
+CHUNK = 4096
+COST_C0 = 180000.0
 
 
 def chunk_cost(n: int, ctx: int) -> float:

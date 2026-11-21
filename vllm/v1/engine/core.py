@@ -348,7 +348,8 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        # DSA-DP per-card DSA KV (VLLM_K3_TP_DSA_DP_KV=1); no-op otherwise.
+        # DSA-DP per-card DSA KV (layout policy: Kimi K3 DSA, TP > 1, no CP; also
+        # sets the engine core's DSA-DP flags for the scheduler); no-op otherwise.
         apply_dsa_dp_regions(
             vllm_config, kv_cache_specs, kv_cache_configs, scheduler_kv_cache_config
         )

@@ -77,12 +77,9 @@ def _hit_unit_block(spec: AttentionSpec, hit_unit: int | None) -> AttentionSpec:
 def _dsa_dp_kv(vllm_config: VllmConfig) -> bool:
     from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
-    pc = vllm_config.parallel_config
-    return (
-        dsa_dp.KV_ENABLED
-        and pc.tensor_parallel_size > 1
-        and pc.decode_context_parallel_size == 1
-    )
+    # Config values only: the grouping runs in the engine core before
+    # apply_dsa_dp_regions configures its flags.
+    return dsa_dp.supported(vllm_config)
 
 
 class GQADraftKVCacheGrouping(SupportsKVCacheGrouping):

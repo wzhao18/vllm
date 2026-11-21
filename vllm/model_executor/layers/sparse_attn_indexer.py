@@ -3,7 +3,6 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
-import os
 
 import numpy as np
 import torch
@@ -727,12 +726,13 @@ def _tp_split_enabled(
     Without DCP every TP rank holds the whole indexer K cache of its DP rank and
     receives identical rows, so each rank scores a contiguous 1/TP of every
     prefill chunk's rows and the ranks all-gather the top-k. Decided on config
-    values only (identical on all ranks of the TP group). VLLM_K3_TP_INDEXER_SPLIT=0
-    turns it off."""
-    if os.environ.get("VLLM_K3_TP_INDEXER_SPLIT", "1") != "1":
-        return 0
+    values only (identical on all ranks of the TP group). The replicated-DSA
+    fallback for TP layouts that DSA-DP (models/kimi_k3/nvidia/ops/dsa_dp.py)
+    does not cover."""
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
     # DSA-DP: the owner card scores its own requests' rows alone.
-    if os.environ.get("VLLM_K3_TP_DSA_DP") == "1":
+    if dsa_dp.ENABLED:
         return 0
     if dcp_world_size != 1 or use_pcp or shardq is not None:
         return 0

@@ -1670,7 +1670,7 @@ class KVCacheConfig:
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
     dsa_dp_group_ids: tuple[int, ...] = ()
-    """DSA-DP (``VLLM_K3_TP_DSA_DP_KV=1``): groups allocated in per-card regions."""
+    """DSA-DP (models/kimi_k3/nvidia/ops/dsa_dp.py): groups in per-card regions."""
 
     dsa_dp_shared_blocks: int = 0
     """DSA-DP: block ids ``[0, S)`` shared by every card (``num_blocks`` on the

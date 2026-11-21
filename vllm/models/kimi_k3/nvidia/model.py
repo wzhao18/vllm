@@ -3,7 +3,6 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
-import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -13,7 +12,7 @@ from torch import nn
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS, KIMI_K3_MEGA_MOE
+from vllm.config.kernel import KIMI_K3_MEGA_MOE, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -40,6 +39,7 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     fused_grouped_topk,
 )
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -48,7 +48,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention as KimiLinearGatedDeltaNetAttention,
@@ -128,8 +127,13 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
     can_pack_mxfp8,
     takes_mxfp8_activation,
 )
-from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
-from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+from vllm.models.kimi_k3.nvidia.ops import (
+    attn_res,
+    dsa_dp,
+    mxfp8_act,
+    prefill_glue,
+    sp_local_aux,
+)
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_dielocal as prefill_attn_res_dielocal,
@@ -138,15 +142,12 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_lp as prefill_attn_res_lp,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
-    attn_res_resid as prefill_attn_res_resid,
-)
-from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
-from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_resid as prefill_attn_res_resid,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
-
-
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -367,17 +368,16 @@ def _rubin_physical_experts(
     vllm_config: VllmConfig, num_experts: int, ep_size: int
 ) -> int:
     """Physical routed experts per layer on the Rubin MegaMoE backend: the logical
-    count plus redundant slots, ``VLLM_K3_MEGAMOE_REDUNDANT`` of them when set, else
-    just enough to make the count divisible by the EP size (e.g. 896 + 4 at EP12).
-    Config-only, so every rank agrees. Other backends keep the logical count."""
+    count plus redundant slots: ``eplb_config.num_redundant_experts`` under EPLB,
+    else just enough to make the count divisible by the EP size (e.g. 896 + 4 at
+    EP12). Config-only, so every rank agrees. Other backends keep the logical
+    count."""
     if vllm_config.kernel_config.moe_backend != KIMI_K3_MEGA_MOE:
         return num_experts
     parallel_config = vllm_config.parallel_config
     if parallel_config.enable_eplb:
         return num_experts + parallel_config.eplb_config.num_redundant_experts
-    env = os.environ.get("VLLM_K3_MEGAMOE_REDUNDANT")
-    redundant = int(env) if env else (-num_experts) % ep_size
-    return num_experts + redundant
+    return num_experts + (-num_experts) % ep_size
 
 
 def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:
@@ -2179,6 +2179,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
+        # DWDP layout (ParallelConfig.dwdp) before the MegaMoE experts are built.
+        dense_dwdp.edwdp.configure(parallel_config)
         use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1

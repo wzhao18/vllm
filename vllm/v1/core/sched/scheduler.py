@@ -456,7 +456,7 @@ class Scheduler(SchedulerInterface):
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
-        # DSA-DP prefix-hit owner choice (VLLM_K3_TP_DSA_DP_PREFIX_OWNER=1, per-card
+        # DSA-DP prefix-hit owner choice (dsa_dp.PREFIX_OWNER, per-card
         # regions): queued DSA prompt cost per owner card, kept incrementally.
         self._dsa_load: list[int] | None = None
         # DSA-DP: running prompts whose chunk was charged at the step's start.
@@ -3728,7 +3728,7 @@ class Scheduler(SchedulerInterface):
         base_salt = request.cache_salt or ""
         owner, best = -1, 0
         sid = getattr(request, "session_id", None)
-        if sid and os.environ.get("VLLM_K3_DSADP_STICKY", "1") == "1":
+        if sid:
             owner = dsa_dp.owner_of(sid, tp)
             dsa_dp.count_admission(True)
             request.dsa_owner = owner
@@ -3765,7 +3765,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.dsa_bind(request)
 
     def _assign_dsa_owner_by_prefix(self, request: Request, tp: int) -> None:
-        """``VLLM_K3_TP_DSA_DP_PREFIX_OWNER=1`` (per-card DSA regions): DEP-like
+        """``dsa_dp.PREFIX_OWNER`` (per-card DSA regions): DEP-like
         owner choice. DSA KV does not depend on the card holding it, so the hashes
         are not salted and Mooncake keys are owner-independent: any owner reuses a
         prefix through the shared store. The owner is the card with the least

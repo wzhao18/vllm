@@ -14,8 +14,6 @@ on how the EPLB algorithm works.
 import numpy as np
 import torch
 
-import vllm.envs as envs
-
 from .abstract import AbstractEplbPolicy
 
 
@@ -336,8 +334,13 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         num_nodes: int,
         num_ranks: int,
         old_global_expert_indices: torch.Tensor | None = None,
+        move_budget: int = 0,
     ) -> torch.Tensor:
         """Entry point for expert-parallelism load balancer.
+
+        ``move_budget`` > 0: rebalance incrementally from
+        ``old_global_expert_indices``, changing at most this many physical slots
+        per layer (``EPLBConfig.resolved_move_budget``).
 
         Args:
             weight: [layers, num_logical_experts], the load statistics for all
@@ -364,7 +367,6 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
             if old_global_expert_indices is not None
             else None
         )
-        move_budget = envs.VLLM_EPLB_MOVE_BUDGET
         if (
             move_budget > 0
             and old_phy2log_np is not None

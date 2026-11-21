@@ -19,7 +19,6 @@ from torch.distributed import (
 )
 
 import vllm.distributed.nixl_utils as nixl_utils
-import vllm.envs as envs
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
@@ -837,14 +836,9 @@ class SymmMemEplbCommunicator(EplbCommunicator):
     def execute(self) -> None:
         with device_stream(self._stream):
             self._barrier()  # Every peer's buffer rows are free to overwrite.
-            if envs.VLLM_EPLB_SYMM_COPY == "sm":
-                self._push_sm()
-            elif envs.VLLM_EPLB_SYMM_COPY_STREAMS > 1:
-                self._push_ce_streams(envs.VLLM_EPLB_SYMM_COPY_STREAMS)
-            else:
-                for tensors, dst_rank, row in self._sends:
-                    for src, peer in zip(tensors, self._peer_buffers[dst_rank]):
-                        peer[row].copy_(src, non_blocking=True)
+            for tensors, dst_rank, row in self._sends:
+                for src, peer in zip(tensors, self._peer_buffers[dst_rank]):
+                    peer[row].copy_(src, non_blocking=True)
             self._barrier()  # Every push has landed in its receiver's buffer.
         self._sends.clear()
 

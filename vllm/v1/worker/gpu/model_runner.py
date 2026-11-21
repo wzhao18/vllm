@@ -214,6 +214,9 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        # DSA-DP is a layout policy (Kimi K3 DSA, TP > 1, no CP): set this
+        # worker's flags before the model and its metadata builders read them.
+        _dsa_dp.configure(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config

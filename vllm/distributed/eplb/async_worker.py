@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger
 
@@ -99,6 +98,9 @@ def run_rebalance_experts(
         eplb_stats.num_nodes,
         eplb_stats.num_gpus,
         physical_to_logical_map_cpu,
+        move_budget=eplb_state.parallel_config.eplb_config.resolved_move_budget(
+            eplb_stats.num_gpus
+        ),
     )
     assert new_physical_to_logical_map.device == torch.device("cpu")
 
@@ -149,7 +151,7 @@ def transfer_run_periodically(
                     )
 
             if (
-                envs.VLLM_EPLB_ASYNC_LAYER_BATCH
+                state.parallel_config.eplb_config.layer_group_transfers
                 and not is_profile
                 and migration_batches_by_layer is None
                 and model_state.communicator.needs_recv_rows

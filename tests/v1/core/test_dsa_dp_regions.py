@@ -3,7 +3,7 @@
 """DSA-DP per-card DSA KV regions (``v1/core/dsa_dp_regions.py``): the DSA
 groups of a request allocate, cache and evict only in its owner card's region,
 and a full region blocks only that owner's requests. With
-``VLLM_K3_TP_DSA_DP_PREFIX_OWNER=1`` the owner is the card holding the longest
+``dsa_dp.PREFIX_OWNER`` the owner is the card holding the longest
 prefix, over unsalted hashes."""
 
 import functools
@@ -272,8 +272,16 @@ def test_region_sizes():
     assert region_sizes(1001, 4, 1, 1, 0, region_blocks_override=300) == (701, 300)
 
 
+def _dsa_dp_layout(monkeypatch):
+    """A DSA-DP layout for apply_dsa_dp_regions (which configures the flags from
+    the config); every flag it sets is restored after the test."""
+    monkeypatch.setattr(dsa_dp, "supported", lambda vllm_config: True)
+    for flag in ("ENABLED", "KV_ENABLED", "PREFIX_OWNER", "SCATTER_IN"):
+        monkeypatch.setattr(dsa_dp, flag, getattr(dsa_dp, flag))
+
+
 def test_apply_regions_sizes_configs(monkeypatch):
-    monkeypatch.setattr(dsa_dp, "KV_ENABLED", True)
+    _dsa_dp_layout(monkeypatch)
     groups = [
         KVCacheGroupSpec(["dsa.attn"], _mla()),
         KVCacheGroupSpec(
@@ -317,7 +325,7 @@ def test_apply_regions_sizes_configs(monkeypatch):
 
 def test_apply_regions_rejects_mixed_group(monkeypatch):
     """A group holding DSA and draft layers cannot go to the regions."""
-    monkeypatch.setattr(dsa_dp, "KV_ENABLED", True)
+    _dsa_dp_layout(monkeypatch)
     mixed = UniformTypeKVCacheSpecs.from_specs(
         {"dsa.attn": _mla(), "draft.attn": _mla(is_draft=True)}
     )
@@ -401,7 +409,7 @@ def test_store_block_id_round_trip():
         dsa_dp.region_block_ids([S], cfg, 1)
 
 
-# Prefix-hit owner choice (VLLM_K3_TP_DSA_DP_PREFIX_OWNER=1).
+# Prefix-hit owner choice (dsa_dp.PREFIX_OWNER).
 
 
 @pytest.fixture
@@ -762,3 +770,4 @@ def test_prefix_owner_ties_take_turns(prefix_owner):
         owners.append(r.dsa_owner)
         _run(sched, [r])
     assert owners == list(range(TP)) * 2
+

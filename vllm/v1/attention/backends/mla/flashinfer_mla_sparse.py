@@ -4,7 +4,6 @@
 
 import bisect
 import math
-import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -1113,9 +1112,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # SparseMLACommonImpl.forward_mqa, which reads dcp_local_topk_counts; only
     # prefill-sized calls take the specialized prefill kernel.
     dcp_decode_reads_topk_counts: ClassVar[bool] = True
-    # TP ShardQ (token-sharded DSA prefill without DCP) when VLLM_K3_TP_SHARDQ=1
-    # (config-wide env, the same on every rank).
-    supports_shardq: ClassVar[bool] = os.environ.get("VLLM_K3_TP_SHARDQ") == "1"
+    # TP ShardQ (token-sharded DSA prefill without DCP) is not used: TP layouts
+    # without DCP run DSA-DP (automatic), and the TP indexer split covers the
+    # replicated fallback.
+    supports_shardq: ClassVar[bool] = False
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
     # for query and kv_cache (mixed bf16+fp8 is not supported).

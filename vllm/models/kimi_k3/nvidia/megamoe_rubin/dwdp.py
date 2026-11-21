@@ -25,10 +25,11 @@ the copies overlap the next attention and stay off the EP dispatch/combine NVLin
 traffic. The first MoE layer stays resident. Weights are fixed after loading: EPLB is
 not supported.
 
-``VLLM_K3_DWDP=<dir>`` enables DWDP of the experts and of the non-expert weights
-(``dense_dwdp``). ``<dir>`` is shared by both engines (fresh per run); they pair and
-take engine indices through it. ``VLLM_K3_DWDP=1`` enables only the non-expert DWDP,
-inside one engine (e.g. DEP8).
+Layout config (``ParallelConfig.dwdp``, set by ``configure`` at model init):
+``dwdp="experts"`` enables DWDP of the experts and of the non-expert weights
+(``dense_dwdp``); ``dwdp_dir`` is shared by both engines (fresh per run), and they
+pair and take engine indices through it. ``dwdp="dense"`` enables only the
+non-expert DWDP, inside one engine (e.g. DEP8).
 """
 
 from __future__ import annotations
@@ -47,10 +48,24 @@ from .symm_arena import aligned
 
 logger = init_logger(__name__)
 
-_SETTING = os.environ.get("VLLM_K3_DWDP", "")
-LOCAL = _SETTING == "1"  # one engine: non-expert DWDP only
-DIR = "" if LOCAL else _SETTING
-ENABLED = bool(DIR)
+# Set by ``configure`` from ``ParallelConfig.dwdp`` / ``dwdp_dir``.
+LOCAL = False  # dwdp="dense": one engine, non-expert DWDP only
+DIR = ""  # dwdp="experts": the pairing directory
+ENABLED = False  # expert DWDP across two engines
+
+
+def configure(parallel_config) -> None:
+    """Set this process's DWDP layout from the parallel config (model init)."""
+    global LOCAL, DIR, ENABLED
+    mode = getattr(parallel_config, "dwdp", "none")
+    LOCAL = mode == "dense"
+    DIR = (parallel_config.dwdp_dir or "") if mode == "experts" else ""
+    ENABLED = bool(DIR)
+
+
+def dense_enabled() -> bool:
+    """Non-expert DWDP (``dense_dwdp``) runs: dwdp="dense" or "experts"."""
+    return ENABLED or LOCAL
 DEPTH = 2  # expert staging slots: copies start one layer ahead
 N_STREAMS = 4  # copy-engine streams
 _FABRIC = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
@@ -140,7 +155,7 @@ def storage_bytes(t: torch.Tensor) -> torch.Tensor:
 
 
 class Store:
-    """A FileStore in ``VLLM_K3_DWDP`` shared by the members of one DWDP group."""
+    """A FileStore in ``dwdp_dir`` shared by the members of one DWDP group."""
 
     def __init__(self, name: str, members: int, me: int):
         self.store = torch.distributed.FileStore(os.path.join(DIR, name), members)
@@ -234,7 +249,7 @@ class ExpertDwdp:
         from .die_local import die_sm_mask32
 
         if get_current_vllm_config().parallel_config.enable_eplb:
-            raise ValueError("Expert DWDP (VLLM_K3_DWDP) does not support EPLB.")
+            raise ValueError("Expert DWDP (dwdp=\"experts\") does not support EPLB.")
         g = get_ep_group()
         os.makedirs(DIR, exist_ok=True)
         index = None
@@ -243,7 +258,7 @@ class ExpertDwdp:
             index = engines.add("engines", 1) - 1
         self.index = g.broadcast_object(index, src=0)
         if self.index not in (0, 1):
-            raise RuntimeError(f"VLLM_K3_DWDP={DIR} is used by more than two engines.")
+            raise RuntimeError(f"dwdp_dir={DIR} is used by more than two engines.")
         self.device = torch.accelerator.current_device_index()
         # Each expert half belongs on its die when the die-local streams run.
         self.die_placed = die_sm_mask32(self.device) is not None

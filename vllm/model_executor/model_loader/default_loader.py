@@ -483,8 +483,7 @@ class DefaultModelLoader(BaseModelLoader):
         from vllm.config.kernel import KIMI_K3_MEGA_MOE
 
         if vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE:
-            env = os.environ.get("VLLM_K3_MEGAMOE_REDUNDANT")
-            physical = num_experts + (int(env) if env else (-num_experts) % ep_size)
+            physical = num_experts + (-num_experts) % ep_size
             if physical != num_experts and physical % ep_size == 0:
                 per_rank = physical // ep_size
                 self.local_expert_ids = {

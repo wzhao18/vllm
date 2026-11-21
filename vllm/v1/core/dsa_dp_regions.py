@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-card DSA KV regions for DSA-DP (``VLLM_K3_TP_DSA_DP_KV=1``).
+"""Per-card DSA KV regions for DSA-DP (``models/kimi_k3/nvidia/ops/dsa_dp.py``).
 
 Under DSA-DP (``models/kimi_k3/nvidia/ops/dsa_dp.py``) each request has one
 owner card in its TP group, and only the owner reads or writes the request's
@@ -248,6 +248,10 @@ class DSARegionPools:
         return [pool.get_usage() for pool in self.regions]
 
 
+# Shared-region pages reserved per sequence for each Mamba (KDA state) group.
+_SHARED_BLOCKS_PER_SEQ = 6
+
+
 def region_sizes(
     num_blocks_per_card: int,
     tp: int,
@@ -282,12 +286,10 @@ def apply_dsa_dp_regions(
     kv_cache_configs: list[Any],
     scheduler_kv_cache_config: Any,
 ) -> None:
-    """Engine core, ``VLLM_K3_TP_DSA_DP_KV=1``: split the per-card pages into the
+    """Engine core, DSA-DP layouts (``dsa_dp.supported``): split the per-card pages into the
     shared region and the card's DSA region, and record the split in every
     config. The scheduler's pool becomes the shared region (``num_blocks = S``);
     the workers keep ``num_blocks = S + D`` pages."""
-    import os
-
     from vllm.logger import init_logger
     from vllm.models.kimi_k3.nvidia.ops import dsa_dp
     from vllm.v1.kv_cache_interface import (
@@ -299,7 +301,7 @@ def apply_dsa_dp_regions(
 
     pc = vllm_config.parallel_config
     tp = pc.tensor_parallel_size
-    if not dsa_dp.KV_ENABLED or tp <= 1 or pc.decode_context_parallel_size > 1:
+    if not dsa_dp.configure(vllm_config) or not dsa_dp.KV_ENABLED:
         return
     # Per-layer specs: a group's merged spec drops ``is_draft``.
     layer_specs = {n: sp for specs in kv_cache_specs for n, sp in specs.items()}
@@ -328,7 +330,7 @@ def apply_dsa_dp_regions(
     if not dsa_ids:
         raise ValueError("DSA-DP KV: no DSA cache group")
     m = scheduler_kv_cache_config.num_blocks
-    per_seq = int(os.environ.get("VLLM_K3_DSADP_KV_SHARED_BLOCKS_PER_SEQ", "6"))
+    per_seq = _SHARED_BLOCKS_PER_SEQ
     reserve = vllm_config.scheduler_config.max_num_seqs * (mamba * per_seq + swa_blocks)
     s, d = region_sizes(
         m,
@@ -336,9 +338,6 @@ def apply_dsa_dp_regions(
         num_dsa_groups=len(dsa_ids),
         num_shared_token_groups=shared_tok,
         shared_reserve_blocks=reserve,
-        region_blocks_override=int(
-            os.environ.get("VLLM_K3_DSADP_KV_REGION_BLOCKS", "0")
-        ),
     )
     for cfg in (*kv_cache_configs, scheduler_kv_cache_config):
         assert cfg.num_blocks == m

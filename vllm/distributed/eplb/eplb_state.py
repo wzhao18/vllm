@@ -34,7 +34,6 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
-import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -684,39 +683,11 @@ class EplbState:
                 # all_reduce in _all_ranks_result_ready will hang
                 if not eplb_model_state.rebalanced:
                     continue
-                t0 = time.perf_counter()
-                ready = self._all_ranks_result_ready(eplb_model_state)
-                t1 = time.perf_counter()
-                layer = -1
-                if ready:
-                    pending = eplb_model_state.pending_result
-                    last = pending[-1] if isinstance(pending, list) else pending
-                    layer = last.layer_idx
+                if self._all_ranks_result_ready(eplb_model_state):
                     _move_to_workspace(
                         model_state=eplb_model_state,
                         ep_rank=ep_group.rank(),
                     )
-                if envs.VLLM_EPLB_ASYNC_TIMING:
-                    t2 = time.perf_counter()
-                    acc = eplb_model_state.__dict__.setdefault(
-                        "_async_timing", [0, 0.0, 0.0, 0.0]
-                    )
-                    acc[0] += 1
-                    acc[1] += (t1 - t0) * 1e3
-                    acc[2] += (t2 - t1) * 1e3
-                    acc[3] = max(acc[3], (t2 - t0) * 1e3)
-                    if layer == eplb_model_state.model.num_moe_layers - 1:
-                        if ep_group.rank() == 0:
-                            logger.info(
-                                "EPLB async cycle landed: %d steps, ready-check "
-                                "%.2f ms total, copy-back %.2f ms total, max "
-                                "step %.2f ms",
-                                acc[0],
-                                acc[1],
-                                acc[2],
-                                acc[3],
-                            )
-                        eplb_model_state._async_timing = [0, 0.0, 0.0, 0.0]
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
@@ -729,13 +700,7 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
-            t0 = time.perf_counter()
             self.rearrange()
-            if envs.VLLM_EPLB_ASYNC_TIMING and get_ep_group().rank_in_group == 0:
-                logger.info(
-                    "EPLB rearrange() on the step loop: %.2f ms",
-                    (time.perf_counter() - t0) * 1e3,
-                )
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -917,6 +882,9 @@ class EplbState:
                         num_nodes,
                         num_gpus,
                         eplb_model_state.physical_to_logical_map.cpu(),
+                        move_budget=self.parallel_config.eplb_config.resolved_move_budget(
+                            num_gpus
+                        ),
                     )
 
                 skip_rearrange = False

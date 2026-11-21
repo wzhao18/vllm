@@ -552,6 +552,8 @@ class EngineArgs:
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_q_replicate: bool | None = ParallelConfig.dcp_q_replicate
+    dwdp: str = ParallelConfig.dwdp
+    dwdp_dir: str | None = ParallelConfig.dwdp_dir
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int | None = None
     data_parallel_size: int = ParallelConfig.data_parallel_size
@@ -1243,6 +1245,8 @@ class EngineArgs:
             "--dcp-q-replicate",
             **parallel_kwargs["dcp_q_replicate"],
         )
+        parallel_group.add_argument("--dwdp", **parallel_kwargs["dwdp"])
+        parallel_group.add_argument("--dwdp-dir", **parallel_kwargs["dwdp_dir"])
         parallel_group.add_argument(
             "--dcp-kv-cache-interleave-size",
             **parallel_kwargs["dcp_kv_cache_interleave_size"],
@@ -2674,6 +2678,8 @@ class EngineArgs:
             decode_context_parallel_size=self.decode_context_parallel_size,
             dcp_comm_backend=self.dcp_comm_backend,
             dcp_q_replicate=self.dcp_q_replicate,
+            dwdp=self.dwdp,
+            dwdp_dir=self.dwdp_dir,
             dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
             cp_kv_cache_interleave_size=(
                 self.cp_kv_cache_interleave_size
