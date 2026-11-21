@@ -173,8 +173,6 @@ def _store_scheduler(channel: _Channel, vllm_cached_tokens: int = 16):
     sched._group_block_sizes = [16]
     sched._block_size = 16
     sched._request_trackers = {}
-    sched.num_early_loads = 0
-    sched.num_metadata_loads = 0
     sched.load_specs = {
         "r": LoadSpec(
             vllm_cached_tokens=vllm_cached_tokens,
@@ -211,7 +209,6 @@ def test_load_into_unused_blocks_is_issued_at_allocation_not_in_metadata():
     assert req_meta.load_spec is not None
     assert req_meta.load_spec.kvpool_cached_tokens == 64
     assert req_meta.block_ids == ([1, 2, 3, 4, 5],)
-    assert sched.num_early_loads == 1
     assert "r" in sched._request_trackers
     # The step's metadata no longer carries it.
     assert "r" not in sched.load_specs
@@ -232,7 +229,6 @@ def test_load_into_a_recently_freed_block_stays_in_metadata():
     sched = _store_scheduler(channel)
     sched._issue_load_early("r", _blocks(recent_index=3))
     assert channel.sent == []
-    assert sched.num_early_loads == 0
     req_meta = sched._load_only_req_meta("r")
     assert req_meta is not None and req_meta.load_spec is not None
 
@@ -240,7 +236,6 @@ def test_load_into_a_recently_freed_block_stays_in_metadata():
 def test_unconnected_channel_leaves_the_load_in_metadata():
     sched = _store_scheduler(_Channel(connected=False))
     sched._issue_load_early("r", _blocks(recent_index=None))
-    assert sched.num_early_loads == 0
     assert sched._load_only_req_meta("r") is not None
 
 

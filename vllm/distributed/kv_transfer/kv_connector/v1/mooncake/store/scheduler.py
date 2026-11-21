@@ -338,8 +338,6 @@ class MooncakeStoreScheduler:
         self._group_block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         ]
-        self.num_early_loads = 0
-        self.num_metadata_loads = 0
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -537,7 +535,7 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
-        if self._early_loads is not None:
+        if getattr(self, "_early_loads", None) is not None:
             self._issue_load_early(request.request_id, blocks)
 
     def _load_only_req_meta(self, request_id: str) -> ReqMeta | None:
@@ -585,8 +583,6 @@ class MooncakeStoreScheduler:
         if not self._early_loads.send(req_meta):
             # Worker channel not connected yet: the step's metadata carries it.
             self.load_specs[request_id] = load_spec
-            return
-        self.num_early_loads += 1
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -775,7 +771,6 @@ class MooncakeStoreScheduler:
             if request_id not in request_ids and request_id not in cached_reqs.req_ids:
                 req_meta = self._load_only_req_meta(request_id)
                 if req_meta is not None:
-                    self.num_metadata_loads += 1
                     meta.add_request(req_meta)
 
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
