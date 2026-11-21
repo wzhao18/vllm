@@ -306,9 +306,11 @@ def prepared_context(monkeypatch, rows):
     norm = SimpleNamespace(
         weight=torch.empty(HIDDEN, dtype=bf16, device="meta"), variance_epsilon=1e-6
     )
-    model = SimpleNamespace(
-        context_proj=SimpleNamespace(weight=weight), context_norm=norm
-    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    # (an unquantized BF16 linear: PreparedContext reads it through bf16_weight)
+    proj = SimpleNamespace(weight=weight, quant_method=UnquantizedLinearMethod())
+    model = SimpleNamespace(context_proj=proj, context_norm=norm)
     return context.PreparedContext(model, None, 16, 0, rows)
 
 
