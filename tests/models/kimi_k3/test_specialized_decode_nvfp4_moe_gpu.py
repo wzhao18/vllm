@@ -87,8 +87,13 @@ def dist():
 
     config = VllmConfig()
     config.kernel_config.moe_backend = "auto"  # production: moe-backend auto
-    d = _Dist(torch.device("cuda", torch.cuda.current_device()), config)
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    d = _Dist(device, config)
+    init_workspace_manager(device)
     yield d
+    reset_workspace_manager()
     d.close()
 
 
@@ -260,8 +265,14 @@ def mxfp8_shared(dev, config):
         is_checkpoint_mxfp8_serialized=True, kv_cache_quant_algo=None,
         exclude_modules=[],
     )  # fmt: skip
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
     gen = _gen(23)
-    with set_current_vllm_config(config), torch.device(dev):
+    with (
+        set_current_vllm_config(config),
+        torch.device(dev),
+        set_default_torch_dtype(torch.bfloat16),
+    ):
         mlp = KimiMLP(
             hidden_size=HIDDEN, intermediate_size=SHARED_INTER, hidden_act="situ",
             quant_config=quant, reduce_results=False,

@@ -149,7 +149,9 @@ def _stock_layer(config, rank, device):
     from vllm.models.kimi_k3.nvidia.model import KimiMoE
     from vllm.models.kimi_k3.nvidia.mxfp8 import enable_kimi_k3_mxfp8_dispatch
 
-    with torch.device(device):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    with torch.device(device), set_default_torch_dtype(torch.bfloat16):
         module = KimiMoE(
             _moe_config(), config, quant_config=_quant_config(), prefix=PREFIX,
             layer_idx=1,
