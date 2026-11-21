@@ -157,6 +157,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        row_multiple: int = 1,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -165,6 +166,8 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        # Uniform decode graphs hold a multiple of this many requests.
+        self.row_multiple = row_multiple
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
@@ -323,7 +326,9 @@ class CudaGraphManager:
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
                 for decode_query_len in decode_query_lens:
-                    rounded_num_tokens = round_up(num_tokens, decode_query_len)
+                    rounded_num_tokens = round_up(
+                        num_tokens, decode_query_len * self.row_multiple
+                    )
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
 
                     if (
@@ -411,6 +416,10 @@ class CudaGraphManager:
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
+
+    def max_graph_tokens(self, mode: CUDAGraphMode) -> int:
+        descs = self._capture_descs.get(mode, [])
+        return max((d.num_tokens for d in descs), default=0)
 
     def _capture_stream(self, desc: BatchExecutionDescriptor) -> torch.cuda.Stream:
         """Capture on the stream used by the microbatch threads."""
@@ -597,6 +606,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        row_multiple: int = 1,
     ):
         super().__init__(
             vllm_config,
@@ -606,6 +616,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            row_multiple=row_multiple,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -628,8 +639,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_hook: Callable[..., None] | None = None,
     ) -> None:
-        """Capture CUDA graphs for model forward pass."""
+        """Capture CUDA graphs for model forward pass. ``capture_hook`` sees each
+        capture batch's inputs and attention state (prepare_inputs_to_capture)."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
@@ -747,6 +760,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
+                capture_hook=capture_hook,
             )
 
             # Capture with dummy rows marked as padding.
@@ -849,6 +863,7 @@ def prepare_inputs_to_capture(
     full_cudagraph: bool,
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
+    capture_hook: Callable[..., None] | None = None,
 ) -> AttentionState:
     if full_cudagraph and max_query_len is None:
         # Mixed graphs can replay a single prefill spanning the entire batch,
@@ -918,6 +933,15 @@ def prepare_inputs_to_capture(
         kv_cache_config,
         for_capture=full_cudagraph,
     )
+    if capture_hook is not None:
+        capture_hook(
+            input_batch,
+            input_block_tables,
+            slot_mappings,
+            attn_metadata,
+            slot_mappings_by_layer,
+            full_cudagraph,
+        )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 
 

@@ -36,7 +36,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -478,6 +478,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
         self.prefill_worker = pd_prefill_worker(vllm_config)
+        text_config = vllm_config.model_config.hf_text_config
+        # MoE layers of the model: an upper bound for the die-local budget check.
+        self.num_moe_layers = getattr(text_config, "num_hidden_layers", 1)
         self.buckets, notes = select_rubin_buckets(
             self.problem,
             ep_size,
@@ -876,7 +879,9 @@ class KimiK3MegaMoEExperts(nn.Module):
                 "EP rank (see its log)."
             )
         assert weights is not None
-        if self.bucket.die_sm_mask32 is not None:
+        if self.bucket.die_sm_mask32 is not None and _die_local_fits(
+            weights, self.num_moe_layers
+        ):
             from .die_local import place_experts
 
             weights = place_experts(weights)
@@ -1152,3 +1157,33 @@ def prepare_rubin_megamoe(model: nn.Module) -> int:
             len(warmed),
         )
     return len(experts)
+
+
+_DIE_LOCAL_FITS: bool | None = None
+
+
+def _die_local_fits(weights: Any, num_moe_layers: int) -> bool:
+    """Decided once, at the first layer: whether the die-localized copies of every
+    MoE layer's experts fit in the device memory left after loading. The
+    checkpoint layouts they replace are freed into the allocator's pool, not to
+    the driver the copies come from, so placement needs the copies' bytes on top
+    of the loaded model (e.g. TP4 x EP12 of the full K3.1 does not fit, EP16 does).
+    Without room every layer keeps the default allocation."""
+    global _DIE_LOCAL_FITS
+    if _DIE_LOCAL_FITS is None:
+        layer = sum(
+            t.numel() * t.element_size()
+            for t in (*weights.fc1, *weights.fc2)
+            if isinstance(t, torch.Tensor)
+        )
+        need = layer * num_moe_layers + (8 << 30)
+        free, _ = torch.cuda.mem_get_info()
+        _DIE_LOCAL_FITS = free >= need
+        if not _DIE_LOCAL_FITS:
+            logger.warning(
+                "Rubin MegaMoE: die-local experts need %.1f GiB, %.1f GiB free "
+                "after loading; keeping the default allocation.",
+                need / 2**30,
+                free / 2**30,
+            )
+    return _DIE_LOCAL_FITS

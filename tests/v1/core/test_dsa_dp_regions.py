@@ -10,6 +10,7 @@ import functools
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -480,47 +481,28 @@ def _expected_load(sched: Scheduler) -> list[int]:
     return load
 
 
-def test_prefix_owner_same_prefix_same_owner_across_turns(prefix_owner):
-    sched = _scheduler(tp=TP)
-    a1, b1 = _turn("a1", _toks(1000, 65)), _turn("b1", _toks(5000, 65))
-    for r in (a1, b1):
-        sched.add_request(r)
-    # Empty cache: by load (a1's queued prompt sends b1 to card 1).
-    assert (a1.dsa_owner, b1.dsa_owner) == (0, 1)
-    _run(sched, [a1, b1])
-    for turn in (2, 3):
-        # The next turns arrive in the other order, without a session id: b's
-        # turn goes to card 1 although both cards are idle.
-        b = _next_turn(f"b{turn}", b1, 6000 + 100 * turn)
-        a = _next_turn(f"a{turn}", a1, 2000 + 100 * turn)
-        for r in (b, a):
-            assert r.session_id is None
-            sched.add_request(r)
-        assert (a.dsa_owner, b.dsa_owner) == (0, 1)
-        assert a.cache_salt is None and b.cache_salt is None
-        assert _hit(sched, a) >= 64 and _hit(sched, b) >= 64
-        _run(sched, [a, b])
-        a1, b1 = a, b
-
-
-def test_prefix_owner_longer_hit_beats_lower_load(prefix_owner):
+def test_prefix_owner_ignores_gpu_prefix_hits(prefix_owner):
+    """Owners are chosen by load like DEP ranks: a card holding a request's
+    prefix does not attract it (the store serves the prefix to any owner)."""
     sched = _scheduler(tp=TP)
     a1 = _turn("a1", _toks(1000, 65))
     sched.add_request(a1)
+    assert a1.dsa_owner == 0
     _run(sched, [a1])
-    # A queued prompt without a hit: idle cards, so card 0.
+    # Idle cards take turns: b on card 1, then the filler on card 0.
+    b = _turn("b", _toks(5000, 65))
+    sched.add_request(b)
+    assert b.dsa_owner == 1
+    _run(sched, [b])
     filler = _turn("filler", _toks(9000, 65))
     sched.add_request(filler)
     assert filler.dsa_owner == 0
     assert sched._dsa_load[0] > sched._dsa_load[1] == 0
-    # Card 0 holds a2's prefix: it wins over the idle card 1.
+    # Card 0 holds a2's prefix, but card 1 is less loaded.
     a2 = _next_turn("a2", a1, 2000)
     sched.add_request(a2)
-    assert a2.dsa_owner == 0
-    # No hit anywhere: the least-loaded card.
-    fresh = _turn("fresh", _toks(12000, 65))
-    sched.add_request(fresh)
-    assert fresh.dsa_owner == 1
+    assert a2.dsa_owner == 1
+    assert a2.cache_salt is None
 
 
 def test_prefix_owner_equal_hits_go_to_least_loaded(prefix_owner):
@@ -564,8 +546,7 @@ def test_prefix_owner_hashes_prompt_once(prefix_owner):
     a2 = _turn("a2", list(a1.all_token_ids) + _toks(2000, 31), hasher=hasher)
     assert hasher.calls == 1
     sched.add_request(a2)
-    # Every card's region was looked up (card 0 holds the prefix), no rehash.
-    assert a2.dsa_owner == 0
+    # Owner choice and admission reuse the request's hashes: no rehash.
     assert hasher.calls == 1
 
 
@@ -696,3 +677,88 @@ def test_mooncake_dsa_owner_from_region_block_ids(rank, monkeypatch):
         assert puts == [("kh1", [s + 3], [1], None)]
     else:
         assert puts == []
+
+
+def test_prefix_owner_spreads_decoding_requests(prefix_owner):
+    """On a decode engine every queued prompt cost is 0 once the prompts are
+    computed; new requests then go to the card with the fewest live requests
+    (decode steps pad every card to the busiest owner)."""
+    sched = _scheduler(tp=TP)
+    owners = []
+    for i in range(2 * TP):
+        params = SamplingParams(max_tokens=8)
+        params.update_from_generation_config({}, eos_token_id=100)
+        r = Request(
+            request_id=f"d{i}",
+            prompt_token_ids=_toks(1000 * (i + 1), BS),
+            sampling_params=params,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(BS, sha256),
+        )
+        sched.add_request(r)
+        _step(sched)
+        assert sched._dsa_load == [0] * TP
+        owners.append(r.dsa_owner)
+    assert owners == [0, 1, 0, 1]
+
+
+@pytest.mark.parametrize("owners", [None, [0, 1, 1, 0, 2, 3, 3, 3], [3, 3, 0]])
+def test_dep_order_segments(owners):
+    """Full-graph decode steps: card r's segment holds exactly its requests,
+    then padding requests; rows / inv are inverse permutations."""
+    tp, q, per = 4, 2, 3
+    o = None if owners is None else np.array(owners)
+    rows, reqs, inv = dsa_dp.dep_order(o, per * tp * q, tp, q)
+    assert sorted(reqs.tolist()) == list(range(per * tp))
+    assert (rows[inv] == np.arange(rows.size)).all()
+    if o is not None:
+        for r in range(tp):
+            seg = reqs[r * per : (r + 1) * per]
+            real = seg[seg < o.size]
+            assert (o[real] == r).all() and real.size == (o == r).sum()
+
+
+def test_prefix_owner_follows_prefiller_owner(prefix_owner):
+    """P/D: a request whose KV comes from a DSA-DP prefiller is owned by the card
+    paired with the prefiller's owner (only that card pulls the DSA KV), even
+    when another card is less loaded."""
+    sched = _scheduler(tp=TP)
+    busy = _turn("busy", _toks(1000, 3 * BS))
+    sched.add_request(busy)
+    assert busy.dsa_owner == 0
+    r = _turn("pd", _toks(5000, 3 * BS))
+    r.kv_transfer_params = {"remote_dsa_owner": 1, "tp_size": 4}
+    sched.add_request(r)
+    assert r.dsa_owner == 0  # rank 1 of TP4 -> rank 0 of TP2, the busy card
+
+
+def test_owner_decode_cap(prefix_owner):
+    """A card runs at most max_num_seqs / tp requests that decode locally (a DEP
+    rank's share), so a full-graph decode step fits max_num_seqs; requests that
+    decode remotely (P/D prefill) are not counted."""
+    sched = _scheduler(tp=TP, max_num_seqs=2)
+    reqs = []
+    for i in range(3):
+        r = _turn(f"c{i}", _toks(1000 * (i + 1), BS))
+        r.kv_transfer_params = {"remote_dsa_owner": 0, "tp_size": TP}
+        sched.add_request(r)
+        reqs.append(r)
+    remote = _turn("rd", _toks(9000, BS))
+    remote.kv_transfer_params = {"remote_dsa_owner": 0, "tp_size": TP,
+                                 "do_remote_decode": True}
+    sched.add_request(remote)
+    out = sched.schedule()
+    assert [r.dsa_owner for r in reqs] == [0, 0, 0]
+    assert set(out.num_scheduled_tokens) == {"c0", "rd"}
+
+
+def test_prefix_owner_ties_take_turns(prefix_owner):
+    """Idle cards (no queued DSA cost, no live requests) are used in turn."""
+    sched = _scheduler(tp=TP)
+    owners = []
+    for i in range(2 * TP):
+        r = _turn(f"t{i}", _toks(1000 + 100 * i, 65))
+        sched.add_request(r)
+        owners.append(r.dsa_owner)
+        _run(sched, [r])
+    assert owners == list(range(TP)) * 2

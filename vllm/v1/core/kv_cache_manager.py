@@ -26,8 +26,9 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
-    MambaSpec,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -971,10 +972,17 @@ class KVCacheManager:
                 continue
             assert num_computed_tokens % manager.block_size == 0
             num_blocks = num_computed_tokens // manager.block_size
-            if isinstance(group.kv_cache_spec, MambaSpec):
-                num_blocks = min(num_blocks, len(group_blocks))
-            else:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
+            if isinstance(spec, FullAttentionSpec):
                 assert num_blocks <= len(group_blocks)
+            else:
+                # Mamba: an external hit can supply the final state. Sliding
+                # window (e.g. a DSpark SWA drafter with prefix replay): the
+                # lookup may return fewer or no blocks. Truncation only drops
+                # trailing blocks, so never ask for more than the lookup gave.
+                num_blocks = min(num_blocks, len(group_blocks))
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 

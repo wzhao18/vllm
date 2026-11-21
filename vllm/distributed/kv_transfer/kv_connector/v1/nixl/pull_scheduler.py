@@ -447,6 +447,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         remote_num_tokens = 0
         blocks_expiry_time = None
         lease_deadline = None
+        dsa_dp_params: dict[str, Any] = {}
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -489,6 +490,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             block_ids = self.get_exchange_clipped_blocks(
                 block_ids, num_tokens=remote_num_tokens
             )
+            block_ids, dsa_dp_params = self.get_dsa_dp_exchange_blocks(block_ids)
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
@@ -510,4 +512,5 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_lease_deadline=lease_deadline,
             remote_lease_check=lease_deadline is not None,
             transfer_mode=self._TRANSFER_MODE,
+            **dsa_dp_params,
         )

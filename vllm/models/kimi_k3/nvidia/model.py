@@ -12,7 +12,7 @@ from torch import nn
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS, KIMI_K3_MEGA_MOE
 from vllm.distributed import (
     get_ep_group,
@@ -1647,6 +1647,11 @@ class KimiDecoderLayer(nn.Module):
                 if self._dsa_dp:
                     dsa_dp.DSA_LAYER_NAMES.add(self.self_attn.mla_attn.mla_attn.layer_name)
                     dsa_dp.DSA_LAYER_NAMES.add(self.self_attn.dsa_indexer.k_cache.prefix)
+                    self._dsa_dp_idx = dsa_dp.register_eager(
+                        self._dsa_scatter_rows
+                        if self._dsa_scatter
+                        else self._run_dsa_dp
+                    )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
             else:
@@ -1731,6 +1736,26 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
+    def _dsa_scatter_rows(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """DSA-DP under SP: owned rows in from, and out to, the sequence shards."""
+        num_rows = positions.shape[0]
+        if dsa_dp.STEP.num_tokens < 0:
+            return dsa_dp.local_rows_out(
+                self.self_attn, hidden_states, positions, num_rows
+            )
+        own_in = dsa_dp.push_in(hidden_states, num_rows)
+        own = None
+        if own_in is not None:
+            own = self.self_attn(
+                hidden_states=own_in,
+                positions=positions.index_select(0, dsa_dp.STEP.own_idx),
+            )
+        return dsa_dp.push_out(
+            own, num_rows, self.hidden_size, hidden_states.dtype, hidden_states.device
+        )
+
     def _run_dsa_dp(
         self,
         positions: torch.Tensor,
@@ -1738,6 +1763,8 @@ class KimiDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """DSA-DP: run the layer on this card's owned rows only (all heads), other
         rows zero, so the TP reduction leaves each row with its owner's output."""
+        if dsa_dp.graph_mode() == CUDAGraphMode.FULL:
+            return dsa_dp.run_segment_rows(self.self_attn, positions, hidden_states)
         num_tokens = hidden_states.shape[0]
         out = hidden_states.new_zeros((num_tokens, self.hidden_size))
         rows = dsa_dp.rows_for(num_tokens, hidden_states.device)
@@ -1906,26 +1933,18 @@ class KimiDecoderLayer(nn.Module):
 
         M = None
         if getattr(self, "_dsa_scatter", False):
-            # Owned rows only: in from, and out to, the sequence shards.
-            num_rows = positions.shape[0]
-            if dsa_dp.STEP.num_tokens >= 0:
-                own_in = dsa_dp.push_in(hidden_states, num_rows)
-                dsa_dp.rec(evs)
-                own = None
-                if own_in is not None:
-                    rows = dsa_dp.STEP.own_idx
-                    own = self.self_attn(
-                        hidden_states=own_in, positions=positions.index_select(0, rows)
-                    )
-                hidden_states = dsa_dp.push_out(
-                    own, num_rows, self.hidden_size, hidden_states.dtype,
-                    hidden_states.device,
+            dsa_dp.rec(evs)
+            mode = dsa_dp.graph_mode()
+            if mode == CUDAGraphMode.FULL:
+                hidden_states = dsa_dp.run_segment(
+                    self.self_attn, positions, hidden_states
                 )
+            elif mode == CUDAGraphMode.PIECEWISE:
+                out = torch.empty_like(hidden_states)
+                dsa_dp.run_eager(self._dsa_dp_idx, positions, hidden_states, out)
+                hidden_states = out
             else:
-                dsa_dp.rec(evs)
-                hidden_states = dsa_dp.local_rows_out(
-                    self.self_attn, hidden_states, positions, num_rows
-                )
+                hidden_states = self._dsa_scatter_rows(positions, hidden_states)
             dsa_dp.rec(evs)
             dsa_dp.rec(evs)
             hidden_states, prefix_sum, residual = self._post_attn_norm(
@@ -1966,7 +1985,14 @@ class KimiDecoderLayer(nn.Module):
             )
             M = None
         elif getattr(self, "_dsa_dp", False):
-            hidden_states = self._run_dsa_dp(positions, hidden_states)
+            if dsa_dp.graph_mode() == CUDAGraphMode.PIECEWISE:
+                out = hidden_states.new_empty(
+                    (hidden_states.shape[0], self.hidden_size)
+                )
+                dsa_dp.run_eager(self._dsa_dp_idx, positions, hidden_states, out)
+                hidden_states = out
+            else:
+                hidden_states = self._run_dsa_dp(positions, hidden_states)
         else:
             hidden_states = self._run_self_attn(
                 positions,

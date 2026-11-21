@@ -224,6 +224,8 @@ class KVCacheCoordinator(ABC):
         self.dsa_group_ids = frozenset(kv_cache_config.dsa_dp_group_ids)
         # Owner whose region could not fit the last checked allocation.
         self.dsa_region_full_owner: int | None = None
+        # DSA-DP: region blocks counted by the last get_num_blocks_to_allocate().
+        self.last_num_region_blocks = 0
         if kv_cache_config.dsa_dp_region_blocks > 0:
             self.dsa_regions = DSARegionPools(
                 self.block_pool,
@@ -328,6 +330,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
+        self.last_num_region_blocks = num_region_blocks
         if (
             check_dsa_region
             and self.dsa_regions is not None

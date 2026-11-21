@@ -461,11 +461,13 @@ class Scheduler(SchedulerInterface):
         self._dsa_load: list[int] | None = None
         # DSA-DP: running prompts whose chunk was charged at the step's start.
         self._dsa_prepaid: set[str] = set()
+        self._dsa_step_has_prompt = False
         if self.kv_cache_manager.dsa_regions is not None:
             from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
             if dsa_dp.PREFIX_OWNER and self._dsa_dp_tp():
                 self._dsa_load = [0] * self._dsa_dp_tp()
+                self._dsa_live = [0] * self._dsa_dp_tp()
                 self._dsa_admits = [0] * self._dsa_dp_tp()
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
@@ -1342,6 +1344,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
+            owner_decodes = self._dsa_owner_decodes()
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
@@ -1358,6 +1361,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    owner_decodes is not None
+                    and _decodes_here(request)
+                    and owner_decodes[getattr(request, "dsa_owner", 0)]
+                    >= owner_decodes[-1]
+                ):
+                    # DSA-DP: this owner card holds its share of max_num_seqs.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1605,6 +1618,9 @@ class Scheduler(SchedulerInterface):
                             request,
                             num_computed_tokens,
                             request_token_budget,
+                            # A chunk that ends the request is not cut back to
+                            # a Mamba block end.
+                            rem=request.num_tokens - num_computed_tokens,
                         )
                         if request_token_budget <= 0:
                             # This owner card's share of the step is full.
@@ -1641,6 +1657,12 @@ class Scheduler(SchedulerInterface):
                             <= self.max_model_len
                         ):
                             if padded_num_tokens > request_token_budget:
+                                if owner_left is not None and padded_num_tokens <= min(
+                                    token_budget, input_budget - draft_slots
+                                ):
+                                    # DSA-DP: only this owner's share is short.
+                                    skip_request(request_queue)
+                                    continue
                                 # Prefer to not schedule than schedule un-padded.
                                 break
                             num_new_tokens = padded_num_tokens
@@ -1750,6 +1772,14 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                if (
+                    load_kv_async
+                    and self.kv_cache_manager.coordinator.dsa_regions is not None
+                    and not self._dsa_region_load_fits(request)
+                ):
+                    # DSA-DP: this owner's region is spoken for.
+                    skip_request(request_queue)
+                    continue
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
@@ -1885,6 +1915,8 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
+                if owner_decodes is not None and _decodes_here(request):
+                    owner_decodes[getattr(request, "dsa_owner", 0)] += 1
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -3502,6 +3534,20 @@ class Scheduler(SchedulerInterface):
     def has_request(self, request_id: str) -> bool:
         return request_id in self.requests
 
+    def _dsa_owner_decodes(self) -> list[int] | None:
+        """DSA-DP: running requests that decode here per owner card, then the cap
+        per card, max_num_seqs / tp (a DEP rank's share). Decode steps pad every
+        card's segment to the busiest owner, and their full CUDA graphs hold at
+        most max_num_seqs requests."""
+        tp = self._dsa_dp_tp()
+        if not tp:
+            return None
+        counts = [0] * tp + [max(1, self.max_num_running_reqs // tp)]
+        for r in self.running:
+            if _decodes_here(r):
+                counts[getattr(r, "dsa_owner", 0)] += 1
+        return counts
+
     def _dsa_dp_tp(self) -> int:
         """TP size when DSA-DP is on (models/kimi_k3/nvidia/ops/dsa_dp.py), else 0."""
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
@@ -3537,7 +3583,7 @@ class Scheduler(SchedulerInterface):
         work: list[list[tuple[int, int]]] = [[] for _ in range(tp)]
         for r in itertools.chain(self.running, self.kv_holding_waiting, self.waiting):
             o = getattr(r, "dsa_owner", 0)
-            if len(work[o]) >= 24:
+            if len(work[o]) >= 24 or _loads_remote_kv(r):
                 continue
             rem = (
                 r.num_tokens_with_spec
@@ -3574,6 +3620,7 @@ class Scheduler(SchedulerInterface):
                     hi = mid
             hi = lo
         self._dsa_step_cap = hi
+        self._dsa_step_has_prompt = False
         left = [hi] * tp
         # A running prompt that yielded its owner's share last step goes first:
         # its chunk comes out of that share before any other request's.
@@ -3591,24 +3638,39 @@ class Scheduler(SchedulerInterface):
         return left
 
     def _dsa_owner_take(
-        self, owner_left: list[float], request: Request, ctx: int, num_new_tokens: int
+        self,
+        owner_left: list[float],
+        request: Request,
+        ctx: int,
+        num_new_tokens: int,
+        rem: int | None = None,
     ) -> int:
+        """Tokens (at most ``num_new_tokens``) of the request's ``rem`` remaining
+        ones (default ``num_new_tokens``) that fit its owner's share.
+
+        The shares only balance the owners: until the step holds a prompt chunk,
+        a chunk is taken whole (within the step's token budget) whatever its
+        owner's share, so the step never stalls on an estimate of the shares."""
         o = getattr(request, "dsa_owner", 0)
         if request.request_id in self._dsa_prepaid:
             return num_new_tokens
-        n = self._dsa_cut(owner_left[o], ctx, num_new_tokens, num_new_tokens)
+        rem = num_new_tokens if rem is None else rem
+        n = self._dsa_cut(owner_left[o], ctx, num_new_tokens, rem)
+        if n <= 0 and not self._dsa_step_has_prompt:
+            n = self._dsa_cut(None, ctx, num_new_tokens, rem)
         if n <= 0 and request.status == RequestStatus.RUNNING:
             request.dsa_yield_step = self.current_step
         return n
 
-    def _dsa_cut(self, left: float, ctx: int, want: int, rem: int) -> int:
+    def _dsa_cut(self, left: float | None, ctx: int, want: int, rem: int) -> int:
         """Tokens of a chunk (at most ``want`` of ``rem`` remaining) that fit an
-        owner's remaining DSA cost ``left``. Prompt chunks other than the last end
-        on Mamba blocks: a cost cut goes to the nearest block end (not the one
-        below), so an owner lands within half a block of its cap."""
+        owner's remaining DSA cost ``left`` (None: no cost bound). Prompt chunks
+        other than the last end on Mamba blocks: a cost cut goes to the nearest
+        block end (not the one below), so an owner lands within half a block of
+        its cap."""
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
-        n = min(want, dsa_dp.max_tokens_for_cost(left, ctx))
+        n = want if left is None else min(want, dsa_dp.max_tokens_for_cost(left, ctx))
         if n < want and self.need_mamba_block_aligned_split:
             bs = self.cache_config.block_size
             up = -(-(ctx + n) // bs) * bs - ctx
@@ -3624,6 +3686,8 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
+        if num_new_tokens > 0 and ctx < request.num_prompt_tokens:
+            self._dsa_step_has_prompt = True
         if request.request_id in self._dsa_prepaid:
             return
         owner_left[getattr(request, "dsa_owner", 0)] -= dsa_dp.chunk_cost(
@@ -3702,41 +3766,32 @@ class Scheduler(SchedulerInterface):
 
     def _assign_dsa_owner_by_prefix(self, request: Request, tp: int) -> None:
         """``VLLM_K3_TP_DSA_DP_PREFIX_OWNER=1`` (per-card DSA regions): DEP-like
-        owner choice. DSA KV does not depend on the card holding it and every
-        region has its own prefix map, so the hashes are not salted: the prompt
-        is hashed once (at request creation), its Mooncake keys are
-        owner-independent, and admission only does dict lookups.
-
-        The owner is the card whose region holds the longest prefix, counted from
-        min(32K, half the prompt) tokens as above. Ties, including no such hit,
-        go to the card with the least queued DSA prompt cost (``_dsa_load``). A
-        store hit is the same for every owner, so it cannot break a tie."""
-        from vllm.models.kimi_k3.nvidia.ops import dsa_dp
-
-        hits = [0] * tp
-        if self.kv_cache_manager.enable_caching:
-            max_len = max(request.num_prompt_tokens - 1, 0)
-            find = self.kv_cache_manager.coordinator.find_longest_cache_hit
-            for o in range(tp):
-                request.dsa_owner = o
-                self.kv_cache_manager.dsa_bind(request)
-                hits[o] = find(request.block_hashes, max_len)[1]
-        best = max(hits)
-        if best < min(32768, request.num_prompt_tokens // 2):
-            best = 0
+        owner choice. DSA KV does not depend on the card holding it, so the hashes
+        are not salted and Mooncake keys are owner-independent: any owner reuses a
+        prefix through the shared store. The owner is the card with the least
+        queued DSA prompt cost (``_dsa_load``), then the fewest live requests; a
+        GPU prefix hit does not pull a request onto a card (AgentX sessions share
+        prefixes, which would pile them onto one card)."""
+        params = request.kv_transfer_params or {}
+        remote = params.get("remote_dsa_owner")
         load = self._dsa_load
         assert load is not None
-        owner = min(
-            (o for o in range(tp) if hits[o] >= best),
-            key=lambda o: (load[o], -hits[o]),
-        )
-        dsa_dp.count_admission(best > 0)
+        # Live requests break ties: on a decode engine (P/D) every prompt cost is
+        # 0 once its KV is loaded, and decode steps pad every card to the busiest
+        # owner's request count.
+        live = self._dsa_live
+        if remote is not None:
+            # P/D: only the card paired with the prefiller's owner pulls its DSA KV.
+            owner = int(remote) * tp // int(params.get("tp_size", tp))
+        else:
+            # Equal cards (e.g. an idle prefiller) take turns, not card 0 first.
+            start = sum(self._dsa_admits)
+            owner = min(range(tp), key=lambda o: (load[o], live[o], (o - start) % tp))
         admits = self._dsa_admits
         admits[owner] += 1
         if sum(admits) % 500 == 0:
             logger.info(
-                "DSA-DP prefix owner: admissions per card %s, queued DSA cost "
-                "per card %s",
+                "DSA-DP owner: admissions per card %s, queued DSA cost per card %s",
                 admits,
                 load,
             )
@@ -3760,6 +3815,10 @@ class Scheduler(SchedulerInterface):
             assert self._dsa_load is not None
             self._dsa_load[request.dsa_owner] += cost - old
             request.dsa_load = cost
+        live = 0 if request.is_finished() else 1
+        if live != getattr(request, "dsa_live", 0):
+            self._dsa_live[request.dsa_owner] += live - getattr(request, "dsa_live", 0)
+            request.dsa_live = live
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -4279,6 +4338,21 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
+    def _dsa_region_load_fits(self, request: Request) -> bool:
+        """DSA-DP: whether ``request``'s owner region holds its whole sequence on
+        top of what the owner's in-flight loads still need. An async load that
+        is admitted into a region it cannot finish in would hold its blocks
+        while waiting for blocks that only another (equally stuck) load frees."""
+        coordinator = self.kv_cache_manager.coordinator
+        regions = coordinator.dsa_regions
+        owner = getattr(request, "dsa_owner", 0)
+        need = 0
+        for req in itertools.chain((request,), self._inflight_prefills):
+            if req is request or getattr(req, "dsa_owner", 0) == owner:
+                self._request_remaining_blocks(req)
+                need += coordinator.last_num_region_blocks
+        return need <= regions.get_num_free_blocks_of(owner)
+
     def _inflight_prefill_reserved_blocks(self) -> int:
         """Num blocks in-flight prefills still need to finish (their reservation)."""
         return sum(
@@ -4643,3 +4717,16 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+def _loads_remote_kv(request: Request) -> bool:
+    """Whether the request's prompt KV is (to be) loaded, not computed, here."""
+    return request.status == RequestStatus.WAITING_FOR_REMOTE_KVS or (
+        request.num_computed_tokens == 0
+        and bool((request.kv_transfer_params or {}).get("do_remote_prefill"))
+    )
+
+
+def _decodes_here(request: Request) -> bool:
+    """Whether the request's decode runs on this engine (not P/D remote decode)."""
+    return not (request.kv_transfer_params or {}).get("do_remote_decode")

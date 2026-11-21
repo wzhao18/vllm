@@ -369,6 +369,9 @@ class NixlBaseConnectorWorker:
     # written, and requests D read before that, whose send is held back.
     _fingerprint_decided: set[ReqId]
     _fingerprint_held: set[ReqId]
+    # DSA-DP (vllm/v1/core/dsa_dp_regions.py): transfer groups held in per-card
+    # regions, of which this card backs only its own.
+    _dsa_dp_groups: tuple[int, ...] = ()
 
     def _compute_desc_ids(
         self,
@@ -922,6 +925,10 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.dsa_dp_region_blocks > 0:
+            from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+            self._dsa_dp_groups = dsa_dp.transfer_group_ids(kv_cache_config)
         transfer_block_sizes = [
             group.kv_cache_spec.block_size
             for group in kv_cache_config.transfer_groups
@@ -4566,7 +4573,8 @@ class NixlBaseConnectorWorker:
         with gpu_sync_allowed():
             for req_id, meta in metadata.reqs_to_save.items():
                 meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                    meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+                    self._dsa_dp_local_block_ids(meta.local_block_ids),
+                    self._physical_blocks_per_logical_kv_block,
                 )
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -5078,10 +5086,18 @@ class NixlBaseConnectorWorker:
                         )
                         continue
                     for group, views in self._fingerprint_views:
+                        block_ids = req.block_ids[group]
+                        if (
+                            self._dsa_dp_groups
+                            and group in self.kv_cache_config.dsa_dp_group_ids
+                        ):
+                            block_ids = self._dsa_dp_card_pages(block_ids)
+                            if not block_ids:
+                                continue
                         log.log_request(
                             req.req_id,
                             views,
-                            req.block_ids[group][req.first_block :],
+                            block_ids[req.first_block :],
                             req.num_tokens,
                             first_block=req.first_block,
                             extra={"group": group, "local_req": local_id},
@@ -5370,11 +5386,15 @@ class NixlBaseConnectorWorker:
         expired = [
             req_id for req_id, expires in self._reqs_to_send.items() if now >= expires
         ]
+        if not expired:
+            return
+        unretrieved = 0
         for req_id in expired:
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.expected_consumer_notifications_by_req.pop(req_id, None)
             self.xfer_stats.record_kv_expired_req()
-            logger.warning(
+            unretrieved += count == 0
+            logger.debug(
                 "Releasing expired KV blocks for request %s which were "
                 "retrieved by %d remote worker(s) before lease expired.",
                 req_id,
@@ -5383,6 +5403,14 @@ class NixlBaseConnectorWorker:
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
+        # One line per pass: a burst of expiries otherwise logs a line per
+        # request on every worker, and a blocked log write stalls the step.
+        logger.warning(
+            "Released expired KV blocks of %d request(s) (%d not retrieved by "
+            "any remote worker) before their leases expired.",
+            len(expired),
+            unretrieved,
+        )
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
@@ -5757,6 +5785,25 @@ class NixlBaseConnectorWorker:
         remote_block_size = self.block_size // block_size_ratio
         first_remote = last_token // remote_block_size - num_remote_blocks + 1
         return first_remote - first_local * block_size_ratio
+
+    def _dsa_dp_card_pages(self, block_ids: list[int]) -> list[int]:
+        """DSA-DP: a DSA group's region ids as this card's pages, or none when
+        another card owns the request."""
+        from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+        cfg = self.kv_cache_config
+        if dsa_dp.region_owner(block_ids, cfg) not in (None, self.tp_rank):
+            return []
+        return dsa_dp.region_block_ids(block_ids, cfg, self.tp_rank)
+
+    def _dsa_dp_local_block_ids(self, block_ids: BlockIds) -> BlockIds:
+        """Transfer-group block ids with the DSA-DP groups as this card's pages."""
+        if not self._dsa_dp_groups or not block_ids:
+            return block_ids
+        return [
+            self._dsa_dp_card_pages(ids) if g in self._dsa_dp_groups else ids
+            for g, ids in enumerate(block_ids)
+        ]
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds, ratio: int) -> BlockIds:
         """Convert block ids to kernel physical block ids.

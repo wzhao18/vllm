@@ -104,7 +104,23 @@ def _place(storage: torch.Tensor, split: int) -> torch.Tensor | None:
     nbytes = storage.numel() * storage.element_size()
     split_byte = nbytes // experts * split
     domains = chunk_domains(nbytes, split_byte)
-    raw = dies.localized_empty(nbytes, domains, storage.device)
+    raw = None
+    for attempt in range(2):
+        try:
+            raw = dies.localized_empty(nbytes, domains, storage.device)
+            break
+        except RuntimeError as e:
+            if "OUT_OF_MEMORY" not in str(e):
+                raise
+            # Driver allocations cannot use memory torch's caching allocator
+            # holds (e.g. the checkpoint layouts of layers placed before).
+            torch.accelerator.empty_cache()
+    if raw is None:
+        logger.warning(
+            "Rubin MegaMoE: no device memory for a die-localized copy of %d "
+            "bytes; default allocation kept for this tensor.", nbytes,
+        )  # fmt: skip
+        return None
     copy = raw.view(storage.dtype).view(storage.shape)
     copy.copy_(storage)
     chunks = len(domains)

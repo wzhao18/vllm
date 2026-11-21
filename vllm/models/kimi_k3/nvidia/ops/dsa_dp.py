@@ -30,10 +30,14 @@ from __future__ import annotations
 import dataclasses
 import os
 import zlib
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 import torch
+
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.triton_utils import tl, triton
 
 ENABLED = os.environ.get("VLLM_K3_TP_DSA_DP", "0") == "1"
 # Phase 2: per-card DSA KV (v1/core/dsa_dp_regions.py). The DSA groups' blocks of
@@ -262,6 +266,11 @@ class StepState:
     in_key: Any = None
     in_src: torch.Tensor | None = None
     in_dst: torch.Tensor | None = None
+    # CUDA graph mode the DSA layers run under (runner per step, or graph capture):
+    # FULL = DEP_PERM segments (run_segment), PIECEWISE = an eager break (run_eager).
+    graph: Any = None
+    # Graph capture: run_eager skips its work (capture-time outputs are unused).
+    capturing: bool = False
 
 
 STEP = StepState()
@@ -274,6 +283,43 @@ def _tp() -> tuple[int, int]:
     )
 
     return get_tensor_model_parallel_world_size(), get_tensor_model_parallel_rank()
+
+
+def graph_mode() -> Any:
+    """CUDA graph mode the DSA layers run under this forward (STEP.graph)."""
+    from vllm.config import CUDAGraphMode
+
+    return STEP.graph or CUDAGraphMode.NONE
+
+
+# The DSA layers' owned-row forwards (decoder layers register them). Their row
+# counts differ per card and step, so a piecewise graph runs them as eager breaks.
+_EAGER: list[Any] = []
+
+
+def register_eager(fn: Any) -> int:
+    _EAGER.append(fn)
+    return len(_EAGER) - 1
+
+
+@eager_break_during_capture
+def run_eager(
+    idx: int, positions: torch.Tensor, hidden_states: torch.Tensor, out: torch.Tensor
+) -> None:
+    if STEP.capturing:
+        out.zero_()
+        return
+    out.copy_(_EAGER[idx](positions, hidden_states))
+
+
+def owners_of(req_ids: list[str]) -> np.ndarray:
+    """Owner card of each request (the scheduler's; a hash for one it did not
+    set), identical on every card."""
+    tp = _tp()[0]
+    return np.array(
+        [REQ_OWNER[r] if r in REQ_OWNER else owner_of(r, tp) for r in req_ids],
+        dtype=np.int64,
+    )
 
 
 def fallback_rows(num_tokens: int, device: torch.device) -> torch.Tensor | None:
@@ -313,6 +359,34 @@ def _sub(x: Any, idx: np.ndarray) -> Any:
     raise TypeError(type(x))
 
 
+class _OwnedBuffers:
+    """Persistent device inputs of this card's owned requests (a DEP rank's batch
+    buffers): CUDA graphs read the DSA metadata built on them in place."""
+
+    def __init__(self) -> None:
+        self.bufs: dict[Any, torch.Tensor] = {}
+        self.rows = 0  # the runner's max tokens / requests per step, plus one
+
+    def fill(self, key: Any, src: torch.Tensor, n: int, pad: int) -> torch.Tensor:
+        """``src`` then ``pad`` up to ``n`` rows, as a view of the persistent buffer
+        ``key``."""
+        buf = self.bufs.get(key)
+        if buf is None:
+            device = src.device if src.is_cuda else torch.device("cuda")
+            buf = torch.empty(
+                (self.rows, *src.shape[1:]), dtype=src.dtype, device=device
+            )
+            self.bufs[key] = buf
+        assert n <= buf.shape[0], (key, n, buf.shape)
+        m = src.shape[0]
+        buf[:m].copy_(src, non_blocking=True)
+        buf[m:n].fill_(pad)
+        return buf[:n]
+
+
+OWNED = _OwnedBuffers()
+
+
 def prepare_step(
     runner: Any,
     input_batch: Any,
@@ -321,9 +395,17 @@ def prepare_step(
     attn_groups: list[list[Any]],
     attn_metadata: dict[str, Any] | None,
     slot_mappings_by_layer: dict[str, torch.Tensor] | None,
+    pad_reqs: int = 0,
+    owners: np.ndarray | None = None,
+    capture: bool = False,
 ) -> None:
     """Restrict this step's DSA metadata and slot mappings to the owned requests and
-    record the owned rows. Called on every TP rank with identical inputs."""
+    record the owned rows. Called on every TP rank with identical inputs.
+
+    Like a DEP rank's batch, the owned requests' inputs live in persistent buffers
+    (OWNED) and the regular metadata builders build on them. A full-graph decode
+    step pads them to ``pad_reqs`` requests (its DEP_PERM segment); ``capture``
+    builds that step's capture metadata."""
     from vllm.v1.worker.gpu.attn_utils import (
         build_attn_metadata,
         build_slot_mappings_by_layer,
@@ -331,6 +413,8 @@ def prepare_step(
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
 
     tp, rank = _tp()
+    if not OWNED.rows:
+        OWNED.rows = max(runner.max_num_tokens, runner.max_num_reqs) + 1
     if PROF:
         import time
 
@@ -351,10 +435,8 @@ def prepare_step(
         # collectives of their own, so ranks stay in lockstep) and output zeros.
         STEP.num_tokens = 0
         return
-    owners = np.array(
-        [REQ_OWNER.get(r, i % tp) for i, r in enumerate(input_batch.req_ids[:n])],
-        dtype=np.int64,
-    )
+    if owners is None:
+        owners = owners_of(input_batch.req_ids[:n])
     reqs = np.nonzero(owners == rank)[0]
     qsl = input_batch.query_start_loc_np[: n + 1].astype(np.int64)
     if SCATTER_IN:
@@ -404,10 +486,11 @@ def prepare_step(
     lens = qsl[reqs + 1] - qsl[reqs]
     if PROF:
         P.own_tok, P.own_cost = 0, 0.0
-    if reqs.size == 0 or lens.sum() == 0:
+    if not pad_reqs and (reqs.size == 0 or lens.sum() == 0):
         # Nothing owned: the DSA layers skip their work on this card.
         return
-    tok = np.concatenate([np.arange(qsl[r], qsl[r + 1]) for r in reqs])
+    tok = np.concatenate([np.arange(qsl[r], qsl[r + 1]) for r in reqs] or [[]])
+    tok = tok.astype(np.int64)
     new_qsl = np.zeros(reqs.size + 1, dtype=np.int32)
     np.cumsum(lens, out=new_qsl[1:])
     own_tok = _h2d(tok, device)
@@ -459,31 +542,54 @@ def prepare_step(
         sub_block_tables, sub_slots = localize_tables(
             sub_block_tables, sub_slots, kv_cfg, rank
         )
-    is_prefilling = torch.from_numpy(sub.is_prefilling_np.copy())
+    # Requests / tokens the metadata covers: the owned ones, then (full-graph
+    # decode) padding requests of q tokens attending to themselves only
+    # (seq_len q on the null block, no writes), as a padded DEP batch.
+    nr = pad_reqs or int(reqs.size)
+    q = DEP_PERM.q
+    qsl_np = np.zeros(nr + 1, dtype=np.int32)
+    qsl_np[: reqs.size + 1] = new_qsl
+    if pad_reqs:
+        qsl_np[reqs.size + 1 :] = n_own_tok + q * np.arange(1, nr - reqs.size + 1)
+    nt = int(qsl_np[-1])
+    dsa = [i for i, gs in enumerate(groups) if gs]
+    qsl_dev = OWNED.fill("qsl", torch.from_numpy(qsl_np).pin_memory(), nr + 1, 0)
+    seq_lens = OWNED.fill("seq_lens", sub.seq_lens, nr, q)
+    positions = OWNED.fill("positions", sub.positions, nt, 0)
+    tables = list(sub_block_tables)
+    slots = list(sub_slots)
+    for g in dsa:
+        tables[g] = OWNED.fill(("bt", g), tables[g], nr, 0)
+        slots[g] = OWNED.fill(("slots", g), slots[g], nt, -1)
+    is_prefilling = torch.zeros(nr, dtype=torch.bool)
+    is_prefilling[: reqs.size] = torch.from_numpy(sub.is_prefilling_np.copy())
     if sub.prefill_runs_as_decode_np is not None:
-        is_prefilling &= ~torch.from_numpy(sub.prefill_runs_as_decode_np.copy())
-    seq_ub = sub.seq_lens_cpu_upper_bound
+        is_prefilling[: reqs.size] &= ~torch.from_numpy(
+            sub.prefill_runs_as_decode_np.copy()
+        )
+    seq_ub = torch.full((nr,), q, dtype=sub.seq_lens_cpu_upper_bound.dtype)
+    seq_ub[: reqs.size] = sub.seq_lens_cpu_upper_bound
     if PROF:
         _t1 = time.perf_counter()
     md = build_attn_metadata(
         attn_groups=groups,
-        num_reqs=sub.num_reqs,
-        num_tokens=n_own_tok,
-        query_start_loc_gpu=sub.query_start_loc,
-        query_start_loc_cpu=torch.from_numpy(new_qsl),
-        max_query_len=int(lens.max()),
-        seq_lens=sub.seq_lens,
-        max_seq_len=int(seq_ub.max().item()),
-        block_tables=sub_block_tables,
-        slot_mappings=sub_slots,
+        num_reqs=nr,
+        num_tokens=nt,
+        query_start_loc_gpu=qsl_dev,
+        query_start_loc_cpu=torch.from_numpy(qsl_np),
+        max_query_len=q if pad_reqs else int(lens.max()),
+        seq_lens=seq_lens,
+        max_seq_len=max(1, int(seq_ub.max().item())),
+        block_tables=tuple(tables),
+        slot_mappings=tuple(slots),
         kv_cache_config=runner.kv_cache_config,
         seq_lens_cpu_upper_bound=seq_ub,
         dcp_local_seq_lens=sub.dcp_local_seq_lens,
-        positions=sub.positions,
+        positions=positions,
         model_specific_attn_metadata=MambaHybridAttnMetadata(
             is_prefilling=is_prefilling
         ),
-        rswa_prefix_lens=sub.prompt_lens,
+        for_cudagraph_capture=capture,
     )
     if PROF:
         _t2 = time.perf_counter()
@@ -493,7 +599,7 @@ def prepare_step(
         if name in md:
             attn_metadata[name] = md[name]
     if slot_mappings_by_layer is not None:
-        sm = build_slot_mappings_by_layer(sub_slots, runner.kv_cache_config, groups)
+        sm = build_slot_mappings_by_layer(slots, runner.kv_cache_config, groups)
         for name in DSA_LAYER_NAMES:
             if name in sm:
                 slot_mappings_by_layer[name] = sm[name]
@@ -701,6 +807,22 @@ def region_block_ids(
     return out
 
 
+def region_owner(block_ids: Iterable[int], kv_cfg: Any) -> int | None:
+    """Owner card of a request's DSA block ids (their region), or None if they
+    hold no region id."""
+    s, d = kv_cfg.dsa_dp_shared_blocks, kv_cfg.dsa_dp_region_blocks
+    return next(((b - s) // d for b in block_ids if b >= s), None)
+
+
+def transfer_group_ids(kv_cfg: Any) -> tuple[int, ...]:
+    """Positions of the DSA groups among the KV transfer groups (connectors)."""
+    return tuple(
+        i
+        for i, g in enumerate(kv_cfg.transfer_group_ids)
+        if g in kv_cfg.dsa_dp_group_ids
+    )
+
+
 def local_block_copies(copies: list[Any], kv_cfg: Any, rank: int) -> list[Any]:
     """Block copies on this card's pages; copies within another card's region
     are dropped."""
@@ -761,3 +883,262 @@ def _check_dsa_groups(kv_cfg: Any) -> None:
                 f"{sorted(names - allowed)[:4]}"
             )
     _CHECKED.append(1)
+
+
+# Full-graph decode steps. prepare_step's owned row counts vary per card and step,
+# which a CUDA graph cannot replay. A decode step under a full graph runs in the DEP
+# row order instead: card r takes the r-th 1/tp segment of the step's requests,
+# holding its own requests and then padding requests (the model runner pads the
+# batch so that every owner fits, and orders it by owner so that under SP a card's
+# sequence shard is mostly its own segment). The order lives in persistent device
+# buffers refreshed before each replay; the DSA metadata is cut to the segment on
+# the device.
+
+
+def dep_order(
+    owners: np.ndarray | None, num_tokens: int, tp: int, q: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, reqs, inv) of a DEP-ordered step of ``num_tokens`` rows: card r's
+    segment holds its requests (``owners``: owner of each real request in batch
+    order; None: identity), then padding requests, which follow the real ones."""
+    per = num_tokens // (tp * q)
+    assert num_tokens == per * tp * q, (num_tokens, tp, q)
+    if owners is None or owners.size == 0:
+        reqs = np.arange(per * tp)
+    else:
+        counts = np.bincount(owners, minlength=tp)
+        assert counts.max() <= per, (counts, per)
+        reqs = np.empty(per * tp, dtype=np.int64)
+        pad = owners.size
+        for r in range(tp):
+            own = np.flatnonzero(owners == r)
+            fill = per - own.size
+            reqs[r * per : r * per + own.size] = own
+            reqs[r * per + own.size : (r + 1) * per] = np.arange(pad, pad + fill)
+            pad += fill
+    rows = (reqs[:, None] * q + np.arange(q)).reshape(-1)
+    inv = np.empty_like(rows)
+    inv[rows] = np.arange(rows.size)
+    return rows, reqs, inv
+
+
+class DepPerm:
+    """The DEP row order of the current full-graph decode step: the batch rows
+    (``rows``) and requests (``reqs``) of every card's segment, card by card, and
+    the segment position of every batch row (``inv``)."""
+
+    def __init__(self) -> None:
+        self.buf: torch.Tensor | None = None
+        self.q = 0
+        self.host: list[torch.Tensor] = []
+        self.events: list[torch.Event] = []
+        self.turn = 0
+
+    def ensure(self, capacity: int, q: int, device: torch.device) -> None:
+        if self.buf is not None:
+            return
+        ident = torch.arange(capacity, dtype=torch.int64).repeat(3)
+        self.buf = ident.to(device)
+        self.q = q
+        self.host = [ident.clone().pin_memory() for _ in range(2)]
+        self.events = [torch.Event(), torch.Event()]
+
+    def reset(self) -> None:
+        """Identity order (graph capture)."""
+        assert self.buf is not None
+        self.buf.copy_(torch.arange(self.capacity, device=self.buf.device).repeat(3))
+
+    @property
+    def capacity(self) -> int:
+        assert self.buf is not None, "DepPerm.ensure() was not called"
+        return self.buf.shape[0] // 3
+
+    def segment(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(rows, reqs) of this card's segment of a step of ``num_tokens`` rows."""
+        assert self.buf is not None
+        tp, rank = _tp()
+        c, per_tok = self.capacity, num_tokens // tp
+        per_req = per_tok // self.q
+        rows = self.buf[rank * per_tok : (rank + 1) * per_tok]
+        reqs = self.buf[c + rank * per_req : c + (rank + 1) * per_req]
+        return rows, reqs
+
+    def inv(self, lo: int, hi: int) -> torch.Tensor:
+        """Segment positions of the batch rows ``[lo, hi)``."""
+        assert self.buf is not None
+        return self.buf[2 * self.capacity + lo : 2 * self.capacity + hi]
+
+    def set(self, owners: np.ndarray | None, num_tokens: int) -> None:
+        """``owners``: the owner card of each real request in batch order (None: a
+        dummy step, identity order). Padding requests follow the real ones."""
+        assert self.buf is not None
+        tp, q, c = _tp()[0], self.q, self.capacity
+        assert num_tokens <= c
+        rows, reqs, inv = dep_order(owners, num_tokens, tp, q)
+        i = self.turn = self.turn ^ 1
+        self.events[i].synchronize()
+        h = self.host[i]
+        h[:num_tokens].copy_(torch.from_numpy(rows))
+        h[c : c + reqs.size].copy_(torch.from_numpy(reqs))
+        h[2 * c : 2 * c + num_tokens].copy_(torch.from_numpy(inv))
+        self.buf.copy_(h, non_blocking=True)
+        self.events[i].record()
+
+
+DEP_PERM = DepPerm()
+
+
+def dep_min_tokens(owners: np.ndarray, q: int) -> int:
+    """Rows of the smallest DEP-ordered decode step that fits ``owners``."""
+    tp = _tp()[0]
+    most = int(np.bincount(owners, minlength=tp).max()) if owners.size else 1
+    return tp * q * max(most, 1)
+
+
+def _dep_exchange(
+    positions: torch.Tensor, hidden: int, dtype: torch.dtype, device: torch.device
+) -> tuple[Any, ...]:
+    """SP exchange buffers and plan of a full-graph decode step, once per forward:
+    every card pushes its sequence shard's rows to their segment positions on
+    their owner (``in``), and the owner pushes its segment's outputs back to the
+    shards (``out``). Rows already on their card stay local. Also the segment's
+    positions."""
+    from vllm.distributed import get_tp_group
+    from vllm.forward_context import get_forward_context
+    from vllm.v1.attention.ops import shardq
+
+    num_rows = positions.shape[0]
+    cache = get_forward_context().__dict__.setdefault("_dsa_dep", {})
+    key = (num_rows, hidden, dtype)
+    if key not in cache:
+        tp, rank = _tp()
+        group = get_tp_group().device_group
+        shard = num_rows // tp
+        row_bytes = hidden * dtype.itemsize
+        buf_in = shardq._symm_buffer(
+            group, "dsadp_dep_in", shard * hidden, dtype, device
+        )
+        buf_out = shardq._symm_buffer(
+            group, "dsadp_dep_out", shard * hidden, dtype, device
+        )
+        src = torch.arange(shard, device=device, dtype=torch.int64) * hidden
+        pos = DEP_PERM.inv(rank * shard, (rank + 1) * shard)
+        rows, _ = DEP_PERM.segment(num_rows)
+        cache[key] = (
+            shard,
+            src,
+            buf_in,
+            buf_in.peer_ptrs[pos // shard] + (pos % shard) * row_bytes,
+            buf_out,
+            buf_out.peer_ptrs[rows // shard] + (rows % shard) * row_bytes,
+            positions.index_select(0, rows),
+        )
+    return cache[key]
+
+
+# Lamport exchange: a buffer slot holds the sentinel (the bit pattern of -0.0)
+# until its row arrives, so a receiver waits on the data itself and no barrier is
+# needed. Pushes write -0.0 as +0.0. The receiver copies its rows out and resets
+# the slots; a peer's next push into them comes a DSA layer later, after the MoE
+# and KDA collectives in between.
+_SENTINEL = -32768  # int16 view of bf16 -0.0
+_LAMPORT_READY: set[int] = set()
+
+
+@triton.jit
+def _lamport_push_kernel(src, src_offsets, dst_addresses, width, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < width
+    source = tl.load(src_offsets + row)
+    dst = tl.load(dst_addresses + row).to(tl.pointer_type(tl.int16))
+    x = tl.load(src + source + col, mask=mask)
+    x = tl.where(x == -32768, tl.zeros_like(x), x)
+    tl.store(dst + col, x, mask=mask)
+
+
+@triton.jit
+def _lamport_recv_kernel(buf, out, numel, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    x = tl.load(buf + offs, mask=mask, other=0, volatile=True)
+    pending = (x == -32768) & mask
+    while tl.max(pending.to(tl.int32), 0) > 0:
+        x = tl.where(
+            pending, tl.load(buf + offs, mask=pending, other=0, volatile=True), x
+        )
+        pending = (x == -32768) & mask
+    tl.store(out + offs, x, mask=mask)
+    tl.store(buf + offs, tl.full([BLOCK], -32768, tl.int16), mask=mask)
+
+
+def _lamport_buffer(buf: Any) -> torch.Tensor:
+    """int16 view of a symmetric exchange buffer, filled with the sentinel on
+    first use (with one barrier, so no peer pushes into it before)."""
+    view = buf.storage.view(torch.int16)
+    if buf.storage.data_ptr() not in _LAMPORT_READY:
+        view.fill_(_SENTINEL)
+        torch.accelerator.synchronize()
+        buf.handle.barrier()
+        _LAMPORT_READY.add(buf.storage.data_ptr())
+    return view
+
+
+def _lamport_exchange(
+    src: torch.Tensor,
+    src_offsets: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    buf: Any,
+    rows: int,
+) -> torch.Tensor:
+    """Push ``src``'s rows to ``dst_addresses`` and return this card's ``rows``
+    rows of ``buf`` once all have arrived."""
+    width = src.shape[1]
+    view = _lamport_buffer(buf)
+    block = 1024
+    _lamport_push_kernel[(src.shape[0], triton.cdiv(width, block))](
+        src.contiguous().view(torch.int16),
+        src_offsets,
+        dst_addresses,
+        width,
+        BLOCK=block,
+    )
+    out = torch.empty((rows, width), dtype=src.dtype, device=src.device)
+    numel = rows * width
+    _lamport_recv_kernel[(triton.cdiv(numel, block),)](
+        view, out.view(torch.int16), numel, BLOCK=block
+    )
+    return out
+
+
+def run_segment_rows(
+    attn: Any, positions: torch.Tensor, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """run_segment without SP: every card holds all rows; this card's DEP_PERM
+    segment goes through ``attn``, other rows are zero (for the TP all-reduce)."""
+    rows, _ = DEP_PERM.segment(positions.shape[0])
+    own = attn(
+        hidden_states=hidden_states.index_select(0, rows),
+        positions=positions.index_select(0, rows),
+    )
+    out = hidden_states.new_zeros((positions.shape[0], own.shape[1]))
+    return out.index_copy_(0, rows, own)
+
+
+def run_segment(
+    attn: Any, positions: torch.Tensor, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """The DSA layer ``attn`` (all heads) on this card's DEP_PERM segment of a
+    full-graph decode step under SP, as a DEP rank runs its batch: the owned
+    (and padding) requests' metadata is prepare_step's. ``hidden_states`` and the
+    result are this card's sequence shard."""
+    n = positions.shape[0]
+    hidden = hidden_states.shape[1]
+    assert hidden_states.dtype.itemsize == 2, hidden_states.dtype
+    shard, src, buf_in, in_dst, buf_out, out_dst, seg_pos = _dep_exchange(
+        positions, hidden, hidden_states.dtype, hidden_states.device
+    )
+    assert hidden_states.shape[0] == shard, (hidden_states.shape, n)
+    seg = _lamport_exchange(hidden_states, src, in_dst, buf_in, shard)
+    own = attn(hidden_states=seg, positions=seg_pos)
+    return _lamport_exchange(own, src, out_dst, buf_out, shard)
