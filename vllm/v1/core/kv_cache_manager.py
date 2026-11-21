@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,

@@ -1128,6 +1128,31 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        """Cache the full window blocks (``_cache_window_blocks``), then, when
+        the group's blocks are coarser than the hash block, the partial tail
+        block (fine-grained hits for sliding-window groups). Groups caching tails
+        at state boundaries (the release drafter's hit-unit blocks) keep their
+        own boundary-aligned tails only."""
+        self._cache_window_blocks(
+            request,
+            num_tokens,
+            retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
+        if (
+            not self.tails_at_state_boundaries
+            and self.block_size != self.block_pool.hash_block_size
+        ):
+            self._cache_partial_tail_block(request, num_tokens)
+
+    def _cache_window_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
         """With ``tails_at_state_boundaries``, cache the window tail ending at
         each boundary a hit can resume at: ``replay_boundaries`` (with the
         state boundaries the coordinator adds), the shared-prefix junction and
@@ -1372,23 +1397,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 if (hit := hit_at(match)) is not None:
                     return hit
         return tuple([] for _ in kv_cache_group_ids), 0
-
-    def cache_blocks(
-        self,
-        request: Request,
-        num_tokens: int,
-        retention_interval: int | None = None,
-        *,
-        replay_boundaries: Sequence[int],
-    ) -> None:
-        super().cache_blocks(
-            request,
-            num_tokens,
-            retention_interval=retention_interval,
-            replay_boundaries=replay_boundaries,
-        )
-        if self.block_size != self.block_pool.hash_block_size:
-            self._cache_partial_tail_block(request, num_tokens)
 
     @classmethod
     def reachable_block_mask(
