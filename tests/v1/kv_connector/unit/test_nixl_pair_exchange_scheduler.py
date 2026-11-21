@@ -213,11 +213,14 @@ class _Engine:
     metadata of each schedule() call emits, and the call promoting each request
     out of WAITING_FOR_REMOTE_KVS."""
 
-    def __init__(self, scheduler: Scheduler):
+    def __init__(self, scheduler: Scheduler, defer: bool = False):
         assert scheduler.connector is not None
         self.scheduler = scheduler
         self.nixl = scheduler.connector.connector_scheduler
         assert isinstance(self.nixl, NixlPullConnectorScheduler)
+        # Deferred admission (DSTEP) is on when one host holds the DCP group;
+        # TP16/DCP16 here spans hosts, so tests opt in explicitly.
+        self.nixl._pair_defer = defer
         self.requests: dict[str, Request] = {}
         self.emitted: list[dict[str, list[PairUnit]]] = []
         self.promoted: dict[str, int] = {}
@@ -275,6 +278,8 @@ class _Engine:
     def assert_idle(self) -> None:
         assert not self.nixl._pair_plans
         assert not self.nixl._pair_ready
+        assert not self.nixl._pair_hidden
+        assert not self.nixl._pair_release
 
 
 @pytest.mark.parametrize("num_p_blocks", [5, 6], ids=["odd_P_blocks", "even_P_blocks"])
@@ -444,11 +449,13 @@ def test_failed_pull_emits_no_plan(policy: Literal["recompute", "fail"]):
     engine.assert_idle()
 
 
+@pytest.mark.parametrize("defer", [False, True], ids=["inline", "deferred"])
 @pytest.mark.parametrize("when", ["pulling", "before_the_pull_ends", "pulled"])
-def test_abort_before_emission_emits_no_plan(when: str):
+def test_abort_before_emission_emits_no_plan(when: str, defer: bool):
     """An aborted request's blocks are freed when its pull ends, or at once
-    once it has ended: its plan must never be emitted."""
-    engine = _Engine(_make_scheduler())
+    once it has ended: its plan must never be emitted. Deferred: a withheld
+    pull is reported at the next schedule(), which frees the blocks."""
+    engine = _Engine(_make_scheduler(), defer=defer)
     request = _pull_request(1, 3 * P_BLOCK)
     req_id = request.request_id
     engine.add(request)
@@ -501,9 +508,10 @@ def test_abort_after_emission_keeps_the_emitted_units(promoted: bool):
     engine.assert_idle()
 
 
+@pytest.mark.parametrize("defer", [False, True], ids=["inline", "deferred"])
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("seed", range(4))
-def test_random_lifecycles(seed: int, async_scheduling: bool):
+def test_random_lifecycles(seed: int, async_scheduling: bool, defer: bool):
     """A4 invariants over random arrivals, pull times, failures, aborts and
     paused (0-token) steps, with one running slot to defer promotions. A plan
     is emitted iff its pull succeeded and its request was alive at the next
@@ -516,7 +524,8 @@ def test_random_lifecycles(seed: int, async_scheduling: bool):
             async_scheduling=async_scheduling,
             max_num_seqs=1,
             kv_load_failure_policy="recompute",
-        )
+        ),
+        defer=defer,
     )
     arrivals = [
         _pull_request(i, rng.randint(1, 5 * P_BLOCK), max_tokens=rng.randint(1, 4))
@@ -576,8 +585,38 @@ def test_random_lifecycles(seed: int, async_scheduling: bool):
             assert engine.emissions(req_id) == [], req_id
     for req_id, promoted_at in engine.promoted.items():
         if req_id not in failed:
-            assert engine.emissions(req_id)[0] <= promoted_at, req_id
+            # Deferred: never in the step whose workers run the exchange.
+            if defer:
+                assert engine.emissions(req_id)[0] < promoted_at, req_id
+            else:
+                assert engine.emissions(req_id)[0] <= promoted_at, req_id
     engine.assert_idle()
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_deferred_admission_promotes_after_the_exchange_step(async_scheduling: bool):
+    """DSTEP: with deferred admission the pull's exchange is emitted by the
+    first schedule() after the pull ends, but the request is promoted by the
+    next one, so the exchange never runs in front of the forward that reads
+    its blocks (the workers order that forward after it on the device)."""
+    engine = _Engine(_make_scheduler(async_scheduling=async_scheduling), defer=True)
+    request = _pull_request(1, 3 * P_BLOCK + 7)
+    req_id = request.request_id
+    engine.add(request)
+    outputs: list[SchedulerOutput] = []
+    depth = 2 if async_scheduling else 1
+    in_flight: deque[SchedulerOutput] = deque()
+    for step in range(6):
+        outputs.append(engine.schedule())
+        in_flight.append(outputs[-1])
+        if len(in_flight) >= depth:
+            done = in_flight.popleft()
+            engine.update(done, finished={req_id} if done is outputs[1] else None)
+    [emitted_at] = engine.emissions(req_id)
+    assert req_id not in outputs[emitted_at].num_scheduled_tokens
+    assert engine.promoted[req_id] == emitted_at + 1
+    assert req_id in outputs[emitted_at + 1].num_scheduled_tokens
+    assert not engine.nixl._pair_hidden and not engine.nixl._pair_release
 
 
 def test_plan_covers_only_the_blocks_past_the_local_prefix_hit():

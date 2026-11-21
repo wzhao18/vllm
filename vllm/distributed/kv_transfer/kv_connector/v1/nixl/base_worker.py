@@ -2749,8 +2749,12 @@ class NixlBaseConnectorWorker:
             )
         # On every rank: checks the partner and logs the buffers and memory.
         exchanger.warm_up()
-        if dcp_pair_exchange.build_peer_copy_swap(
-            exchanger, get_dcp_group().cpu_group
+        try:
+            dcp_cpu_group = get_dcp_group().cpu_group
+        except AssertionError:
+            dcp_cpu_group = None  # no DCP group (unit tests): NCCL inline
+        if dcp_cpu_group is not None and dcp_pair_exchange.build_peer_copy_swap(
+            exchanger, dcp_cpu_group
         ):
             self._pair_side = torch.cuda.Stream(device=device)
         self._pair_exchanger = exchanger
