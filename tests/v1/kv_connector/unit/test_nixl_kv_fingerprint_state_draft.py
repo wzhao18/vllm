@@ -144,3 +144,75 @@ def test_draft_heads_swapped_between_ranks_change_f():
         dv[3],
     ]
     assert len(set(_draft_f(pv, tp_, swapped, td, num_tokens))) == 2
+
+
+def _worker_draft_views(
+    region: torch.Tensor,
+    spec_block: int,
+    lcm_block: int,
+    ratio: int = 1,
+    tp: int = 1,
+    rank: int = 0,
+):
+    """``NixlBaseConnectorWorker._fingerprint_state_draft_views`` on one
+    head-sharded drafter region ``region`` ([blocks, page bytes]) whose layer
+    spec has ``spec_block`` tokens per block, next to transfer groups whose LCM
+    (the worker's block size) is ``lcm_block``."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        NixlBaseConnectorWorker,
+    )
+
+    name = LAYER  # the reference views' name (the F salt)
+    blocks, page = region.shape
+    worker = SimpleNamespace(
+        kv_caches_base_addr={"e": {rank: [region.data_ptr()]}},
+        engine_id="e",
+        tp_rank=rank,
+        world_size=tp,
+        _has_mamba=False,
+        _conv_decomp=None,
+        _head_sharded_draft_kv_heads=H,
+        _head_sharded_draft_regions={0},
+        region_names=[name],
+        block_len_per_layer=[page],
+        block_stride_per_layer=[page],
+        region_num_blocks=[blocks],
+        block_size=lcm_block // ratio,
+        _physical_blocks_per_logical_kv_block=ratio,
+        _layer_specs={name: SimpleNamespace(block_size=spec_block, sliding_window=10)},
+    )
+    _, drafts = NixlBaseConnectorWorker._fingerprint_state_draft_views(
+        worker, {name: region}, {name: 2}
+    )
+    return drafts
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_worker_draft_view_uses_the_drafter_block_size(ratio: int):
+    """BUG-INTEGRATE-2: a sliding-window drafter keeps its own block size (128
+    next to a 16384-token hybrid attention block under MC=1 prefix caching), so
+    its page is ``heads x spec block x row bytes``, not the transfer groups'
+    LCM. The worker's draft view must page by the drafter's block and log the
+    same F as the TP1 reference pages of that block size."""
+    num_tokens = 37
+    spec_block = B_P * ratio  # logical; the registered pages hold B_P tokens
+    pv, table_p, _, _ = _draft_case(num_tokens, window=10, seed=4)
+    region = pv.pages.reshape(pv.pages.shape[0], -1).clone()
+    drafts = _worker_draft_views(region, spec_block, 1024 * ratio, ratio)
+    (view,) = drafts[2]
+    assert view.pages.shape == pv.pages.shape
+    assert view.window == 10 and view.head0 == 0 and view.total_heads == H
+    assert draft_fingerprint(view, table_p, num_tokens) == draft_fingerprint(
+        pv, table_p, num_tokens
+    )
+
+
+def test_worker_draft_view_refuses_a_page_that_is_not_heads_x_block():
+    pv, _, _, _ = _draft_case(5, window=None)
+    region = pv.pages.reshape(pv.pages.shape[0], -1)[:, :-4].contiguous()
+    with pytest.raises(ValueError, match="draft page"):
+        _worker_draft_views(region, B_P, 1024)
+    with pytest.raises(ValueError, match="physical pages"):
+        _worker_draft_views(pv.pages.reshape(pv.pages.shape[0], -1), 3, 1024, 2)
