@@ -9,9 +9,11 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
+from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -28,6 +30,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.logprob import (
+    warmup_logprob_token_ids,
+    warmup_token_logprobs,
+)
 
 logger = init_logger(__name__)
 
@@ -283,6 +289,68 @@ def warmup_kernels(
         acceptance_estimator.warmup()
 
 
+def _warmup_logprobs_kernels(model_runner: GPUModelRunner) -> None:
+    """Compile the logprobs kernels for every token-id count a request can ask for.
+
+    The steps above score only the counts of ``SamplingParams.for_sampler_warmup``
+    (5 sample and 1 prompt logprob, no ``logprob_token_ids``), so any other
+    ``logprobs`` / ``prompt_logprobs`` / ``logprob_token_ids`` request would
+    compile in the serving loop. Sample logprobs score 1 + up to
+    max(max_logprobs, MAX_LOGPROB_TOKEN_IDS) token ids per row, prompt logprobs
+    1 + up to max_logprobs, and prompt_logprob_token_ids up to max_logprobs
+    (from any row offset). Rows come from ``compute_logits`` (prompt logprobs,
+    raw modes), the batch-sharded sampler's all-to-all view, and the FP32
+    processed logits (processed modes), each also one row in when a row is not a
+    multiple of 16 bytes (the rejection sampler scores row chunks). The logits
+    modes gather instead of running the log-softmax kernel.
+    """
+    sampler = model_runner.sampler
+    if (
+        current_platform.is_cpu()
+        or model_runner.is_pooling_model
+        or not model_runner.is_last_pp_rank
+        or sampler is None
+    ):
+        return
+    model_config = model_runner.model_config
+    device = model_runner.device
+    vocab_size = model_runner.vocab_size
+    max_logprobs = model_config.max_logprobs
+    if max_logprobs < 0:
+        max_logprobs = vocab_size
+    max_num_cols = max(max_logprobs, MAX_LOGPROB_TOKEN_IDS)
+    # The sampler's sampled ids and request mapping are int64.
+    int64_ids = torch.zeros(1, dtype=torch.int64, device=device)
+    warmup_logprob_token_ids(
+        sampler.logprob_token_ids_state, int64_ids, int64_ids, max_num_cols
+    )
+    if sampler.logprobs_mode in ("raw_logits", "processed_logits"):
+        return
+    hidden_states = torch.zeros(
+        1, model_config.get_hidden_size(), dtype=model_config.dtype, device=device
+    )
+    # Every TP rank computes the logits together (gathered across the group).
+    logits = model_runner.model.compute_logits(hidden_states)
+    if logits is None:
+        return
+    layouts = [logits]
+    if model_runner.batch_sharder is not None:
+        shard = model_runner.model.compute_logits_local(hidden_states)
+        tp_size = model_runner.parallel_config.tensor_parallel_size
+        layouts.append(shard.new_empty(1, tp_size * shard.shape[-1])[:, :vocab_size])
+    if sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+        layouts.append(torch.empty_like(logits, dtype=torch.float32))
+    for layout in list(layouts):
+        if layout.stride(0) * layout.element_size() % 16:
+            rows = layout.new_empty((2, layout.stride(0)))
+            layouts.append(rows[1:, : layout.shape[1]])
+    for layout in layouts:
+        # Only prompt_logprob_token_ids (scored on compute_logits rows) slices.
+        unaligned = max_logprobs if layout is logits else 0
+        warmup_token_logprobs(layout, 1 + max_num_cols, max_unaligned_count=unaligned)
+    del logits, layouts
+
+
 def _warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -497,6 +565,9 @@ def _warmup_kernels(
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
+
+        if not greedy:
+            _warmup_logprobs_kernels(model_runner)
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
