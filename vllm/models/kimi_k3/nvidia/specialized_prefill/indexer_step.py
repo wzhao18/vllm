@@ -106,6 +106,59 @@ class _Group:
         assert self.sp.t == r1 - r0
 
 
+_HOST_KEY = "kimi_k3_pidx_host"
+
+
+def _host_copies(chunks):
+    """Pinned host copies of the chunks' row bounds and block tables plus an
+    event recorded after the copies, enqueued on the current stream."""
+    host = []
+    for c in chunks:
+        row = []
+        for t in (c.cu_seqlen_ks, c.cu_seqlen_ke, c.local_cu_seq_lens, c.block_table):
+            h = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            h.copy_(t, non_blocking=True)
+            row.append(h)
+        host.append(tuple(row))
+    event = torch.cuda.Event()
+    event.record()
+    return host, event
+
+
+def prefetch_host(attn_metadata) -> None:
+    """Enqueue the layout's host copies at the start of the step's forward.
+
+    The layout of the selective prefill indexer needs the row bounds on the
+    host. Copied at the first DSA layer, the host had to wait for every layer
+    enqueued before it (stream synchronize), and the GPU then idled while the
+    host launched the rest of the step. Enqueued before layer 0, the copies only
+    wait for the step's metadata build; the first DSA layer waits on their
+    event. Same data, same layout: the copies are only issued earlier."""
+    if attn_metadata is None or torch.cuda.is_current_stream_capturing():
+        return
+    metas = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+    seen = set()
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        for m in meta.values():
+            prefill = getattr(m, "prefill", None)
+            chunks = getattr(prefill, "chunks", None)
+            if not chunks or id(chunks[0]) in seen:
+                continue
+            c0 = chunks[0]
+            if not hasattr(c0, "cu_seqlen_ks") or not hasattr(c0, "logits_inputs"):
+                continue
+            seen.add(id(c0))
+            if any(
+                c.local_cu_seq_lens is None or c.pcp_deinterleave_idx is not None
+                for c in chunks
+            ):
+                continue
+            if _HOST_KEY not in c0.logits_inputs and _KEY not in c0.logits_inputs:
+                c0.logits_inputs[_HOST_KEY] = _host_copies(chunks)
+
+
 def _layout(chunks, device):
     cached = chunks[0].logits_inputs.get(_KEY)
     if cached is not None:
@@ -114,16 +167,13 @@ def _layout(chunks, device):
         "the selective prefill indexer layout is built by the step's first "
         "(eager) forward"
     )
-    host = [
-        (
-            c.cu_seqlen_ks.to("cpu", non_blocking=True),
-            c.cu_seqlen_ke.to("cpu", non_blocking=True),
-            c.local_cu_seq_lens.to("cpu", non_blocking=True),
-            c.block_table.to("cpu", non_blocking=True),
-        )
-        for c in chunks
-    ]
-    torch.cuda.current_stream(device).synchronize()
+    pre = chunks[0].logits_inputs.pop(_HOST_KEY, None)
+    if pre is not None and len(pre[0]) == len(chunks):
+        host, event = pre
+        event.synchronize()
+    else:
+        host, event = _host_copies(chunks)
+        event.synchronize()
     groups, segs, r0 = [], [], chunks[0].token_start
     next_row = r0
     pitch = 0

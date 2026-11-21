@@ -263,6 +263,15 @@ def _dummy_srow(dev: torch.device):
     return tensor
 
 
+def state_cache_view(cache, H: int):
+    """The (1, D, D) state view of ``state_cache_rows`` alone (no index work),
+    for a layer that reuses the step's ``srow`` table."""
+    assert cache.dtype == torch.float32 and cache.shape[1:] == (H, D, D)
+    assert cache.stride()[1:] == (D * D, D, 1)
+    assert cache.stride(0) % 8 == 0, "state slots must be 32-byte aligned"
+    return cache.as_strided((1, D, D), (D * D, D, 1))
+
+
 def state_cache_rows(cache, indices, has_initial_state, H: int):
     """In-place state I/O on the recurrent-state cache ``cache`` [slots, H, D, D]
     (FP32; each (D, D) block dense, any slot stride, e.g. the hybrid cache's

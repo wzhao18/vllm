@@ -103,6 +103,25 @@ def frost_prefill(
 
 _persistent_plans: dict = {}
 
+# Per-step memo of the host-side KDA prefill inputs (plan, state-row table),
+# keyed by the identity of the step's per-cache-group KDA metadata object. The
+# metadata object is built once per step and shared by every KDA layer of its
+# cache group, so an entry is valid exactly for that step; a new step brings a
+# new object. Strong references keep ids unique while an entry lives.
+_step_memos: dict = {}
+
+
+def step_memo_for(metadata) -> dict:
+    """The memo dict of this step's KDA metadata object (see _step_memos)."""
+    entry = _step_memos.get(id(metadata))
+    if entry is not None and entry[0] is metadata:
+        return entry[1]
+    if len(_step_memos) >= 16:
+        _step_memos.clear()
+    memo: dict = {}
+    _step_memos[id(metadata)] = (metadata, memo)
+    return memo
+
 
 def persistent_supported(device: torch.device) -> bool:
     """The persistent CuTe DSL KDA core can run (SM100-class GPU, CuTe DSL)."""
@@ -146,6 +165,7 @@ def persistent_prefill(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    step_memo: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
@@ -161,14 +181,27 @@ def persistent_prefill(
     from .kda_persistent import forward as kp
 
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
-    offsets = tuple(cu_seqlens_cpu.tolist())
-    key = (offsets, H, q.device.index)
-    plan = _persistent_plans.get(key)
+    # Every KDA layer of a step passes the same host offsets and state rows:
+    # the host plan and the state-row table are built by the step's first layer
+    # and reused by the other layers (step_memo is the step's per-cache-group
+    # dict, see step_memo_for()).
+    memo = step_memo
+    plan = memo.get(("plan", H, q.device.index)) if memo is not None else None
     if plan is None:
-        if len(_persistent_plans) >= 64:
-            _persistent_plans.clear()
-        plan = kp.make_plan(list(offsets), H, q.device)
-        _persistent_plans[key] = plan
+        offsets = tuple(cu_seqlens_cpu.tolist())
+        key = (offsets, H, q.device.index)
+        plan = _persistent_plans.get(key)
+        if plan is None:
+            if len(_persistent_plans) >= 64:
+                _persistent_plans.clear()
+            plan = kp.make_plan(list(offsets), H, q.device)
+            _persistent_plans[key] = plan
+        if memo is not None:
+            memo[("plan", H, q.device.index)] = plan
+            memo[("nseq", H, q.device.index)] = len(offsets) - 1
+        nseq = len(offsets) - 1
+    else:
+        nseq = memo[("nseq", H, q.device.index)]
     if out is None:
         out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
     elif not (
@@ -182,10 +215,26 @@ def persistent_prefill(
     srow = None
     if state_cache is not None:
         assert state_indices is not None and has_initial_state is not None
-        nseq = len(offsets) - 1
-        rows, srow = kp.state_cache_rows(
-            state_cache, state_indices[:nseq], has_initial_state, H
+        # The row table depends only on the slot indices, the zero-state flags
+        # and the slot stride: one per step and stride for all layers.
+        skey = (
+            "srow",
+            H,
+            state_cache.stride(0),
+            state_cache.device.index,
+            state_indices.data_ptr(),
+            has_initial_state.data_ptr(),
+            nseq,
         )
+        srow = memo.get(skey) if memo is not None else None
+        if srow is None:
+            rows, srow = kp.state_cache_rows(
+                state_cache, state_indices[:nseq], has_initial_state, H
+            )
+            if memo is not None:
+                memo[skey] = srow
+        else:
+            rows = kp.state_cache_view(state_cache, H)
         initial_state = final_state = rows
     else:
         final_state = torch.empty_like(initial_state)
