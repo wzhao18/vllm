@@ -335,7 +335,10 @@ class NixlBaseConnectorWorker:
     _pair_exchanger: "DcpStagedExchanger | None" = None
     _pair_group: int | None = None
     _pair_consumed: NixlConnectorMetadata | None = None
-    _pair_events: tuple[tuple[NixlConnectorMetadata, torch.cuda.Event], ...] = ()
+    # (metadata, event, blocks the exchange rewrites) per exchanging step.
+    _pair_events: tuple[
+        tuple[NixlConnectorMetadata, torch.cuda.Event, frozenset[int]], ...
+    ] = ()
     # Pair mode with VLLM_ITERLOG_DIR: each step's exchange GPU time.
     _pair_times: _PairExchangeTimes | None = None
 
@@ -5199,26 +5202,54 @@ class NixlBaseConnectorWorker:
             exchanger.exchange(units)
             if times is not None:
                 times.end(len(metadata.reqs_to_pair_exchange), len(units))
-            self._pair_events += ((metadata, exchanger.record_event()),)
+            self._pair_events += (
+                (
+                    metadata,
+                    exchanger.record_event(),
+                    frozenset(u.block_id for u in units),
+                ),
+            )
 
     def _drain_pair_events(self, metadata: NixlConnectorMetadata) -> None:
-        """Wait for the exchanges of earlier steps before this step's READs.
+        """Wait for the exchanges of earlier steps that this step's READs
+        could race.
 
         An aborted request frees its blocks while its exchange may still be
-        queued, and a later pull can READ into them. This step's exchanges
+        queued, and a later pull can READ into them. Only a READ into a block
+        an unfinished exchange rewrites is a hazard (NIXL writes are not
+        stream-ordered; everything else on the device is), so the host waits
+        only for those exchanges: a full wait would drain the async-scheduling
+        lookahead on every step after an admission. This step's exchanges
         need no wait: their requests were alive when this metadata was built,
         so its pulls do not target their blocks.
         """
         if not self._pair_events:
             return
+        targets: set[int] | None = None
         pending = []
-        for meta, event in self._pair_events:
+        for meta, event, blocks in self._pair_events:
             if meta is metadata:
-                pending.append((meta, event))
+                pending.append((meta, event, blocks))
+                continue
+            if event.query():
+                continue
+            if targets is None:
+                targets = self._pair_read_targets(metadata)
+            if targets.isdisjoint(blocks):
+                pending.append((meta, event, blocks))
                 continue
             with gpu_sync_allowed():
                 event.synchronize()
         self._pair_events = tuple(pending)
+
+    def _pair_read_targets(self, metadata: NixlConnectorMetadata) -> set[int]:
+        """Blocks of the exchanged group that this step's pulls READ into."""
+        group = self._pair_group
+        targets: set[int] = set()
+        for meta in metadata.reqs_to_recv.values():
+            if group < len(meta.local_block_ids):
+                targets.update(meta.local_block_ids[group])
+        return targets
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Compatibility wrapper for the legacy completion API."""

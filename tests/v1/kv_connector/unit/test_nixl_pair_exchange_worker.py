@@ -227,6 +227,10 @@ class _FakeEvent:
     def synchronize(self) -> None:
         self.log.append(("synchronize", self.name))
 
+    def query(self) -> bool:
+        # Still queued on the device: the drain decides by block overlap.
+        return False
+
 
 class _Fabric:
     """Pairs the fake exchangers as NCCL pairs DCP ranks r and r ^ W: the
@@ -1259,7 +1263,9 @@ def test_start_load_kv_raises_a_peer_mismatch_before_reads():
     worker._peer_config_mismatch = base_worker.NixlPeerConfigMismatch("skew")
     metadata = _recv_metadata("r", ([1],), (0,), ([2],), 16)
     log: list = []
-    worker._pair_events = ((_pair_step(a=[1]), _FakeEvent(log, "earlier")),)
+    worker._pair_events = (
+        (_pair_step(a=[1]), _FakeEvent(log, "earlier"), frozenset({1})),
+    )
     # A stub without a NIXL agent: posting a READ would raise AttributeError.
     with pytest.raises(base_worker.NixlPeerConfigMismatch, match="skew"):
         worker.start_load_kv(metadata)
@@ -1310,7 +1316,9 @@ def test_reuse_guard_waits_for_earlier_exchanges(k31_env, fabric):
     """A5: an abort can free a request's blocks while its exchange is queued,
     and a later step's pull can READ into them: start_load_kv waits for the
     earlier exchange before its first READ, once. The step's own pulls do not
-    wait: they cannot target blocks of requests alive when it was scheduled."""
+    wait: they cannot target blocks of requests alive when it was scheduled.
+    A pull into other blocks does not wait either (DSTEP: a full wait drains
+    the async-scheduling lookahead after every admission)."""
     small = dict(block_size=64, num_dsa=2, num_kda=3)
     prefillers = {p: _Rank(fabric, P_DCP, p, 8, **small) for p in (1, 3)}
     decoder = _Rank(
@@ -1341,6 +1349,8 @@ def test_reuse_guard_waits_for_earlier_exchanges(k31_env, fabric):
     # Request a's exchange (block 5) runs in the step that posts b's pull.
     assert step("b", 4, [PairUnit(dsa, 5, False)]) == ["exchange", "read", "read"]
     # a is aborted and its block goes to c: c's READs wait for a's exchange.
+    # e's pull targets block 6: a's exchange (block 5) is no hazard to it.
+    assert step("e", 6, []) == ["read", "read"]
     assert step("c", 5, []) == ["synchronize", "read", "read"]
     assert step("d", 3, []) == ["read", "read"]
 
