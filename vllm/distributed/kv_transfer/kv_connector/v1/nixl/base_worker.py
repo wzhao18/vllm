@@ -2609,13 +2609,24 @@ class NixlBaseConnectorWorker:
             assert heads is not None
             name = self.region_names[r]
             local_heads = heads // self.world_size
-            token_head, rest = divmod(
-                self.block_len_per_layer[r], local_heads * self.block_size
-            )
+            # Tokens per registered page: the drafter layer's own block size
+            # (a sliding-window drafter picks its own, e.g. 128 next to a
+            # 16384-token hybrid attention block), split into physical pages as
+            # the registration splits its page bytes. Not self.block_size,
+            # which is the transfer groups' LCM.
+            spec_block_size = self._layer_specs[name].block_size
+            ratio = self._physical_blocks_per_logical_kv_block
+            tokens, tokens_rest = divmod(spec_block_size, ratio)
+            if tokens_rest or not tokens:
+                raise ValueError(
+                    f"{name}: drafter block of {spec_block_size} tokens is not "
+                    f"{ratio} physical pages"
+                )
+            token_head, rest = divmod(self.block_len_per_layer[r], local_heads * tokens)
             if rest or token_head % 4:
                 raise ValueError(
                     f"{name}: draft page {self.block_len_per_layer[r]} B is not "
-                    f"{local_heads} heads x {self.block_size} tokens"
+                    f"{local_heads} heads x {tokens} tokens"
                 )
             pages = byte_pages(
                 kv_caches[name],
@@ -2623,7 +2634,7 @@ class NixlBaseConnectorWorker:
                 self.block_len_per_layer[r],
                 self.block_stride_per_layer[r],
                 self.region_num_blocks[r],
-            ).view(-1, local_heads, self.block_size, token_head)
+            ).view(-1, local_heads, tokens, token_head)
             window = getattr(self._layer_specs[name], "sliding_window", None)
             drafts[group_of[name]].append(
                 DraftView(name, pages, self.tp_rank * local_heads, heads, window)
