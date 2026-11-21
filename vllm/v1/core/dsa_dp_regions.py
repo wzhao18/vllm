@@ -248,8 +248,20 @@ class DSARegionPools:
         return [pool.get_usage() for pool in self.regions]
 
 
-# Shared-region pages reserved per sequence for each Mamba (KDA state) group.
+# Shared-region pages reserved per sequence for a Mamba (KDA state) group when
+# its spec cannot say (``MambaSpec.max_memory_usage_bytes``).
 _SHARED_BLOCKS_PER_SEQ = 6
+
+
+def _mamba_pages_per_seq(spec: Any, vllm_config: Any) -> int:
+    """State pages one sequence holds in a Mamba group (align mode: the state,
+    its speculative and prefill-checkpoint copies)."""
+    try:
+        return max(
+            1, -(-spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes)
+        )
+    except AttributeError:
+        return _SHARED_BLOCKS_PER_SEQ
 
 
 def region_sizes(
@@ -286,8 +298,8 @@ def apply_dsa_dp_regions(
     kv_cache_configs: list[Any],
     scheduler_kv_cache_config: Any,
 ) -> None:
-    """Engine core, DSA-DP layouts (``dsa_dp.supported``): split the per-card pages into the
-    shared region and the card's DSA region, and record the split in every
+    """Engine core, DSA-DP layouts (``dsa_dp.supported``): split the per-card pages
+    into the shared region and the card's DSA region, and record the split in every
     config. The scheduler's pool becomes the shared region (``num_blocks = S``);
     the workers keep ``num_blocks = S + D`` pages."""
     from vllm.logger import init_logger
@@ -320,7 +332,7 @@ def apply_dsa_dp_regions(
                 f"{group.layer_names[:4]}"
             )
         elif all(isinstance(s, MambaSpec) for s in specs):
-            mamba += 1
+            mamba += _mamba_pages_per_seq(specs[0], vllm_config)
         elif all(isinstance(s, SlidingWindowSpec) for s in specs):
             # A sliding-window group (e.g. the SWA DSpark) holds a fixed number
             # of blocks per request, not one per block of context.
@@ -335,8 +347,25 @@ def apply_dsa_dp_regions(
     if not dsa_ids:
         raise ValueError("DSA-DP KV: no DSA cache group")
     m = scheduler_kv_cache_config.num_blocks
-    per_seq = _SHARED_BLOCKS_PER_SEQ
-    reserve = vllm_config.scheduler_config.max_num_seqs * (mamba * per_seq + swa_blocks)
+    per_seq = mamba + swa_blocks
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    reserve = max_num_seqs * per_seq
+    # Large hybrid pages (unified with the FP32 KDA state: thousands of tokens a
+    # page) can make max_num_seqs sequences' state pages exceed the card. Then
+    # the shared region keeps at most half the pages and the DSA region the rest,
+    # instead of a 1-page DSA region.
+    cap = (m - 1) // 2
+    if reserve > cap:
+        init_logger(__name__).warning(
+            "DSA-DP KV regions: the per-sequence state of max_num_seqs=%d "
+            "sequences (%d pages each) exceeds half of the %d pages per card; the "
+            "shared region holds about %d sequences' state.",
+            max_num_seqs,
+            per_seq,
+            m,
+            cap // max(per_seq, 1),
+        )
+        reserve = cap
     s, d = region_sizes(
         m,
         tp,
@@ -354,7 +383,8 @@ def apply_dsa_dp_regions(
     bs = groups[dsa_ids[0]].kv_cache_spec.block_size
     init_logger(__name__).info(
         "DSA-DP KV regions: %d pages/card = shared %d + DSA region %d (tp %d, "
-        "DSA groups %s, shared token groups %.2f, Mamba groups %d, reserve %d). "
+        "DSA groups %s, shared token groups %.2f, Mamba state pages/seq %d, "
+        "reserve %d). "
         "Per card: DSA KV %d tokens (owned requests), shared-group KV %d tokens "
         "(all requests); TP group DSA KV %d tokens. Without regions: %d tokens "
         "of every group per card.",

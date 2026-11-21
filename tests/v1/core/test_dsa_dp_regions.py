@@ -804,3 +804,33 @@ def test_apply_regions_slot_packed_draft(monkeypatch, per_page):
     per_seq = 17 if per_page == 1 else 4
     s, d = region_sizes(1001, 4, 1, 0, 10 * per_seq)
     assert (cfg.dsa_dp_shared_blocks, cfg.dsa_dp_region_blocks) == (s, d)
+
+
+def test_apply_regions_caps_the_state_reserve(monkeypatch):
+    """Hybrid pages unified with the FP32 KDA state hold thousands of tokens, so
+    max_num_seqs sequences' state pages can exceed the card: the shared region
+    then keeps half the pages and the DSA region the rest (not one page)."""
+    _dsa_dp_layout(monkeypatch)
+    groups = [
+        KVCacheGroupSpec(["dsa.attn"], _mla()),
+        KVCacheGroupSpec(
+            ["kda"],
+            MambaSpec(block_size=BS, shapes=((1, 1),), dtypes=(torch.float32,)),
+        ),
+    ]
+    cfg = KVCacheConfig(num_blocks=241, kv_cache_tensors=[], kv_cache_groups=groups)
+    sched = replace(cfg)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4, decode_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+    )
+    dsa_dp_regions.apply_dsa_dp_regions(
+        vllm_config,
+        [{"dsa.attn": _mla(), "kda": groups[1].kv_cache_spec}],
+        [cfg],
+        sched,
+    )
+    # 32 x 6 = 192 state pages > (241 - 1) // 2 = 120: reserve 120, D = 120.
+    assert (cfg.dsa_dp_shared_blocks, cfg.dsa_dp_region_blocks) == (121, 120)
