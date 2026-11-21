@@ -3125,6 +3125,10 @@ class KimiLinearForCausalLM(
             step = decode.plan(positions, intermediate_tensors)
             if step is not None:
                 return decode.run(step, input_ids, inputs_embeds)
+        if is_forward_context_available():
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer_step
+
+            indexer_step.prefetch_host(get_forward_context().attn_metadata)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
