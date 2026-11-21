@@ -75,6 +75,29 @@ def _num_blocks(
     return skipped, total - skipped
 
 
+def _dsa_dp_owners(case: BenchCase) -> list[int]:
+    """DSA-DP owner card of each request (models/kimi_k3/nvidia/ops/dsa_dp.py), or
+    -1 without DSA-DP. Like the scheduler's load-based owner choice: longest
+    DSA cost first onto the least-loaded card of the TP group (same on every
+    rank: config and case only), so a bench step spreads its DSA rows over the
+    cards instead of hashing request ids."""
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    if not dsa_dp.ENABLED:
+        return [-1] * len(case.requests)
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp = get_tensor_model_parallel_world_size()
+    costs = [dsa_dp.chunk_cost(r.query_len, r.prefix_len) for r in case.requests]
+    load = [0.0] * tp
+    owners = [-1] * len(case.requests)
+    for i in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        card = min(range(tp), key=lambda c: (load[c], c))
+        owners[i] = card
+        load[card] += costs[i]
+    return owners
+
+
 def build_batch(
     case: BenchCase,
     kv_cache_groups,
@@ -112,6 +135,7 @@ def build_batch(
     query_token_ids = {}
     group_block_ranges: list[list[tuple[int, int]]] = [[] for _ in kv_cache_groups]
     output = SchedulerOutput.make_empty()
+    owners = _dsa_dp_owners(case)
     for i, req in enumerate(case.requests):
         req_id = f"bench-{i}"
         replay = min(replay_window, req.prefix_len) if req.prefix_hit else 0
@@ -151,6 +175,7 @@ def build_batch(
                 num_computed_tokens=computed,
                 lora_request=None,
                 replay_start=computed if replay else 0,
+                dsa_owner=owners[i],
             )
         )
         output.num_scheduled_tokens[req_id] = req.query_len + replay
