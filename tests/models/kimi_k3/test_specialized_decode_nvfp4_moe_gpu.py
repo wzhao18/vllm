@@ -24,6 +24,7 @@ Needs a Blackwell-family GPU with FlashInfer's TRT-LLM fused MoE (SiTU)."""
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
