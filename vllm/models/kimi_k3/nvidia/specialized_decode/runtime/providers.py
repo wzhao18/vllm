@@ -529,11 +529,11 @@ class Attention:
         mx_out = kind == "kda" and mxfp8_kda_linear(
             decoder, "self_attn.o_proj", attention.o_proj
         )
-        sms = torch.cuda.get_device_properties(runtime.device).multi_processor_count
         self.projection: Any  # SkinnyProjection or Mxfp8Projection
         if mx_in:
-            weight = None
-            with torch.accelerator.device_index(runtime.device.index):
+            weight, device = None, attention.in_proj_qkvgfab.weight.device
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            with torch.accelerator.device_index(device.index):
                 self.projection = Mxfp8Projection(
                     attention.in_proj_qkvgfab, runtime.batches, family="kda_in",
                     cap=runtime.capacity,
@@ -547,6 +547,7 @@ class Attention:
                 name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
                 weight = bf16_weight(getattr(attention, name))
             pitch = weight.shape[0]
+            sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
             policies = projection_policies(tp, pitch, runtime.batches, sms, runtime.q)
             split_k = PreparedProjection(weight, policies).prepare()
             skinny = WIDE_SKINNY.get(pitch, SKINNY) if sms > 152 else SKINNY
@@ -769,7 +770,7 @@ class Attention:
         if mx_out:
             # the MXFP8 GEMM's partial rows (one scratch for every MXFP8 layer)
             partial = scratch(runtime, "oproj.mxfp8.partial", (rows, 7168))
-            with torch.accelerator.device_index(runtime.device.index):
+            with torch.accelerator.device_index(local.device.index):
                 self.output = Mxfp8Oproj(
                     decoder, mailbox, oproj_batches, front, twoshot, local, sharded,
                     partial=partial,
@@ -796,7 +797,7 @@ class Attention:
         stock = unfused & runtime.stock_attn_res
         self.post_stock = StockAttnRes.for_post(decoder) if stock else None
         if kind == "mla" and set(runtime.wide) - self.mla_wide:  # S2's output gate
-            warm_gate(pitch, 12288 // tp, runtime.device)
+            warm_gate(pitch, 12288 // tp, weight.device)
         self.storage = {b: (projected[:b], local[:b]) for b in range(1, rows + 1)}
         # Verify batches (token rows) whose MLA runs as single-query rows on the q = 1
         # path (mla.rows.VERIFY_ROWS; SpecializedDecode.verify_rows writes their
