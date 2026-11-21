@@ -25,12 +25,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     DEFAULT_PRUNE_DELAY_S,
+    EarlyLoadClient,
     LookupKeyClient,
+    early_load_supported,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BLOCK_FREE_CLOCK, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
@@ -320,6 +322,25 @@ class MooncakeStoreScheduler:
         # job's _pinned_saves entry.
         self._pinned_slots: dict[int, dict[int, list[int]]] = {}
 
+        # Early loads: handed to the worker when their blocks are allocated
+        # (early_load_supported); a load whose blocks an in-flight step may
+        # still use goes with the step's metadata instead.
+        self._early_loads: EarlyLoadClient | None = None
+        if (
+            not self._capacity_only
+            and self.load_async
+            and kv_cache_config.hisparse_host_num_blocks is None
+            and early_load_supported(vllm_config)
+        ):
+            self._early_loads = EarlyLoadClient(vllm_config)
+            logger.info("Mooncake early loads on (issued at schedule time)")
+        # Tokens per block of each KV cache group (indexes the request's blocks).
+        self._group_block_sizes = [
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
+        ]
+        self.num_early_loads = 0
+        self.num_metadata_loads = 0
+
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
@@ -516,6 +537,56 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        if self._early_loads is not None:
+            self._issue_load_early(request.request_id, blocks)
+
+    def _load_only_req_meta(self, request_id: str) -> ReqMeta | None:
+        """Pop ``request_id``'s pending load spec and build the load-only
+        ReqMeta of a request that loads before it is scheduled (None if the
+        connector holds no load for it)."""
+        load_spec = self.load_specs.pop(request_id, None)
+        # A load spec may have been proposed by this connector's lookup but
+        # rejected by MultiConnector in favor of another connector. Only the
+        # chosen connector may issue the pending load; the normal store path
+        # gets its blocks later from SchedulerOutput once the request is
+        # actually scheduled.
+        if load_spec is None or not load_spec.can_load:
+            return None
+        unfinished_req, block_ids = self._unfinished_requests[request_id]
+        request_tracker = RequestTracker(
+            req_id=request_id,
+            token_len=load_spec.kvpool_cached_tokens,
+            allocated_block_ids=block_ids,
+            num_saved_tokens=0,
+        )
+        self._request_trackers[request_id] = request_tracker
+        return ReqMeta.from_request_tracker(
+            request_tracker,
+            self._block_size,
+            load_spec=load_spec,
+            skip_save=None,
+            block_hashes=unfinished_req.block_hashes,
+            num_prompt_tokens=unfinished_req.num_prompt_tokens,
+        )
+
+    def _issue_load_early(self, request_id: str, blocks: KVCacheBlocks) -> None:
+        """Hand the load to the worker now if no step in flight uses its
+        blocks; otherwise it goes with this step's metadata."""
+        assert self._early_loads is not None
+        load_spec = self.load_specs[request_id]
+        for group_id in self._store_group_ids:
+            first = load_spec.vllm_cached_tokens // self._group_block_sizes[group_id]
+            for block in blocks.blocks[group_id][first:]:
+                if not block.is_null and BLOCK_FREE_CLOCK.freed_recently(block):
+                    return
+        req_meta = self._load_only_req_meta(request_id)
+        if req_meta is None:
+            return
+        if not self._early_loads.send(req_meta):
+            # Worker channel not connected yet: the step's metadata carries it.
+            self.load_specs[request_id] = load_spec
+            return
+        self.num_early_loads += 1
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -700,36 +771,11 @@ class MooncakeStoreScheduler:
 
         # Handle requests with pending load specs not yet scheduled
         request_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
-        for request_id, (
-            unfinished_req,
-            block_ids,
-        ) in self._unfinished_requests.items():
+        for request_id in self._unfinished_requests:
             if request_id not in request_ids and request_id not in cached_reqs.req_ids:
-                load_spec = self.load_specs.pop(request_id, None)
-                # A load spec may have been proposed by this connector's
-                # lookup but rejected by MultiConnector in favor of another
-                # connector. Only the chosen connector may issue the pending
-                # load; the normal store path gets its blocks later from
-                # SchedulerOutput once the request is actually scheduled.
-                if load_spec is None or not load_spec.can_load:
-                    continue
-                num_tokens_to_compute = load_spec.kvpool_cached_tokens
-                request_tracker = RequestTracker(
-                    req_id=request_id,
-                    token_len=num_tokens_to_compute,
-                    allocated_block_ids=block_ids,
-                    num_saved_tokens=0,
-                )
-                self._request_trackers[request_id] = request_tracker
-                req_meta = ReqMeta.from_request_tracker(
-                    request_tracker,
-                    self._block_size,
-                    load_spec=load_spec,
-                    skip_save=None,
-                    block_hashes=unfinished_req.block_hashes,
-                    num_prompt_tokens=unfinished_req.num_prompt_tokens,
-                )
+                req_meta = self._load_only_req_meta(request_id)
                 if req_meta is not None:
+                    self.num_metadata_loads += 1
                     meta.add_request(req_meta)
 
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
