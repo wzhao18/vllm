@@ -68,6 +68,12 @@ constexpr int kCgBins = 496;   // CG round: bins of the bracket (12-bit counts, 
 constexpr int kCgMsg = kV2Hdr + kCgBins / 2;  // CG slot words = one radix-round slot
 static_assert(kCgMsg == 256 && kV2RadR >= 2 && kV2Cand <= 4095);
 constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
+// long-row helpers: at most kV2HMax helper CTAs, one SMEM chunk (kNR x T groups) each; a task
+// payload is its candidate count, valid-key count, then up to kV2Cand positions and keys
+constexpr int kV2HMax = 256;
+constexpr int kV2HTask = 4 + kV2Cand + kV2Cand / 2;
+constexpr int kV2HMaxC = 15;  // chunks after the first a row can hand out (rows up to 16 x kNR x T groups)
+__host__ __device__ constexpr int64_t kV2HWords(int64_t cap) { return cap + kV2HMax + (int64_t)kV2HMax * kV2HTask; }
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
@@ -94,6 +100,11 @@ struct V2Params {
   int64_t off_r1, off_tie, off_rad, off_r2;
   int* epoch;
   int* redo;  // per row: 0, or the epoch the complete body runs the row at (+1)
+  // long-row helpers (wide variant): CTAs [T, T + nhelp) of the hot launch scan the later
+  // SMEM chunks of long rows for their owner CTAs; hbox: kV2HWords(cap) words of the epoch
+  // buffer (row theta words, task done words, task payloads); nullptr / 0: no helpers
+  uint32_t* hbox;
+  int nhelp;
   int* err;
   long long spin_ns;
   int* stats;
@@ -222,6 +233,25 @@ struct V2Sm {
   unsigned long long* pref;
   long long* dbg;
 };
+
+// Long-row helpers: a row's SMEM chunks after its first (kNR x T groups each) when the hot
+// body walks it in chunks (more than K valid tokens globally, >= 8 local); 0 otherwise. Rows
+// are numbered in order, so row r's tasks are [sum of the earlier rows' counts, + count).
+// the most chunks after the first any row of the launch can have (rows fit in lcols), capped
+template <int T>
+__device__ __forceinline__ int v2_max_extra(const V2Params& p) {
+  return min(kV2HMaxC, ((p.lcols + 14) >> 3) / (V2Cfg<T>::kNR * T));
+}
+template <int T>
+__device__ __forceinline__ int v2_extra_chunks(const V2Params& p, const int r) {
+  const int L = p.local_len[r];
+  if (p.global_len[r] <= p.K || L < 8) return 0;
+  const uintptr_t la = reinterpret_cast<uintptr_t>(p.logits + (int64_t)r * p.lstride);
+  const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
+  const int sh = (8 - min(L, head0)) & 7;
+  const int ng = (L + sh + 7) >> 3;
+  return (ng - 1) / (V2Cfg<T>::kNR * T);
+}
 
 // CG rounds for rank-skewed rows (round-1 windows disjoint, or tau outside their common
 // range), out of line so the hot row body keeps its code layout. hi2 = the largest exact
@@ -597,6 +627,34 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     int th = s_th;
     V2DBG(1);
+    // long-row helpers (hot wide body). Tasks = the (row, chunk c >= 1) pairs of long rows,
+    // ordered by c descending, then row: helper h takes the h-th, so the rows with the most
+    // chunks (the critical path) get helpers first and each row's helped chunks are its
+    // last ones. Task index of (row, c) = #{tasks with c' > c} + #{rows < row with >= c
+    // chunks after the first}. This CTA publishes theta, scans chunk 0 and its unhelped
+    // chunks itself, and appends the helpers' candidates for the others: same candidates,
+    // same order as one CTA walking every chunk.
+    int nx = 0;
+    uint32_t hmask = 0;
+    int ht[kV2HMaxC + 1];
+    if constexpr (kFast && T >= 1024) {
+      if (p.nhelp > 0 && regp && ng > kCap) {
+        nx = (ng - 1) / kCap;
+        if (tid == 0) st_u32(p.hbox + row, ((uint32_t)(ep + 1) << 16) | (uint32_t)th);
+        const int nme = tid < p.T ? v2_extra_chunks<T>(p, tid) : 0;
+        int above = 0;
+#pragma unroll 1
+        for (int cc = v2_max_extra<T>(p); cc >= 1; --cc) {
+          const int nc_ = __syncthreads_count(nme >= cc);
+          if (cc <= nx) {
+            const int b = __syncthreads_count(tid < row && nme >= cc);
+            ht[cc] = above + b;
+            if (above + b < p.nhelp) hmask |= 1u << cc;
+          }
+          above += nc_;
+        }
+      }
+    }
     // the SMEM path's candidate pass: every key >= thv with its position, in position
     // order; returns this thread's valid-key count
     auto cand_regp = [&](int thv, int gb, int ngc, int cbase) -> uint32_t {
@@ -670,10 +728,37 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #pragma unroll 1
         for (int gb = 0;; gb += kCap) {
           int cb = 0;
+          bool helped = false;
           if (K31_RARE(gb > 0)) {
             // the next chunk of a long row into the SMEM row (the previous one is read)
             __syncthreads();
             cb = s_cnt;
+            if (kFast && T >= 1024 && gb / kCap <= kV2HMaxC && ((hmask >> (gb / kCap)) & 1u)) {
+              // a helper scanned this chunk: append its candidates (position order)
+              const int t = ht[gb / kCap];
+              const uint32_t* const tb = p.hbox + p.cap + kV2HMax + (int64_t)t * kV2HTask;
+              if (tid == 0) {
+                const uint32_t want = ((uint32_t)(ep + 1) << 16) | (uint32_t)row;
+                const long long t0 = now_ns();
+                while (ld_sys(p.hbox + p.cap + t) != want) {
+                  if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 61); break; }
+                  __nanosleep(64);
+                }
+                __threadfence();
+              }
+              __syncthreads();
+              const int n = (int)__ldcg(tb);
+              const uint16_t* const tk = reinterpret_cast<const uint16_t*>(tb + 4 + kV2Cand);
+              for (int j = tid; j < n && cb + j < kV2Cand; j += kV2T) {
+                cpos[cb + j] = __ldcg(tb + 4 + j);
+                ckey[cb + j] = __ldcg(tk + j);
+              }
+              if (tid == 0) {
+                s_cnt = cb + n;
+                nv += __ldcg(tb + 1);
+              }
+              helped = true;
+            } else {
             const int ge = min(ng, gb + kCap), gfull = min((p.lcols + sh0) >> 3, ge);
             if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
               asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -690,9 +775,18 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             bar_phase ^= 1u;
             if (tid == 32 && tl) srow[g_hi - gb] = pt;
             __syncthreads();
+            }
           }
-          nv += cand_regp(th, gb, min(kCap, ng - gb), cb);
+          if (!helped) nv += cand_regp(th, gb, min(kCap, ng - gb), cb);
           if (!kFast || gb + kCap >= ng) break;
+        }
+        if constexpr (kFast && T >= 1024) {
+          // every helper of this row has finished (its done word seen): re-arm the words
+          if (nx > 0 && tid == 0) {
+            for (int cc = 1; cc <= min(nx, kV2HMaxC); ++cc)
+              if ((hmask >> cc) & 1u) st_u32(p.hbox + p.cap + ht[cc], 0u);
+            st_u32(p.hbox + row, 0u);
+          }
         }
       }
       const int nfull = regp ? 0 : g_hi - g_lo;
@@ -1660,9 +1754,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           for (int j = 0; j < 8; ++j) {
             const uint32_t k = k8.key(j);
             if (!((valid >> j) & 1u) || !k) continue;
+            // rounds 0-1 (shb >= 24) read key bits only; later rounds need the key equal to
+            // the prefix's key part before the token id is formed (same counts, fewer ops)
+            if (shb >= 24) {
+              if (rd > 0 && (k >> (shb - 16)) != (uint32_t)pref) continue;
+              atomicAdd(&hist[(k >> (shb - 24)) & 0xFFu], 1u);
+              continue;
+            }
+            if (k != (uint32_t)(pref >> (24 - shb - 8))) continue;
             const unsigned long long c =
                 ((unsigned long long)k << 24) | (0xFFFFFFu - gid_of(i0 + j));
-            if (rd > 0 && (c >> (shb + 8)) != pref) continue;
+            if ((c >> (shb + 8)) != pref) continue;
             atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
           }
         });
@@ -1877,12 +1979,167 @@ __device__ __noinline__ void v2_complete(const V2Params p, const V2Sm sm, const 
   *bar_phase = ph;
 }
 
+// Long-row helper CTA h of the hot wide launch: task h (row order, chunks after the first)
+// -> the chunk into SMEM (as the owner would), the owner's theta, the owner's candidate pass
+// over the chunk (keys >= theta with positions, in position order; valid-key count), then the
+// payload and its done word. A CTA without a task exits.
+template <int T>
+__device__ __noinline__ void v2_help(const V2Params p, const V2Sm sm, const int h, uint32_t* bar_phase) {
+  constexpr int kNR = V2Cfg<T>::kNR, kCap = kNR * T;
+  const int tid = threadIdx.x;
+  int* const s_i = sm.s_i;
+  uint32_t* const s_u = sm.s_u;
+  uint4* const srow = sm.srow;
+  uint32_t* const cpos = sm.cpos;
+  uint16_t* const ckey = sm.ckey;
+  // task h (the owners' order: chunk c descending, then row): one row per thread
+  const int nme = tid < p.T ? v2_extra_chunks<T>(p, tid) : 0;
+  int above = 0, c = 0, k = 0;
+#pragma unroll 1
+  for (int cc = v2_max_extra<T>(p); cc >= 1; --cc) {
+    const int nc_ = __syncthreads_count(nme >= cc);
+    if (c == 0 && h < above + nc_) { c = cc; k = h - above; }
+    above += nc_;
+  }
+  if (c == 0) return;  // no task (uniform across the CTA)
+  if (tid == 0) s_i[0] = -1;
+  uint32_t tot;
+  const uint32_t ex = v2_scan<T>(nme >= c ? 1u : 0u, sm.warp_sums + 32, &tot);
+  if (nme >= c && (int)ex == k) s_i[0] = tid;
+  __syncthreads();
+  const int r = s_i[0];
+  const uint16_t* lrow = p.logits + (int64_t)r * p.lstride;
+  const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
+  const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
+  const int sh0 = (8 - head0) & 7;
+  const int L = p.local_len[r];
+  const int sh = (8 - min(L, head0)) & 7;
+  const int ng = (L + sh + 7) >> 3, g_lo = sh ? 1 : 0, g_hi = (L + sh) >> 3;
+  const int gb = c * kCap, ge = min(ng, gb + kCap), gfull = min((p.lcols + sh0) >> 3, ge);
+  auto load_group = [&](int g) -> uint4 {
+    if (g >= g_lo && g < g_hi) return __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g);
+    if (g < 0 || g >= ng) return make_uint4(~0u, ~0u, ~0u, ~0u);
+    uint32_t w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int a = 8 * g - sh + 2 * j, b = a + 1;
+      const uint32_t lo16 = (a >= 0 && a < L) ? lrow[a] : 0xFFFFu;
+      const uint32_t hi16 = (b >= 0 && b < L) ? lrow[b] : 0xFFFFu;
+      w[j] = lo16 | (hi16 << 16);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+  };
+  if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    const int n = max(0, gfull - gb), cc = tid >> 5;
+    const int a = gb + (int)((int64_t)n * cc / kV2Cp), b = gb + (int)((int64_t)n * (cc + 1) / kV2Cp);
+    const uint4* gsrc = reinterpret_cast<const uint4*>(lrow - sh0);
+    if (b > a) bulk_g2s(srow + (a - gb), gsrc + a, (uint32_t)(b - a) * 16u, sm.bar);
+    else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(sm.bar)) : "memory");
+  }
+  const bool tl = g_hi < ng && g_hi >= gb && g_hi < ge;
+  uint4 pt = make_uint4(~0u, ~0u, ~0u, ~0u);
+  if (tid == 32 && tl) pt = load_group(g_hi);
+  const int ep = p.epoch[r];
+  if (tid == 0) {
+    const long long t0 = now_ns();
+    uint32_t v = ld_sys(p.hbox + r);
+    while ((v >> 16) != (uint32_t)(ep + 1)) {
+      if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 60); break; }
+      __nanosleep(64);
+      v = ld_sys(p.hbox + r);
+    }
+    s_i[2] = (int)(v & 0xFFFFu);
+    s_u[0] = 0;
+  }
+  mbar_wait(sm.bar, *bar_phase);
+  *bar_phase ^= 1u;
+  if (tid == 32 && tl) srow[g_hi - gb] = pt;
+  __syncthreads();
+  const int th = s_i[2];
+  // the owner's candidate pass (cand_regp) over this chunk, from candidate 0
+  const int ngc = min(kCap, ng - gb);
+  const int tg0 = tid * kNR;
+  const uint32_t t2 = v2_th_bf16(th);
+  const bool kx = th == 0x8000;
+  constexpr int kMW = (kNR + 3) / 4;
+  uint32_t mk[kMW];
+#pragma unroll
+  for (int w = 0; w < kMW; ++w) mk[w] = 0u;
+  uint32_t cnt = 0, nv = 0;
+#pragma unroll
+  for (int i = 0; i < kNR; ++i) {
+    const int g = tg0 + i;
+    if (g < ngc) {
+      const uint4 rr = srow[g];
+      nv += v2_is_nan2(v2_max_nan(rr)) ? v2_nvalid(rr) : 8u;
+      uint32_t m8;
+      if (!kx) {
+        const uint32_t lo = __byte_perm(v2_ge2(rr.x, t2), v2_ge2(rr.y, t2), 0x6420);
+        const uint32_t hi = __byte_perm(v2_ge2(rr.z, t2), v2_ge2(rr.w, t2), 0x6420);
+        m8 = (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
+      } else {
+        const Keys8 k8(rr);
+        m8 = 0;
+#pragma unroll 1
+        for (int j = 0; j < 8; ++j) m8 |= (k8.key(j) >= (uint32_t)th ? 1u : 0u) << j;
+      }
+      cnt += __popc(m8);
+      mk[i / 4] |= m8 << (8 * (i % 4));
+    }
+  }
+  uint32_t ctot;
+  int cc = (int)v2_scan<T>(cnt, sm.warp_sums, &ctot);
+  const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
+#pragma unroll
+  for (int w = 0; w < kMW; ++w) {
+    uint32_t m = mk[w];
+    while (m) {
+      const int b = __ffs(m) - 1;
+      m &= m - 1;
+      const int i = 4 * w + (b >> 3), j = b & 7;
+      const int g = tg0 + i;
+      if (cc < kV2Cand) {
+        const uint32_t raw = srow16[8 * g + j];
+        cpos[cc] = (uint32_t)(8 * (gb + g) - sh + j);
+        ckey[cc] = (uint16_t)(keys2(raw) & 0xFFFFu);
+      }
+      ++cc;
+    }
+  }
+  for (int o = 16; o > 0; o >>= 1) nv += __shfl_xor_sync(0xffffffffu, nv, o);
+  if ((tid & 31) == 0 && nv) atomicAdd(&s_u[0], nv);
+  __syncthreads();
+  uint32_t* const tb = p.hbox + p.cap + kV2HMax + (int64_t)h * kV2HTask;
+  uint16_t* const tk = reinterpret_cast<uint16_t*>(tb + 4 + kV2Cand);
+  const int n = (int)ctot;
+  for (int j = tid; j < min(n, kV2Cand); j += T) {
+    tb[4 + j] = cpos[j];
+    tk[j] = ckey[j];
+  }
+  if (tid == 0) {
+    tb[0] = (uint32_t)n;
+    tb[1] = s_u[0];
+  }
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    st_u32(p.hbox + p.cap + h, ((uint32_t)(ep + 1) << 16) | (uint32_t)r);
+  }
+}
+
 // The common case: one compact row body (PDL: the prologue overlaps the logits kernel's
 // tail; every global read follows the wait); a row that needs the complete body runs it
 // right away (v2_complete; the inline complete body measured ~8 us in-step: instruction fetch).
 template <int T>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(T)
+  if constexpr (T >= 1024) {
+    if ((int)blockIdx.x >= p.T) {  // long-row helper (CTAs past the rows)
+      v2_help<T>(p, sm, (int)blockIdx.x - p.T, &bar_phase);
+      return;
+    }
+  }
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
     // per shape: the 1024-thread variant (r1/r8) keeps topk_v2_redo_kernel (its in-CTA call

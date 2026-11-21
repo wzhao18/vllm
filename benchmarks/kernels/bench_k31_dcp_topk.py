@@ -91,6 +91,10 @@ def main():
     ap.add_argument("--spread", type=float, default=0.0, help="ctx uniform in ctx*(1 +- spread)")
     ap.add_argument("--long-ctx", type=int, default=0, help="every --long-every-th request gets this context")
     ap.add_argument("--long-every", type=int, default=32)
+    ap.add_argument("--ctx-file", default="",
+                    help="served running sets (json {'sets': [[ctx, ...], ...]}, e.g. from decode iterlogs); "
+                         "--reqs then names cases: p50 / p90 / max (the set whose longest context is at that "
+                         "quantile of the sets' longest contexts) or poolN (N contexts drawn from all sets)")
     ap.add_argument("--cases", default="normal,relu,hot_recent")
     ap.add_argument("--max-model-len", type=int, default=1 << 20)
     ap.add_argument("--max-local", type=int, default=0, help="override the launch bound")
@@ -121,7 +125,22 @@ def main():
     torch.cuda.set_device(lr)
     dev = torch.device("cuda", lr)
     props = torch.cuda.get_device_properties(dev)
-    reqs = [int(x) for x in a.reqs.split(",")]
+    served = None
+    if a.ctx_file:
+        sets = json.load(open(a.ctx_file))["sets"]
+        by_max = sorted(sets, key=max)
+        pool = [c for st_ in sets for c in st_]
+        served = {}
+        rng = __import__("random").Random(7)
+        for name in a.reqs.split(","):
+            if name.startswith("pool"):
+                served[name] = [rng.choice(pool) for _ in range(int(name[4:]))]
+            else:
+                qv = {"p50": 0.5, "p90": 0.9, "max": 1.0}[name]
+                served[name] = by_max[min(len(by_max) - 1, int(qv * len(by_max)))]
+        reqs = list(served)
+    else:
+        reqs = [int(x) for x in a.reqs.split(",")]
     cap = 512
     ex = DcpExchange(dist.group.WORLD, dev, cap=cap, cap1=cap, one_round_window=256,
                      heads=96, o_dims=(), topk=K, interleave=1)
@@ -138,15 +157,22 @@ def main():
     bs = 64
     results = []
     for B in reqs:
+        ctx_list = served[B] if served is not None else None
+        if ctx_list is not None:
+            ctx_list = [min(int(c), a.max_model_len - 1) for c in ctx_list]
+        set_name = B
+        B = len(ctx_list) if ctx_list is not None else B
         T = B * a.q
         gen = torch.Generator(device=dev)
         gen.manual_seed(1234 + B)  # same contexts on every rank
-        if a.spread > 0:
+        if ctx_list is not None:
+            Greq = torch.tensor(ctx_list, dtype=torch.int32, device=dev)
+        elif a.spread > 0:
             u = torch.rand(B, generator=gen, device=dev) * 2 - 1
             Greq = (a.ctx * (1 + a.spread * u)).to(torch.int32)
         else:
             Greq = torch.full((B,), a.ctx, dtype=torch.int32, device=dev)
-        if a.long_ctx:
+        if a.long_ctx and ctx_list is None:
             Greq[:: a.long_every] = a.long_ctx
         j = torch.arange(a.q, device=dev, dtype=torch.int32)
         G = (Greq[:, None] - (a.q - 1 - j)[None, :]).reshape(-1).contiguous()
@@ -312,7 +338,7 @@ def main():
             st = torch.zeros(8, dtype=torch.int32, device=dev)
             st.copy_(stats)
             dist.all_reduce(st)
-            r = dict(B=B, T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,
+            r = dict(B=B, set=set_name, Gmax=int(G.max()), Gmean=float(G.float().mean()), T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,
                      us_per_call=round(float(med), 2), ok_count=ok_count, impl=a.impl,
                      segcap=segcap, mismatch_rows=mism,
                      stats=dict(zip(STATS_V2 if a.impl == "v2" else STAT_NAMES, st.tolist())), phases=phases, kernels=kern,

@@ -3315,6 +3315,14 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
     return;
   }
+  // long-row helpers on the SMs the rows leave free (every CTA co-resident: grid <= nwide);
+  // the epoch buffer carries their words past its [0, 2 cap) (topk_v2_help_words)
+  if (epoch.numel() >= 2 * cap + kV2HWords(cap) && T < nwide) {
+    p.hbox = reinterpret_cast<uint32_t*>(p.epoch + 2 * cap);
+    const int grid = std::min(nwide, T + kV2HMax);
+    p.nhelp = grid - T;
+    cfg.gridDim = dim3((unsigned)grid, 1, 1);
+  }
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
   // the wide variant leaves those rows to the redo kernel (most CTAs exit after the PDL wait)
   cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
@@ -3325,6 +3333,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_v2", &topk_v2);
   m.def("topk_v2_layout", &topk_v2_layout);
+  m.def("topk_v2_help_words", [](int64_t cap) { return kV2HWords(cap); });
   m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);
   m.def("o_exchange", &o_exchange);
