@@ -490,6 +490,57 @@ def test_quantized_activation_replay_does_not_retain_tensors(
         torch.testing.assert_close(scale_out, source[:, ::32].to(torch.uint8))
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+def test_weak_ref_buffer_object_replay_does_not_retain_tensors(
+    cuda_capture_stream, keyword
+):
+    """An output buffer object with ``weak_ref()`` (e.g. the Kimi K3 MXFP8
+    ``Mxfp8Buffer`` a KDA eager segment fills) passed to a break point is held
+    weakly by the replay closure: its tensor is released (so its graph-pool slot
+    is not pinned per captured batch size) and replays still write it."""
+    import gc
+    import weakref
+
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.utils.torch_utils import weak_ref_tensor
+
+    class Buf:
+        def __init__(self, data):
+            self.data = data
+
+        def weak_ref(self):
+            return Buf(weak_ref_tensor(self.data))
+
+    @eager_break_during_capture
+    def fill(x, out):
+        out.data.copy_(x * 2)
+
+    source = torch.ones((64, 64), device=DEVICE_TYPE, dtype=torch.float32)
+    output = torch.empty_like(source)
+    cap = BreakableCUDAGraphCapture()
+    with cap:
+        buf = Buf(torch.empty_like(source))
+        data_ref = weakref.ref(buf.data)
+        if keyword:
+            fill(x=source, out=buf)
+        else:
+            fill(source, buf)
+        output.copy_(buf.data + 1)
+
+    del buf
+    gc.collect()
+    assert data_ref() is None
+
+    for value in (1, 2, 3):
+        source.fill_(value)
+        cap.replay()
+        cuda_capture_stream.synchronize()
+        torch.testing.assert_close(output, source * 2 + 1, rtol=0, atol=0)
+
+
 def test_eager_attention_inside_multistream_overlap(cuda_capture_stream):
     """Handle an eager attention break inside a multi-stream overlap region."""
     from vllm.compilation.breakable_cudagraph import (

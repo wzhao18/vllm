@@ -61,6 +61,11 @@ F = TypeVar("F", bound=Callable[..., Any])
 def _weak_ref_capture_arg(arg: Any) -> Any:
     if isinstance(arg, QuantizedActivation):
         return arg.weak_ref()
+    # Other activation containers (e.g. an output buffer object the eager op fills)
+    # expose the same ``weak_ref()``: kept strong, they pin their graph-pool slots
+    # for every captured batch descriptor.
+    if not isinstance(arg, torch.Tensor) and callable(getattr(arg, "weak_ref", None)):
+        return arg.weak_ref()
     return weak_ref_tensor(arg)
 
 
