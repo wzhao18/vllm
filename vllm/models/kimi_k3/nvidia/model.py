@@ -568,6 +568,19 @@ class KimiMLP(nn.Module):
 
     # specialized_prefill.shared_situ.PrefillSharedSitu (prefill workers only).
     _prefill_situ = None
+    # gate_up_proj's weight rows are in the Rubin MegaMoE fused shared expert's 16-row
+    # gate/up stripes (specialized_decode.runtime.sp_mlp.stripe_shared_gate_up: its
+    # fused FC1 views this weight); its GEMM output is de-striped here.
+    gate_up_striped = False
+
+    def _gate_up(self, x) -> torch.Tensor:
+        """``[gate | up]`` = gate_up_proj(x)."""
+        gate_up, _ = self.gate_up_proj(x)
+        if self.gate_up_striped:
+            from .megamoe_rubin.weights import deinterleave_gate_up_cols_16
+
+            gate_up = deinterleave_gate_up_cols_16(gate_up)
+        return gate_up
 
     def mxfp8_input(self) -> bool:
         """gate_up_proj takes an MXFP8 activation (QuantizedActivation)."""
@@ -624,7 +637,7 @@ class KimiMLP(nn.Module):
         situ = self._prefill_situ
         qa = situ.fused(x) if situ is not None else None
         if qa is None:
-            gate_up, _ = self.gate_up_proj(x)
+            gate_up = self._gate_up(x)
             if situ is not None:
                 gate_up = situ.deinterleave(gate_up)
             qa = self._act_mxfp8(gate_up)
@@ -647,7 +660,7 @@ class KimiMLP(nn.Module):
             qa = situ.fused(x)
             if qa is not None:
                 return self.down_proj(qa)[0]
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up = self._gate_up(x)
         if situ is not None:
             gate_up = situ.deinterleave(gate_up)
         # Online-MXFP8 down_proj: the activation kernel writes its MXFP8 input.
@@ -1338,7 +1351,7 @@ class KimiMoE(nn.Module):
             # GEMM-AR adds this rank's routed rows (latent norm + up-projection)
             # in its epilogue and all-reduces in the same kernel.
             shared = self.shared_experts
-            gate_up, _ = shared.gate_up_proj(hidden_states)
+            gate_up = shared._gate_up(hidden_states)
             act = shared.act_fn(gate_up)
             routed_rows = (
                 self.routed_output_transform(routed[:rows]) if rows > 0 else None

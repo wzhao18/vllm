@@ -235,6 +235,9 @@ class SpMlp:
                 down.output_size_per_partition, down.input_size_per_partition
             ):
                 fused_cap = max(self.rows[-1], RUBIN_WIDE_EP_DECODE_TOKENS)
+        # One resident copy of the shared gate_up: the fused FC1 views the stock
+        # weight striped in place (before any GEMM below binds it).
+        self.striped = fused_cap is not None and stripe_shared_gate_up(mlp)
         with torch.accelerator.device_index(weights["latent_down"].device.index):
             if self.mxfp8:  # NVFP4 checkpoint: MXFP8 W8A8 shared expert (gemm.mxfp8)
                 self.gemms["shared_gu"] = Mxfp8Projection(
@@ -277,10 +280,11 @@ class SpMlp:
             fc1, fc2 = prepare_mxfp8_shared_weights(
                 gu.weight, gu.scale, dn.weight, dn.scale,
                 hidden=self.hidden, intermediate=self.inter2 // 2,
+                striped=self.striped,
             )  # fmt: skip
             buf = gu.input.buf
             self.fused_shared = mlp.experts.warmup_fused_shared(
-                FusedSharedArgs(buf.data, buf.scale, fc1, fc2)
+                FusedSharedArgs(buf.data, buf.scale, fc1, fc2), placed=self.striped
             )
         # Rubin MegaMoE: the latent RMSNorm folds into the kernel's top-k reduce (one
         # kernel and one [n, latent] round trip fewer per layer); compiled here, before
@@ -312,6 +316,10 @@ class SpMlp:
         shared, gemms, n = self.mlp.shared_experts, self.gemms, h.shape[0]
         x = gemms["shared_gu"].input.view(n) if prequantized else h
         gate_up = gemms["shared_gu"].run(x, h.new_empty((n, self.inter2)))
+        if self.striped:  # rows above the fused bucket: [gate | up] for the act
+            from ...megamoe_rubin.weights import deinterleave_gate_up_cols_16
+
+            gate_up = deinterleave_gate_up_cols_16(gate_up)
         if self.mxfp8:
             # stock's online-MXFP8 shared expert: SiTU-and-mul writes the down
             # projection's MXFP8 input (KimiMLP._act_mxfp8), bitwise act -> quantize
@@ -403,6 +411,39 @@ class SpMlp:
             self.latent_up_parts.run(final.contiguous(), partials)
             return SplitDelta(partials, shared_out, split)
         return gemms["latent_up"].run(final, residual=shared_out)
+
+
+def stripe_shared_gate_up(mlp) -> bool:
+    """Before the fused shared expert is prepared and before any GEMM binds the
+    weight: stripe the stock MXFP8 shared ``gate_up_proj`` in place (16-row gate/up
+    stripes with their scales, ``weights.stripe_mxfp8_gate_up_``), home it per die
+    where the fused bucket is die-local (the copy replaces the parameter's storage),
+    and mark the stock ``KimiMLP`` so its own forwards de-stripe the GEMM output. The
+    fused FC1 then views this one copy instead of a second striped copy (W4:
+    2I x H FP8 per MoE layer). False (nothing changed: the fused FC1 keeps its own
+    striped copy) when the weight is a view of a packed projection or the shared
+    expert is not the stock ``KimiMLP``."""
+    from ...model import KimiMLP
+    from ...mxfp8 import _kernel_layout
+    from ...megamoe_rubin.weights import stripe_mxfp8_gate_up_
+    from ..cutedsl.gemm.mxfp8 import mxfp8_weight
+
+    shared, experts = mlp.shared_experts, mlp.experts
+    if not isinstance(shared, KimiMLP) or getattr(mlp, "_packed_moe", None) is not None:
+        return False
+    lin = shared.gate_up_proj
+    if shared.gate_up_striped:  # (a rebuilt runtime: striped and homed already)
+        return True
+    weight, scale = mxfp8_weight(lin, "shared_gu")
+    if not lin.weight_scale.data.is_contiguous():
+        raise RuntimeError("shared gate_up scale is not contiguous (cannot stripe in place)")
+    n, k = weight.shape
+    stripe_mxfp8_gate_up_(weight, scale, hidden=k, intermediate=n // 2)
+    homed = experts.home_fused_shared_rows(weight)
+    if homed is not weight:
+        lin.weight.data = homed.t() if _kernel_layout(lin) == "kn" else homed
+    shared.gate_up_striped = True
+    return True
 
 
 def _rubin_megamoe(experts) -> bool:
