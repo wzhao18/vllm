@@ -354,8 +354,26 @@ class KdaFlow(KdaWS):
         slots = args[8]
         requests: cutlass.Constexpr = args[10].shape[0] // self.tokens
         head, request = item // requests, item % requests
-        offset = args[17][request] - 1
-        slot, conv_slot = slots[request, offset], slots[request, 0]
+        accepted = Int32(args[17][request])
+        offset = accepted - 1
+        # RHEADEC DIAGNOSTIC (never merge): bounds-check the slot-table column before
+        # indexing; a bad item is reported and skipped (slot 0).
+        bad = Int32(0)
+        if offset < 0 or offset >= slots.shape[1]:
+            bad = Int32(1)
+            offset = Int32(0)
+        slot, conv_slot = Int32(slots[request, offset]), Int32(slots[request, 0])
+        if slot >= args[9].shape[0] or conv_slot >= args[3].shape[0]:
+            bad = bad + Int32(2)
+        if bad != 0:
+            if head == 0:
+                cute.printf(
+                    "RHEADEC_BAD kind {} request {} accepted {} slot {} conv_slot {} "
+                    "state_rows {} conv_rows {} slot_cols {} requests {}",
+                    bad, request, accepted, slot, conv_slot, args[9].shape[0],
+                    args[3].shape[0], slots.shape[1], requests,
+                )  # fmt: skip
+            slot = Int32(0)
         return head, request, Int32(slot), Int32(conv_slot), Int32(offset)
 
     @cute.jit
@@ -369,6 +387,15 @@ class KdaFlow(KdaWS):
         if cutlass.const_expr(self.folds(args)):
             rec = Int32(args[20][request])
             pending = Int32(0)
+            # RHEADEC DIAGNOSTIC (never merge): record row bounds.
+            if rec >= args[21].shape[0] or rec >= args[19].shape[0] or rec >= args[18].shape[0]:
+                if head == 0:
+                    cute.printf(
+                        "RHEADEC_BAD kind 4 request {} rec {} pending_rows {} record_rows {} slot {}",
+                        request, rec, args[21].shape[0], args[19].shape[0], slot,
+                    )  # fmt: skip
+                rec = Int32(-1)
+                slot = Int32(0)
             if rec >= 0:
                 pending = Int32(args[21][rec])
             if pending > self.tokens:
