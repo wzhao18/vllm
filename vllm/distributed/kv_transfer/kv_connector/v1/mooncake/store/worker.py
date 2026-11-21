@@ -3337,17 +3337,21 @@ def early_load_supported(vllm_config: VllmConfig) -> bool:
     (async scheduling with two batches in flight and a KV consumer role) and
     a single worker per engine (the scheduler addresses one worker).
     """
-    kv_transfer_config = vllm_config.kv_transfer_config
-    if kv_transfer_config is None:
+    # Every condition must hold exactly (``is True`` / ``== 1``): a partial or
+    # mock config never turns early loads on.
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if kv_transfer_config is None or parallel_config is None:
         return False
-    extra_config = kv_transfer_config.kv_connector_extra_config
-    parallel_config = vllm_config.parallel_config
-    return bool(
-        extra_config.get("load_async", True)
-        and kv_transfer_config.is_kv_consumer
-        and parallel_config.world_size == 1
-        and parallel_config.pipeline_parallel_size == 1
-        and vllm_config.max_concurrent_batches == 2
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+    if not isinstance(extra_config, dict):
+        return False
+    return (
+        extra_config.get("load_async", True) is True
+        and getattr(kv_transfer_config, "is_kv_consumer", False) is True
+        and getattr(parallel_config, "world_size", 0) == 1
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and getattr(vllm_config, "max_concurrent_batches", 0) == 2
     )
 
 
