@@ -1002,6 +1002,51 @@ def test_cutedsl_gathered_select_compact_keys_match_reference(num_positions: int
         assert sorted(compact[row].tolist()) == want
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not has_cutedsl(),
+    reason="This test requires CUDA and CuteDSL",
+)
+@pytest.mark.parametrize("rows", [512, 1000])
+def test_cutedsl_gathered_select_is_deterministic(rows: int):
+    """The DCP prefill top-k merge feeds the order-sensitive sparse MLA, so the
+    selector must emit the same ids in the same order on every call (an atomic
+    slot counter made DCP8 prefill steps without ShardQ non-reproducible,
+    BUG-DCP8-4), and still select the exact top-k."""
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        dcp_topk_id_bits,
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    world, topk, num_positions = 8, 2048, 1 << 20
+    num_candidates = world * topk
+    scores = torch.randn((rows, num_candidates), device=device)
+    scores[::2, : num_candidates // 2] = 0.0  # zero-KV ties across the cutoff
+    scores = scores.bfloat16().float()
+    ids = torch.stack(
+        [torch.randperm(num_positions, device=device)[:num_candidates] for _ in range(rows)]
+    ).to(torch.int32)
+    ids[1::3, ::5] = -1  # padding
+    gathered = torch.stack((scores, ids.float()), dim=-1).contiguous()
+    outs = []
+    for _ in range(4):
+        out = torch.full((rows, topk), -7, device=device, dtype=torch.int32)
+        stable_topk_from_gathered_candidates_cutedsl(
+            gathered, topk, out=out, score_bits=16,
+            id_bits=dcp_topk_id_bits(num_positions),
+        )
+        outs.append(out)
+    torch.accelerator.synchronize()
+    for out in outs[1:]:
+        assert torch.equal(out, outs[0]), (
+            f"{int((out != outs[0]).any(1).sum())} of {rows} rows differ between calls"
+        )
+    expected = _ref_stable_topk_from_candidates_fp64(scores, ids, topk)
+    for row in range(0, rows, 37):
+        assert sorted(outs[0][row].tolist()) == sorted(expected[row].tolist())
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("world", [2, 8])
 @pytest.mark.parametrize("interleave", [1, 64])
