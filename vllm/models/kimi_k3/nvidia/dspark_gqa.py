@@ -594,7 +594,15 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         same target rows and ``fc`` is replicated, so from
         ``_CONTEXT_ROW_SHARD_MIN_ROWS`` rows per rank each rank combines a contiguous
         1/tp of the rows and the TP group all-gathers the result. All TP ranks call
-        this with the same rows."""
+        this with the same rows. Sequence-shard aux states (``SpLocalAux``: the
+        target under sequence parallelism hands each rank its own 1/tp shard,
+        ops/sp_local_aux.py) take the base class's shard-local projection and
+        all-gather instead."""
+        from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
+
+        if isinstance(aux_hidden_states, sp_local_aux.SpLocalAux):
+            super().combine_aux_rows(aux_hidden_states, start, end, out)
+            return
         num_rows = end - start
         if num_rows <= 0:
             return
