@@ -182,6 +182,7 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         rng,
         dcp_size,
         lookahead,
+        kv_config=kv_config,
     )
     zero_kv_blocks(kv_caches, attn_groups, batch, kv_config.num_blocks)
     profile_prefix = None
