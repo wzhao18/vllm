@@ -509,6 +509,7 @@ class SpecializedDecode:
                     module.routed_expert_norm.variance_epsilon,
                     moe_batches, state.rows, moe_layers.index(index),
                     sharded=(self.sharded, self.shard_box),
+                    deferred=deferred_rows(module, moe_batches),
                 )  # fmt: skip
                 self.feed_forward[index] = Nvfp4MoE(
                     module, state, rows, moe_batches, prefetch=prefetch,

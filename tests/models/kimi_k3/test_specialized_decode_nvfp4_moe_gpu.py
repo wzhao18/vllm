@@ -4,7 +4,7 @@
 (``specialized_decode.cutedsl.moe.nvfp4``) against the stock layers on identical
 inputs, one GPU, at a TP16 rank's shapes:
 
-- ``test_nvfp4_routed_experts_match_stock``: the stock routed-experts layer production
+- ``test_nvfp4_experts_match_stock``: the stock routed-experts layer production
   builds for one TP16 MoE layer (``FusedMoEFactory`` with ``KimiMoE``'s arguments:
   896 experts, top 16, SiTU beta 4 / linear 25, sigmoid grouped top-k with an FP32
   correction bias; intermediate 3072 / 16 = 192 zero-padded to 256 as ``KimiMoE``
@@ -12,10 +12,8 @@ inputs, one GPU, at a TP16 rank's shapes:
   the monolithic TRT-LLM-Gen kernel, routing from the logits), random NVFP4 weights
   (E2M1, E4M3 block scales per 16, per-expert global and input scales), processed by
   the layer's ``process_weights_after_loading``. Stock = the layer's
-  ``apply_monolithic`` on (latent, logits); ours = ``prepared.stock_router`` on the
-  logits, then ``Nvfp4RoutedExperts.run``. Routes must be the stock routes; the
-  outputs within the routed partial's FP32 finalize reordering (``ROUTED_TOL``,
-  bitwise rows reported); our eager repeat and our CUDA-graph replay bitwise.
+  ``apply_monolithic`` on (latent, logits); ours = ``Nvfp4Experts.run``: bitwise,
+  eager repeat and CUDA-graph replay bitwise.
 - ``test_mxfp8_shared_expert_matches_stock``: stock ``KimiMLP`` (a TP16 rank's shared
   expert: gate_up [768, 7168], down [7168, 384], ModelOpt MXFP8 W8A8, SiTU, no
   reduce) after load + the SM107 dispatch kernel, vs ``Mxfp8SharedExpert.run``: the
@@ -26,7 +24,6 @@ Needs a Blackwell-family GPU with FlashInfer's TRT-LLM fused MoE (SiTU)."""
 
 import os
 import tempfile
-from types import SimpleNamespace
 
 import pytest
 
@@ -36,9 +33,6 @@ SHARED_INTER = 2 * 3072 // TP  # two shared experts, TP16 shard
 BETA, LINEAR_BETA = 4.0, 25.0
 PREFIX = "language_model.model.layers.1.mlp"
 ROWS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1536)
-# Our partial vs the stock monolithic kernel's (same experts, same FP4 operands): the
-# finalize sums the 16 BF16 expert rows in FP32 in another order -> a few BF16 ulps.
-ROUTED_TOL = 1e-2
 
 
 def _torch():
@@ -208,79 +202,48 @@ def _rel(a, b):
     return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
 
 
-def test_nvfp4_routed_experts_match_stock(dist):
+def test_nvfp4_experts_match_stock(dist):
+    """``Nvfp4Experts`` is the stock layer's own monolithic experts call (routing in
+    the kernel): bitwise the stock output, eager repeat and CUDA-graph replay bitwise.
+    Also records why the routed-ids entry is not used: on the stock router's routes
+    with its FP32 weights it is 2.7-3.1e-3 (rel) off the stock layer (the kernel's own
+    routing hands BF16 weights; with BF16-rounded weights it is bitwise), and the
+    kernel's routing and vLLM's grouped top-k op disagree on near-ties (1 row in 256 /
+    1536 here)."""
     import torch
 
     from vllm.config import set_current_vllm_config
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.nvfp4 import (
-        Nvfp4RoutedExperts,
-    )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (
-        stock_router,
+        Nvfp4Experts,
     )
 
     dev = torch.device("cuda", torch.cuda.current_device())
-    runner, layer = nvfp4_layer(dev, dist.config)
+    _, layer = nvfp4_layer(dev, dist.config)
     method = layer.quant_method
     with set_current_vllm_config(dist.config), torch.inference_mode():
-        route = stock_router(runner.router)
-        ours = Nvfp4RoutedExperts(layer)
-        report = []
+        ours = Nvfp4Experts(layer)
+        assert not ours.deferred(8)  # (TP1: the layer never defers)
         for rows in ROWS:
             latent, logits = _inputs(rows, 1000 + rows)
-            # The stock layer's monolithic kernel, its own routes captured (the
-            # layer's routed-experts sink interface)
-            sink = SimpleNamespace(
-                buffer=torch.empty(rows, TOPK, dtype=torch.int16, device="cuda"),
-                capture_fn=lambda ids: None,
-            )
-            stock = method.moe_kernel.apply_monolithic(
-                latent, layer.w13_weight, layer.w2_weight, logits,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                expert_map=layer.expert_map,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                num_expert_group=layer.num_expert_group, topk_group=layer.topk_group,
-                e_score_correction_bias=layer.e_score_correction_bias,
-                routed_scaling_factor=layer.routed_scaling_factor, routing_sink=sink,
-            )  # fmt: skip
+            stock = method.apply_monolithic(layer, latent, logits)
             assert isinstance(stock, torch.Tensor), type(stock)
-            stock = stock[:, :LATENT].clone()
-            weights, ids = route(logits)
-            got = ours.run(latent, weights, ids).clone()
-            repeat = ours.run(latent, weights, ids).clone()
-            bf16w = ours.run(latent, weights.bfloat16().float(), ids).clone()
+            stock = stock.clone()
+            got = ours.run(latent, logits).clone()
+            repeat = ours.run(latent, logits).clone()
             torch.cuda.synchronize()
-            assert torch.isfinite(got).all() and torch.isfinite(stock).all()
+            assert torch.isfinite(got).all()
+            assert torch.equal(got, stock), f"M{rows}: not the stock output"
             assert torch.equal(got, repeat), f"M{rows}: eager repeat not bitwise"
-            # Rows whose top-16 set differs between the two stock routers (the
-            # kernel's internal sigmoid + bias top-k vs vLLM's grouped top-k op):
-            # near-ties at the 16th / 17th score
-            mine = torch.sort(ids.long(), dim=1).values
-            theirs = torch.sort(sink.buffer.long(), dim=1).values
-            same_route = (mine == theirs).all(dim=1)
-            differ = int((~same_route).sum())
-            rel = _rel(got[same_route], stock[same_route])
-            rel_all = _rel(got, stock)
-            same = (got == stock).all(dim=1).float().mean().item()
-            report.append(
-                f"M{rows} rel {rel:.2e} (all rows {rel_all:.2e}, bf16 weights "
-                f"{_rel(bf16w, stock):.2e}) route-differing rows {differ} bitwise "
-                f"rows {same:.3f}"
-            )
-            assert differ <= max(1, rows // 50), f"M{rows}: {differ} routes ({report})"
-            assert rel <= ROUTED_TOL, f"M{rows}: rel {rel:.3e} vs stock ({report})"
-            graph, out = _graph(lambda: ours.run(latent, weights, ids))
+            graph, out = _graph(lambda: ours.run(latent, logits))
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(out, got), f"M{rows}: graph replay != eager"
             latent.copy_(_inputs(rows, 7 + rows)[0])
             graph.replay()
-            fresh = ours.run(latent, weights, ids)
+            fresh = ours.run(latent, logits)
             torch.cuda.synchronize()
             assert torch.equal(out, fresh), f"M{rows}: graph ignores new input"
             del graph
-        print("NVFP4 routed vs stock:", "; ".join(report))
 
 
 def mxfp8_shared(dev, config):
@@ -365,8 +328,7 @@ def test_mxfp8_shared_expert_matches_stock(dist):
 
 def test_refusals():
     _torch()
-    from types import SimpleNamespace
-
+    
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.nvfp4 import (
         mxfp8_shared_cause,
         nvfp4_experts_cause,

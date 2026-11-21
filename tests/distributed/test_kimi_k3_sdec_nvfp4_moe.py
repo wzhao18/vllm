@@ -14,9 +14,9 @@ rank, the TP-sharded ones (experts, shared expert) per rank; processed as the lo
 does (``process_weights_after_loading`` + the SM107 MXFP8 dispatch kernel).
 
 Per row count R: stock = ``KimiMoE.forward(x)`` (all-reduced [R, 7168]); ours =
-``Nvfp4MoE.run`` (stock router + latent down + routes, NVFP4 TRT-LLM-Gen routed
-experts, MXFP8 shared expert + RS push, the wide tail into the output ring), read from
-the ring. Checks: finite; ours vs stock within ``TOL`` (the experts' operands are the
+``Nvfp4MoE.run`` (stock router + latent down, the layer's NVFP4 TRT-LLM-Gen experts,
+MXFP8 shared expert + RS push, the wide tail into the output ring), read from the
+ring; then again with the layer's top-k finalize deferred to the tail (R <= 128). Checks: finite; ours vs stock within ``TOL`` (the experts' operands are the
 same; the latent all-reduce, RMS and up projection sum in another FP32 order, and
 stock's monolithic kernel routes from the logits itself); our eager repeat and our
 CUDA-graph replay bitwise; every rank's output equal (one multicast ring)."""
@@ -32,6 +32,7 @@ from vllm.utils.network_utils import get_open_port
 WORLD = 4
 ROWS = (1, 4, 8, 16, 32, 64, 96, 128, 256, 512)
 TOL = 2e-2
+DEFER_ROWS = 128  # (the stock tail op's cap)
 TIMEOUT = 1800
 PREFIX = "language_model.model.layers.1.mlp"
 SENTINEL = -0x80000000
@@ -202,12 +203,13 @@ def _case(config, rank, device, group):
         norm.variance_epsilon, ROWS, state.rows, 0,
     )  # fmt: skip
     ours = Nvfp4MoE(module, state, rows, ROWS)
-    report = []
+    report, refs = [], {}
     with torch.inference_mode(), set_forward_context(None, config):
         for r in ROWS:
             gen = torch.Generator(device=device).manual_seed(100 + r)  # same x per rank
             x = torch.randn(r, 7168, generator=gen, device=device).bfloat16()
             stock = module(x.clone()).clone()
+            refs[r] = x, stock
             out = torch.empty_like(x)
             ours.run(x, out, consume=lambda o: o)
             got = _read_ring(state.rows, r, group)
@@ -235,8 +237,34 @@ def _case(config, rank, device, group):
             replay = _read_ring(state.rows, r, group)
             assert torch.equal(replay, got), f"R{r}: graph replay != eager"
             del graph
+    # The layer's deferred top-k finalize (the stock runner asks for it at TP8 /
+    # TP16 for small batches): the experts return their unfinalized output and the
+    # wide tail's LatentRows sums the top k. Against the stock references above.
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (
+        deferred_rows,
+    )
+
+    module.experts.moe_config.defer_moe_finalize(DEFER_ROWS)
+    late = deferred_rows(module, ROWS)
+    assert late[0] == tuple(r for r in ROWS if r <= DEFER_ROWS), late
+    rows = PreparedTailRows(
+        WORLD, rank, module.routed_expert_up_proj.weight, norm.weight,
+        norm.variance_epsilon, ROWS, state.rows, 1, deferred=late,
+    )  # fmt: skip
+    ours = Nvfp4MoE(module, state, rows, ROWS)
+    deferred = []
+    with torch.inference_mode(), set_forward_context(None, config):
+        for r in ROWS:
+            x, stock = refs[r]
+            out = torch.empty_like(x)
+            ours.run(x, out, consume=lambda o: o)
+            got = _read_ring(state.rows, r, group)
+            rel = ((got.float() - stock.float()).norm() / stock.float().norm()).item()
+            deferred.append(f"R{r} {rel:.2e}")
+            assert rel <= TOL, f"rank {rank} deferred R{r}: rel {rel:.3e}"
     if rank == 0:
         print("NVFP4 MoE vs stock KimiMoE (rel):", "; ".join(report), flush=True)
+        print("deferred finalize (rel):", "; ".join(deferred), flush=True)
 
 
 def _worker(rank: int, port: int) -> None:
