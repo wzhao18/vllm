@@ -20,6 +20,7 @@ from ..cutedsl.dsa.index import DIM, HEADS
 from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
 from ..cutedsl.dsa.wide import WideDsa
 from ..cutedsl.dsa.wide import choose as dsa_choose
+from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.head import (
     PreparedKdaHead,
@@ -34,6 +35,7 @@ from ..cutedsl.mla.prepared import SWITCH, PreparedMla
 from ..cutedsl.mla.prepared import choose as mla_choose
 from ..cutedsl.mla.query import POLLED_X
 from ..cutedsl.mla.rows import VERIFY_ROWS
+from ..cutedsl.oproj.mxfp8 import Mxfp8Oproj
 from ..cutedsl.oproj.prepared import PreparedOproj, fused_schedule, shared_x
 from ..cutedsl.oproj.prepared import choose as oproj_choose
 from ..shapes import Path, Shape, refuse, rows_policy
@@ -229,7 +231,10 @@ INPROJ_LT = {
 def inproj_note(attention, b):
     """NQ-NOFALLBACK: the coverage note of an attention's in-projection at a wide
     batch: the specialized GEMM, or the stock cuBLAS GEMM with its measured reason
-    (``PROJECTION_GENERIC`` / ``INPROJ_LT``; NQ-TUNE where none exists)."""
+    (``PROJECTION_GENERIC`` / ``INPROJ_LT``; NQ-TUNE where none exists), or the
+    MXFP8 GEMM's kind (an MXFP8 KDA layer: stock's kernel unless ``MX_TUNED``)."""
+    if getattr(attention, "mx_in", False):
+        return f"inproj mxfp8 {attention.projection.engine(b)}"
     if b in attention.projection.fallback.kernels:
         return "inproj splitk"
     library = "cuBLASLt" if attention.lt_rows.get(b) else "cuBLAS"
@@ -343,6 +348,22 @@ UNREAD_LINEARS = ("kv_b_proj",)
 # Unquantized linears stock keeps in another dtype, read as that dtype: the KDA
 # short-convolution taps (``KimiDeltaAttention.conv1d``, FP32).
 LINEAR_DTYPES = {"conv1d": torch.float32}
+# Linears of a KDA layer the TP providers also read as online MXFP8 (the NVFP4
+# ``modelopt_mixed`` checkpoint): the in-projection (``Attention``:
+# ``gemm.mxfp8.Mxfp8Projection``) and the o-projection (``oproj.mxfp8.Mxfp8Oproj``).
+KDA_MXFP8_LINEARS = ("self_attn.in_proj_qkvgfab", "self_attn.o_proj")
+
+
+def mxfp8_kda_linear(decoder, name, module):
+    """Whether ``module`` (``name`` in ``decoder``) is a KDA projection the TP
+    providers read as online MXFP8 (``KDA_MXFP8_LINEARS``)."""
+    from ...mxfp8 import is_mxfp8_linear
+
+    return (
+        attention_kind(decoder.self_attn) == "kda"
+        and name in KDA_MXFP8_LINEARS
+        and is_mxfp8_linear(module)
+    )
 
 
 def check_bf16_projections(decoder, own=()):
@@ -360,7 +381,7 @@ def check_bf16_projections(decoder, own=()):
         leaf = name.rsplit(".", 1)[-1]
         if not isinstance(module, LinearBase) or leaf in UNREAD_LINEARS:
             continue
-        if id(module) in owned:
+        if id(module) in owned or mxfp8_kda_linear(decoder, name, module):
             continue
         dtype = LINEAR_DTYPES.get(leaf)
         if dtype is None:
@@ -500,24 +521,47 @@ def attention_kind(attention):
 class Attention:
     """Input projection -> KDA/MLA/DSA core -> o-projection with its fused AttnRes."""
 
+    # An online-MXFP8 KDA in-projection (``Mxfp8Projection``; set per layer)
+    mx_in = False
+
     def __init__(self, decoder, runtime, prefetch, mailbox, small_batch, twoshot=None):
         attention, tp = decoder.self_attn, runtime.tp
         self.kind = kind = attention_kind(attention)
-        if kind == "dsa":
-            weight = pack_dsa_projection(attention)
+        # An online-MXFP8 KDA in-projection / o-projection (the NVFP4 checkpoint):
+        # the stock layer's MXFP8 GEMM per batch (``gemm.mxfp8``), no BF16 tactic.
+        self.mx_in = mx_in = kind == "kda" and mxfp8_kda_linear(
+            decoder, "self_attn.in_proj_qkvgfab", attention.in_proj_qkvgfab
+        )
+        mx_out = kind == "kda" and mxfp8_kda_linear(
+            decoder, "self_attn.o_proj", getattr(attention, "o_proj", None)
+        )
+        self.projection: Any  # SkinnyProjection or Mxfp8Projection
+        if mx_in:
+            weight, device = None, attention.in_proj_qkvgfab.weight.device
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            with torch.accelerator.device_index(device.index):
+                self.projection = Mxfp8Projection(
+                    attention.in_proj_qkvgfab, runtime.batches, family="kda_in",
+                    cap=runtime.capacity,
+                )  # fmt: skip
+            pitch, policies = self.projection.n, {}
+            self.lt_rows = {}
         else:
-            name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
-            weight = bf16_weight(getattr(attention, name))
-        pitch = weight.shape[0]
-        sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
-        policies = projection_policies(tp, pitch, runtime.batches, sms, runtime.q)
-        split_k = PreparedProjection(weight, policies).prepare()
-        skinny = WIDE_SKINNY.get(pitch, SKINNY) if sms > 152 else SKINNY
-        self.projection = SkinnyProjection(weight, split_k, skinny)
+            if kind == "dsa":
+                weight = pack_dsa_projection(attention)
+            else:
+                name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
+                weight = bf16_weight(getattr(attention, name))
+            pitch = weight.shape[0]
+            sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
+            policies = projection_policies(tp, pitch, runtime.batches, sms, runtime.q)
+            split_k = PreparedProjection(weight, policies).prepare()
+            skinny = WIDE_SKINNY.get(pitch, SKINNY) if sms > 152 else SKINNY
+            self.projection = SkinnyProjection(weight, split_k, skinny)
+            # Wide rows whose cuBLAS in-projection prefers cuBLASLt (``INPROJ_LT``)
+            lt = INPROJ_LT.get(pitch, "") if sms > 152 and tp == 16 else ""
+            self.lt_rows = batch_table(lt)
         self.weight = weight
-        # Wide rows whose cuBLAS in-projection prefers cuBLASLt (``INPROJ_LT``)
-        lt = INPROJ_LT.get(pitch, "") if sms > 152 and tp == 16 else ""
-        self.lt_rows = batch_table(lt)
         self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
         self.core_long: Any = None  # MLA: the step switch's body 1 core (SWITCH)
         # MLA decode batches whose o-projection polls DcpValue's output (one of two
@@ -598,7 +642,8 @@ class Attention:
             verify = [b // q for b in kdasplit if q > 1 and b % q == 0]
             policies.update({(b, q): (pitch, int(tp == 8)) for b in verify})
             fold = KDA_FOLD64 if runtime.bf16_state else KDA_FOLD64_FP32
-            fold = batch_table(fold.get(tp, "") if sms > 152 else "")
+            # (the fold's epilogue is a BF16 in-projection's: no MXFP8 layer folds)
+            fold = batch_table(fold.get(tp, "") if sms > 152 and not mx_in else "")
             folded = 64 in tactics and len(tactics[64]) > 4 and pitch == 3216
             folded = folded and bool(fold.get(8 * q)) and 4 <= q <= 8 and 8 in verify
             prepared = ((8, q),) if folded else ()
@@ -630,8 +675,9 @@ class Attention:
             # in-projection -> KdaSplit pair. Decided here, not in ``prepare_layout``:
             # the MoE tail before this layer (``use_heads``) and its AttnRes's
             # carve-out are set up for the head.
+            # KdaHead fuses a BF16 in-projection: an MXFP8 one keeps the pair.
             state = torch.bfloat16 if runtime.bf16_state else torch.float32
-            eligible = sms > 152 and tp == 16 and pitch == 3216
+            eligible = sms > 152 and tp == 16 and pitch == 3216 and not mx_in
             kda_core, fa_width = self.core, pitch - 4 * self.core.dim
             fits = lambda b, t: eligible and head_supported(
                 kda_core.heads, state, kda_core.has_bias, weight.shape[1], b, t,
@@ -727,18 +773,30 @@ class Attention:
         self.oproj_wide = frozenset(
             s.rows for s in shapes if oproj_choose(s, runtime.context)
         )
-        self.output = PreparedOproj(
-            decoder,
-            mailbox,
-            (*runtime.tuned, *sorted(self.oproj_wide)),
-            kind != "kda",
-            front,
-            twoshot,
-            self.polled_out,
-            head_polled,
-            x_buffer=local,
-            sharded=(runtime.sharded, runtime.shard_box),
-        )
+        oproj_batches = (*runtime.tuned, *sorted(self.oproj_wide))
+        sharded = (runtime.sharded, runtime.shard_box)
+        self.output: Any  # PreparedOproj or Mxfp8Oproj
+        if mx_out:
+            # the MXFP8 GEMM's partial rows (one scratch for every MXFP8 layer)
+            partial = scratch(runtime, "oproj.mxfp8.partial", (rows, 7168))
+            with torch.accelerator.device_index(local.device.index):
+                self.output = Mxfp8Oproj(
+                    decoder, mailbox, oproj_batches, front, twoshot, local, sharded,
+                    partial=partial,
+                )  # fmt: skip
+        else:
+            self.output = PreparedOproj(
+                decoder,
+                mailbox,
+                oproj_batches,
+                kind != "kda",
+                front,
+                twoshot,
+                self.polled_out,
+                head_polled,
+                x_buffer=local,
+                sharded=sharded,
+            )
         self.prefetch, self.layer = prefetch, decoder
         # Wide batches whose o-projection runs stock: the AttnRes after it runs unfused,
         # on ClusterAttnRes or (``runtime.stock_attn_res``) the stock op.
@@ -954,7 +1012,7 @@ class Attention:
         (seam S3)."""
         b = x.shape[0]
         projected, local = self.storage[b]
-        if b in self.projection.fallback.kernels:
+        if self.mx_in or b in self.projection.fallback.kernels:
             projected = self.projection.run(x, projected)
         else:  # no generic tactic at these rows: cuBLAS, as the stock layer
             with blas_library("cublaslt" if self.lt_rows.get(b) else None):
