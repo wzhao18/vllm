@@ -62,12 +62,17 @@ SCATTER_IN = False
 
 def supported(vllm_config: Any) -> bool:
     """Whether ``vllm_config`` runs DSA-DP: a Kimi K3 model with DSA layers on
-    CUDA, TP > 1, no decode / prefill context parallelism. Config values only."""
+    CUDA, TP > 1, no decode / prefill context parallelism, and not the specialized
+    decode (``decode_backend=latency_specialized``: its plain TP8 / TP16 layouts
+    keep replicated DSA KV and read it on every rank). Config values only."""
     from vllm.platforms import current_platform
 
     pc = vllm_config.parallel_config
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None or not current_platform.is_cuda():
+        return False
+    extra = getattr(vllm_config, "additional_config", None)
+    if isinstance(extra, dict) and extra.get("decode_backend") == "latency_specialized":
         return False
     hf = model_config.hf_text_config
     return (
