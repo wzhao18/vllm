@@ -15,12 +15,20 @@ DSA KV. The block-id space is split in two:
 Each card allocates ``S + D`` pages; the scheduler addresses ``S + tp * D``.
 """
 
+import weakref
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
+
+
+def _pool_of(block: KVCacheBlock) -> BlockPool | None:
+    """The pool that allocated ``block`` (``block.pool`` is a weak reference to it
+    since KVCacheBlock stays out of the cyclic GC)."""
+    pool = block.pool
+    return pool() if isinstance(pool, weakref.ref) else pool
 
 
 class _OffsetBlocks:
@@ -65,6 +73,8 @@ class DSARegionBlockPool(SharedEventQueueBlockPool):
         for i, block in enumerate(blocks):
             block.block_id = first_block_id + i
         self.blocks = _OffsetBlocks(blocks, first_block_id)  # type: ignore[assignment]
+        # The hash map resolves cached block ids through the block list.
+        self.cached_block_hash_to_block = BlockHashToBlockMap(self.blocks)
         self.null_block = shared_pool.null_block
         self.first_block_id = first_block_id
         self.demotion_gate = shared_pool.demotion_gate
@@ -177,7 +187,7 @@ class DSARegionPools:
         for block in blocks:
             if block.is_null:
                 continue
-            out.setdefault(block.pool or self.pool, []).append(block)
+            out.setdefault(_pool_of(block) or self.pool, []).append(block)
         return out
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
@@ -207,14 +217,15 @@ class DSARegionPools:
             pool.unpin_blocks(group, on_reuse)
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
-        return (block.pool or self.pool).is_block_writable(block)
+        return (_pool_of(block) or self.pool).is_block_writable(block)
 
     def move_block_hashes(self, src_block: KVCacheBlock, dst_block: KVCacheBlock):
-        assert src_block.pool is dst_block.pool
-        return src_block.pool.move_block_hashes(src_block, dst_block)
+        pool = _pool_of(src_block)
+        assert pool is _pool_of(dst_block)
+        return pool.move_block_hashes(src_block, dst_block)
 
     def cache_full_blocks(self, request, blocks, *args, **kwargs) -> None:
-        pool = next((b.pool for b in blocks if not b.is_null), None) or self.pool
+        pool = next((_pool_of(b) for b in blocks if not b.is_null), None) or self.pool
         pool.cache_full_blocks(request, blocks, *args, **kwargs)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
