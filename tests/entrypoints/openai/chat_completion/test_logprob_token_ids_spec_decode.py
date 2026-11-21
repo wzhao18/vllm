@@ -6,6 +6,7 @@ every list length 1..128, and the response formatting never fails on a step
 without logprobs."""
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -113,50 +114,46 @@ def spec_server():
         yield server
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_spec_decode_logprob_token_ids_every_length(spec_server, stream: bool):
+def test_spec_decode_logprob_token_ids_every_length(spec_server, stream: bool):
     """Lengths 1..128, greedy and sampled, through the speculative-decoding
     rejection sampler: HTTP 200, one logprobs entry per generated token, and on
     every step exactly the requested ids (plus the sampled token)."""
-    import asyncio
+    client = spec_server.get_client()
 
-    async with spec_server.get_async_client() as client:
+    def one(n: int, temperature: float):
+        ids = list(range(100, 100 + n))
+        kwargs = dict(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": PROMPT}],
+            max_tokens=12,
+            temperature=temperature,
+            logprobs=True,
+            extra_body={
+                "logprob_token_ids": ids,
+                "return_tokens_as_token_ids": True,
+                "ignore_eos": True,
+            },
+        )
+        if not stream:
+            resp = client.chat.completions.create(**kwargs)
+            assert resp.usage.completion_tokens == 12
+            return ids, resp.choices[0].logprobs.content
+        contents = []
+        for chunk in client.chat.completions.create(stream=True, **kwargs):
+            if chunk.choices and chunk.choices[0].logprobs is not None:
+                contents.extend(chunk.choices[0].logprobs.content or [])
+        return ids, contents
 
-        async def one(n: int, temperature: float):
-            ids = list(range(100, 100 + n))
-            kwargs = dict(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": PROMPT}],
-                max_tokens=12,
-                temperature=temperature,
-                logprobs=True,
-                extra_body={
-                    "logprob_token_ids": ids,
-                    "return_tokens_as_token_ids": True,
-                    "ignore_eos": True,
-                },
-            )
-            contents = []
-            if stream:
-                async for chunk in await client.chat.completions.create(
-                    stream=True, **kwargs
-                ):
-                    if chunk.choices and chunk.choices[0].logprobs is not None:
-                        contents.extend(chunk.choices[0].logprobs.content or [])
-            else:
-                resp = await client.chat.completions.create(**kwargs)
-                assert resp.usage.completion_tokens == 12
-                contents = resp.choices[0].logprobs.content
-            return ids, contents
-
-        jobs = [one(n, t) for n in LENGTHS for t in (0.0, 0.8)]
-        for ids, contents in await asyncio.gather(*jobs):
-            assert len(contents) == 12, len(ids)
-            for content in contents:
-                sampled = _token_id(content.token)
-                returned = [_token_id(e.token) for e in content.top_logprobs]
-                assert returned[0] == sampled
-                assert sorted(set(returned)) == sorted({sampled, *ids}), len(ids)
-                assert len(returned) == len(set(returned))
-                assert all(not math.isnan(e.logprob) for e in content.top_logprobs)
+    jobs = [(n, t) for n in LENGTHS for t in (0.0, 0.8)]
+    with ThreadPoolExecutor(16) as pool:
+        results = list(pool.map(lambda job: one(*job), jobs))
+    for ids, contents in results:
+        assert len(contents) == 12, len(ids)
+        for content in contents:
+            sampled = _token_id(content.token)
+            returned = [_token_id(e.token) for e in content.top_logprobs]
+            assert returned[0] == sampled
+            assert sorted(set(returned)) == sorted({sampled, *ids}), len(ids)
+            assert len(returned) == len(set(returned))
+            assert all(not math.isnan(e.logprob) for e in content.top_logprobs)
