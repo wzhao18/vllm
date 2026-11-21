@@ -800,8 +800,11 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            if self._dp_step_token_cap is not None:
-                max_prefill_tokens = min(max_prefill_tokens, self._dp_step_token_cap)
+            # getattr: the split is also called on bare scheduler stand-ins
+            # (unit tests), like the other optional attributes it reads.
+            step_cap = getattr(self, "_dp_step_token_cap", None)
+            if step_cap is not None:
+                max_prefill_tokens = min(max_prefill_tokens, step_cap)
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
