@@ -23,6 +23,8 @@ tests pin the pieces that change relies on:
 """
 
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -288,8 +290,16 @@ def _channel_config(dp_rank: int = 0):
     )
 
 
-def test_channel_round_trips_a_load_only_req_meta(monkeypatch, tmp_path):
-    monkeypatch.setenv("VLLM_RPC_BASE_PATH", str(tmp_path))
+@pytest.fixture
+def short_rpc_dir(monkeypatch):
+    # IPC socket paths are limited to 107 bytes; pytest's tmp_path is too long.
+    path = tempfile.mkdtemp(prefix="el", dir="/tmp")
+    monkeypatch.setenv("VLLM_RPC_BASE_PATH", path)
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def test_channel_round_trips_a_load_only_req_meta(short_rpc_dir):
     received: queue.Queue[ReqMeta] = queue.Queue()
     server = store_worker.EarlyLoadServer(_channel_config(), received.put)
     client = store_worker.EarlyLoadClient(_channel_config())
@@ -309,8 +319,15 @@ def test_channel_round_trips_a_load_only_req_meta(monkeypatch, tmp_path):
         server.close()
 
 
-def test_channel_paths_are_per_engine_and_differ_from_lookup(monkeypatch, tmp_path):
-    monkeypatch.setenv("VLLM_RPC_BASE_PATH", str(tmp_path))
+def test_channel_send_fails_while_the_worker_is_not_listening(short_rpc_dir):
+    client = store_worker.EarlyLoadClient(_channel_config())
+    try:
+        assert client.send(_load_only_meta()) is False
+    finally:
+        client.close()
+
+
+def test_channel_paths_are_per_engine_and_differ_from_lookup(short_rpc_dir):
     paths = {store_worker.get_zmq_path_early_load(_channel_config(dp)) for dp in (0, 1)}
     assert len(paths) == 2
     assert store_worker.get_zmq_path_early_load(
