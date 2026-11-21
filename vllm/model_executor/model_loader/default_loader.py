@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
+    LayerExpertIds,
     compute_local_expert_ids,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -89,7 +90,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        self.local_expert_ids: set[int] | None = None
+        self.local_expert_ids: set[int] | LayerExpertIds | None = None
         # Set in load_weights when --mm-encoder-only; used to drop LM-only shards.
         self._encoder_only_lm_prefixes: tuple[str, ...] | None = None
         self._encoder_only_weights_mapper: WeightsMapper | None = None
@@ -511,6 +512,11 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         self._init_ep_weight_filter(model_config)
+        # A model may hold fewer experts than its EP slice on some layers (e.g.
+        # Kimi K3 expert DWDP): it narrows the filter per layer.
+        restrict = getattr(model, "restrict_local_expert_ids", None)
+        if self.local_expert_ids is not None and callable(restrict):
+            self.local_expert_ids = restrict(self.local_expert_ids)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))

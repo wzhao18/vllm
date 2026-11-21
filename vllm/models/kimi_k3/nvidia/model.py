@@ -3231,6 +3231,13 @@ class KimiLinearForCausalLM(
         )
         return verify.run(logits, steps, **kwargs)
 
+    def restrict_local_expert_ids(self, local_expert_ids):
+        """Loader hook: skip the expert weights this rank does not hold (expert
+        DWDP keeps half of the EP-local experts per layer)."""
+        from .megamoe_rubin.experts import restrict_local_expert_ids
+
+        return restrict_local_expert_ids(self, local_expert_ids)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
@@ -3694,6 +3701,13 @@ class KimiK3ForConditionalGeneration(
         return packed_dsa_block_size(
             vllm_config, attn_page_size_1_token, mamba_page_size, alignment
         )
+
+    def restrict_local_expert_ids(self, local_expert_ids):
+        """Loader hook: skip the expert weights this rank does not hold (expert
+        DWDP keeps half of the EP-local experts per layer)."""
+        from .megamoe_rubin.experts import restrict_local_expert_ids
+
+        return restrict_local_expert_ids(self, local_expert_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)

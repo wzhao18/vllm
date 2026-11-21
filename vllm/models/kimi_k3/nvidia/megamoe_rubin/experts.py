@@ -507,6 +507,19 @@ class KimiK3MegaMoEExperts(nn.Module):
             )
         # Kernel-layout weights, set by process_weights_after_loading.
         self.kernel_weights: RubinMoeWeights | None = None
+        # Local experts [lo, hi) this rank holds: all of them, except under expert
+        # DWDP, where each layer after the first keeps only the half its engine
+        # owns (dwdp.ExpertDwdp.claim). NVFP4 checkpoints then allocate and load only
+        # that half of the codes and block scales (the per-expert global scales stay
+        # whole: they are the kernel's alphas for both halves).
+        self.resident_experts = (0, num_local_experts)
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            self._dwdp_layer, lo, hi = expert_dwdp.claim(num_local_experts)
+            self.resident_experts = (lo, hi)
+        self.sharded_experts = weight_format is MEGA_MOE_NVFP4 and (
+            self.resident_experts != (0, num_local_experts)
+        )
 
         if weight_format is MEGA_MOE_NVFP4:
             self._create_nvfp4_weights()
@@ -575,14 +588,16 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"Rubin MegaMoE needs hidden and intermediate sizes that are multiples "
                 f"of {group}, got {h} and {i}."
             )
+        lo, hi = self.resident_experts
+        r = hi - lo  # resident experts (codes and block scales)
         e4m3 = torch.float8_e4m3fn
         shapes = {
-            "w13_weight": ((e, 2 * i, h // 2), torch.uint8),
-            "w13_weight_scale": ((e, 2 * i, h // NV_BLOCK), e4m3),
+            "w13_weight": ((r, 2 * i, h // 2), torch.uint8),
+            "w13_weight_scale": ((r, 2 * i, h // NV_BLOCK), e4m3),
             "w13_weight_scale_2": ((e, 2), torch.float32),
             "w13_input_scale": ((e, 2), torch.float32),
-            "w2_weight": ((e, h, i // 2), torch.uint8),
-            "w2_weight_scale": ((e, h, i // NV_BLOCK), e4m3),
+            "w2_weight": ((r, h, i // 2), torch.uint8),
+            "w2_weight_scale": ((r, h, i // NV_BLOCK), e4m3),
             "w2_weight_scale_2": ((e,), torch.float32),
             "w2_input_scale": ((e,), torch.float32),
         }
@@ -653,6 +668,11 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{weight_name}: NVFP4 block scales must be E4M3, got "
                 f"{loaded_weight.dtype}."
             )
+        if self.sharded_experts:  # only the resident experts' rows exist
+            lo, hi = self.resident_experts
+            local_expert_ids = [x - lo for x in local_expert_ids if lo <= x < hi]
+            if not local_expert_ids:
+                return False if return_success else None
         for local_expert_id in local_expert_ids:
             self._load_weight(param.data[local_expert_id], loaded_weight, shard_id)
         return True if return_success else None
@@ -713,6 +733,29 @@ class KimiK3MegaMoEExperts(nn.Module):
                     "Rubin NVFP4 path takes unit activation scales only."
                 )
         return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone()
+
+    def _prepare_resident_nvfp4(self, runtime: RubinMegaMoE) -> RubinMoeWeights:
+        """Expert DWDP, NVFP4: the kernel layout of the resident half (the layout is
+        per expert, so the half converts to the same bytes as the same experts of a
+        whole conversion), with every local expert's alphas."""
+        lo, hi = self.resident_experts
+        fc1_alpha, fc2_alpha = self._nvfp4_alphas()
+        for name, g in (("w13", fc1_alpha), ("w2", fc2_alpha)):
+            if not bool(torch.isfinite(g).all()) or not bool((g > 0).all()):
+                raise ValueError(
+                    f"{self.prefix}: {name} weight_scale_2 must be finite and positive."
+                )
+        weights = runtime.prepare_nvfp4_checkpoint_weights(
+            *self.canonical_weights(),
+            fc1_alpha[lo:hi].contiguous(),
+            fc2_alpha[lo:hi].contiguous(),
+            num_experts=hi - lo,
+        )
+        return weights._replace(
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=torch.ones_like(fc1_alpha),
+        )
 
     def reserve_sms_for_shared_expert(
         self,
@@ -886,7 +929,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         error: Exception | None = None
         weights = None
         try:
-            if self.weight_format is MEGA_MOE_NVFP4:
+            if self.weight_format is MEGA_MOE_NVFP4 and self.sharded_experts:
+                weights = self._prepare_resident_nvfp4(runtime)
+            elif self.weight_format is MEGA_MOE_NVFP4:
                 alphas = self._nvfp4_alphas()
                 weights = runtime.prepare_nvfp4_checkpoint_weights(
                     *self.canonical_weights(), *alphas
@@ -912,6 +957,14 @@ class KimiK3MegaMoEExperts(nn.Module):
         assert weights is not None
         expert_dwdp = dwdp.get()
         if expert_dwdp is not None:
+            lo, hi = self.resident_experts
+            if not self.sharded_experts and (lo, hi) != (0, self.num_local_experts):
+                # Converted whole (MXFP4: the alphas come from the conversion):
+                # keep the home half.
+                weights = weights._replace(
+                    fc1=tuple(t[lo:hi] for t in weights.fc1),
+                    fc2=tuple(t[lo:hi] for t in weights.fc2),
+                )
             weights = expert_dwdp.register(self, weights)
         elif self.bucket.die_sm_mask32 is not None and _die_local_fits(
             weights, self.num_moe_layers
@@ -1229,3 +1282,22 @@ def _die_local_fits(weights: Any, num_moe_layers: int) -> bool:
                 free / 2**30,
             )
     return _DIE_LOCAL_FITS
+
+
+def restrict_local_expert_ids(model: nn.Module, local_expert_ids: Any) -> Any:
+    """The loader's EP expert filter narrowed to what each MoE layer allocated:
+    under expert DWDP a layer after the first holds only its home half, so the
+    other half's weights are skipped before they are read."""
+    from vllm.model_executor.model_loader.ep_weight_filter import LayerExpertIds
+
+    layers: dict[int, set[int]] = {}
+    for m in model.modules():
+        if isinstance(m, KimiK3MegaMoEExperts) and m.sharded_experts:
+            lo, hi = m.resident_experts
+            first = m.experts_start_idx
+            layers[m.layer_id] = {
+                p % m.num_logical_experts for p in range(first + lo, first + hi)
+            }
+    if not layers or isinstance(local_expert_ids, LayerExpertIds):
+        return local_expert_ids
+    return LayerExpertIds(set(local_expert_ids), layers)

@@ -234,8 +234,10 @@ class Copies:
 
 
 class _Layer:
-    def __init__(self, ordinal: int):
+    def __init__(self, ordinal: int, experts: int, home: int | None):
         self.ordinal = ordinal
+        self.experts = experts  # local experts of the layer (both halves)
+        self.home = home  # the half this engine owns; None: the resident first layer
         # (dst, key, size, data offset) of the partner's half, mapped at finalize
         self.pending: list[tuple] = []
         self.copies: Copies | None = None
@@ -271,30 +273,55 @@ class ExpertDwdp:
 
     # -- loading ---------------------------------------------------------------------
 
+    def claim(self, num_local_experts: int) -> tuple[_Layer, int, int]:
+        """At construction of one MoE layer (module order, identical on every rank):
+        its DWDP layer and the local experts ``[lo, hi)`` this rank holds, which are
+        the only ones it allocates and loads. The first layer stays resident (all
+        experts); every other layer keeps the half this engine owns,
+        ``index ^ (ordinal & 1)``."""
+        from .die_local import expert_split
+
+        ordinal = len(self.order)
+        if ordinal == 0:
+            layer = _Layer(0, num_local_experts, None)
+            self.order.append(layer)
+            return layer, 0, num_local_experts
+        half = expert_split(num_local_experts)
+        if 2 * half != num_local_experts:
+            raise ValueError(
+                f"Expert DWDP needs an even local expert count, got {num_local_experts}."
+            )
+        home = self.index ^ (ordinal & 1)
+        layer = _Layer(ordinal, num_local_experts, home)
+        self.order.append(layer)
+        return layer, home * half, (home + 1) * half
+
     def register(self, module, weights):
         """Replace one MoE layer's kernel weights (``RubinMoeWeights``) with tensors
-        assembled from home memory and a staging slot. The first layer stays resident
-        (die-placed when the die streams run)."""
+        assembled from home memory and a staging slot. ``weights`` holds the experts
+        ``claim`` gave this rank: all of them on the first layer, which stays
+        resident (die-placed when the die streams run), else the home half."""
         from .die_local import place_experts
 
-        layer = _Layer(len(self.order))
-        self.order.append(layer)
-        module._dwdp_layer = layer
-        if layer.ordinal == 0:
+        layer = module._dwdp_layer
+        assert self.order[layer.ordinal] is layer, "register: unclaimed layer"
+        if layer.home is None:
             return place_experts(weights) if self.die_placed else weights
         tensors = (*weights.fc1, *weights.fc2)
         new = [self._assemble(layer, name, t) for name, t in zip("ABCD", tensors)]
         return weights._replace(fc1=tuple(new[:2]), fc2=tuple(new[2:]))
 
     def _assemble(self, layer: _Layer, name: str, t: torch.Tensor) -> torch.Tensor:
-        """One kernel tensor as [half 0 | half 1] in a fixed VA range; half ``p`` is
-        owned by engine ``p`` on even layers, by the other engine on odd ones."""
-        from .die_local import expert_split
-
+        """One kernel tensor as [half 0 | half 1] in a fixed VA range from the home
+        half ``t`` (experts on dim 0); half ``p`` is owned by engine ``p`` on even
+        layers, by the other engine on odd ones."""
+        if 2 * t.shape[0] != layer.experts:
+            raise ValueError(
+                f"expert DWDP: layer {layer.ordinal} {name} has {t.shape[0]} experts, "
+                f"expected the home half of {layer.experts}."
+            )
         src = storage_bytes(t)
-        E = t.shape[0]
-        hb = src.numel() // E * expert_split(E)
-        assert 2 * hb == src.numel(), "expert DWDP needs an even local expert count"
+        hb = src.numel()
         chunk = _dies().CHUNK
         pad = (-hb) % chunk  # the half boundary lands on a chunk
         total = aligned(pad + 2 * hb, chunk)
@@ -306,17 +333,19 @@ class ExpertDwdp:
             owner = p ^ (layer.ordinal & 1)
             key = f"{layer.ordinal}/{name}/{p}"
             if owner == self.index:
+                assert p == layer.home
                 handle = create(va1 - va0, self.device, die)
                 self.exports[key] = export(handle)
                 rng.map(va0, va1 - va0, handle)
-                full[p * hb : (p + 1) * hb].copy_(src[p * hb : (p + 1) * hb])
+                full[p * hb : (p + 1) * hb].copy_(src)
             else:
                 slot = (layer.ordinal % DEPTH, f"{name}/{p}")
                 if slot not in self.slots:
                     self.slots[slot] = create(va1 - va0, self.device, die)
                 rng.map(va0, va1 - va0, self.slots[slot])
                 layer.pending.append((full[p * hb : (p + 1) * hb], key, va1 - va0, off))
-        return full.view(t.dtype).as_strided(t.shape, t.stride())
+        shape = (layer.experts, *t.shape[1:])
+        return full.view(t.dtype).as_strided(shape, t.stride())
 
     def finalize(self) -> None:
         """After every layer registered (on both engines): map the partner's halves.
