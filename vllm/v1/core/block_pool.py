@@ -4,6 +4,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Container, Iterable, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -36,6 +37,77 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class BlockFreeClock:
+    """When KV cache blocks were last returned to their pool.
+
+    A KV connector that writes a newly allocated block outside the GPU stream
+    order (MooncakeStoreConnector's early loads, issued from schedule() while
+    the previous step still runs) needs the block to be unused by every step
+    still in flight. With async scheduling (two batches in flight) the only
+    step in flight during schedule() is the last non-empty step built before
+    it, and the frees that step may still read or write are those made since
+    its schedule() returned:
+
+    - a block freed while that step was being scheduled is not read by its
+      forward (the scheduler invariant the connector loads already rely on),
+      and every earlier step has completed;
+    - fenced frees (the scheduler's deferred frees and request frees whose
+      last step has been processed) have no GPU user left.
+
+    The scheduler ticks the clock when schedule() starts, calls
+    ``step_built()`` when a non-empty schedule() returns, and wraps fenced
+    frees in ``fenced()``. ``freed_recently(block)`` is then True for a block
+    returned by an unfenced free since the last non-empty schedule() returned
+    (including during the current schedule()).
+    """
+
+    FENCED = -1
+
+    def __init__(self) -> None:
+        self.epoch = 0
+        # Epoch of the first free after the last non-empty schedule() returned.
+        self._boundary = 0
+        self._fenced = 0
+
+    def tick(self) -> None:
+        self.epoch += 1
+
+    def step_built(self) -> None:
+        self.epoch += 1
+        self._boundary = self.epoch
+
+    def stamp(self) -> int:
+        return self.FENCED if self._fenced else self.epoch
+
+    @contextmanager
+    def fenced(self):
+        """Frees inside are of blocks whose last GPU user has completed."""
+        self._fenced += 1
+        try:
+            yield
+        finally:
+            self._fenced -= 1
+
+    def freed_recently(self, block: KVCacheBlock) -> bool:
+        """Whether ``block`` (or, for a packed slot, its parent block) was
+        returned by an unfenced free since the last non-empty schedule()
+        returned."""
+        if self._recent(block.free_epoch):
+            return True
+        pool = block.pool() if block.pool is not None else None
+        if isinstance(pool, SlotBlockPool):
+            row_block = pool.row_block(block.block_id)
+            return row_block is None or self._recent(row_block.free_epoch)
+        return False
+
+    def _recent(self, free_epoch: int) -> bool:
+        return free_epoch != self.FENCED and free_epoch >= self._boundary
+
+
+# One scheduler per engine core process; ticked by Scheduler.schedule().
+BLOCK_FREE_CLOCK = BlockFreeClock()
 
 
 class BlockHashToBlockMap:
@@ -1041,6 +1113,7 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
+                block.free_epoch = BLOCK_FREE_CLOCK.stamp()
                 if self._evict_on_free and block.block_id in self._evict_on_free:
                     self._forget_eviction_marks(block)
                     self._maybe_evict_cached_block(block)
@@ -1162,6 +1235,7 @@ class BlockPool:
         it evicts those slots (``reclaim_slot_row`` takes it back on a hit)."""
         assert block.ref_cnt == 1 and block.block_hash is None
         block.ref_cnt = 0
+        block.free_epoch = BLOCK_FREE_CLOCK.stamp()
         self._slot_rows[block.block_id] = slot_pool
         if self.enable_caching:
             self._lru_since[block.block_id] = self._clock()
@@ -1331,6 +1405,10 @@ class SlotBlockPool(BlockPool):
         for slot in cached:
             self._lru_since[slot.block_id] = now
         self.free_block_queue.append_n(cached)
+
+    def row_block(self, slot_id: int) -> KVCacheBlock | None:
+        """The parent block holding ``slot_id`` while this pool holds it."""
+        return self._held.get(slot_id // self.slots_per_block)
 
     def drop_row(self, row: int) -> None:
         """The parent reuses a block given back with cached slots: evict them."""

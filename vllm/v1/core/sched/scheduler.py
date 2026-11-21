@@ -36,7 +36,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.block_pool import SlotBlockPool
+from vllm.v1.core.block_pool import BLOCK_FREE_CLOCK, SlotBlockPool
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -889,6 +889,9 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # Frees from here until this call returns are "recent" for connector
+        # loads issued during the next call (BlockFreeClock).
+        BLOCK_FREE_CLOCK.tick()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -2176,6 +2179,9 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if total_num_scheduled_tokens > 0:
+            # This step may now be in flight: later frees are recent.
+            BLOCK_FREE_CLOCK.step_built()
         return scheduler_output
 
     def _trim_new_reqs_for_workers(
@@ -3986,7 +3992,12 @@ class Scheduler(SchedulerInterface):
         pool when an in-flight GPU step may still write them.
         """
         if self._request_blocks_can_be_freed(request):
-            self.kv_cache_manager.free(request)
+            if self.defer_block_free:
+                # Its last step has been processed: no GPU user is left.
+                with BLOCK_FREE_CLOCK.fenced():
+                    self.kv_cache_manager.free(request)
+            else:
+                self.kv_cache_manager.free(request)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
@@ -3998,8 +4009,12 @@ class Scheduler(SchedulerInterface):
         """Release CoW copy retentions, deferring their return to the block
         pool while the step that runs the copy may still be in flight.
         """
-        if not self.defer_block_free or fence_seq <= self.processed_step_seq:
+        if not self.defer_block_free:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
+            return
+        if fence_seq <= self.processed_step_seq:
+            with BLOCK_FREE_CLOCK.fenced():
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
@@ -4016,7 +4031,8 @@ class Scheduler(SchedulerInterface):
                 break
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            with BLOCK_FREE_CLOCK.fenced():
+                self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     def _drain_deferred_loads(self) -> None:
         """Start deferred async loads whose fence step has completed."""
