@@ -26,6 +26,7 @@ Needs a Blackwell-family GPU with FlashInfer's TRT-LLM fused MoE (SiTU)."""
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -227,18 +228,47 @@ def test_nvfp4_routed_experts_match_stock(dist):
         report = []
         for rows in ROWS:
             latent, logits = _inputs(rows, 1000 + rows)
-            stock = method.apply_monolithic(layer, latent, logits)
+            # The stock layer's monolithic kernel, its own routes captured (the
+            # layer's routed-experts sink interface)
+            sink = SimpleNamespace(
+                buffer=torch.empty(rows, TOPK, dtype=torch.int16, device="cuda"),
+                capture_fn=lambda ids: None,
+            )
+            stock = method.moe_kernel.apply_monolithic(
+                latent, layer.w13_weight, layer.w2_weight, logits,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                num_expert_group=layer.num_expert_group, topk_group=layer.topk_group,
+                e_score_correction_bias=layer.e_score_correction_bias,
+                routed_scaling_factor=layer.routed_scaling_factor, routing_sink=sink,
+            )  # fmt: skip
             assert isinstance(stock, torch.Tensor), type(stock)
             stock = stock[:, :LATENT].clone()
             weights, ids = route(logits)
             got = ours.run(latent, weights, ids).clone()
             repeat = ours.run(latent, weights, ids).clone()
+            bf16w = ours.run(latent, weights.bfloat16().float(), ids).clone()
             torch.cuda.synchronize()
             assert torch.isfinite(got).all() and torch.isfinite(stock).all()
             assert torch.equal(got, repeat), f"M{rows}: eager repeat not bitwise"
-            rel = _rel(got, stock)
+            # Rows whose top-16 set differs between the two stock routers (the
+            # kernel's internal sigmoid + bias top-k vs vLLM's grouped top-k op):
+            # near-ties at the 16th / 17th score
+            mine = torch.sort(ids.long(), dim=1).values
+            theirs = torch.sort(sink.buffer.long(), dim=1).values
+            same_route = (mine == theirs).all(dim=1)
+            differ = int((~same_route).sum())
+            rel = _rel(got[same_route], stock[same_route])
+            rel_all = _rel(got, stock)
             same = (got == stock).all(dim=1).float().mean().item()
-            report.append(f"M{rows} rel {rel:.2e} bitwise rows {same:.3f}")
+            report.append(
+                f"M{rows} rel {rel:.2e} (all rows {rel_all:.2e}, bf16 weights "
+                f"{_rel(bf16w, stock):.2e}) route-differing rows {differ} bitwise "
+                f"rows {same:.3f}"
+            )
+            assert differ <= max(1, rows // 50), f"M{rows}: {differ} routes ({report})"
             assert rel <= ROUTED_TOL, f"M{rows}: rel {rel:.3e} vs stock ({report})"
             graph, out = _graph(lambda: ours.run(latent, weights, ids))
             graph.replay()

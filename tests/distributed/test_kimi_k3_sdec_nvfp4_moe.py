@@ -30,7 +30,7 @@ import torch
 from vllm.utils.network_utils import get_open_port
 
 WORLD = 4
-ROWS = (1, 4, 8, 16, 32, 64, 96, 128, 256)
+ROWS = (1, 4, 8, 16, 32, 64, 96, 128, 256, 512)
 TOL = 2e-2
 TIMEOUT = 1800
 PREFIX = "language_model.model.layers.1.mlp"
