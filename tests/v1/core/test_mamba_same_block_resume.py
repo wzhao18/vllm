@@ -105,6 +105,7 @@ class _Engine:
             mamba_has_prefill_checkpoint_blocks=True,
             mamba_prefill_checkpoint_alignment=16,
             mamba_internal_snapshot=self.snapshot,
+            kv_cache_manager=self.manager,
         )
         return Scheduler._mamba_block_aligned_split(stub, request, num_new, local)
 
@@ -409,3 +410,100 @@ def test_snapshot_block_retires_after_the_step():
         PREFIX + 5000
     )
     assert engine.manager.take_block_table_writes() == {}
+
+
+def test_stale_worker_column_never_receives_the_export():
+    """Cold 40000: the worker's column 0 still holds the block of the first
+    chunk's state after the scheduler retired it. Another request takes that
+    block before the last chunk. The last chunk's checkpoint goes to the block
+    the scheduler wrote into the column, never to the other request's block."""
+    engine = _Engine(snapshot=True)
+    request = _turn("cold", list(range(1, 40001)))
+    for _ in range(2):
+        start, end, new = engine.allocate(request)
+        engine.forward(request, start, end, new)
+    stale = engine.tables["cold"][0]
+    # The retirement the next allocation runs first (synchronous scheduling).
+    engine.manager.remove_skipped_blocks("cold", 32768)
+    assert engine.mamba.req_to_blocks["cold"][0].is_null
+    pool = engine.manager.block_pool
+    taken = []
+    while not taken or taken[-1].block_id != stale:
+        taken.extend(pool.get_new_blocks(1))
+    engine.state[stale] = -999  # the other request's state
+    start, end, new = engine.allocate(request)
+    assert (start, end) == (32768, 40000)
+    engine.forward(request, start, end, new)
+    assert engine.state[stale] == -999
+    snapshot = engine.mamba.req_to_blocks["cold"][0]
+    assert snapshot.block_id != stale
+    assert engine.tables["cold"][0] == snapshot.block_id
+    assert engine.state[snapshot.block_id] == _checkpoint(40000)
+    pool.free_blocks(taken)
+    engine.finish(request)
+    nxt = _turn("t2", list(request.all_token_ids) + [5] * 100)
+    _, num_hit, _ = engine.manager.get_computed_blocks(nxt)
+    assert num_hit == _checkpoint(40000)
+    assert engine.stale_blocks() == []
+
+
+def test_block_table_writes_cover_every_snapshot_group():
+    """The worker exports per row into every Mamba group: a write in only some
+    of the snapshot groups would leave the others' stale ids exported into, so
+    the KV cache manager refuses it."""
+    import copy
+
+    engine = _Engine(snapshot=True)
+    mgr = engine.manager
+    second = copy.copy(engine.mamba)
+    second.kv_cache_group_id = MAMBA_GID + 1
+    second._pending_block_table_writes = []
+    coordinator = mgr.coordinator
+    coordinator.single_type_managers = (*coordinator.single_type_managers, second)
+    engine.mamba._pending_block_table_writes = [("r", 6, 11)]
+    second._pending_block_table_writes = [("r", 6, 12)]
+    assert mgr.take_block_table_writes() == {
+        "r": [(MAMBA_GID, 6, 11), (MAMBA_GID + 1, 6, 12)]
+    }
+    engine.mamba._pending_block_table_writes = [("r", 6, 11)]
+    with pytest.raises(RuntimeError, match="expected each of"):
+        mgr.take_block_table_writes()
+    assert mgr.take_block_table_writes() == {}
+
+
+@pytest.mark.parametrize(
+    "prompt_len",
+    [40000, 60000, PREFIX + 5000],
+    ids=["cold-40000", "cold-60000", "resume"],
+)
+@pytest.mark.parametrize("snapshot", [False, True], ids=["split", "snapshot"])
+def test_async_scheduling_keeps_the_checkpoint(prompt_len, snapshot):
+    """Async scheduling allocates a chunk while the previous one is in flight:
+    the manager retires blocks on the processed-token basis only, so the column
+    below the initial state can still hold the previous chunk's initial state.
+    The prompt checkpoint must still be cached (one pass or not)."""
+    engine = _Engine(snapshot=snapshot)
+    if prompt_len == PREFIX + 5000:
+        request = _next_turn(engine, 5000)
+        budgets = [2000]
+    else:
+        request = _turn("cold", list(range(1, prompt_len + 1)))
+        budgets = []
+    rid = request.request_id
+    spans = []
+    prev = 0
+    while request.num_computed_tokens < request.num_tokens:
+        budget = budgets[len(spans)] if len(spans) < len(budgets) else BUDGET
+        request.num_in_flight_tokens = prev
+        start, end, new = engine.allocate(request, budget)
+        request.num_in_flight_tokens = 0
+        engine.forward(request, start, end, new)
+        spans.append((start, end))
+        prev = end - start
+    checkpoint = _checkpoint(prompt_len)
+    assert checkpoint in [t for _, t in engine.offloads.get(rid, [])], spans
+    engine.finish(request)
+    nxt = _turn("t2", list(request.all_token_ids) + [5] * 100)
+    _, num_hit, _ = engine.manager.get_computed_blocks(nxt)
+    assert num_hit == checkpoint, spans
+    assert engine.stale_blocks() == []

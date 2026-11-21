@@ -3169,6 +3169,7 @@ class _AlignModel:
             mamba_has_prefill_checkpoint_blocks=True,
             mamba_prefill_checkpoint_alignment=16,
             mamba_internal_snapshot=self.snapshot,
+            kv_cache_manager=self.manager,
         )
         return Scheduler._mamba_block_aligned_split(stub, request, num_new, local)
 

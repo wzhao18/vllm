@@ -780,16 +780,22 @@ class Scheduler(SchedulerInterface):
             # last chunk of a chunked one), so the checkpoint goes to the
             # snapshot column below the initial state. A running request's
             # worker gets that column as a block-table write.
-            use_internal_checkpoint = (
-                get_mamba_prefill_snapshot_col(
-                    query_start=start,
-                    query_end=end,
-                    checkpoint_position=checkpoint_position,
-                    hash_block_size=self.hash_block_size,
-                    mamba_block_size=block_size,
-                    checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
-                )
-                >= 0
+            snapshot_col = get_mamba_prefill_snapshot_col(
+                query_start=start,
+                query_end=end,
+                checkpoint_position=checkpoint_position,
+                hash_block_size=self.hash_block_size,
+                mamba_block_size=block_size,
+                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+            )
+            # The KV cache manager must be able to place the block, or the chunk
+            # would run past the checkpoint without caching it (async
+            # scheduling: the column can still hold the in-flight chunk's
+            # initial state). Then stop at the checkpoint as before.
+            kv_cache_manager = getattr(self, "kv_cache_manager", None)
+            use_internal_checkpoint = snapshot_col >= 0 and (
+                kv_cache_manager is None
+                or kv_cache_manager.mamba_snapshot_col_available(request, snapshot_col)
             )
         if use_internal_checkpoint:
             last_cache_position = 0

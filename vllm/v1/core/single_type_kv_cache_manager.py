@@ -2092,6 +2092,23 @@ class MambaManager(SingleTypeKVCacheManager):
             return col if new_computed_blocks[col - len(blocks)].is_null else -1
         return col
 
+    def snapshot_col_available(
+        self, request_id: str, col: int, processed_computed_tokens: int
+    ) -> bool:
+        """Whether this allocation can place a running request's snapshot block
+        at ``col``: the column is a null placeholder, or the retirement that
+        runs first (``remove_skipped_blocks`` on the processed-token basis)
+        frees it. Under async scheduling the previous chunk is still in flight,
+        so the column below the new initial state can hold that chunk's initial
+        state, which is not retired yet."""
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks or col >= len(blocks) or blocks[col].is_null:
+            return True
+        num_skipped = self.get_num_skipped_tokens(processed_computed_tokens)
+        return num_skipped > 0 and col < min(
+            num_skipped // self.block_size, len(blocks)
+        )
+
     def _place_snapshot_block(
         self, request_id: str, returned_blocks: list[KVCacheBlock]
     ) -> list[KVCacheBlock]:
