@@ -3372,22 +3372,25 @@ class EarlyLoadServer:
             bind=True,
         )
         self._submit = submit
+        self._running = True
         self.thread = threading.Thread(
             target=self._run, daemon=True, name="MooncakeEarlyLoadServer"
         )
         self.thread.start()
 
     def _run(self) -> None:
-        while True:
-            try:
-                frame = self.socket.recv(copy=False)
-            except zmq.ZMQError:  # type: ignore[attr-defined]
-                return  # closed
-            req_meta = pickle.loads(frame.buffer)
-            self._submit(req_meta)
+        # The socket is used by this thread only; close() stops the loop.
+        while self._running:
+            if not self.socket.poll(timeout=100):
+                continue
+            frame = self.socket.recv(copy=False)
+            self._submit(pickle.loads(frame.buffer))
 
     def close(self) -> None:
+        self._running = False
+        self.thread.join(timeout=5)
         self.socket.close(linger=0)
+        self.ctx.term()
         if os.path.exists(self._ipc_path):
             os.unlink(self._ipc_path)
 
@@ -3397,12 +3400,13 @@ class EarlyLoadClient:
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        self.socket = make_zmq_socket(
-            self.ctx,
-            get_zmq_path_early_load(vllm_config),
-            zmq.PUSH,  # type: ignore[attr-defined]
-            bind=False,
-        )
+        self.socket = self.ctx.socket(zmq.PUSH)  # type: ignore[attr-defined]
+        self.socket.setsockopt(zmq.LINGER, 0)  # type: ignore[attr-defined]
+        # Queue only on an established connection (set before connecting):
+        # until the worker listens, send() fails and the load goes with the
+        # step's metadata.
+        self.socket.setsockopt(zmq.IMMEDIATE, 1)  # type: ignore[attr-defined]
+        self.socket.connect(get_zmq_path_early_load(vllm_config))
 
     def send(self, req_meta: ReqMeta) -> bool:
         """Hand ``req_meta`` to the worker; False (nothing sent) when the
@@ -3419,3 +3423,4 @@ class EarlyLoadClient:
 
     def close(self) -> None:
         self.socket.close(linger=0)
+        self.ctx.term()
