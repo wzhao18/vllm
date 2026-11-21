@@ -26,6 +26,7 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from .....helpers.device_workspace import DeviceWorkspace
 from ......common.ptx_helpers import red_add_relaxed_sys_s32
+from ......common.spin_guard import globaltimer_ns, spin_guard
 
 
 class GenphaseTail:
@@ -92,8 +93,9 @@ class GenphaseTail:
             )
         cute.arch.store(workspace.ptr(self.epoch_region), epoch + Int32(1), sem="relaxed", scope="gpu")
         local_signal = workspace.ptr(self.signal_region) + signal_phase
+        spin_start_ns = globaltimer_ns()
         while cute.arch.load(local_signal, Int32, sem="acquire", scope="sys") != signal_target:
-            pass
+            spin_guard(spin_start_ns, 50, local_signal, signal_target)
 
     @cute.jit
     def signal_done(self, workspace: DeviceWorkspace, peer_rank_ptr_mapper, epoch: Int32) -> None:
@@ -153,5 +155,7 @@ class GenphaseTail:
         if (status >> Int32(1)) != Int32(0):
             signal_target = Int32(0)
         local_signal = workspace.ptr(self.signal_region) + signal_phase
+        spin_start_ns = globaltimer_ns()
         while observed != signal_target:
             observed = cute.arch.load(local_signal, Int32, sem="acquire", scope="sys")
+            spin_guard(spin_start_ns, 51, local_signal, signal_target)
