@@ -162,7 +162,8 @@ def _owner_region_block_ids(
     warmup id in ``[S, S + D)`` owned by card ``c > 0`` is not read as page
     ``id - c * D`` (another group's or a negative page: illegal address)."""
     kv_cfg = model_runner.kv_cache_config
-    if kv_cfg.dsa_dp_region_blocks <= 0 or getattr(
+    # getattr: test doubles of the KV cache config carry only the fields they use.
+    if getattr(kv_cfg, "dsa_dp_region_blocks", 0) <= 0 or getattr(
         worker_execute_model, "_dsa_dp_owner_ids", False
     ):
         return worker_execute_model
