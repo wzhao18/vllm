@@ -51,6 +51,7 @@ def test_mixed_warmup_disables_watermarking():
         num_speculative_steps=0,
         model_state=SimpleNamespace(max_encoder_len=0),
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+        kv_block_zeroer=None,
     )
 
     assert run_mixed_prefill_decode_warmup(
