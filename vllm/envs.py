@@ -293,6 +293,11 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_EPLB_ASYNC_LAYER_BATCH: bool = False
+    VLLM_EPLB_MOVE_BUDGET: int = 0
+    VLLM_EPLB_SYMM_COPY: Literal["ce", "sm"] = "ce"
+    VLLM_EPLB_SYMM_COPY_STREAMS: int = 1
+    VLLM_EPLB_ASYNC_TIMING: bool = False
     VLLM_MM_EMBEDS_ON_CONSUMERS: bool = True
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -2103,6 +2108,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, allows GC to run during capture.
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
+    ),
+    # Async EPLB: stage as many MoE layers as fit in one receive buffer and
+    # transfer them with one barrier pair (applied in one step).
+    "VLLM_EPLB_ASYNC_LAYER_BATCH": lambda: bool(
+        int(os.getenv("VLLM_EPLB_ASYNC_LAYER_BATCH", "0"))
+    ),
+    # EPLB: if > 0, rebalance incrementally from the current placement,
+    # changing at most this many physical slots per layer.
+    "VLLM_EPLB_MOVE_BUDGET": lambda: int(os.getenv("VLLM_EPLB_MOVE_BUDGET", "0")),
+    # symm_mem EPLB push: "ce" (copy_ on the copy engine) or "sm" (one Triton
+    # pointer-array copy per weight tensor; faster only for large moves).
+    "VLLM_EPLB_SYMM_COPY": env_with_choices("VLLM_EPLB_SYMM_COPY", "ce", ["ce", "sm"]),
+    # symm_mem EPLB push with "ce": spread the row copies over this many streams.
+    "VLLM_EPLB_SYMM_COPY_STREAMS": lambda: int(
+        os.getenv("VLLM_EPLB_SYMM_COPY_STREAMS", "1")
+    ),
+    # Log the step-loop host time of each async EPLB cycle (EP rank 0).
+    "VLLM_EPLB_ASYNC_TIMING": lambda: bool(
+        int(os.getenv("VLLM_EPLB_ASYNC_TIMING", "0"))
     ),
     # Whether EC/KV consumers automatically accept pre-computed-embedding inputs
     # (the default). Set 0 on a consumer that never receives multimodal requests

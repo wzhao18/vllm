@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -359,6 +360,23 @@ def mega_moe_experts_cls(vllm_config: VllmConfig) -> type[nn.Module]:
 
         return KimiK3MegaMoEExperts
     return DeepGemmMegaMoEExperts
+
+
+def _rubin_physical_experts(
+    vllm_config: VllmConfig, num_experts: int, ep_size: int
+) -> int:
+    """Physical routed experts per layer on the Rubin MegaMoE backend: the logical
+    count plus redundant slots, ``VLLM_K3_MEGAMOE_REDUNDANT`` of them when set, else
+    just enough to make the count divisible by the EP size (e.g. 896 + 4 at EP12).
+    Config-only, so every rank agrees. Other backends keep the logical count."""
+    if vllm_config.kernel_config.moe_backend != KIMI_K3_MEGA_MOE:
+        return num_experts
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.enable_eplb:
+        return num_experts + parallel_config.eplb_config.num_redundant_experts
+    env = os.environ.get("VLLM_K3_MEGAMOE_REDUNDANT")
+    redundant = int(env) if env else (-num_experts) % ep_size
+    return num_experts + redundant
 
 
 def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:
@@ -956,12 +974,15 @@ class KimiMoE(nn.Module):
             ep_group = get_ep_group()
             ep_size = ep_group.world_size
             ep_rank = ep_group.rank_in_group
-            if num_experts % ep_size != 0:
+            num_physical_experts = _rubin_physical_experts(
+                vllm_config, num_experts, ep_size
+            )
+            if num_physical_experts % ep_size != 0:
                 raise ValueError(
                     f"Kimi K3 num_experts={num_experts} must be divisible by "
                     f"EP size {ep_size}."
                 )
-            num_local_experts = num_experts // ep_size
+            num_local_experts = num_physical_experts // ep_size
             max_num_tokens = mega_moe_max_num_tokens(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.tp_size,
@@ -983,7 +1004,8 @@ class KimiMoE(nn.Module):
                     if self._prefill_moe is None
                     else self._prefill_moe.capacity
                 ),
-                num_experts=num_experts,
+                num_experts=num_physical_experts,
+                num_logical_experts=num_experts,
                 num_local_experts=num_local_experts,
                 experts_start_idx=ep_rank * num_local_experts,
                 top_k=num_experts_per_token,
@@ -2847,6 +2869,39 @@ class KimiLinearForCausalLM(
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
+        self._init_moe_metadata()
+
+    def _init_moe_metadata(self) -> None:
+        """MixtureOfExperts attributes for EPLB, over the Rubin MegaMoE routed experts
+        (the only backend here that rearranges experts in place)."""
+        from .megamoe_rubin.experts import KimiK3MegaMoEExperts
+
+        self.moe_layers = [
+            m for m in self.model.modules() if isinstance(m, KimiK3MegaMoEExperts)
+        ]
+        self.num_moe_layers = len(self.moe_layers)
+        self.expert_weights = []
+        self.num_expert_groups = getattr(self.config, "num_expert_group", 1) or 1
+        self.num_shared_experts = getattr(self.config, "num_shared_experts", 0) or 0
+        if not self.moe_layers:
+            self.num_logical_experts = self.num_physical_experts = 0
+            self.num_local_physical_experts = self.num_routed_experts = 0
+            self.num_redundant_experts = 0
+            return
+        first = self.moe_layers[0]
+        self.num_logical_experts = first.num_logical_experts
+        self.num_physical_experts = first.num_experts
+        self.num_local_physical_experts = first.num_local_experts
+        self.num_routed_experts = first.num_logical_experts
+        self.num_redundant_experts = first.num_redundant_experts
+
+    def update_physical_experts_metadata(
+        self, num_physical_experts: int, num_local_physical_experts: int
+    ) -> None:
+        raise NotImplementedError(
+            "Kimi K3 Rubin MegaMoE: elastic EP (changing the physical expert count) "
+            "is not supported."
+        )
 
     def process_weights_after_loading(self) -> None:
         from .mxfp8 import enable_kimi_k3_mxfp8_dispatch

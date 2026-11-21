@@ -14,6 +14,8 @@ on how the EPLB algorithm works.
 import numpy as np
 import torch
 
+import vllm.envs as envs
+
 from .abstract import AbstractEplbPolicy
 
 
@@ -269,6 +271,62 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
 
         return post_phy2log
 
+    @staticmethod
+    def bounded_moves(
+        p2l: np.ndarray,
+        load: np.ndarray,
+        num_ranks: int,
+        budget: int,
+        target: float = 0.99,
+    ) -> np.ndarray:
+        """Migration-bounded rebalance of one layer: start from the current
+        placement and repeatedly pair the most- and least-loaded ranks, then
+        either swap one expert between them or overwrite a spare replica
+        (count >= 2) on the cold rank with the hot rank's hottest expert,
+        whichever balances the pair best. At most `budget` physical slots
+        change; stops at `target` balancedness (mean / max rank load) or when
+        no move helps. Every logical expert keeps at least one replica."""
+        p = p2l.astype(np.int64).copy()
+        slots = len(p) // num_ranks
+        n = len(load)
+        changed: set[int] = set()
+        while True:
+            cnt = np.bincount(p, minlength=n)
+            w = load[p] / cnt[p]
+            r = w.reshape(num_ranks, slots).sum(1)
+            if r.max() <= 0 or r.mean() / r.max() >= target:
+                break
+            h, c = int(r.argmax()), int(r.argmin())
+            hs = slice(h * slots, (h + 1) * slots)
+            cs = slice(c * slots, (c + 1) * slots)
+            wh, wc = w[hs], w[cs]
+            m = np.maximum(
+                r[h] - wh[:, None] + wc[None, :], r[c] - wc[None, :] + wh[:, None]
+            )
+            m[p[hs][:, None] == p[cs][None, :]] = np.inf
+            a, b = np.unravel_index(int(np.argmin(m)), m.shape)
+            best, move = m[a, b], ("swap", h * slots + int(a), c * slots + int(b))
+            hot = h * slots + int(np.argmax(wh))
+            for s in range(c * slots, (c + 1) * slots):
+                if cnt[p[s]] >= 2 and p[s] != p[hot]:
+                    q = p.copy()
+                    q[s] = p[hot]
+                    cq = np.bincount(q, minlength=n)
+                    rq = (load[q] / cq[q]).reshape(num_ranks, slots).sum(1)
+                    if max(rq[h], rq[c]) < best and rq.max() <= r.max():
+                        best, move = max(rq[h], rq[c]), ("rep", s, hot)
+            if not best < r[h]:
+                break
+            touched = {move[1], move[2]} if move[0] == "swap" else {move[1]}
+            if len(changed | touched) > budget:
+                break
+            changed |= touched
+            if move[0] == "swap":
+                p[move[1]], p[move[2]] = p[move[2]], p[move[1]]
+            else:
+                p[move[1]] = p[move[2]]
+        return p
+
     @classmethod
     def rebalance_experts(
         cls,
@@ -306,6 +364,21 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
             if old_global_expert_indices is not None
             else None
         )
+        move_budget = envs.VLLM_EPLB_MOVE_BUDGET
+        if (
+            move_budget > 0
+            and old_phy2log_np is not None
+            and old_phy2log_np.shape[1] == num_replicas
+            and (old_phy2log_np >= 0).all()
+        ):
+            return torch.from_numpy(
+                np.stack(
+                    [
+                        cls.bounded_moves(o, w, num_ranks, move_budget)
+                        for o, w in zip(old_phy2log_np, weight_np)
+                    ]
+                )
+            )
 
         if num_groups % num_nodes == 0:
             # use hierarchical load-balance policy

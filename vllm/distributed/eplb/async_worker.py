@@ -5,19 +5,52 @@
 import threading
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger
 
 from .eplb_utils import CpuGpuEvent, device_stream
 from .migration_scheduler import schedule_migration_batches_for_layers
-from .rebalance_execute import AsyncEplbLayerResult, transfer_layer
+from .rebalance_execute import (
+    AsyncEplbLayerResult,
+    buffer_row_maps,
+    buffer_rows_needed,
+    transfer_layer,
+)
 
 if TYPE_CHECKING:
     from .eplb_state import EplbModelState, EplbState
 
 logger = init_logger(__name__)
+
+
+def plan_layer_groups(
+    old_map: np.ndarray, new_map: np.ndarray, num_local_experts: int
+) -> list[tuple[list[int], list[list[np.ndarray]]]]:
+    """Greedily group consecutive layers whose staged rows fit in one buffer of
+    `num_local_experts` rows on every rank. Returns, per group, the layers and
+    each layer's per-rank buffer row maps. Deterministic, so every rank plans
+    the same groups."""
+    groups: list[tuple[list[int], list[list[np.ndarray]]]] = []
+    layers: list[int] = []
+    maps: list[list[np.ndarray]] = []
+    used = None
+    for layer in range(old_map.shape[0]):
+        need = buffer_rows_needed(old_map[layer], new_map[layer], num_local_experts)
+        counts = np.array([n.shape[0] for n in need])
+        if used is None or (used + counts > num_local_experts).any():
+            if layers:
+                groups.append((layers, maps))
+            layers, maps, used = [], [], np.zeros_like(counts)
+        maps.append(buffer_row_maps(need, used.tolist(), num_local_experts))
+        layers.append(layer)
+        used = used + counts
+    if layers:
+        groups.append((layers, maps))
+    return groups
 
 
 def start_async_worker(
@@ -115,6 +148,22 @@ def transfer_run_periodically(
                         new_physical_to_logical_map.numpy(),
                     )
 
+            if (
+                envs.VLLM_EPLB_ASYNC_LAYER_BATCH
+                and not is_profile
+                and migration_batches_by_layer is None
+                and model_state.communicator.needs_recv_rows
+            ):
+                _transfer_layer_groups(
+                    model_state,
+                    physical_to_logical_map_cpu,
+                    new_physical_to_logical_map,
+                    eplb_group,
+                    eplb_cpu_group,
+                    stream,
+                )
+                continue
+
             # Execute one EPLB layer transfer per model forward pass. Each iteration
             # of this loop will copy the new set of expert weights into
             # model_state.expert_buffer, which will be consumed by the main thread in
@@ -184,3 +233,58 @@ def transfer_run_periodically(
                 consumed_event.wait(stream=stream)
                 assert model_state.pending_result is None
                 layer_idx += 1
+
+
+def _transfer_layer_groups(
+    model_state: "EplbModelState",
+    old_map: torch.Tensor,
+    new_map: torch.Tensor,
+    eplb_group,
+    eplb_cpu_group,
+    stream: torch.Stream,
+) -> None:
+    """Transfer layer groups that fit in the receive buffer together: one
+    communicator execute (barrier pair) per group, and the main thread applies
+    the whole group in one step."""
+    num_local_experts = model_state.model.expert_weights[0][0].shape[0]
+    groups = plan_layer_groups(old_map.numpy(), new_map.numpy(), num_local_experts)
+    for layers, maps in groups:
+        flag = torch.tensor([int(model_state.rebalanced)], dtype=torch.int32)
+        torch.distributed.all_reduce(flag, group=eplb_cpu_group)
+        if int(flag.item()) != eplb_cpu_group.size():
+            logger.warning(
+                "async worker (rank=%d): layer %d coordinated stop",
+                eplb_group.rank(),
+                layers[0],
+            )
+            model_state.rebalanced = False
+            return
+        metas = [
+            transfer_layer(
+                old_layer_indices=old_map[layer],
+                new_layer_indices=new_map[layer],
+                expert_weights=model_state.model.expert_weights[layer],
+                expert_weights_buffer=model_state.expert_buffer,
+                communicator=model_state.communicator,
+                ep_group=eplb_group,
+                stream=stream,
+                layer_idx=layer,
+                buffer_maps=layer_maps,
+                defer_execute=True,
+            )
+            for layer, layer_maps in zip(layers, maps)
+        ]
+        model_state.communicator.execute()
+        stream.synchronize()
+        consumed_event = CpuGpuEvent()
+        model_state.pending_result = [
+            AsyncEplbLayerResult(
+                layer_idx=layer,
+                new_physical_to_logical_map=new_map[layer],
+                transfer_metadata=meta,
+                consumed_event=consumed_event,
+            )
+            for layer, meta in zip(layers, metas)
+        ]
+        consumed_event.wait(stream=stream)
+        assert model_state.pending_result is None

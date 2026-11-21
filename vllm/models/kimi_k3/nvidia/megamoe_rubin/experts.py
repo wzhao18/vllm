@@ -418,10 +418,17 @@ class KimiK3MegaMoEExperts(nn.Module):
             raise NotImplementedError(
                 "Rubin MegaMoE does not fuse the shared expert; pass it to forward()."
             )
-        if num_logical_experts not in (None, num_experts):
-            raise NotImplementedError(
-                "Rubin MegaMoE places experts linearly without redundant experts "
-                f"(num_logical_experts {num_logical_experts} != {num_experts})."
+        # Redundant experts: ``num_experts`` physical slots hold ``num_logical_experts``
+        # logical experts; physical slot ``p`` holds logical ``p % num_logical`` (the
+        # default EPLB placement), still linear over the EP ranks. Routed ids are
+        # logical; without an EPLB map they address the primary slots ``[0, L)``, so
+        # the extra slots only pad the expert count to a multiple of the EP size.
+        if num_logical_experts is None:
+            num_logical_experts = num_experts
+        if not 0 < num_logical_experts <= num_experts:
+            raise ValueError(
+                f"Rubin MegaMoE: num_logical_experts {num_logical_experts} must be in "
+                f"(0, {num_experts}]."
             )
         ep_group = get_ep_group()
         ep_size, ep_rank = ep_group.world_size, ep_group.rank_in_group
@@ -442,7 +449,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
         self.experts_end_idx = experts_start_idx + num_local_experts
-        self.num_logical_experts = num_experts
+        self.num_logical_experts = num_logical_experts
+        self.num_redundant_experts = num_experts - num_logical_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

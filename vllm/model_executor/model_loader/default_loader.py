@@ -477,6 +477,20 @@ class DefaultModelLoader(BaseModelLoader):
             ep_rank,
             placement=parallel_config.expert_placement_strategy,
         )
+        # Kimi K3 Rubin MegaMoE pads the experts with redundant slots to a multiple
+        # of the EP size (model.py _rubin_physical_experts): linear physical slots,
+        # slot p holding logical p % num_experts.
+        from vllm.config.kernel import KIMI_K3_MEGA_MOE
+
+        if vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE:
+            env = os.environ.get("VLLM_K3_MEGAMOE_REDUNDANT")
+            physical = num_experts + (int(env) if env else (-num_experts) % ep_size)
+            if physical != num_experts and physical % ep_size == 0:
+                per_rank = physical // ep_size
+                self.local_expert_ids = {
+                    p % num_experts
+                    for p in range(ep_rank * per_rank, (ep_rank + 1) * per_rank)
+                }
         if self.local_expert_ids is not None:
             logger.info_once(
                 "EP weight filter: ep_size=%d, ep_rank=%d, loading %d/%d experts",

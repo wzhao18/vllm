@@ -30,9 +30,11 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -56,6 +58,7 @@ from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     AsyncEplbLayerResult,
+    copy_rows,
     move_from_buffer,
     rearrange_expert_weights_inplace,
 )
@@ -213,7 +216,7 @@ class EplbModelState:
     """
     The communicator for expert weight transfers.
     """
-    pending_result: AsyncEplbLayerResult | None = None
+    pending_result: AsyncEplbLayerResult | list[AsyncEplbLayerResult] | None = None
     """
     Set by the async worker after all writes to expert_buffer are done. Consumed
     and reset to None by the main thread in move_to_workspace() after the contents of
@@ -489,17 +492,25 @@ class EplbState:
             logical_replica_count,
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
-        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
-
-        assert self.parallel_config.eplb_config.communicator is not None, (
+        backend = self.parallel_config.eplb_config.communicator
+        assert backend is not None, (
             "EPLB communicator backend must be set by ParallelConfig"
+        )
+        expert_buffer = (
+            None
+            if backend == "symm_mem"
+            else [torch.empty_like(w) for w in model.expert_weights[0]]
         )
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
-            backend=self.parallel_config.eplb_config.communicator,
+            backend=backend,
             expert_weights=model.expert_weights,
             expert_buffer=expert_buffer,
         )
+        expert_buffer = communicator.owned_expert_buffer or expert_buffer
+        assert expert_buffer is not None
+        # Compile the copy-back kernels now rather than mid-serving (no-op copy).
+        copy_rows(model.expert_weights[0], [0], model.expert_weights[0], [0])
 
         model_state = EplbModelState(
             physical_to_logical_map=physical_to_logical_map,
@@ -671,13 +682,41 @@ class EplbState:
             for eplb_model_state in self.model_states.values():
                 # rebalanced must remain consistent amongst all ranks otherwise the
                 # all_reduce in _all_ranks_result_ready will hang
-                if eplb_model_state.rebalanced and self._all_ranks_result_ready(
-                    eplb_model_state
-                ):
+                if not eplb_model_state.rebalanced:
+                    continue
+                t0 = time.perf_counter()
+                ready = self._all_ranks_result_ready(eplb_model_state)
+                t1 = time.perf_counter()
+                layer = -1
+                if ready:
+                    pending = eplb_model_state.pending_result
+                    last = pending[-1] if isinstance(pending, list) else pending
+                    layer = last.layer_idx
                     _move_to_workspace(
                         model_state=eplb_model_state,
                         ep_rank=ep_group.rank(),
                     )
+                if envs.VLLM_EPLB_ASYNC_TIMING:
+                    t2 = time.perf_counter()
+                    acc = eplb_model_state.__dict__.setdefault(
+                        "_async_timing", [0, 0.0, 0.0, 0.0]
+                    )
+                    acc[0] += 1
+                    acc[1] += (t1 - t0) * 1e3
+                    acc[2] += (t2 - t1) * 1e3
+                    acc[3] = max(acc[3], (t2 - t0) * 1e3)
+                    if layer == eplb_model_state.model.num_moe_layers - 1:
+                        if ep_group.rank() == 0:
+                            logger.info(
+                                "EPLB async cycle landed: %d steps, ready-check "
+                                "%.2f ms total, copy-back %.2f ms total, max "
+                                "step %.2f ms",
+                                acc[0],
+                                acc[1],
+                                acc[2],
+                                acc[3],
+                            )
+                        eplb_model_state._async_timing = [0, 0.0, 0.0, 0.0]
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
@@ -690,7 +729,13 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
+            t0 = time.perf_counter()
             self.rearrange()
+            if envs.VLLM_EPLB_ASYNC_TIMING and get_ep_group().rank_in_group == 0:
+                logger.info(
+                    "EPLB rearrange() on the step loop: %.2f ms",
+                    (time.perf_counter() - t0) * 1e3,
+                )
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -1017,6 +1062,8 @@ class EplbState:
                 if self._all_ranks_result_ready(ms):
                     result = ms.pending_result
                     assert result is not None
+                    if isinstance(result, list):
+                        result = result[-1]
                     if result.layer_idx == ms.model.num_moe_layers - 1:
                         ms.rebalanced = False
                     ms.pending_result = None
@@ -1261,6 +1308,31 @@ def _node_count_with_rank_mapping(
     return next_node_id
 
 
+def _logical_maps_np(
+    p2l: np.ndarray, num_logical_experts: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """NumPy `compute_logical_maps` for host maps: replicas of each logical
+    expert in ascending physical-slot order, -1 padded."""
+    num_layers = p2l.shape[0]
+    li, pi = np.nonzero(p2l >= 0)
+    ei = p2l[li, pi]
+    count = np.zeros((num_layers, num_logical_experts), dtype=np.int64)
+    np.add.at(count, (li, ei), 1)
+    out = np.full(
+        (num_layers, num_logical_experts, int(count.max()) if count.size else 0),
+        -1,
+        dtype=np.int64,
+    )
+    order = np.lexsort((pi, ei, li))
+    li, pi, ei = li[order], pi[order], ei[order]
+    first = np.ones(li.shape[0], dtype=bool)
+    first[1:] = (li[1:] != li[:-1]) | (ei[1:] != ei[:-1])
+    pos = np.arange(li.shape[0])
+    replica = pos - np.maximum.accumulate(np.where(first, pos, 0))
+    out[li, ei, replica] = pi
+    return out, count
+
+
 def compute_logical_maps(
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
@@ -1292,6 +1364,18 @@ def compute_logical_maps(
         physical_to_logical_map_view = physical_to_logical_map.unsqueeze(0)
     assert len(physical_to_logical_map_view.shape) == 2
     num_layers, num_physical = physical_to_logical_map_view.shape
+
+    if device.type == "cpu":
+        # Vectorized: the per-slot loop below costs ~10-40 ms per layer on the
+        # host, which async EPLB pays on the step loop for every layer.
+        out_np, count_np = _logical_maps_np(
+            physical_to_logical_map_view.numpy(), num_logical_experts
+        )
+        out_t = torch.from_numpy(out_np).to(dtype)
+        count_t = torch.from_numpy(count_np).to(dtype)
+        if per_layer:
+            return out_t.squeeze(0), count_t.squeeze(0)
+        return out_t, count_t
 
     valid_mask = physical_to_logical_map_view >= 0
     logical_replica_count = torch.zeros(
@@ -1344,7 +1428,12 @@ def _pad_out_tensor(src: torch.Tensor, dst: torch.Tensor) -> None:
     src_padding = dst.shape[-1] - src.shape[-1]
     assert src_padding >= 0
     new_src = torch.nn.functional.pad(src, (0, src_padding), value=-1)
-    # The map is committed from the host once per layer per rearrangement.
+    # The map is committed from the host once per layer per rearrangement. A
+    # pageable-source copy would block the step loop until the GPU drains.
+    if PIN_MEMORY and new_src.is_cpu:
+        new_src = new_src.pin_memory()
+        dst.copy_(new_src, non_blocking=True)
+        return
     with gpu_sync_allowed():
         dst.copy_(new_src)
 
@@ -1427,23 +1516,25 @@ def _move_to_workspace(
     model_state: EplbModelState,
     ep_rank: int,
 ) -> None:
-    result = model_state.pending_result
-    assert result is not None
-    move_from_buffer(
-        expert_weights=model_state.model.expert_weights[result.layer_idx],
-        expert_weights_buffers=model_state.expert_buffer,
-        transfer_metadata=result.transfer_metadata,
-        new_indices=result.new_physical_to_logical_map.numpy(),
-        ep_rank=ep_rank,
-    )
+    pending = model_state.pending_result
+    assert pending is not None
+    # A list is a layer group staged together in the buffer (one shared event).
+    results = pending if isinstance(pending, list) else [pending]
+    for result in results:
+        move_from_buffer(
+            expert_weights=model_state.model.expert_weights[result.layer_idx],
+            expert_weights_buffers=model_state.expert_buffer,
+            transfer_metadata=result.transfer_metadata,
+            new_indices=result.new_physical_to_logical_map.numpy(),
+            ep_rank=ep_rank,
+        )
+        _commit_eplb_maps_for_layer(
+            model_state,
+            new_physical_to_logical_map=result.new_physical_to_logical_map,
+            layer=result.layer_idx,
+        )
 
-    _commit_eplb_maps_for_layer(
-        model_state,
-        new_physical_to_logical_map=result.new_physical_to_logical_map,
-        layer=result.layer_idx,
-    )
-
-    if result.layer_idx == model_state.model.num_moe_layers - 1:
+    if results[-1].layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False
 
     # Reset pending_result before unblocking the async worker

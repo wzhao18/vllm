@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build a `SchedulerOutput` for an exact batch, without the scheduler."""
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +17,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+
+# Windows of real token ids (a 1-D .npy, e.g. AgentX prompts) instead of uniform
+# random ids, so MoE routing follows a real expert-load distribution.
+_TOKEN_FILE = os.environ.get("VLLM_BENCH_FWD_TOKEN_FILE")
+_REAL_TOKENS = np.load(_TOKEN_FILE) if _TOKEN_FILE else None
 
 
 @dataclass
@@ -125,7 +131,11 @@ def build_batch(
             block_ids.append([0] * skipped + list(range(first, first + live)))
             ranges.append((cursor, cursor + rows))
             cursor += rows
-        tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
+        if _REAL_TOKENS is not None and len(_REAL_TOKENS) > req.kv_len:
+            start = int(rng.integers(0, len(_REAL_TOKENS) - req.kv_len))
+            tokens = _REAL_TOKENS[start : start + req.kv_len].astype(np.int64)
+        else:
+            tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
         prompt = tokens[: req.prefix_len] if req.is_decode else tokens
         query_token_ids[req_id] = tokens[computed:]
         expected[req_id] = (req.query_len + replay, computed, req.is_decode)
