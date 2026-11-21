@@ -417,6 +417,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        _dp_step_token_cap=None,
     )
     req = make_request("0", [0] * prompt_length, 32, sha256)
     split = Scheduler._mamba_block_aligned_split

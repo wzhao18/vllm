@@ -61,7 +61,7 @@ def _add(sched, rid: str, owner: int, num_tokens: int):
 
 def _step(sched, dp: bool):
     if dp:
-        sched.set_dp_prefill_exchange(lambda own: own)
+        sched.set_dp_prefill_exchange(lambda own, demand: own)
     ctx = {r.request_id: r.num_computed_tokens for r in sched.running}
     out = sched.schedule()
     cost = np.zeros(TP)
