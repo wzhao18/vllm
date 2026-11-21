@@ -479,8 +479,10 @@ class KimiK3MegaMoEExperts(nn.Module):
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
         self.prefill_worker = pd_prefill_worker(vllm_config)
-        text_config = vllm_config.model_config.hf_text_config
-        # MoE layers of the model: an upper bound for the die-local budget check.
+        model_config = getattr(vllm_config, "model_config", None)
+        text_config = getattr(model_config, "hf_text_config", None)
+        # MoE layers of the model: an upper bound for the die-local budget check
+        # (1 without a model config, e.g. a standalone experts module).
         self.num_moe_layers = getattr(text_config, "num_hidden_layers", 1)
         self.buckets, notes = select_rubin_buckets(
             self.problem,
