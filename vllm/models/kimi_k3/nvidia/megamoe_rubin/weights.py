@@ -708,6 +708,48 @@ def prepare_mxfp4_mxfp8_weights(
     return RubinMoeWeights("mxfp4_mxfp8", fc1, fc2)
 
 
+def deinterleave_gate_up_cols_16(y: torch.Tensor) -> torch.Tensor:
+    """``[..., 2I]`` GEMM output of gate/up weight rows in the kernel's 16-row
+    stripes (:func:`stripe_mxfp8_gate_up_`) -> ``[gate | up]`` (a new tensor)."""
+    n = y.shape[-1]
+    if n % (2 * GATE_UP_INTERLEAVE):
+        raise ValueError(f"gate_up width {n} is not a multiple of 32.")
+    return (
+        y.unflatten(-1, (n // (2 * GATE_UP_INTERLEAVE), 2, GATE_UP_INTERLEAVE))
+        .transpose(-3, -2)
+        .reshape(y.shape)
+    )
+
+
+def stripe_mxfp8_gate_up_(
+    gate_up: torch.Tensor, gate_up_scale: torch.Tensor, *, hidden: int, intermediate: int
+) -> None:
+    """In place: an MXFP8 E4M3 gate_up (row-major ``[2I, H]``, gate rows first, F8_128x4
+    swizzled E8M0 block-32 scales: the stock linear's own storage) -> the same bytes
+    in the GenPhase kernel's 16-row gate/up stripes (rows and their scales move
+    together). A GEMM on the striped weight returns its ``[gate | up]`` output columns
+    in stripes too (:func:`deinterleave_gate_up_cols_16`); the fused shared expert's
+    FC1 then views the weight (``prepare_mxfp8_shared_weights(striped=True)``)
+    instead of holding a striped copy of it."""
+    w, s = _u8(gate_up), _u8(gate_up_scale)
+    if (
+        tuple(w.shape) != (2 * intermediate, hidden)
+        or not w.is_contiguous()
+        or hidden % 128
+        or intermediate % 128
+    ):
+        raise ValueError(
+            f"gate_up must be a row-major [{2 * intermediate}, {hidden}] FP8 weight "
+            "(128-aligned)."
+        )
+    if s.numel() != swizzled_flat_sf_size(2 * intermediate, hidden // MX_BLOCK):
+        raise ValueError(f"gate_up scale has {s.numel()} bytes, expected F8_128x4.")
+    w.copy_(interleave_gate_up_16(w, intermediate_size=intermediate))
+    plane = from_blocked(s.reshape(-1), 2 * intermediate, hidden // MX_BLOCK)
+    plane = interleave_gate_up_16(plane, intermediate_size=intermediate)
+    s.view(-1).copy_(to_blocked_batched(plane[None].contiguous()).reshape(-1))
+
+
 def prepare_mxfp8_shared_weights(
     gate_up: torch.Tensor,
     gate_up_scale: torch.Tensor,
@@ -716,13 +758,16 @@ def prepare_mxfp8_shared_weights(
     *,
     hidden: int,
     intermediate: int,
+    striped: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """An MXFP8 E4M3 shared expert (the stock linears' storage: row-major FP8
     ``gate_up [2I, H]`` (gate rows first) / ``down [H, I]`` with F8_128x4 swizzled
     E8M0 block-32 scales) -> the GenPhase kernel's fused-shared (FC1, FC2) pairs
     (FlashInfer ``preprocess_prequantized_block_scaled_weights`` layout: 16-row
     gate/up stripes, K-major ``[1, K, N]`` views, re-swizzled scales). FC2 views the
-    down weight in place; FC1 is a striped copy. Same bytes, no requantization."""
+    down weight in place. FC1 is a striped copy, or with ``striped`` (gate_up and its
+    scales already striped in place by :func:`stripe_mxfp8_gate_up_`) a view of the
+    weight itself. Same bytes, no requantization."""
     fp8, e8m0 = torch.float8_e4m3fn, torch.float8_e8m0fnu
     if (
         gate_up.dtype != fp8
@@ -738,15 +783,28 @@ def prepare_mxfp8_shared_weights(
             f"shared expert must be row-major FP8 E4M3 gate_up {(2 * intermediate, hidden)}"
             f" and down {(hidden, intermediate)} (128-aligned)."
         )
-    s13 = from_blocked(_u8(gate_up_scale).reshape(-1), 2 * intermediate, hidden // MX_BLOCK)
     s2 = from_blocked(_u8(down_scale).reshape(-1), hidden, intermediate // MX_BLOCK)
-    d13 = interleave_gate_up_16(_u8(gate_up)[None], intermediate_size=intermediate)
-    s13 = interleave_gate_up_16(s13[None], intermediate_size=intermediate)
-    d13 = d13.contiguous()
+    if striped:
+        # The stock storage is already in stripes: FC1 is a view of it, and the
+        # re-swizzled striped scale plane is the stock F8_128x4 bytes themselves.
+        d13 = _u8(gate_up)[None]
+        if d13.data_ptr() % 16:
+            raise ValueError("shared gate_up weight must be 16-byte aligned.")
+        sf13 = _u8(gate_up_scale).reshape(1, -1)
+        if sf13.shape[1] != swizzled_flat_sf_size(2 * intermediate, hidden // MX_BLOCK):
+            raise ValueError("shared gate_up scale is not an F8_128x4 plane.")
+    else:
+        s13 = from_blocked(
+            _u8(gate_up_scale).reshape(-1), 2 * intermediate, hidden // MX_BLOCK
+        )
+        d13 = interleave_gate_up_16(_u8(gate_up)[None], intermediate_size=intermediate)
+        s13 = interleave_gate_up_16(s13[None], intermediate_size=intermediate)
+        d13 = d13.contiguous()
+        sf13 = to_blocked_batched(s13.contiguous())
     d2 = _u8(down)[None]
     if d2.data_ptr() % 16:
         raise ValueError("shared down weight must be 16-byte aligned.")
-    fc1 = (d13.view(fp8).permute(0, 2, 1), to_blocked_batched(s13.contiguous()).view(e8m0))
+    fc1 = (d13.view(fp8).permute(0, 2, 1), sf13.view(e8m0))
     fc2 = (d2.view(fp8).permute(0, 2, 1), to_blocked_batched(s2[None].contiguous()).view(e8m0))
     return fc1, fc2
 

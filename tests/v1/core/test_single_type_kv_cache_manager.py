@@ -1044,3 +1044,57 @@ def test_pop_blocks_for_free_trims_null_head():
     block_pool.free_blocks([null])
     assert null.ref_cnt == null_ref_cnt
     assert block_pool.get_num_free_blocks() == num_free_blocks
+
+
+@pytest.mark.parametrize(
+    "keys, max_length, eagle, expect_blocks, expect_length",
+    [
+        # Prompt tail inside the first block: no full block is needed.
+        ({1: 20}, 6, False, [20], 2),
+        # Full block 0 + partial tail of block 1 at 6 tokens.
+        ({2: 20, 3: 21}, 8, False, [20, 21], 6),
+        # Block 0 falls out of the window (3 tokens) of a hit at 10.
+        ({4: 21, 5: 22}, 12, False, [None, 21, 22], 10),
+        # EAGLE: the tail key at 6 proves the prefix; resume one unit (2) earlier.
+        ({2: 20, 3: 21}, 8, True, [20], 4),
+        # EAGLE on a block-aligned key drops one unit, not one block.
+        ({2: 20, 4: 21}, 8, True, [20, 21], 6),
+    ],
+)
+def test_sliding_window_fine_grained_hit(
+    keys, max_length, eagle, expect_blocks, expect_length
+):
+    """With partial hash hits on (hash unit < block), a sliding-window group must
+    match a prompt tail inside a block, as full attention does; otherwise the
+    whole engine (and the Mooncake store) is limited to block-aligned hits."""
+    block_size, unit = 4, 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=unit
+    )
+    block_hashes = [BlockHash(str(i).encode()) for i in range(max_length // unit)]
+    # keys: hash units of the prefix -> cached block id.
+    for units, block_id in keys.items():
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(block_hashes[units - 1], 0),
+            block_pool.blocks[block_id],
+        )
+
+    computed, hit_length = SlidingWindowManager.find_longest_cache_hit(
+        block_hashes=block_hashes,
+        max_length=max_length,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        drop_eagle_block=eagle,
+        alignment_tokens=unit,
+    )
+
+    assert hit_length == expect_length
+    assert [None if b.is_null else b.block_id for b in computed[0]] == expect_blocks

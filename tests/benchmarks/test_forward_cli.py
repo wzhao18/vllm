@@ -696,3 +696,45 @@ def test_bench_forward(tmp_path):
         assert profile["top_kernels"] and profile["span_us"] > 0
         summary = json.loads(Path(profile["summary"]).read_text())
         assert Path(summary["trace"]).exists()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_build_batch_dsa_dp_regions(monkeypatch, rank):
+    """Under DSA-DP regions each request's DSA-group blocks come from its owner's
+    region (scheduler ids [S + c * D, S + (c + 1) * D), balanced owners), every
+    other group's from the shared [1, S); only this card's DSA pages are listed
+    for zeroing (local ids), and a case past a region raises."""
+    import vllm.distributed as dist
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    monkeypatch.setattr(dsa_dp, "ENABLED", True)
+    monkeypatch.setattr(dist, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_tensor_model_parallel_rank", lambda: rank)
+    shared, region = 50, 20
+    kv_config = SimpleNamespace(
+        dsa_dp_group_ids=(0,),
+        dsa_dp_shared_blocks=shared,
+        dsa_dp_region_blocks=region,
+    )
+    groups = [_group(16), _group(16)]  # group 0: DSA, group 1: shared
+    case = parse_case("c=2*64@96")  # two 64-token prefills at a 32-token prefix
+    batch = build_batch(
+        case, groups, shared + region, 1000, np.random.default_rng(0),
+        kv_config=kv_config,
+    )  # fmt: skip
+    reqs = batch.scheduler_output.scheduled_new_reqs
+    assert sorted(r.dsa_owner for r in reqs) == [0, 1]
+    for r in reqs:
+        dsa, other = r.block_ids
+        lo = shared + r.dsa_owner * region
+        assert all(lo <= b < lo + region for b in dsa)
+        assert all(0 < b < shared for b in other)
+    mine = [r for r in reqs if r.dsa_owner == rank]
+    assert [
+        (lo, hi) for lo, hi in batch.group_block_ranges[0]
+    ] == [(shared, shared + len(mine[0].block_ids[0]))]
+    with pytest.raises(ValueError, match="DSA region"):
+        build_batch(
+            parse_case("c=2*64@1024"), groups, shared + region, 1000,
+            np.random.default_rng(0), kv_config=kv_config,
+        )  # fmt: skip

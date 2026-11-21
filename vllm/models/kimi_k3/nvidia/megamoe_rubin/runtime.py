@@ -187,9 +187,13 @@ class RubinMegaMoE:
         w2_scale: torch.Tensor,
         w13_global: torch.Tensor,
         w2_global: torch.Tensor,
+        *,
+        num_experts: int | None = None,
     ) -> RubinMoeWeights:
         """Native NVFP4 local-expert weights (E4M3 block-16 scales + per-expert
-        ``weight_scale_2``) -> kernel layout, as stored (no conversion)."""
+        ``weight_scale_2``) -> kernel layout, as stored (no conversion).
+        ``num_experts``: a subset of the local experts (expert DWDP's home half);
+        default all of them."""
         p = self.problem
         if p.quant_kind != "nvfp4":
             raise ValueError(
@@ -199,10 +203,11 @@ class RubinMegaMoE:
             raise ValueError(
                 "NVFP4 checkpoint alphas assume unit activation norm constants."
             )
-        if w13.shape[0] != self.experts_per_rank:
+        expected = self.experts_per_rank if num_experts is None else num_experts
+        if w13.shape[0] != expected:
             raise ValueError(
-                f"expected {self.experts_per_rank} local experts (linear EP "
-                f"placement), got {w13.shape[0]}."
+                f"expected {expected} local experts (linear EP placement), got "
+                f"{w13.shape[0]}."
             )
         return prepare_nvfp4_checkpoint_weights(
             w13,

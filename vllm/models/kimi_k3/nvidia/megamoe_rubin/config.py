@@ -661,6 +661,16 @@ def resolve_knobs(
     if entries is None:
         return RubinKnobs.from_dict(load_knob_source(source)), None, warnings
     matches = _matching_records(entries, problem, variant, world_size)
+    if not matches:
+        # Redundant experts (num_experts padded past the checkpoint's 896) or an EP
+        # size without tuned records (EP12, EP20, EP24): borrow the nearest tuned
+        # contract of the same variant / dtype (records tuned at the logical expert
+        # count, the closest world size with per-rank experts >= this one's). The
+        # knobs are tile / schedule choices valid for any expert count; only their
+        # tuning is borrowed.
+        matches, note = _nearest_contract_records(entries, problem, variant, world_size)
+        if note:
+            warnings.append(note)
     selected = _select_token_entries(matches, max_tokens, live_tokens)
     if not selected:
         available = sorted(
@@ -743,6 +753,37 @@ def _matching_records(
         and isinstance(e.get("max_tokens"), int)
         and not e["knobs"].get("reduce_topk_in_kernel", False)
     ]
+
+
+def _nearest_contract_records(
+    entries: list[dict[str, Any]],
+    problem: RubinMoeProblem,
+    variant: Variant,
+    world_size: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Records of the tuned contract closest to (``problem``, ``world_size``) when none
+    match exactly: same fields except ``num_experts`` and ``world_size``; among the
+    tuned (num_experts, world_size) pairs, the one whose experts per rank is closest
+    to ``problem.num_experts / world_size`` (ties: larger world size)."""
+    base = {}
+    for ws in {e.get("world_size") for e in entries}:
+        for ne in {e.get("num_experts") for e in entries}:
+            if not isinstance(ws, int) or not isinstance(ne, int):
+                continue
+            probe = dataclasses.replace(problem, num_experts=ne)
+            recs = _matching_records(entries, probe, variant, ws)
+            if recs:
+                base[(ne, ws)] = recs
+    if not base:
+        return [], None
+    want = problem.num_experts / world_size
+    (ne, ws), recs = min(
+        base.items(), key=lambda kv: (abs(kv[0][0] / kv[0][1] - want), -kv[0][1])
+    )
+    return recs, (
+        f"no knob record for E={problem.num_experts} at EP{world_size}; borrowed the "
+        f"E={ne} EP{ws} records ({ne // ws} experts/rank vs {want:.1f})"
+    )
 
 
 def default_capacity(tokens: int) -> int:

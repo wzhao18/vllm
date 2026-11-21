@@ -66,9 +66,10 @@ class LoadConfig:
     """
     Specifies the loading strategy for safetensors weights.
 
-    - None (default): Uses memory-mapped (lazy) loading. When an NFS
-      filesystem is detected and the total checkpoint size fits within 90%%
-      of available RAM, prefetching is enabled automatically.
+    - None (default): On a network filesystem (NFS, Lustre) the tensors each
+      rank needs (after the expert-parallel filter) are read with large
+      parallel reads, pipelined ahead of the weight loaders, in bounded host
+      buffers. Otherwise memory-mapped (lazy) loading.
     - "lazy": Weights are memory-mapped from the file. This enables
       on-demand loading and is highly efficient for models on local storage.
       Unlike the default (None), auto-prefetch on NFS is not performed.

@@ -278,6 +278,11 @@ class RemoteMeta:
     # Sub-blocks per remote block the scheduler expanded ``block_ids`` into
     # (DCP pair mode with a larger remote per-rank block); 1 when unexpanded.
     sub_blocks: int = 1
+    # DSA-DP producer (vllm/v1/core/dsa_dp_regions.py): its TP rank that alone
+    # holds the transfer groups ``dsa_groups``, whose block ids are that rank's
+    # local pages.
+    dsa_owner: int | None = None
+    dsa_groups: tuple[int, ...] = ()
 
 
 @dataclass
@@ -427,5 +432,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             lease_deadline=kv_transfer_params.get("remote_lease_deadline"),
             lease_check=kv_transfer_params.get("remote_lease_check") is True,
             sub_blocks=kv_transfer_params.get("remote_sub_blocks", 1),
+            dsa_owner=kv_transfer_params.get("remote_dsa_owner"),
+            dsa_groups=tuple(kv_transfer_params.get("remote_dsa_groups", ())),
         )
         self.reqs_to_recv[request_id] = req

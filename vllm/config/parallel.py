@@ -40,7 +40,7 @@ DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
-    "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl"
+    "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl", "symm_mem"
 ]
 All2AllBackend = Literal[
     "naive",
@@ -102,9 +102,32 @@ class EPLBConfig:
     - "torch_xccl": Use torch.distributed XCCL device P2P on XPU
     - "nixl": Use NIXL with staged send/recv buffers
     - "pynccl": Use PyNccl send/recv
+    - "symm_mem": Push expert rows over CUDA symmetric memory; needs all EP
+      ranks in one NVLink domain
     - None: Auto-select backend ("torch_xccl" on XPU, prefers "nixl" 
       on CUDA, falls back to "torch_gloo")
     """
+
+    layer_group_transfers: bool = True
+    """Async EPLB with a communicator that pushes into the receivers' buffer
+    rows (``symm_mem``): stage as many MoE layers as fit in one receive buffer
+    and transfer them with one barrier pair, so a rearrangement lands in 1-2
+    steps instead of one step per layer. No effect on other communicators."""
+
+    move_budget: int | None = None
+    """Default policy: rebalance incrementally from the current placement,
+    changing at most this many physical expert slots per layer (0: unbounded,
+    a fresh placement). ``None`` picks the validated default per communicator:
+    32 (64 at EP >= 20) for ``symm_mem``, unbounded otherwise. See
+    ``resolved_move_budget``."""
+
+    def resolved_move_budget(self, ep_size: int) -> int:
+        """The move budget used for an EP group of ``ep_size`` ranks."""
+        if self.move_budget is not None:
+            return self.move_budget
+        if self.communicator == "symm_mem":
+            return 64 if ep_size >= 20 else 32
+        return 0
 
     enable_migration_batching: bool = False
     """Schedule expert migrations in batches where each rank communicates with
@@ -128,6 +151,8 @@ class EPLBConfig:
                 "'torch_gloo' or 'nixl' instead, or leave communicator "
                 "unset for automatic selection."
             )
+        if self.move_budget is not None and self.move_budget < 0:
+            raise ValueError("move_budget must be >= 0 (0: unbounded).")
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
         return self
@@ -428,6 +453,22 @@ class ParallelConfig:
     `None` selects the model default, which is "ag_rs" unless the model
     overrides it via [`set_dcp_defaults`][vllm.config.ParallelConfig.set_dcp_defaults].
     """
+
+    dwdp: Literal["none", "dense", "experts"] = "none"
+    """Distributed weight data parallelism (DWDP) of a prefill engine
+    (Kimi K3 on the Rubin MegaMoE, DEP layout: attention TP1, expert parallel).
+    A layout choice, never for a decode engine:
+    - "none": every rank holds its full non-expert weights.
+    - "dense": the non-expert weights are split over the engine's ranks and each
+      layer's are streamed to every rank (copy engine) one layer ahead, e.g. a
+      DEP8 engine that holds the full model on 8 GPUs.
+    - "experts": "dense" plus expert DWDP across two engines with the same EP
+      layout (e.g. two DEP4 engines of one 8-GPU prefill unit, EP4 x DWDP2);
+      they pair through ``dwdp_dir``. Incompatible with EPLB."""
+
+    dwdp_dir: str | None = None
+    """``dwdp="experts"``: a directory shared by the two paired engines (fresh
+    per run), through which they pair and exchange memory handles."""
 
     dcp_q_replicate: bool | None = None
     """Replicate the MLA query projection within each DCP group so decode can skip the
@@ -961,6 +1002,8 @@ class ParallelConfig:
             "distributed_executor_backend",
             "worker_cls",
             "worker_extension_cls",
+            # DWDP pairing rendezvous path (per run; the mode itself is hashed).
+            "dwdp_dir",
             "_api_process_count",
             "_api_process_rank",
             # NUMA binding is per-rank host-side memory locality; it does
@@ -1180,6 +1223,19 @@ class ParallelConfig:
                 "values are 'ray', 'mp' 'uni', 'external_launcher', "
                 " custom Executor subclass or its import path."
             )
+        if self.dwdp != "none":
+            if self.tensor_parallel_size != 1 or self.data_parallel_size < 2:
+                raise ValueError(
+                    f"dwdp={self.dwdp!r} needs a DEP engine (tensor_parallel_size=1, "
+                    "data_parallel_size >= 2)."
+                )
+            if self.dwdp == "experts":
+                if not self.dwdp_dir:
+                    raise ValueError('dwdp="experts" needs dwdp_dir.')
+                if self.enable_eplb:
+                    raise ValueError('dwdp="experts" does not support EPLB.')
+        elif self.dwdp_dir:
+            raise ValueError('dwdp_dir is only used with dwdp="experts".')
         if self.use_ray:
             from vllm.v1.executor import ray_utils
 

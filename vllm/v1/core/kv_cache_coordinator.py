@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool, SlotBlockPool
+from vllm.v1.core.dsa_dp_regions import DSARegionPools
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -217,6 +218,23 @@ class KVCacheCoordinator(ABC):
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers
         )
+        # DSA-DP per-card DSA regions (``dsa_dp_regions.py``): the DSA groups
+        # allocate in their request's owner region instead of this pool.
+        self.dsa_regions: DSARegionPools | None = None
+        self.dsa_group_ids = frozenset(kv_cache_config.dsa_dp_group_ids)
+        # Owner whose region could not fit the last checked allocation.
+        self.dsa_region_full_owner: int | None = None
+        # DSA-DP: region blocks counted by the last get_num_blocks_to_allocate().
+        self.last_num_region_blocks = 0
+        if kv_cache_config.dsa_dp_region_blocks > 0:
+            self.dsa_regions = DSARegionPools(
+                self.block_pool,
+                kv_cache_config.num_blocks,
+                kv_cache_config.dsa_dp_region_blocks,
+                kv_cache_config.dsa_dp_num_regions,
+            )
+            for group_id in self.dsa_group_ids:
+                self.single_type_managers[group_id].block_pool = self.dsa_regions
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -237,6 +255,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        check_dsa_region: bool = True,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -263,16 +282,32 @@ class KVCacheCoordinator(ABC):
                 retention Mamba reserves a prefill checkpoint only on the chunk
                 reaching it; under dense retention every chunk publishes a
                 state, so it is ignored (0).
+            check_dsa_region: DSA-DP per-card regions: return the sentinel
+                ``num_gpu_blocks + 1`` when the owner's region cannot fit the
+                DSA groups' blocks. The count is always shared-pool blocks only.
 
         Returns:
             The number of blocks to allocate.
 
         """
         num_blocks_to_allocate = 0
+        num_region_blocks = 0
+        self._dsa_bind(request_id)
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
-            if isinstance(manager, CrossAttentionManager):
+            if i in self.dsa_group_ids:
+                num_region_blocks += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=prefill_end,
+                )
+            elif isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
@@ -295,7 +330,20 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
+        self.last_num_region_blocks = num_region_blocks
+        if (
+            check_dsa_region
+            and self.dsa_regions is not None
+            and num_region_blocks > self.dsa_regions.pool.get_num_free_blocks()
+        ):
+            # The owner's region is full: no shared-pool count can fit this.
+            self.dsa_region_full_owner = self.dsa_regions.owner
+            return self.block_pool.num_gpu_blocks + 1
         return num_blocks_to_allocate
+
+    def _dsa_bind(self, request_id: str) -> None:
+        if self.dsa_regions is not None:
+            self.dsa_regions.bind_request_id(request_id)
 
     def allocate_new_computed_blocks(
         self,
@@ -318,6 +366,7 @@ class KVCacheCoordinator(ABC):
                 written by an async load and must not be zeroed.
 
         """
+        self._dsa_bind(request_id)
         # A running request is already tracked in num_cached_block and won't
         # have new prefix-cache hits, so this is a no-op for it.
         if any(
@@ -371,6 +420,7 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
+        self._dsa_bind(request_id)
         new_blocks: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
         for i in self._allocation_order:
             manager = self.single_type_managers[i]
@@ -401,6 +451,7 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
+        self._dsa_bind(request.request_id)
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
             self.scheduler_block_size,
@@ -453,6 +504,9 @@ class KVCacheCoordinator(ABC):
         pools = dict.fromkeys(
             manager.block_pool for manager in self.single_type_managers
         )
+        if self.dsa_regions is not None:
+            pools.update(dict.fromkeys(self.dsa_regions.regions))
+            pools.pop(self.dsa_regions, None)
         return all([pool.reset_prefix_cache() for pool in pools])
 
     def free(self, request_id: str) -> None:
@@ -462,6 +516,7 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
 
         """
+        self._dsa_bind(request_id)
         for manager in self.single_type_managers:
             manager.free(request_id)
 
@@ -479,6 +534,7 @@ class KVCacheCoordinator(ABC):
             The request's blocks in allocation order.
 
         """
+        self._dsa_bind(request_id)
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
@@ -502,6 +558,7 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
+        self._dsa_bind(request_id)
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens

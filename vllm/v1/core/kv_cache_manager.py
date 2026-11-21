@@ -26,8 +26,10 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -217,6 +219,9 @@ class KVCacheManager:
             # superseded prompt checkpoint stays in plain LRU; short prompts'
             # states are low priority (16384 unless set).
             self.coordinator.block_pool.demotion_gate = False
+            if self.coordinator.dsa_regions is not None:
+                for pool in self.coordinator.dsa_regions.regions:
+                    pool.demotion_gate = False
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.demote_superseded_checkpoints = False
@@ -255,6 +260,7 @@ class KVCacheManager:
                 manager.record_state_hashes = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.dsa_regions = self.coordinator.dsa_regions
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -358,6 +364,7 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
+        self.dsa_bind(request)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -419,6 +426,7 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0, 0, False
 
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
+        self.dsa_bind(request)
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, max_cache_hit_length
@@ -561,6 +569,8 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        self.dsa_bind(request)
+        self.coordinator.dsa_region_full_owner = None
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -743,6 +753,7 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        self._dsa_forget(request)
 
     def remove_skipped_blocks(
         self,
@@ -776,7 +787,23 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        self._dsa_forget(request)
+        return blocks
+
+    def dsa_bind(self, request: Request) -> None:
+        """DSA-DP: bind the request's owner card for the DSA groups' regions."""
+        if self.dsa_regions is not None:
+            self.dsa_regions.bind(request.request_id, getattr(request, "dsa_owner", 0))
+
+    def _dsa_forget(self, request: Request) -> None:
+        if self.dsa_regions is not None and request.is_finished():
+            self.dsa_regions.forget(request.request_id)
+
+    @property
+    def dsa_region_full_owner(self) -> int | None:
+        """DSA-DP: owner card whose region failed the last ``allocate_slots``."""
+        return self.coordinator.dsa_region_full_owner
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -785,6 +812,9 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
 
         """
+        if self.dsa_regions is not None:
+            self.dsa_regions.evict_blocks(block_ids)
+            return
         self.block_pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
@@ -883,12 +913,12 @@ class KVCacheManager:
                 # Cross-attention and encoder-only groups are not prefix cached.
                 continue
 
+            # Coverage grows along the block table: the last hashed block has the most.
             group_cached_tokens = 0
-            for block in blocks:
-                group_cached_tokens = max(
-                    group_cached_tokens,
-                    block.block_hash_num_tokens or 0,
-                )
+            for block in reversed(blocks):
+                if block.block_hash_num_tokens:
+                    group_cached_tokens = block.block_hash_num_tokens
+                    break
 
             cached_tokens = (
                 group_cached_tokens
@@ -908,6 +938,7 @@ class KVCacheManager:
 
         """
         if self.enable_caching:
+            self.dsa_bind(request)
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
@@ -942,10 +973,17 @@ class KVCacheManager:
                 continue
             assert num_computed_tokens % manager.block_size == 0
             num_blocks = num_computed_tokens // manager.block_size
-            if isinstance(group.kv_cache_spec, MambaSpec):
-                num_blocks = min(num_blocks, len(group_blocks))
-            else:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
+            if isinstance(spec, FullAttentionSpec):
                 assert num_blocks <= len(group_blocks)
+            else:
+                # Mamba: an external hit can supply the final state. Sliding
+                # window (e.g. a DSpark SWA drafter with prefix replay): the
+                # lookup may return fewer or no blocks. Truncation only drops
+                # trailing blocks, so never ask for more than the lookup gave.
+                num_blocks = min(num_blocks, len(group_blocks))
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 

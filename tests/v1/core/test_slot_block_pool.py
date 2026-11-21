@@ -269,10 +269,12 @@ def _draft_hit(manager: KVCacheManager, request) -> tuple[int, list[int]]:
 
 @pytest.mark.parametrize("packed", [True, False])
 def test_prompt_end_hit_restores_the_writers_draft_window(packed):
-    """Unpacked, the draft group's 64-token blocks turn fine-grained hits off:
-    the next turn resumes at the scheduler block (512). Packed, it resumes at
-    the prompt's last hash boundary (592) with exactly the writer's draft
-    window blocks."""
+    """Both resume at the prompt's last hash boundary (592). Unpacked, the
+    draft group's 64-token blocks reach it through the sliding-window partial
+    tail block (fine-grained SWA hits, juntian #20 99d7e25efc; before it the
+    turn resumed at the scheduler block, 512). Packed, the draft caches its
+    window tails at the state boundaries and the hit holds exactly the writer's
+    draft window blocks."""
     manager = _manager(packed)
     tokens = list(range(1000, 1600))
     writer = make_request("writer", tokens, HASH, sha256)
@@ -282,11 +284,11 @@ def test_prompt_end_hit_restores_the_writers_draft_window(packed):
 
     turn = make_request("turn", tokens + list(range(5000, 5100)), HASH, sha256)
     num_hit, draft_blocks = _draft_hit(manager, turn)
-    if not packed:
-        assert num_hit == 512
-        return
     assert manager.coordinator.enable_partial_hash_hits
     assert num_hit == 592
+    if not packed:
+        assert draft_blocks
+        return
     tail = range(592 // HASH - WINDOW // HASH, 592 // HASH)
     assert draft_blocks == [window[i] for i in tail]
 

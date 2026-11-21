@@ -393,7 +393,7 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     )
 
     def cached(block_id):
-        return KVCacheBlock(block_id=block_id, _block_hash=object())
+        return KVCacheBlock(block_id=block_id, block_hash=object())
 
     def uncached(block_id):
         return KVCacheBlock(block_id=block_id)
@@ -446,7 +446,7 @@ def test_full_local_hit_is_not_awaited_by_the_scheduler():
         select_transfer_block_ids=lambda block_ids: block_ids
     )
 
-    blocks = KVCacheBlocks(blocks=([KVCacheBlock(block_id=0, _block_hash=object())],))
+    blocks = KVCacheBlocks(blocks=([KVCacheBlock(block_id=0, block_hash=object())],))
     request = create_request(do_remote_prefill=True)
 
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
@@ -2498,3 +2498,193 @@ def test_sync_recved_kv_issues_one_copy_per_request(group_block_ids, expected_id
     worker.sync_recved_kv_to_device("req", meta)
 
     assert calls == [(expected_ids, expected_ids, "h2d")]
+
+
+# DSA-DP (vllm/v1/core/dsa_dp_regions.py): Kimi K3's DSA (MLA) group lives only
+# on the request's owner card, in a per-card region; the KDA group is shared.
+# Region layouts (S shared blocks, D blocks per card) differ between P and D.
+_P_S, _P_D, _D_S, _D_D = 100, 50, 80, 40
+
+
+def _dsa_dp_cfg(shared: int, region: int, tp: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        transfer_group_ids=(0, 1),
+        dsa_dp_group_ids=(0,),
+        dsa_dp_shared_blocks=shared,
+        dsa_dp_region_blocks=region,
+        dsa_dp_num_regions=tp,
+    )
+
+
+def _dsa_dp_params(owner: int | None, num_blocks: int = 2) -> dict[str, Any]:
+    """P's kv_transfer_params block ids: DSA blocks of ``owner``'s region (or
+    replicated ids without DSA-DP) and one KDA state block."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+        NixlBaseConnectorScheduler,
+    )
+
+    if owner is None:
+        p = SimpleNamespace(kv_cache_config=SimpleNamespace(dsa_dp_region_blocks=0))
+        dsa = list(range(10, 10 + num_blocks))
+    else:
+        p = SimpleNamespace(kv_cache_config=_dsa_dp_cfg(_P_S, _P_D, 4))
+        dsa = [_P_S + owner * _P_D + 3 + i for i in range(num_blocks)]
+    block_ids, params = NixlBaseConnectorScheduler.get_dsa_dp_exchange_blocks(
+        p, ([*dsa], [7])
+    )
+    return {
+        "remote_block_ids": block_ids,
+        "remote_engine_id": "P",
+        "remote_request_id": "r-P",
+        "remote_host": "localhost",
+        "remote_port": 1,
+        **params,
+    }
+
+
+def _dsa_dp_pull_worker(tp_rank: int, tp_size: int, d_dsa_dp: bool):
+    """A Kimi K3 decoder rank (DSA MLA group, KDA Mamba group) pulling from a TP4
+    prefiller. Real TP mapping and page translation; reads are mocked."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.page_zeroer import (
+        PageZeroer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        compute_tp_mapping,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    topo = object.__new__(TransferTopology)
+    topo.tp_rank, topo.tp_size, topo.dcp_size = tp_rank, tp_size, 1
+    topo.is_mla, topo.is_mamba, topo.total_num_kv_heads = True, True, 1
+    types = (MLAAttentionSpec, MambaSpec)
+    w = object.__new__(NixlConnectorWorker)
+    w.tp_rank = tp_rank
+    w.use_mla, w._has_mamba = True, True
+    w.dcp_size, w.dcp_rank = 1, 0
+    w._group_spec_types = types
+    w._physical_blocks_per_logical_kv_block = 1
+    w._bidirectional_kv_xfer_enabled = False
+    w._invalid_remote_engines = set()
+    w._remote_registration_generations = {}
+    w._remote_agents = {"P": {(0, r): f"P{r}" for r in range(4)}}
+    w._engine_last_active = {}
+    w._recving_transfers = defaultdict(list)
+    w._recv_failures = set()
+    # PDHETERO DCP pair mode (sub-block peers): none in these TP pulls.
+    w._sub_block_peers = {}
+    w.region_group_ids = [0, 1]
+    w.dst_region_group_ids = {"P": [0, 1]}
+    w.kv_cache_config = _dsa_dp_cfg(_D_S, _D_D, tp_size)
+    if d_dsa_dp:
+        w._dsa_dp_groups = (0,)
+    w.transfer_topo = MagicMock()
+    w.transfer_topo.tp_ratio.side_effect = topo.tp_ratio
+    w.transfer_topo.block_size_ratio.return_value = 1
+    w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=4,
+        remote_dcp_size=1,
+        remote_block_size=16,
+        remote_physical_blocks_per_logical=1,
+    )
+    w.tp_mappings = {"P": compute_tp_mapping(topo, 4, types)}
+    ratio = topo.tp_ratio(4)
+    w.src_xfer_handles_by_tp_ratio = {(ratio, 16): ["split"] * 4}
+    w.src_xfer_handles_by_block_size = {16: "whole"}
+    w._mixed_mem_types = False
+    w.dst_xfer_side_handles = {"P": {r: f"P{r}" for r in range(4)}}
+    w._read_blocks = MagicMock(return_value=True)
+    # Group 0 pages of this card: S + D, or S + tp * D without DSA-DP.
+    w.dsa_cache = torch.full((_D_S + _D_D * (1 if d_dsa_dp else 4), 8), 0xFF)
+    w._page_zeroer = PageZeroer({0: [w.dsa_cache]}, {0: None})
+    w._unwritten_batch = {}
+    w._fresh_zeroed_reqs = set()
+    w.use_host_buffer = False
+    return w
+
+
+def _dsa_dp_pull(w, local_dsa: list[int], params: dict[str, Any]):
+    """Pull one request (as start_load_kv does); return its reads by P rank."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv("r", (local_dsa, [3]), params, awaiting_kvs=True)
+    meta = metadata.reqs_to_recv["r"]
+    meta.local_physical_block_ids = w._dsa_dp_local_block_ids(meta.local_block_ids)
+    w._recving_metadata = {"r": meta}
+    w._read_blocks_for_req("r", meta)
+    w._flush_unwritten_zeroing()
+    reads = {}
+    for call in w._read_blocks.call_args_list:
+        spec = call.kwargs["read_spec"]
+        assert spec.remote_rank not in reads, "P rank read or notified twice"
+        assert call.kwargs["expected_consumers"] == 1
+        reads[spec.remote_rank] = (spec.local_block_ids, spec.remote_block_ids)
+    return reads
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("d_rank", range(4))
+def test_dsa_dp_pull_tp4_to_tp4_same_owner(d_rank):
+    """TP4 DSA-DP P -> TP4 DSA-DP D, both owned by card 2: D rank 2 reads the DSA
+    group from P rank 2's local pages into its own; the others read only KDA."""
+    owner = 2
+    params = _dsa_dp_params(owner)
+    assert params["remote_dsa_owner"] == owner
+    assert params["remote_dsa_groups"] == [0]
+    assert params["remote_block_ids"] == ([_P_S + 3, _P_S + 4], [7])
+    w = _dsa_dp_pull_worker(d_rank, 4, d_dsa_dp=True)
+    local_dsa = [_D_S + owner * _D_D + 5, _D_S + owner * _D_D + 6]
+    reads = _dsa_dp_pull(w, local_dsa, params)
+    dsa_local = [_D_S + 5, _D_S + 6]
+    if d_rank == owner:
+        assert reads == {d_rank: ([dsa_local, [3]], [[_P_S + 3, _P_S + 4], [7]])}
+    else:
+        assert reads == {d_rank: ([[], [3]], [[], [7]])}
+    # Pages left unwritten (all, as the reads are mocked) are zeroed on the
+    # owner at its local pages only; other cards never touch the region.
+    zeroed = (w.dsa_cache == 0).all(dim=1).nonzero().flatten().tolist()
+    assert zeroed == (dsa_local if d_rank == owner else [])
+    assert not w._recv_failures
+
+
+@pytest.mark.cpu_test
+def test_dsa_dp_pull_tp4_to_tp4_other_owner_fails():
+    """D owner 1 cannot read P owner 2's DSA KV (no handle to P rank 2): the
+    request fails on that rank and nothing is read. D rank 2 still reads its
+    KDA shard and notifies P rank 2."""
+    params = _dsa_dp_params(2)
+    local_dsa = [_D_S + _D_D + 5]
+    w = _dsa_dp_pull_worker(1, 4, d_dsa_dp=True)
+    assert _dsa_dp_pull(w, local_dsa, params) == {}
+    assert w._recv_failures == {"r"}
+    w = _dsa_dp_pull_worker(2, 4, d_dsa_dp=True)
+    assert _dsa_dp_pull(w, local_dsa, params) == {2: ([[], [3]], [[], [7]])}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("owner", range(4))
+def test_dsa_dp_pull_tp4_to_tp1(owner):
+    """TP4 DSA-DP P -> TP1 D (DEP decode): the DSA group comes from P's owner;
+    every P rank is read for its KDA shard exactly once."""
+    w = _dsa_dp_pull_worker(0, 1, d_dsa_dp=False)
+    reads = _dsa_dp_pull(w, [5, 6], _dsa_dp_params(owner))
+    for rank in range(4):
+        dsa = ([5, 6], [_P_S + 3, _P_S + 4]) if rank == owner else ([], [])
+        assert reads[rank] == ([dsa[0], [3]], [dsa[1], [7]])
+    assert not w._recv_failures
+
+
+@pytest.mark.cpu_test
+def test_dsa_dp_pull_without_dsa_dp_prefiller_unchanged():
+    """P without DSA-DP exports no owner, and D reads its replicated DSA KV
+    from the usual source rank."""
+    params = _dsa_dp_params(None)
+    assert "remote_dsa_owner" not in params
+    w = _dsa_dp_pull_worker(0, 1, d_dsa_dp=False)
+    reads = _dsa_dp_pull(w, [5, 6], params)
+    assert reads[0] == ([[5, 6], [3]], [[10, 11], [7]])
+    for rank in (1, 2, 3):
+        assert reads[rank] == ([[], [3]], [[], [7]])

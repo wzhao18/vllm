@@ -461,6 +461,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                 return group.map_to_kernel_slot_mapping(slots, out=out)
         return slots
 
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        # The target may then hand over sequence-shard aux states.
+        enable = getattr(target_model, "enable_sp_local_aux", None)
+        if enable is not None and hasattr(self.model, "aux_head_rows"):
+            enable()
+
     def _store_hidden_states(
         self,
         num_tokens: int,
@@ -474,11 +481,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_graph_tokens and self._aux_staging is not None:
             assert aux_hidden_states
             start = min(num_tokens, num_graph_tokens)
-            torch.cat(
-                [h[:start] for h in aux_hidden_states],
-                dim=-1,
-                out=self._aux_staging[:start],
-            )
+            # Sequence-shard aux states (models/kimi_k3/nvidia/ops/sp_local_aux.py).
+            head_rows = getattr(self.model, "aux_head_rows", None)
+            if head_rows is None or not head_rows(
+                aux_hidden_states, start, self._aux_staging[:start]
+            ):
+                torch.cat(
+                    [h[:start] for h in aux_hidden_states],
+                    dim=-1,
+                    out=self._aux_staging[:start],
+                )
         if start == num_tokens:
             return
         combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
@@ -548,6 +560,44 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         return rows
 
+    def _combine_sp_local_rows(
+        self, aux_hidden_states: list[torch.Tensor], rows: np.ndarray, n: int
+    ) -> None:
+        """``hidden_states[:n] = combine(cat(aux)[rows])`` from sequence-shard
+        aux states (``SpLocalAux``, models/kimi_k3/nvidia/ops/sp_local_aux.py:
+        each TP rank holds rows ``[rank * shard, (rank + 1) * shard)``). ``rows``
+        is sorted and identical on every rank, so each rank combines the kept
+        rows of its own shard, a contiguous run of the output, and the TP group
+        all-gathers the runs (padded to the longest)."""
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_gather,
+        )
+
+        shard = aux_hidden_states.shard  # type: ignore[attr-defined]
+        tp = get_tensor_model_parallel_world_size()
+        bounds = np.searchsorted(rows, np.arange(tp + 1) * shard)
+        counts = np.diff(bounds)
+        k = int(counts.max())
+        rank = get_tensor_model_parallel_rank()
+        out = self.hidden_states[:n]
+        local = out.new_zeros((k, out.shape[-1]))
+        lo, hi = int(bounds[rank]), int(bounds[rank + 1])
+        if hi > lo:
+            idx = torch.from_numpy(rows[lo:hi] - rank * shard).to(
+                self.device, non_blocking=True
+            )
+            local[: hi - lo] = self.model.combine_hidden_states(
+                torch.cat([h.index_select(0, idx) for h in aux_hidden_states], dim=-1)
+            )
+        gathered = tensor_model_parallel_all_gather(local, dim=0)
+        for r in range(tp):
+            c = int(counts[r])
+            if c:
+                b = int(bounds[r])
+                out[b : b + c].copy_(gathered[r * k : r * k + c])
+
     def _stage_context_rows(self, rows: np.ndarray) -> torch.Tensor:
         """``rows`` on device, staged through persistent pinned / device
         buffers (stable addresses, so the copy may also sit in a captured
@@ -601,14 +651,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
         index = self._stage_context_rows(rows)
         n = int(rows.size)
-        kept = gather_aux_rows(aux_hidden_states, index)
-        combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
-        if combine_aux_rows is not None:
-            combine_aux_rows(kept, 0, n, self.hidden_states[:n])
+        if _is_sp_local_aux(aux_hidden_states):
+            self._combine_sp_local_rows(aux_hidden_states, rows, n)
         else:
-            self.hidden_states[:n].copy_(
-                self.model.combine_hidden_states(torch.cat(kept, dim=-1))
-            )
+            kept = gather_aux_rows(aux_hidden_states, index)
+            combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
+            if combine_aux_rows is not None:
+                combine_aux_rows(kept, 0, n, self.hidden_states[:n])
+            else:
+                self.hidden_states[:n].copy_(
+                    self.model.combine_hidden_states(torch.cat(kept, dim=-1))
+                )
         self.context_positions[:n].copy_(self.context_positions[index])
         for i in range(self._context_slot_mappings.shape[0]):
             self._context_slot_mappings[i, :n].copy_(
@@ -939,6 +992,13 @@ def _gather_rows_kernel(
     src_row = tl.load(index_ptr + row).to(tl.int64)
     vals = tl.load(src_ptr + src_row * src_stride + cols, mask=mask)
     tl.store(out_ptr + row.to(tl.int64) * out_stride + cols, vals, mask=mask)
+
+
+def _is_sp_local_aux(aux_hidden_states) -> bool:
+    """Sequence-shard aux states of the Kimi K3 target under SP."""
+    from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
+
+    return isinstance(aux_hidden_states, sp_local_aux.SpLocalAux)
 
 
 def gather_aux_rows(

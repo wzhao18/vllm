@@ -42,19 +42,22 @@ def balanced_topk_ids(
     """Expert IDs [num_tokens, top_k] giving every EP rank equal load.
 
     Each token's slots go round-robin over EP ranks, to distinct experts.
+    When ``num_experts`` is not a multiple of ``ep_size`` (redundant-slot
+    padding, linear placement), rank ``r`` owns logical experts
+    ``[r * local, min((r + 1) * local, num_experts))``.
     """
-    assert num_experts % ep_size == 0
-    local = num_experts // ep_size
+    local = -(-num_experts // ep_size)
+    owned = np.clip(num_experts - np.arange(ep_size) * local, 0, local)
     slots = np.arange(num_tokens)[:, None] * top_k + np.arange(top_k)
     ranks = slots % ep_size
     # Slots of one token that land on the same rank take consecutive experts.
     repeat = np.zeros_like(ranks)
     for j in range(1, top_k):
         repeat[:, j] = (ranks[:, :j] == ranks[:, j : j + 1]).sum(axis=1)
-    assert repeat.max() < local
+    assert owned.min() > 0 and repeat.max() < owned.min()
     base = rng.integers(local, size=(num_tokens, ep_size))
     offset = np.take_along_axis(base, ranks, axis=1)
-    return ranks * local + (offset + repeat) % local
+    return ranks * local + (offset + repeat) % owned[ranks]
 
 
 def zipf_topk_ids(

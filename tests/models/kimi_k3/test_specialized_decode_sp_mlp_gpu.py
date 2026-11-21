@@ -93,6 +93,7 @@ class Shared(types.SimpleNamespace):
     """The shared expert: the stock ``KimiMLP`` methods bound to stand-in fields."""
 
     _prefill_situ = None  # KimiMLP class default (prefill SiTU epilogue, unset in decode)
+    gate_up_striped = False  # KimiMLP class default (no fused-shared stripes here)
 
     def __call__(self, x):
         return self.forward(x)
@@ -108,7 +109,7 @@ def layer(overlap, seed=0):
         shard_sequence_parallel=False,
         gemm_rs_ar=None,
     )
-    for name in ("forward", "_act_mxfp8", "_act_mxfp8_ok", "mxfp8_input"):
+    for name in ("forward", "_gate_up", "_act_mxfp8", "_act_mxfp8_ok", "mxfp8_input"):
         setattr(shared, name, types.MethodType(getattr(kimi.KimiMLP, name), shared))
     router_w = torch.randn(64, HIDDEN, device=DEVICE, generator=g).bfloat16()
 

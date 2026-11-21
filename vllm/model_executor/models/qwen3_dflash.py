@@ -14,7 +14,9 @@ from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -901,6 +903,62 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def combine_aux_rows(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        start: int,
+        end: int,
+        out: torch.Tensor,
+    ) -> None:
+        """combine_hidden_states(cat(aux)[start:end]) into ``out``. On sequence-shard
+        aux states (Kimi K3 under SP, models/kimi_k3/nvidia/ops/sp_local_aux.py)
+        each rank projects its own shard's rows, then all-gathers them."""
+        from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
+
+        if not isinstance(aux_hidden_states, sp_local_aux.SpLocalAux):
+            out.copy_(
+                self.combine_hidden_states(
+                    torch.cat([h[start:end] for h in aux_hidden_states], dim=-1)
+                )
+            )
+            return
+        shard = aux_hidden_states.shard
+        lo, hi = sp_local_aux.local_span(
+            start, end, shard, get_tensor_model_parallel_rank()
+        )
+        local = out.new_zeros((shard, out.shape[-1]))
+        if hi > lo:
+            local[lo:hi] = self.combine_hidden_states(
+                torch.cat([h[lo:hi] for h in aux_hidden_states], dim=-1)
+            )
+        out.copy_(tensor_model_parallel_all_gather(local, dim=0)[start:end])
+
+    def aux_head_rows(
+        self, aux_hidden_states: list[torch.Tensor], n: int, out: torch.Tensor
+    ) -> bool:
+        """On sequence-shard aux states, write rows [0, n) of cat(aux) into ``out``
+        and return True; otherwise False."""
+        from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
+
+        if not isinstance(aux_hidden_states, sp_local_aux.SpLocalAux):
+            return False
+        if n <= 0:
+            return True
+        shard = aux_hidden_states.shard
+        counts = sp_local_aux.head_counts(
+            n, shard, get_tensor_model_parallel_world_size()
+        )
+        k = max(counts)
+        piece = out.new_zeros((k, out.shape[-1]))
+        mine = counts[get_tensor_model_parallel_rank()]
+        if mine:
+            torch.cat([h[:mine] for h in aux_hidden_states], dim=-1, out=piece[:mine])
+        gathered = tensor_model_parallel_all_gather(piece, dim=0)
+        for r, c in enumerate(counts):
+            if c:
+                out[r * shard : r * shard + c].copy_(gathered[r * k : r * k + c])
+        return True
 
     def combine_hidden_states(
         self,

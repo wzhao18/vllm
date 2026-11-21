@@ -1458,6 +1458,61 @@ def test_truncate_computed_blocks_allows_short_mamba_group_only():
     assert [len(group) for group in blocks.blocks] == [3, 2]
 
 
+def test_truncate_computed_blocks_allows_short_sliding_window_group():
+    """A sliding-window group's lookup may return fewer (or no) blocks than the
+    endpoint, e.g. a SWA draft whose window is replayed (P/D decode crashed on
+    the old assert). Truncation keeps what the lookup gave."""
+    hash_block_size = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=2 * hash_block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    producer = make_request("producer", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
+    blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request(
+        "consumer", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed == 6
+
+    full = list(blocks.blocks[0])
+    for swa in ([], list(blocks.blocks[1][:1])):
+        short_swa = manager.create_kv_cache_blocks((full, swa))
+        truncated = manager.truncate_computed_blocks(short_swa, 4)
+        assert [len(group) for group in truncated.blocks] == [2, len(swa)]
+
+
 def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
     hash_block_size = 2
     block_size = 2 * hash_block_size
@@ -2229,7 +2284,11 @@ def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary():
     assert num_computed == 4
 
 
-def test_hybrid_sliding_window_group_disables_partial_hash_hits():
+def test_hybrid_sliding_window_group_keeps_partial_hash_hits():
+    """Sliding-window groups support fine-grained lookups, so an EAGLE
+    sliding-window draft group keeps partial hits on, and its EAGLE check
+    (one hash unit past the hit) is satisfied by a cached full block when
+    no partial-tail entry exists: the hit stays at the Mamba boundary."""
     hash_block_size = 2
     sliding_window_block_size = 2 * hash_block_size
     mamba_block_size = 2 * sliding_window_block_size
@@ -2279,7 +2338,7 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
     tokens = list(range(3 * sliding_window_block_size))
     request = make_request("0", tokens, hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
-    assert not manager.coordinator.enable_partial_hash_hits
+    assert manager.coordinator.enable_partial_hash_hits
     assert (
         manager.allocate_slots(request, mamba_block_size, num_computed, computed_blocks)
         is not None
@@ -2303,8 +2362,8 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
 @pytest.mark.parametrize("with_sliding_window", [False, True])
 def test_resolved_cache_hit_alignment_matches_coordinator(with_sliding_window):
     """Workers place Mamba checkpoints on the engine-resolved alignment, so it
-    must be where the coordinator lands hits, including when a group without
-    fine-grained lookups disables partial hits."""
+    must be where the coordinator lands hits, with or without a sliding-window
+    group (which supports fine-grained lookups)."""
     hash_block_size = 2
     mamba_block_size = 4 * hash_block_size
     kv_cache_groups = [
@@ -2354,7 +2413,7 @@ def test_resolved_cache_hit_alignment_matches_coordinator(with_sliding_window):
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
 
-    assert coordinator.enable_partial_hash_hits != with_sliding_window
+    assert coordinator.enable_partial_hash_hits
     assert (
         resolve_cache_hit_alignment_tokens(
             kv_cache_config,

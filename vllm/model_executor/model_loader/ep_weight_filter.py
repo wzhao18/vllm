@@ -15,6 +15,30 @@ import regex as re
 # (no numeric id) — those are intentionally left unfiltered so the full
 # tensor is loaded and sliced later by RoutedExperts.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+# The decoder layer of a weight name (".layers.12.").
+_LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+class LayerExpertIds:
+    """Local expert ids that differ per decoder layer: ``layers[L]`` for the
+    expert weights of layer ``L``, ``default`` for every other layer.
+
+    A model whose ranks hold a different expert subset per layer (e.g. Kimi K3's
+    expert DWDP, where each layer keeps half of the EP-local experts) returns
+    one from ``restrict_local_expert_ids`` so the loader skips the rest before
+    reading them."""
+
+    def __init__(self, default: set[int], layers: dict[int, set[int]]):
+        self.default = default
+        self.layers = layers
+
+    def __len__(self) -> int:
+        return len(self.default)
+
+    def contains(self, weight_name: str, expert_id: int) -> bool:
+        m = _LAYER_ID_RE.search(weight_name)
+        ids = self.layers.get(int(m.group(1)), self.default) if m else self.default
+        return expert_id in ids
 
 
 def parse_expert_id(weight_name: str) -> int | None:
@@ -67,7 +91,7 @@ def compute_local_expert_ids(
 
 def should_skip_weight(
     weight_name: str,
-    local_expert_ids: set[int] | None,
+    local_expert_ids: set[int] | LayerExpertIds | None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
     belong to the local rank and should be skipped during loading."""
@@ -82,4 +106,6 @@ def should_skip_weight(
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
     if not weight_name.endswith((".weight", ".weight_packed")):
         return False
+    if isinstance(local_expert_ids, LayerExpertIds):
+        return not local_expert_ids.contains(weight_name, eid)
     return eid not in local_expert_ids

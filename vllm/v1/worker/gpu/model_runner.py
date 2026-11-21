@@ -60,6 +60,7 @@ from vllm.model_executor.offloader import (
     set_offloader,
 )
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.models.kimi_k3.nvidia.ops import dsa_dp as _dsa_dp
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -213,6 +214,9 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        # DSA-DP is a layout policy (Kimi K3 DSA, TP > 1, no CP): set this
+        # worker's flags before the model and its metadata builders read them.
+        _dsa_dp.configure(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -831,11 +835,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        target_cg_mode, row_multiple = cudagraph_mode, 1
+        if _dsa_dp.ENABLED:
+            # DSA-DP: decode steps replay full graphs in the DEP row order, whose
+            # sizes are multiples of tp requests. Other steps pick the owned rows
+            # on the host; the DSA layers run them as eager breaks of piecewise
+            # graphs (breakable CUDA graphs only). Drafter unchanged.
+            full = (
+                cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                and self.adaptive_verification is None
+            )
+            piecewise = (
+                cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
+                and envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            )
+            target_cg_mode = {
+                (True, True): CUDAGraphMode.FULL_AND_PIECEWISE,
+                (True, False): CUDAGraphMode.FULL_DECODE_ONLY,
+                (False, True): CUDAGraphMode.PIECEWISE,
+                (False, False): CUDAGraphMode.NONE,
+            }[(full, piecewise)]
+            row_multiple = self.parallel_config.tensor_parallel_size
+            _dsa_dp.DEP_PERM.ensure(
+                self.max_num_tokens, self.decode_query_len, self.device
+            )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            target_cg_mode,
             decode_query_len=self.decode_query_len,
+            row_multiple=row_multiple,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
@@ -1220,6 +1249,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_buffers = self.input_buffers
                     if self.pcp_manager is not None:
                         input_buffers = self.pcp_manager.input_buffers
+                    # Captured graphs are DSA-DP full-graph decode steps.
                     self.cudagraph_manager.capture(
                         self.model,
                         self.model_state,
@@ -1234,7 +1264,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         lora_capture_hook=create_lora_capture_hook(
                             self.lora_config, self
                         ),
+                        capture_hook=(
+                            self._dsa_dp_capture_hook if _dsa_dp.ENABLED else None
+                        ),
                     )
+                    _dsa_dp.STEP.graph, _dsa_dp.STEP.capturing = None, False
                     self.model_state.capture_inner_cudagraphs(
                         input_buffers,
                         self.block_tables,
@@ -1287,6 +1321,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def _dsa_dp_capture_hook(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_metadata: dict[str, Any],
+        slot_mappings_by_layer: dict[str, torch.Tensor],
+        full_cudagraph: bool,
+    ) -> None:
+        """DSA-DP graph capture (warm-up and capture of each graph). A full-graph
+        decode step captures on its padded DEP batch of dummy requests (owners
+        round-robin), built as a real step's; a piecewise graph records the DSA
+        layers' eager breaks, which skip their work at capture."""
+        _dsa_dp.STEP.capturing = not full_cudagraph
+        if not full_cudagraph:
+            _dsa_dp.STEP.graph = CUDAGraphMode.PIECEWISE
+            return
+        _dsa_dp.STEP.graph = CUDAGraphMode.FULL
+        tp = self.parallel_config.tensor_parallel_size
+        num_tokens = input_batch.num_tokens_after_padding
+        owners = np.arange(input_batch.num_reqs) % tp
+        _dsa_dp.DEP_PERM.set(owners, num_tokens)
+        _dsa_dp.prepare_step(
+            self,
+            input_batch,
+            block_tables,
+            slot_mappings,
+            self.attn_groups,
+            attn_metadata,
+            slot_mappings_by_layer,
+            pad_reqs=num_tokens // (tp * self.decode_query_len),
+            owners=owners,
+            capture=True,
+        )
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
@@ -1336,6 +1405,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            if _dsa_dp.ENABLED and new_req_data.dsa_owner >= 0:
+                _dsa_dp.REQ_OWNER[req_id] = new_req_data.dsa_owner
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -1417,17 +1488,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        new_block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+        kv_cache_block_copies = scheduler_output.kv_cache_block_copies
+        if self.kv_cache_config.dsa_dp_region_blocks > 0:
+            # DSA-DP per-card DSA KV: this card's pages only.
+            rank = _dsa_dp._tp()[1]
+            if new_block_ids_to_zero:
+                new_block_ids_to_zero = _dsa_dp.local_block_ids(
+                    new_block_ids_to_zero, self.kv_cache_config, rank
+                )
+            if kv_cache_block_copies:
+                kv_cache_block_copies = _dsa_dp.local_block_copies(
+                    list(kv_cache_block_copies), self.kv_cache_config, rank
+                )
+        if new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self.kv_block_zeroer.zero_block_ids(new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
-        if scheduler_output.kv_cache_block_copies:
+        if kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
+                kv_cache_block_copies,
                 self.kv_block_copy_groups,
             )
 
@@ -1453,6 +1537,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = sort_batch_req_ids(
             num_tokens_per_req, draft_tokens, self.decode_query_len
         )
+        if _dsa_dp.ENABLED and all(
+            num_tokens_per_req[r] == self.decode_query_len for r in req_ids
+        ):
+            # DSA-DP decode: by owner, so a card's sequence shard is mostly its
+            # own DEP segment (run_dep_decode pushes only the other rows).
+            owners = _dsa_dp.owners_of(req_ids)
+            req_ids = [req_ids[i] for i in np.argsort(owners, kind="stable")]
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
@@ -2026,6 +2117,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
+        dep_owners, dep_eager = None, False
+        if (
+            _dsa_dp.ENABLED
+            and batch_req_state is not None
+            and uniform_tok_count == self.decode_query_len
+        ):
+            # DSA-DP: a full-graph decode step pads every owner's segment (DEP_PERM)
+            # to the busiest owner's; owners too unbalanced for the captured graphs
+            # run eager, unpadded.
+            dep_owners = _dsa_dp.owners_of(batch_req_state.req_ids)
+            need = _dsa_dp.dep_min_tokens(dep_owners, self.decode_query_len)
+            if need <= self.cudagraph_manager.max_graph_tokens(CUDAGraphMode.FULL):
+                num_toks = max(num_toks, need)
+            else:
+                dep_eager = True
+
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
@@ -2041,7 +2148,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or dep_eager,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
@@ -2055,6 +2162,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+        dep = _dsa_dp.ENABLED and batch_desc.cg_mode == CUDAGraphMode.FULL
+        if dep:
+            _dsa_dp.DEP_PERM.set(dep_owners, batch_desc.num_tokens)
+        if _dsa_dp.ENABLED:
+            _dsa_dp.STEP.graph = batch_desc.cg_mode
 
         if iterlog is not None:
             cg = batch_desc.cg_mode.value
@@ -2202,6 +2314,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            if _dsa_dp.ENABLED and _dsa_dp.DSA_LAYER_NAMES:
+                # DSA-DP: the DSA groups' metadata is built for the owned requests
+                # only (_dsa_dp.prepare_step); skip the full-batch build.
+                attn_groups = [
+                    [
+                        g
+                        for g in groups
+                        if not all(n in _dsa_dp.DSA_LAYER_NAMES for n in g.layer_names)
+                    ]
+                    for groups in attn_groups
+                ]
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -2214,6 +2337,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+
+        if _dsa_dp.ENABLED:
+            if attn_metadata is not None and block_tables is not None:
+                tp = self.parallel_config.tensor_parallel_size
+                per = batch_desc.num_tokens // (tp * self.decode_query_len)
+                if dep and dep_owners is None:
+                    # A dummy full-graph step runs the identity DEP order.
+                    dep_owners = np.arange(input_batch.num_reqs) // max(per, 1)
+                _dsa_dp.prepare_step(
+                    self,
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups if dummy_run else self.step_attn_groups,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    pad_reqs=per if dep else 0,
+                    owners=dep_owners if dep else None,
+                )
+            else:
+                _dsa_dp.STEP.num_tokens = -1
+        elif _dsa_dp.PROF:
+            _dsa_dp.prof_tick()
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2335,6 +2481,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+        _dsa_dp.STEP.num_tokens = -1
+        _dsa_dp.STEP.graph = None
 
         self.kv_connector.finish_forward()
         if iterlog is not None:

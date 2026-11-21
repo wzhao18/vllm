@@ -522,7 +522,11 @@ class KVConnectorBase_V1(ABC):
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
         """Bind the scheduler's cache manager after it has been constructed."""
         self._kv_cache_manager = kv_cache_manager
-        self.bind_gpu_block_pool(kv_cache_manager.block_pool)
+        # DSA-DP KV regions: block ids span the shared pool and every region.
+        regions = getattr(kv_cache_manager, "dsa_regions", None)
+        self.bind_gpu_block_pool(
+            kv_cache_manager.block_pool if regions is None else regions.by_block_id
+        )
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """Bind the GPU block pool to the connector for per-GPU block status tracking.

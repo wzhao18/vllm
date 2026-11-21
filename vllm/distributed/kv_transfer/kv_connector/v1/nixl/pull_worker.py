@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
+    TPMapping,
     _is_attention_spec,
 )
 from vllm.logger import init_logger
@@ -56,7 +57,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         self._drain_pair_events(metadata)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+                self._dsa_dp_local_block_ids(meta.local_block_ids),
+                self._physical_blocks_per_logical_kv_block,
             )
             assert meta.remote is not None
             # Remote block IDs are kept logical here; expanded in
@@ -252,6 +254,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "Different NIXL cache-group layouts are only supported for "
                     "pure MLA models"
                 )
+            if meta.remote.dsa_owner is not None or self._dsa_dp_groups:
+                raise NotImplementedError(
+                    "Region-mapped NIXL transfers do not support DSA-DP"
+                )
             if self.block_size != remote_info.remote_block_size:
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
@@ -313,6 +319,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 for r, blocks in enumerate(local_by_region)
             ]
         else:
+            source_ranks = plan.source_ranks_per_group
+            if meta.remote.dsa_owner is not None or self._dsa_dp_groups:
+                dsa_source_ranks = self._dsa_dp_source_ranks(req_id, meta, plan)
+                if dsa_source_ranks is None:
+                    return
+                source_ranks = dsa_source_ranks
             written = [set() for _ in local_block_ids]
             remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._logical_to_kernel_block_ids(
@@ -323,7 +335,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
                 return [
-                    list(block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
+                    list(block_ids[g]) if rank in source_ranks[g] else []
                     for g in range(num_groups)
                 ]
 
@@ -563,6 +575,46 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 assert handle is not None
                 self._recving_transfers[request_id].append(handle)
             return False
+    def _dsa_dp_source_ranks(
+        self, req_id: str, meta: ReqMeta, plan: TPMapping
+    ) -> tuple[tuple[int, ...], ...] | None:
+        """Per-group source ranks with DSA-DP (vllm/v1/core/dsa_dp_regions.py).
+
+        A DSA-DP producer holds a request's DSA groups on its owner rank only, so
+        they are read from that rank. Groups this rank does not back (a local
+        DSA-DP group owned by another card) are not read. Every source rank is
+        still read or notified once, as P expects.
+
+        Returns None after failing the request when the owner is not a source of
+        this rank. A DSA-DP decoder avoids that by binding the request to the
+        owner ``remote_dsa_owner * tp_size // remote_tp_size``.
+        """
+        assert meta.remote is not None
+        owner = meta.remote.dsa_owner
+        remote_groups = meta.remote.dsa_groups if owner is not None else ()
+        local = meta.local_physical_block_ids
+        source_ranks = list(plan.source_ranks_per_group)
+        for g in {*remote_groups, *self._dsa_dp_groups}:
+            if not local[g]:
+                source_ranks[g] = ()
+            elif g in remote_groups:
+                if owner not in plan.all_source_ranks:
+                    logger.error(
+                        "Request %s: its DSA-DP KV is on remote rank %d, which "
+                        "TP rank %d does not read from (sources %s). The "
+                        "decoder must place the request on the owner rank "
+                        "matching remote_dsa_owner.",
+                        req_id,
+                        owner,
+                        self.tp_rank,
+                        plan.all_source_ranks,
+                    )
+                    self._handle_failed_transfer(
+                        req_id, None, self._recv_failures, record_failed_transfer=False
+                    )
+                    return None
+                source_ranks[g] = (owner,)
+        return tuple(source_ranks)
 
     def _read_blocks(
         self,

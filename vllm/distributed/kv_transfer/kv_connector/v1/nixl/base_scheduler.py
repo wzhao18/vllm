@@ -520,6 +520,30 @@ class NixlBaseConnectorScheduler:
             clipped.append(blocks)
         return tuple(clipped)
 
+    def get_dsa_dp_exchange_blocks(
+        self, block_ids: BlockIds
+    ) -> tuple[BlockIds, dict[str, Any]]:
+        """DSA-DP (vllm/v1/core/dsa_dp_regions.py): a request's DSA groups live
+        only on its owner card. Export them as that card's local pages, with the
+        owner and the groups' transfer positions, so readers pull them from it.
+
+        Takes and returns clipped (transfer-group) block ids.
+        """
+        cfg = self.kv_cache_config
+        if cfg.dsa_dp_region_blocks <= 0 or not block_ids:
+            return block_ids, {}
+        from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+        groups = dsa_dp.transfer_group_ids(cfg)
+        owner = dsa_dp.region_owner((b for g in groups for b in block_ids[g]), cfg)
+        if owner is None:
+            return block_ids, {}
+        block_ids = tuple(
+            dsa_dp.region_block_ids(ids, cfg, owner) if g in groups else ids
+            for g, ids in enumerate(block_ids)
+        )
+        return block_ids, {"remote_dsa_owner": owner, "remote_dsa_groups": list(groups)}
+
     def set_xfer_handshake_metadata(
         self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:

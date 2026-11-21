@@ -353,6 +353,19 @@ class KVTransferThread(threading.Thread):
         # Bounded store calls (store_op_failover); None = direct calls.
         self.store_guard: StoreCallGuard | None = None
 
+    # DSA-DP owner hooks; the worker binds its own when it creates the thread.
+    @staticmethod
+    def _dsa_dp_owner(
+        g_idx: int, req_id: str, block_ids: Sequence[int] = ()
+    ) -> int | None:
+        return None
+
+    @staticmethod
+    def _dsa_dp_block_ids(
+        g_idx: int, req_id: str, block_ids: list[int], to_global: bool = False
+    ) -> list[int]:
+        return block_ids
+
     def _store_call(
         self, op: str, fn: Callable[..., _T], *args: Any, keys: Sequence[str] = ()
     ) -> _T:
@@ -642,11 +655,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if hash_idx >= len(req_meta.block_hashes):
                 continue
             db = self.token_databases[group_id]
-            # Distribute across ranks by the same rule as normal chunks.
-            put_step = self.group_put_steps[group_id]
-            put_step_rank = (self.tp_rank + group_id) % put_step
-            if (cdiv(num_tokens, db.block_size) - 1) % put_step != put_step_rank:
-                continue
+            dsa_owner = self._dsa_dp_owner(group_id, req_meta.req_id, [block_id])
+            if dsa_owner is not None:
+                # DSA-DP: only the owner card holds the block.
+                if dsa_owner != self.tp_rank:
+                    continue
+                (block_id,) = self._dsa_dp_block_ids(
+                    group_id, req_meta.req_id, [block_id]
+                )
+            else:
+                # Distribute across ranks by the same rule as normal chunks.
+                put_step = self.group_put_steps[group_id]
+                put_step_rank = (self.tp_rank + group_id) % put_step
+                if (cdiv(num_tokens, db.block_size) - 1) % put_step != put_step_rank:
+                    continue
             addr, size = db.prepare_value_for_block(block_id)
             puts.append(
                 (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
@@ -969,6 +991,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 # Rotate the stride phase per group to balance load across ranks.
                 put_step = self.group_put_steps[g_idx]
                 put_step_rank = (self.tp_rank + g_idx) % put_step
+                dsa_owner = self._dsa_dp_owner(
+                    g_idx, req_id, block_ids_per_group[g_idx]
+                )
+                if dsa_owner is not None:
+                    # DSA-DP: only the owner card holds this request's DSA KV;
+                    # it saves every chunk, the other cards none.
+                    if dsa_owner != self.tp_rank:
+                        continue
+                    put_step, put_step_rank = 1, 0
                 group_blocks = block_ids_per_group[g_idx]
                 for start, end, block_hash in db.process_tokens(
                     token_len,
@@ -1083,7 +1114,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 db = self.token_databases[g_idx]
                 group_addrs, group_sizes, _ = db.store_layout.prepare_values(
                     chunks,
-                    block_ids_per_group[g_idx],
+                    self._dsa_dp_block_ids(g_idx, req_id, block_ids_per_group[g_idx]),
                     shards_per_group[g_idx],
                 )
                 addrs.extend(group_addrs)
@@ -1391,8 +1422,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         size_list: list[list[int]] = []
         key_list: list[str] = []
         block_id_list: list[int] = []
+        dsa_skipped = False
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
+                continue
+            dsa_owner = self._dsa_dp_owner(g_idx, req_id, req_meta.block_ids[g_idx])
+            if dsa_owner is not None and dsa_owner != self.tp_rank:
+                # DSA-DP: the owner card alone reads this request's DSA KV.
+                dsa_skipped = True
                 continue
             mask = load_mask_per_group[g_idx]
             chunks: list[tuple[int, int]] = []
@@ -1416,13 +1453,20 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     store_shard_ids.append(store_shard_id)
             g_addrs, g_sizes, g_block_ids = db.store_layout.prepare_values(
                 chunks,
-                req_meta.block_ids[g_idx],
+                self._dsa_dp_block_ids(g_idx, req_id, req_meta.block_ids[g_idx]),
                 store_shard_ids,
+            )
+            # Errors report scheduler block ids.
+            g_block_ids = self._dsa_dp_block_ids(
+                g_idx, req_id, g_block_ids, to_global=True
             )
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
 
+        if not key_list and dsa_skipped:
+            # DSA-DP: every hit chunk is another card's DSA KV.
+            return
         if not key_list:
             # The lookup reported a hit this rank has no keys for.
             raise RuntimeError(
@@ -1640,6 +1684,11 @@ class MooncakeStoreWorker:
         self.dp_rank = parallel_config.data_parallel_index
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # DSA-DP per-card DSA KV: the DSA groups' block ids are owner-region
+        # ids, mapped to this card's pages (``_dsa_dp_block_ids``).
+        self._dsa_kv_cfg = (
+            kv_cache_config if kv_cache_config.dsa_dp_region_blocks > 0 else None
+        )
         self.pp_size = parallel_config.pipeline_parallel_size
         self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
 
@@ -2023,6 +2072,40 @@ class MooncakeStoreWorker:
             return self.tp_size
         return max(1, self.tp_size // self.num_kv_head)
 
+    def _dsa_dp_owner(
+        self, g_idx: int, req_id: str, block_ids: Sequence[int] = ()
+    ) -> int | None:
+        """DSA-DP (models/kimi_k3/nvidia/ops/dsa_dp.py): the request's owner card
+        for a DSA cache group, or None (not a DSA-DP group). With per-card DSA
+        regions the owner is the region of the request's blocks: a load can run
+        before this worker has seen the request (async load)."""
+        from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+        if not dsa_dp.ENABLED or self.dcp_size > 1 or self.tp_size == 1:
+            return None
+        names = self._kv_cache_groups[g_idx].layer_names
+        if not any(name in dsa_dp.DSA_LAYER_NAMES for name in names):
+            return None
+        cfg = self._dsa_kv_cfg
+        if cfg is not None:
+            s = cfg.dsa_dp_shared_blocks
+            first = next((b for b in block_ids if b >= s), None)
+            if first is not None:
+                return (first - s) // cfg.dsa_dp_region_blocks
+        return dsa_dp.REQ_OWNER.get(req_id, 0)
+
+    def _dsa_dp_block_ids(
+        self, g_idx: int, req_id: str, block_ids: list[int], to_global: bool = False
+    ) -> list[int]:
+        """DSA-DP per-card DSA KV: a DSA group's scheduler block ids as this
+        (owner) card's pages, or back (``to_global``); other groups unchanged."""
+        from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+        cfg = self._dsa_kv_cfg
+        if cfg is None or self._dsa_dp_owner(g_idx, req_id, block_ids) is None:
+            return block_ids
+        return dsa_dp.region_block_ids(block_ids, cfg, self.tp_rank, to_global)
+
     def _compute_group_tp_replication_factors(self) -> tuple[int, ...]:
         """Return the number of byte-identical TP replicas per cache group.
 
@@ -2265,6 +2348,8 @@ class MooncakeStoreWorker:
             self.kv_send_thread.store_guard = self._make_store_guard(
                 "KVCacheStoreSendingThread", self.kv_send_thread
             )
+            self.kv_send_thread._dsa_dp_owner = self._dsa_dp_owner
+            self.kv_send_thread._dsa_dp_block_ids = self._dsa_dp_block_ids
             self.kv_send_thread.start()
 
         self.kv_recv_threads = []
@@ -2291,6 +2376,8 @@ class MooncakeStoreWorker:
             recv_thread.store_guard = self._make_store_guard(
                 recv_thread.name, recv_thread
             )
+            recv_thread._dsa_dp_owner = self._dsa_dp_owner
+            recv_thread._dsa_dp_block_ids = self._dsa_dp_block_ids
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)

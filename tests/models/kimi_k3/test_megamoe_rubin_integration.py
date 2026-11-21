@@ -347,11 +347,14 @@ def test_shared_overlap_sm_cap_admits_every_server_bucket(monkeypatch, world, to
         X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
 
 
-def test_server_bucket_without_knob_record_raises():
+def test_server_bucket_without_knob_record_borrows_nearest():
+    """No EP4 genphase record: the nearest tuned contract's knobs are borrowed
+    (juntian #21, for redundant experts / EP sizes without records), with a note."""
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind="mxfp4_mxfp8")
-    with pytest.raises(C.KnobLookupError):
-        X.select_rubin_bucket(problem, 4, 256)  # no EP4 genphase record
+    bucket, notes = X.select_rubin_bucket(problem, 4, 256)
+    assert bucket.max_tokens >= 256
+    assert any("borrowed" in note for note in notes)
 
 
 # -- experts module --------------------------------------------------------------------
@@ -403,8 +406,9 @@ def test_constructor_refuses_what_it_cannot_run(ep):
     with torch.device("meta"):
         with pytest.raises(NotImplementedError, match="shared expert"):
             _experts(_vllm_config(), shared_experts=torch.nn.Identity(), **cfg)
-        with pytest.raises(NotImplementedError, match="redundant"):
-            _experts(_vllm_config(), num_logical_experts=448, **cfg)
+        # Redundant experts (juntian #21): physical slot p holds logical p % 448.
+        redundant = _experts(_vllm_config(), num_logical_experts=448, **cfg)
+        assert redundant.num_redundant_experts == 448
         with pytest.raises(ValueError, match="Duplicate layer name"):
             vc = _vllm_config()
             _experts(vc, **cfg)

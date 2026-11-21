@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build a `SchedulerOutput` for an exact batch, without the scheduler."""
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +17,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+
+# Windows of real token ids (a 1-D .npy, e.g. AgentX prompts) instead of uniform
+# random ids, so MoE routing follows a real expert-load distribution.
+_TOKEN_FILE = os.environ.get("VLLM_BENCH_FWD_TOKEN_FILE")
+_REAL_TOKENS = np.load(_TOKEN_FILE) if _TOKEN_FILE else None
 
 
 @dataclass
@@ -69,6 +75,44 @@ def _num_blocks(
     return skipped, total - skipped
 
 
+def _dsa_dp_owners(case: BenchCase) -> list[int]:
+    """DSA-DP owner card of each request (models/kimi_k3/nvidia/ops/dsa_dp.py), or
+    -1 without DSA-DP. Like the scheduler's load-based owner choice: longest
+    DSA cost first onto the least-loaded card of the TP group (same on every
+    rank: config and case only), so a bench step spreads its DSA rows over the
+    cards instead of hashing request ids."""
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    if not dsa_dp.ENABLED:
+        return [-1] * len(case.requests)
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp = get_tensor_model_parallel_world_size()
+    costs = [dsa_dp.chunk_cost(r.query_len, r.prefix_len) for r in case.requests]
+    load = [0.0] * tp
+    owners = [-1] * len(case.requests)
+    for i in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        card = min(range(tp), key=lambda c: (load[c], c))
+        owners[i] = card
+        load[card] += costs[i]
+    return owners
+
+
+def _dsa_dp_regions(kv_config) -> tuple[frozenset[int], int, int, int] | None:
+    """(DSA group ids, shared pages S, region pages D, this card's TP rank) of a
+    worker KV config split into DSA-DP regions, else None."""
+    if kv_config is None or getattr(kv_config, "dsa_dp_region_blocks", 0) <= 0:
+        return None
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return (
+        frozenset(kv_config.dsa_dp_group_ids),
+        kv_config.dsa_dp_shared_blocks,
+        kv_config.dsa_dp_region_blocks,
+        get_tensor_model_parallel_rank(),
+    )
+
+
 def build_batch(
     case: BenchCase,
     kv_cache_groups,
@@ -77,6 +121,7 @@ def build_batch(
     rng: np.random.Generator,
     dcp_size: int = 1,
     lookahead: int = 0,
+    kv_config=None,
 ) -> BenchBatch:
     """Allocate disjoint blocks and build `NewRequestData` for every request.
 
@@ -106,15 +151,37 @@ def build_batch(
     query_token_ids = {}
     group_block_ranges: list[list[tuple[int, int]]] = [[] for _ in kv_cache_groups]
     output = SchedulerOutput.make_empty()
+    owners = _dsa_dp_owners(case)
+    # DSA-DP per-card DSA KV regions (v1/core/dsa_dp_regions.py): a request's DSA
+    # group blocks come from its owner card's region, scheduler ids
+    # [S + c * D, S + (c + 1) * D); the other groups from the shared [1, S).
+    regions = _dsa_dp_regions(kv_config) if owners and owners[0] >= 0 else None
+    if regions is not None:
+        dsa_ids, shared, region, rank = regions
+        region_cursor = {}
     for i, req in enumerate(case.requests):
         req_id = f"bench-{i}"
         replay = min(replay_window, req.prefix_len) if req.prefix_hit else 0
         computed = req.prefix_len - replay
         block_ids = []
-        for group, ranges in zip(kv_cache_groups, group_block_ranges):
+        for gi, (group, ranges) in enumerate(zip(kv_cache_groups, group_block_ranges)):
             skipped, live = _num_blocks(
                 group.kv_cache_spec, computed, req.kv_len + lookahead, dcp_size
             )
+            if regions is not None and gi in dsa_ids:
+                owner = owners[i]
+                first = region_cursor.get(owner, shared + owner * region)
+                region_cursor[owner] = first + live
+                if first + live > shared + (owner + 1) * region:
+                    raise ValueError(
+                        f"Case {case.name!r} needs more than the {region} DSA "
+                        f"region pages of card {owner}. Increase the KV cache size."
+                    )
+                block_ids.append([0] * skipped + list(range(first, first + live)))
+                if owner == rank:  # this card's pages (kv_init zeroes them)
+                    local = first - owner * region
+                    ranges.append((local, local + live))
+                continue
             # A slot-packed group (``blocks_per_pool_block`` S > 1) addresses slot
             # j in pool row j // S: reserve whole rows from the shared cursor and
             # hand out the slot ids inside them. ``ranges`` stays in row units,
@@ -125,7 +192,11 @@ def build_batch(
             block_ids.append([0] * skipped + list(range(first, first + live)))
             ranges.append((cursor, cursor + rows))
             cursor += rows
-        tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
+        if _REAL_TOKENS is not None and len(_REAL_TOKENS) > req.kv_len:
+            start = int(rng.integers(0, len(_REAL_TOKENS) - req.kv_len))
+            tokens = _REAL_TOKENS[start : start + req.kv_len].astype(np.int64)
+        else:
+            tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
         prompt = tokens[: req.prefix_len] if req.is_decode else tokens
         query_token_ids[req_id] = tokens[computed:]
         expected[req_id] = (req.query_len + replay, computed, req.is_decode)
@@ -141,6 +212,7 @@ def build_batch(
                 num_computed_tokens=computed,
                 lora_request=None,
                 replay_start=computed if replay else 0,
+                dsa_owner=owners[i],
             )
         )
         output.num_scheduled_tokens[req_id] = req.query_len + replay
@@ -148,6 +220,11 @@ def build_batch(
             output.scheduled_spec_decode_tokens[req_id] = tokens[
                 req.prefix_len + 1 :
             ].tolist()
+    if regions is not None and cursor > regions[1]:
+        raise ValueError(
+            f"Case {case.name!r} needs {cursor} shared-region KV blocks, but the "
+            f"DSA-DP shared region has {regions[1]}. Increase the KV cache size."
+        )
     if cursor > num_kv_blocks:
         raise ValueError(
             f"Case {case.name!r} needs {cursor} KV blocks, but only "

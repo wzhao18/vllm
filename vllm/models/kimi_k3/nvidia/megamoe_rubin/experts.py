@@ -36,7 +36,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -60,6 +60,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+from . import dwdp
 from .config import (
     DEDUP_VARIANTS,
     SHIPPED_KNOBS,
@@ -418,10 +419,17 @@ class KimiK3MegaMoEExperts(nn.Module):
             raise NotImplementedError(
                 "Rubin MegaMoE does not fuse the shared expert; pass it to forward()."
             )
-        if num_logical_experts not in (None, num_experts):
-            raise NotImplementedError(
-                "Rubin MegaMoE places experts linearly without redundant experts "
-                f"(num_logical_experts {num_logical_experts} != {num_experts})."
+        # Redundant experts: ``num_experts`` physical slots hold ``num_logical_experts``
+        # logical experts; physical slot ``p`` holds logical ``p % num_logical`` (the
+        # default EPLB placement), still linear over the EP ranks. Routed ids are
+        # logical; without an EPLB map they address the primary slots ``[0, L)``, so
+        # the extra slots only pad the expert count to a multiple of the EP size.
+        if num_logical_experts is None:
+            num_logical_experts = num_experts
+        if not 0 < num_logical_experts <= num_experts:
+            raise ValueError(
+                f"Rubin MegaMoE: num_logical_experts {num_logical_experts} must be in "
+                f"(0, {num_experts}]."
             )
         ep_group = get_ep_group()
         ep_size, ep_rank = ep_group.world_size, ep_group.rank_in_group
@@ -442,7 +450,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
         self.experts_end_idx = experts_start_idx + num_local_experts
-        self.num_logical_experts = num_experts
+        self.num_logical_experts = num_logical_experts
+        self.num_redundant_experts = num_experts - num_logical_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -470,6 +479,11 @@ class KimiK3MegaMoEExperts(nn.Module):
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
         self.prefill_worker = pd_prefill_worker(vllm_config)
+        model_config = getattr(vllm_config, "model_config", None)
+        text_config = getattr(model_config, "hf_text_config", None)
+        # MoE layers of the model: an upper bound for the die-local budget check
+        # (1 without a model config, e.g. a standalone experts module).
+        self.num_moe_layers = getattr(text_config, "num_hidden_layers", 1)
         self.buckets, notes = select_rubin_buckets(
             self.problem,
             ep_size,
@@ -493,6 +507,19 @@ class KimiK3MegaMoEExperts(nn.Module):
             )
         # Kernel-layout weights, set by process_weights_after_loading.
         self.kernel_weights: RubinMoeWeights | None = None
+        # Local experts [lo, hi) this rank holds: all of them, except under expert
+        # DWDP, where each layer after the first keeps only the half its engine
+        # owns (dwdp.ExpertDwdp.claim). NVFP4 checkpoints then allocate and load only
+        # that half of the codes and block scales (the per-expert global scales stay
+        # whole: they are the kernel's alphas for both halves).
+        self.resident_experts = (0, num_local_experts)
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            self._dwdp_layer, lo, hi = expert_dwdp.claim(num_local_experts)
+            self.resident_experts = (lo, hi)
+        self.sharded_experts = weight_format is MEGA_MOE_NVFP4 and (
+            self.resident_experts != (0, num_local_experts)
+        )
 
         if weight_format is MEGA_MOE_NVFP4:
             self._create_nvfp4_weights()
@@ -561,14 +588,16 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"Rubin MegaMoE needs hidden and intermediate sizes that are multiples "
                 f"of {group}, got {h} and {i}."
             )
+        lo, hi = self.resident_experts
+        r = hi - lo  # resident experts (codes and block scales)
         e4m3 = torch.float8_e4m3fn
         shapes = {
-            "w13_weight": ((e, 2 * i, h // 2), torch.uint8),
-            "w13_weight_scale": ((e, 2 * i, h // NV_BLOCK), e4m3),
+            "w13_weight": ((r, 2 * i, h // 2), torch.uint8),
+            "w13_weight_scale": ((r, 2 * i, h // NV_BLOCK), e4m3),
             "w13_weight_scale_2": ((e, 2), torch.float32),
             "w13_input_scale": ((e, 2), torch.float32),
-            "w2_weight": ((e, h, i // 2), torch.uint8),
-            "w2_weight_scale": ((e, h, i // NV_BLOCK), e4m3),
+            "w2_weight": ((r, h, i // 2), torch.uint8),
+            "w2_weight_scale": ((r, h, i // NV_BLOCK), e4m3),
             "w2_weight_scale_2": ((e,), torch.float32),
             "w2_input_scale": ((e,), torch.float32),
         }
@@ -639,6 +668,11 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{weight_name}: NVFP4 block scales must be E4M3, got "
                 f"{loaded_weight.dtype}."
             )
+        if self.sharded_experts:  # only the resident experts' rows exist
+            lo, hi = self.resident_experts
+            local_expert_ids = [x - lo for x in local_expert_ids if lo <= x < hi]
+            if not local_expert_ids:
+                return False if return_success else None
         for local_expert_id in local_expert_ids:
             self._load_weight(param.data[local_expert_id], loaded_weight, shard_id)
         return True if return_success else None
@@ -700,6 +734,29 @@ class KimiK3MegaMoEExperts(nn.Module):
                 )
         return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone()
 
+    def _prepare_resident_nvfp4(self, runtime: RubinMegaMoE) -> RubinMoeWeights:
+        """Expert DWDP, NVFP4: the kernel layout of the resident half (the layout is
+        per expert, so the half converts to the same bytes as the same experts of a
+        whole conversion), with every local expert's alphas."""
+        lo, hi = self.resident_experts
+        fc1_alpha, fc2_alpha = self._nvfp4_alphas()
+        for name, g in (("w13", fc1_alpha), ("w2", fc2_alpha)):
+            if not bool(torch.isfinite(g).all()) or not bool((g > 0).all()):
+                raise ValueError(
+                    f"{self.prefix}: {name} weight_scale_2 must be finite and positive."
+                )
+        weights = runtime.prepare_nvfp4_checkpoint_weights(
+            *self.canonical_weights(),
+            fc1_alpha[lo:hi].contiguous(),
+            fc2_alpha[lo:hi].contiguous(),
+            num_experts=hi - lo,
+        )
+        return weights._replace(
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=torch.ones_like(fc1_alpha),
+        )
+
     def reserve_sms_for_shared_expert(
         self,
         max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS,
@@ -734,19 +791,35 @@ class KimiK3MegaMoEExperts(nn.Module):
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
         # The prefill-sized dedup buckets have no die-split schedule: they keep the
         # die-oblivious form and leave the decode buckets' die-local choice alone.
+        # Expert DWDP homes each half of a layer's experts on its die, so every
+        # phase-interleaved inference bucket streams die-locally, prefill included.
+        def die_streams(bucket: RubinBucket) -> bool:
+            if bucket.variant in DEDUP_VARIANTS:
+                return False
+            if dwdp.ENABLED:
+                return (
+                    bucket.variant == "inference"
+                    and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
+                )
+            return True
+
         die_mask = None
-        if die_local and not self.prefill_worker and all(
-            tuple(bucket.knobs.schedule_policy)[0]
-            == ("decode" if bucket.variant == "genphase" else "phase_interleave")
-            for bucket in self.buckets
-            if bucket.variant not in DEDUP_VARIANTS
+        if (dwdp.ENABLED and any(die_streams(b) for b in self.buckets)) or (
+            die_local
+            and not self.prefill_worker
+            and all(
+                tuple(bucket.knobs.schedule_policy)[0]
+                == ("decode" if bucket.variant == "genphase" else "phase_interleave")
+                for bucket in self.buckets
+                if bucket.variant not in DEDUP_VARIANTS
+            )
         ):
             from . import die_local
 
             die_mask = die_local.current_die_sm_mask32()
 
         def _placed(bucket: RubinBucket) -> RubinBucket:
-            mask = None if bucket.variant in DEDUP_VARIANTS else die_mask
+            mask = die_mask if die_streams(bucket) else None
             return dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
@@ -795,13 +868,25 @@ class KimiK3MegaMoEExperts(nn.Module):
         takes ``fused_shared=``)."""
         return self.select_bucket(num_tokens).shared is not None
 
-    def warmup_fused_shared(self, shared):
+    def home_fused_shared_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """The fused shared expert's FC1 weight rows ``[N, K]`` (contiguous, 16-row
+        gate/up stripes) homed per die (feature halves, as :meth:`warmup_fused_shared`
+        homes FC1) on die-local buckets: a die-local copy the caller swaps in for
+        ``rows``; ``rows`` itself otherwise."""
+        if self.bucket.die_sm_mask32 is None:
+            return rows
+        from .die_local import place_halves
+
+        return place_halves(rows)
+
+    def warmup_fused_shared(self, shared, placed: bool = False):
         """Collective: build, compile and warm the fused-shared runtime with one
         layer's ``session.FusedSharedArgs``; returns the arguments to launch with
-        (FC1 homed per die on die-local buckets)."""
+        (FC1 homed per die on die-local buckets, unless ``placed``: FC1 views rows
+        already homed by :meth:`home_fused_shared_rows`)."""
         if self.kernel_weights is None:
             raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
-        if self.bucket.die_sm_mask32 is not None:
+        if self.bucket.die_sm_mask32 is not None and not placed:
             from .die_local import place_halves
 
             # FC1 [1, K, N] is a K-major view of the striped [1, N, K] copy: home its
@@ -844,7 +929,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         error: Exception | None = None
         weights = None
         try:
-            if self.weight_format is MEGA_MOE_NVFP4:
+            if self.weight_format is MEGA_MOE_NVFP4 and self.sharded_experts:
+                weights = self._prepare_resident_nvfp4(runtime)
+            elif self.weight_format is MEGA_MOE_NVFP4:
                 alphas = self._nvfp4_alphas()
                 weights = runtime.prepare_nvfp4_checkpoint_weights(
                     *self.canonical_weights(), *alphas
@@ -868,7 +955,20 @@ class KimiK3MegaMoEExperts(nn.Module):
                 "EP rank (see its log)."
             )
         assert weights is not None
-        if self.bucket.die_sm_mask32 is not None:
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            lo, hi = self.resident_experts
+            if not self.sharded_experts and (lo, hi) != (0, self.num_local_experts):
+                # Converted whole (MXFP4: the alphas come from the conversion):
+                # keep the home half.
+                weights = weights._replace(
+                    fc1=tuple(t[lo:hi] for t in weights.fc1),
+                    fc2=tuple(t[lo:hi] for t in weights.fc2),
+                )
+            weights = expert_dwdp.register(self, weights)
+        elif self.bucket.die_sm_mask32 is not None and _die_local_fits(
+            weights, self.num_moe_layers
+        ):
             from .die_local import place_experts
 
             weights = place_experts(weights)
@@ -878,7 +978,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         # The kernel copy replaces the checkpoint layout (the MX path may alias w2).
         for _, param in self.named_parameters(recurse=False):
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-        if self.bucket.die_sm_mask32 is not None:
+        if self.bucket.die_sm_mask32 is not None or dwdp.ENABLED:
             del weights
             torch.accelerator.empty_cache()  # the default-allocated originals
 
@@ -1019,6 +1119,9 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{self.prefix}: Rubin MegaMoE used before "
                 "process_weights_after_loading (prepare_rubin_megamoe)."
             )
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            expert_dwdp.before_experts(self)
         num_tokens = hidden_states.shape[0]
         # Static per captured CUDA graph size (shape-only + host DP metadata).
         bucket = self.select_bucket(num_tokens)
@@ -1091,6 +1194,8 @@ class KimiK3MegaMoEExperts(nn.Module):
             y = y[0]
         if shared_experts is not None:
             y += shared_experts(hidden_states)
+        if expert_dwdp is not None:
+            expert_dwdp.after_experts(self)
         return y
 
 
@@ -1136,6 +1241,9 @@ def prepare_rubin_megamoe(model: nn.Module) -> int:
         assert module.kernel_weights is not None
         runtime.warmup(module.kernel_weights)
         warmed.add(id(runtime))
+    expert_dwdp = dwdp.get()
+    if experts and expert_dwdp is not None:
+        expert_dwdp.finalize()  # cross-engine, before any forward
     if experts:
         logger.info_once(
             "Rubin MegaMoE: %d layers in the %s kernel layout, %d runtime(s) warmed.",
@@ -1144,3 +1252,52 @@ def prepare_rubin_megamoe(model: nn.Module) -> int:
             len(warmed),
         )
     return len(experts)
+
+
+_DIE_LOCAL_FITS: bool | None = None
+
+
+def _die_local_fits(weights: Any, num_moe_layers: int) -> bool:
+    """Decided once, at the first layer: whether the die-localized copies of every
+    MoE layer's experts fit in the device memory left after loading. The
+    checkpoint layouts they replace are freed into the allocator's pool, not to
+    the driver the copies come from, so placement needs the copies' bytes on top
+    of the loaded model (e.g. TP4 x EP12 of the full K3.1 does not fit, EP16 does).
+    Without room every layer keeps the default allocation."""
+    global _DIE_LOCAL_FITS
+    if _DIE_LOCAL_FITS is None:
+        layer = sum(
+            t.numel() * t.element_size()
+            for t in (*weights.fc1, *weights.fc2)
+            if isinstance(t, torch.Tensor)
+        )
+        need = layer * num_moe_layers + (8 << 30)
+        free, _ = torch.cuda.mem_get_info()
+        _DIE_LOCAL_FITS = free >= need
+        if not _DIE_LOCAL_FITS:
+            logger.warning(
+                "Rubin MegaMoE: die-local experts need %.1f GiB, %.1f GiB free "
+                "after loading; keeping the default allocation.",
+                need / 2**30,
+                free / 2**30,
+            )
+    return _DIE_LOCAL_FITS
+
+
+def restrict_local_expert_ids(model: nn.Module, local_expert_ids: Any) -> Any:
+    """The loader's EP expert filter narrowed to what each MoE layer allocated:
+    under expert DWDP a layer after the first holds only its home half, so the
+    other half's weights are skipped before they are read."""
+    from vllm.model_executor.model_loader.ep_weight_filter import LayerExpertIds
+
+    layers: dict[int, set[int]] = {}
+    for m in model.modules():
+        if isinstance(m, KimiK3MegaMoEExperts) and m.sharded_experts:
+            lo, hi = m.resident_experts
+            first = m.experts_start_idx
+            layers[m.layer_id] = {
+                p % m.num_logical_experts for p in range(first + lo, first + hi)
+            }
+    if not layers or isinstance(local_expert_ids, LayerExpertIds):
+        return local_expert_ids
+    return LayerExpertIds(set(local_expert_ids), layers)

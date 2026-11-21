@@ -178,9 +178,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     # Each count fixes where that group's DCP slice starts, which the
                     # worker needs to line up with the remote's slice.
                     local_num_computed_blocks = tuple(
-                        sum(
-                            block.block_hash is not None and not block.is_null
-                            for block in group
+                        len(
+                            [
+                                block
+                                for block in group
+                                if block.block_hash is not None and not block.is_null
+                            ]
                         )
                         for group in blocks.blocks
                     )
@@ -444,6 +447,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         remote_num_tokens = 0
         blocks_expiry_time = None
         lease_deadline = None
+        dsa_dp_params: dict[str, Any] = {}
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -486,6 +490,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             block_ids = self.get_exchange_clipped_blocks(
                 block_ids, num_tokens=remote_num_tokens
             )
+            block_ids, dsa_dp_params = self.get_dsa_dp_exchange_blocks(block_ids)
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
@@ -507,4 +512,5 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_lease_deadline=lease_deadline,
             remote_lease_check=lease_deadline is not None,
             transfer_mode=self._TRANSFER_MODE,
+            **dsa_dp_params,
         )
