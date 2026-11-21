@@ -3407,8 +3407,9 @@ class EarlyLoadClient:
     """Scheduler side of the early-load channel (see early_load_supported)."""
 
     def __init__(self, vllm_config: VllmConfig) -> None:
-        self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        self.socket = self.ctx.socket(zmq.PUSH)  # type: ignore[attr-defined]
+        # The process-wide context: a dropped client then never terminates a
+        # context of its own from the garbage collector.
+        self.socket = zmq.Context.instance().socket(zmq.PUSH)  # type: ignore[attr-defined]
         self.socket.setsockopt(zmq.LINGER, 0)  # type: ignore[attr-defined]
         # Queue only on an established connection (set before connecting):
         # until the worker listens, send() fails and the load goes with the
@@ -3431,4 +3432,3 @@ class EarlyLoadClient:
 
     def close(self) -> None:
         self.socket.close(linger=0)
-        self.ctx.term()
