@@ -130,6 +130,15 @@ def _within_rounding(got, delta, old):
     return bool(((got.float() - want).abs() <= tol).all())
 
 
+def _say(rank, *what):
+    """Progress on stderr (a hung collective otherwise shows nothing)."""
+    import sys
+
+    print(
+        f"[{time.strftime('%H:%M:%S')} rank {rank}]", *what, file=sys.stderr, flush=True
+    )
+
+
 def _armed(*tensors):
     return all(bool((t.view(torch.int32) == SENTINEL).all()) for t in tensors)
 
@@ -280,6 +289,7 @@ def _worker(env: dict[str, str]) -> None:
             holder = torch.nn.ModuleList([in_proj, o_proj])
             assert enable_kimi_k3_mxfp8_dispatch(holder) == 2
             _check_formats(in_proj, o_proj, qcfg, world)
+            _say(rank, "layers built, formats checked")
 
             # W1: the TP in-projection vs the stock layer, bit for bit
             projection = Mxfp8Projection(
@@ -294,6 +304,7 @@ def _worker(env: dict[str, str]) -> None:
                 projection.run(x, got)
                 assert projection.engine(r) == stock_kind(pitch, HIDDEN, r)
                 assert torch.equal(got, want), f"in-projection R{r}"
+            _say(rank, "W1 in-projection bitwise at", IN_ROWS)
 
             # W2: the MXFP8 o-projection + exchange + AttnRes vs stock
             prepared.TWOSHOT[world] = TWOSHOT_TABLE
@@ -311,6 +322,7 @@ def _worker(env: dict[str, str]) -> None:
                 for d in decoders
             ]
             stock = [StockAttnRes.for_post(d) for d in decoders]
+            _say(rank, "W2 providers compiled")
             boxes = [mailbox.buffer, twoshot.recv, twoshot.gather]
             boxes += [twoshot.rows_box(cap).recv, twoshot.rows_box(cap).gather]
             boxes += [shard.owners.buffer, shard.gathers[0].buffer]
@@ -331,6 +343,7 @@ def _worker(env: dict[str, str]) -> None:
                     local[:r].copy_(x)
                     ours_prefix, ours_blocks = prefix.clone(), blocks.clone()
                     out = torch.empty(r, HIDDEN, device=device, dtype=torch.bfloat16)
+                    _say(rank, f"W2 run R{r} layer {i}")
                     provider.run(local[:r], ours_prefix, ours_blocks, out)
                     torch.accelerator.synchronize()
                     case = f"o-projection R{r} layer {i} rank {rank}"
@@ -355,6 +368,7 @@ def _worker(env: dict[str, str]) -> None:
                     _check_rows(f"{case} out", out, ref_out)
                     assert torch.equal(ours_blocks, blocks), case
                     assert _armed(*boxes), f"{case}: a mailbox left unarmed"
+                    _say(rank, "W2 ok", case)
 
             # a captured two-layer step replays its eager bits
             for r in GRAPH_ROWS:
@@ -386,6 +400,7 @@ def _worker(env: dict[str, str]) -> None:
                     for a, b in zip(outs + prefixes, eager + eager_prefix):
                         assert torch.equal(a, b), f"graph R{r}"
                     assert _armed(*boxes), f"graph R{r}: a mailbox left unarmed"
+            _say(rank, "graph replays ok")
             torch.distributed.barrier(group=group)
         finally:
             cleanup_dist_env_and_memory()
