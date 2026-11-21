@@ -25,9 +25,11 @@ class _Exchange:
     def __init__(self, peer: int):
         self.peer = peer
         self.calls: list[int] = []
+        self.demands: list[int] = []
 
-    def __call__(self, num_tokens: int) -> int:
+    def __call__(self, num_tokens: int, demand: int = 0) -> int:
         self.calls.append(num_tokens)
+        self.demands.append(demand)
         return max(num_tokens, self.peer)
 
 
@@ -264,3 +266,35 @@ def test_async_scheduler_pull_up():
     scheduler.set_dp_prefill_exchange(_Exchange(peer=900))
     out = scheduler.schedule()
     assert _tokens(out, requests) == [500, 200, 200]
+
+
+def test_exchange_reports_prompt_tokens_left():
+    """The exchange carries the prompt tokens this rank still has to compute
+    after the step (the DP lockstep step cap's input)."""
+    scheduler = _scheduler(budget=1024, threshold=200)
+    requests = _running_chunked(scheduler, num_requests=3, num_tokens=1000)
+    left = sum(r.num_prompt_tokens - r.num_computed_tokens for r in requests)
+    ex = _Exchange(peer=0)
+    scheduler.set_dp_prefill_exchange(ex)
+    out = scheduler.schedule()
+    assert ex.demands == [left - sum(out.num_scheduled_tokens.values())]
+
+
+def test_step_token_cap_bounds_the_step():
+    """A DP lockstep step cap below the budget bounds the step's tokens; None
+    restores the stock budget."""
+    stock = _scheduler(budget=1024, threshold=0)
+    capped = _scheduler(budget=1024, threshold=0)
+    a = create_requests(num_requests=2, num_tokens=1000, req_ids=["a0", "a1"])
+    b = create_requests(num_requests=2, num_tokens=1000, req_ids=["a0", "a1"])
+    for r in a:
+        stock.add_request(r)
+    for r in b:
+        capped.add_request(r)
+    capped.set_dp_step_token_cap(256)
+    assert sum(stock.schedule().num_scheduled_tokens.values()) == 1024
+    out = capped.schedule()
+    assert sum(out.num_scheduled_tokens.values()) == 256
+    _finish_step(capped, out, b)
+    capped.set_dp_step_token_cap(None)
+    assert sum(capped.schedule().num_scheduled_tokens.values()) == 1024
