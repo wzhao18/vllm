@@ -377,6 +377,16 @@ def draft_fingerprint(
     blocks, rows = ids[tokens // block_size], tokens % block_size
     mix = _i64(salt(view.name, "draft_h"))
     total = torch.zeros((), dtype=torch.int64, device=device)
+    if num_tokens % 128 in (127, 126) and view.head0 + heads >= view.total_heads and "24." in view.name:
+        # PDRDBG: per-row hashes of the last 6 rows and the first 2 rows, last head of this rank
+        rh = _row_hash(view.pages[blocks, heads - 1, rows]).tolist()
+        tl = tokens.tolist()
+        import logging
+        logging.getLogger("vllm").warning(
+            "PDRDBGFP %s ntok=%d first=%s head0=%d blocks_tail=%s rows=%s",
+            view.name, num_tokens, first, view.head0,
+            ids[-3:].tolist(), list(zip(tl[:2] + tl[-6:], rh[:2] + rh[-6:])),
+        )
     for h in range(heads):
         key = tokens * view.total_heads + (view.head0 + h)
         row_hash = _row_hash(view.pages[blocks, h, rows])
