@@ -16,6 +16,7 @@ import heapq
 import itertools
 import math
 import os
+import pickle
 import queue
 import socket
 import threading
@@ -1834,6 +1835,9 @@ class MooncakeStoreWorker:
             else None
         )
 
+        self._vllm_config = vllm_config
+        # Started with the receive threads (early_load_supported).
+        self.early_load_server: EarlyLoadServer | None = None
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
         if vllm_config.parallel_config.rank == 0:
@@ -2386,6 +2390,27 @@ class MooncakeStoreWorker:
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
+        if early_load_supported(self._vllm_config) and self.early_load_server is None:
+            self.early_load_server = EarlyLoadServer(
+                self._vllm_config, self._issue_early_load
+            )
+            logger.info("Mooncake early loads on (issued at schedule time)")
+
+    def _issue_early_load(self, req_meta: ReqMeta) -> None:
+        """Queue a load the scheduler issued when it allocated the blocks.
+
+        No GPU-order wait: the scheduler issues a load early only into blocks
+        no step still in flight uses (BlockFreeClock), and the blocks' own
+        step (zeroing skips loaded groups, no copy-on-write for a loading
+        request) does not touch them. Reported like any load.
+        """
+        load_spec = req_meta.load_spec
+        assert load_spec is not None and load_spec.can_load
+        load_spec.token_len = load_spec.kvpool_cached_tokens
+        req_meta.load_ready_event = None
+        req_meta.load_issue_time = time.perf_counter()
+        self._increment_kv_connector_counter("load_issued_early", 1)
+        self.recv_request_queue.put(req_meta)
 
     def unregister_kv_caches(self) -> None:
         """Unregister device KV buffers after the engine has drained transfers."""
@@ -2872,6 +2897,10 @@ class MooncakeStoreWorker:
         buffers, and the connection to the master server. Idempotent so it is
         safe to call from both the explicit shutdown path and ``__del__``.
         """
+        early_load_server = getattr(self, "early_load_server", None)
+        if early_load_server is not None:
+            self.early_load_server = None
+            early_load_server.close()
         store = getattr(self, "store", None)
         if store is None:
             return
@@ -3280,3 +3309,113 @@ def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
     return (
         f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_host_{hostname}_dp_rank{dp_rank}"
     )
+
+
+# ============================================================
+# Early loads (issued by the scheduler at schedule time)
+# ============================================================
+
+
+def early_load_supported(vllm_config: VllmConfig) -> bool:
+    """Whether the scheduler may hand async loads straight to the worker when
+    it allocates their blocks (EarlyLoadClient -> EarlyLoadServer) instead of
+    in the step's connector metadata.
+
+    The metadata path starts a load only when the worker binds the step,
+    after its CPU launched the previous step, and then orders it after that
+    step's forward: the load overlaps the step it is scheduled in, and its
+    report comes with that step's output, after the next step was already
+    scheduled (async scheduling), so the request's first chunk runs two steps
+    after the allocation. An early load overlaps the step still in flight at
+    allocation instead and is usually reported with its output, one step
+    sooner. The scheduler issues one early only for blocks no in-flight step
+    uses (BlockFreeClock), which needs the scheduler's deferred block frees
+    (async scheduling with two batches in flight and a KV consumer role) and
+    a single worker per engine (the scheduler addresses one worker).
+    """
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return False
+    extra_config = kv_transfer_config.kv_connector_extra_config
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        extra_config.get("load_async", True)
+        and kv_transfer_config.is_kv_consumer
+        and parallel_config.world_size == 1
+        and parallel_config.pipeline_parallel_size == 1
+        and vllm_config.max_concurrent_batches == 2
+    )
+
+
+def get_zmq_path_early_load(vllm_config: VllmConfig) -> str:
+    """IPC path of the early-load channel of this engine's worker."""
+    lookup_path = get_zmq_rpc_path_lookup(vllm_config)
+    return lookup_path.replace("/lookup_rpc_port_", "/early_load_port_", 1)
+
+
+class EarlyLoadServer:
+    """Worker side of the early-load channel: queues each load the scheduler
+    sends (a pickled load-only ReqMeta) for the receive threads at once."""
+
+    def __init__(
+        self, vllm_config: VllmConfig, submit: Callable[[ReqMeta], None]
+    ) -> None:
+        self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        socket_path = get_zmq_path_early_load(vllm_config)
+        self._ipc_path = socket_path.removeprefix("ipc://")
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
+        self.socket = make_zmq_socket(
+            self.ctx,
+            socket_path,
+            zmq.PULL,  # type: ignore[attr-defined]
+            bind=True,
+        )
+        self._submit = submit
+        self.thread = threading.Thread(
+            target=self._run, daemon=True, name="MooncakeEarlyLoadServer"
+        )
+        self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                frame = self.socket.recv(copy=False)
+            except zmq.ZMQError:  # type: ignore[attr-defined]
+                return  # closed
+            req_meta = pickle.loads(frame.buffer)
+            self._submit(req_meta)
+
+    def close(self) -> None:
+        self.socket.close(linger=0)
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
+
+
+class EarlyLoadClient:
+    """Scheduler side of the early-load channel (see early_load_supported)."""
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        self.socket = make_zmq_socket(
+            self.ctx,
+            get_zmq_path_early_load(vllm_config),
+            zmq.PUSH,  # type: ignore[attr-defined]
+            bind=False,
+        )
+
+    def send(self, req_meta: ReqMeta) -> bool:
+        """Hand ``req_meta`` to the worker; False (nothing sent) when the
+        worker is not connected or its queue is full."""
+        try:
+            self.socket.send(
+                pickle.dumps(req_meta, protocol=pickle.HIGHEST_PROTOCOL),
+                flags=zmq.NOBLOCK,  # type: ignore[attr-defined]
+                copy=False,
+            )
+        except zmq.Again:  # type: ignore[attr-defined]
+            return False
+        return True
+
+    def close(self) -> None:
+        self.socket.close(linger=0)
