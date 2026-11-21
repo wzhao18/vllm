@@ -1282,8 +1282,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Setup TMA store for C
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+        # c_store_reduce: the TMA store adds the BF16 tile into C in L2
+        # (cp.reduce.async.bulk.tensor .add): C <- bf16(C + bf16(acc)).
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+            cpasync.CopyReduceBulkTensorTileS2GOp()
+            if getattr(self, "c_store_reduce", False)
+            else cpasync.CopyBulkTensorTileS2GOp(),
             c_tensor,
             epi_smem_layout,
             self.epi_tile,
