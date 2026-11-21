@@ -2571,6 +2571,8 @@ def _dsa_dp_pull_worker(tp_rank: int, tp_size: int, d_dsa_dp: bool):
     w._engine_last_active = {}
     w._recving_transfers = defaultdict(list)
     w._recv_failures = set()
+    # PDHETERO DCP pair mode (sub-block peers): none in these TP pulls.
+    w._sub_block_peers = {}
     w.region_group_ids = [0, 1]
     w.dst_region_group_ids = {"P": [0, 1]}
     w.kv_cache_config = _dsa_dp_cfg(_D_S, _D_D, tp_size)
