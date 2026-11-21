@@ -39,30 +39,37 @@ def _reserved_block_count(
     num_lookahead_tokens: int,
     max_model_len: int,
     max_encoder_len: int,
+    dcp_world_size: int = 1,
 ) -> int:
     """Number of blocks the scheduler would hold for a request of `num_tokens`.
 
     Warmup hand-builds its `SchedulerOutput`s, so it must reserve what
     `KVCacheManager.allocate_slots` reserves: the token range plus
     `num_lookahead_tokens`, where the speculator writes the KV of its drafts.
+    A DCP-sharded group's block holds `block_size * dcp_world_size` tokens of
+    the request (each rank stores its `block_size` share), as in
+    `SingleTypeKVCacheManager.block_size` and the worker's block-table rows.
     """
     if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
         kvcache_spec = kvcache_spec.first_spec
+    block_size = kvcache_spec.block_size
+    if kvcache_spec.dcp_sharded:
+        block_size *= dcp_world_size
     if isinstance(kvcache_spec, CircularBufferSpec):
         # Circular caches keep one physical ring block for the request lifetime.
         return 1
     if isinstance(kvcache_spec, CrossAttentionSpec):
         # Cross-attention blocks cover the encoder sequence only.
-        return cdiv(max_encoder_len, kvcache_spec.block_size)
+        return cdiv(max_encoder_len, block_size)
     num_speculative_blocks = 0
     if isinstance(kvcache_spec, MambaSpec):
         # MambaManager appends speculative running-state blocks in every cache
         # mode; align mode sizes from the uncapped, lookahead-free token range.
         num_speculative_blocks = kvcache_spec.num_speculative_blocks
         if kvcache_spec.mamba_cache_mode == "align":
-            return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
+            return cdiv(num_tokens, block_size) + num_speculative_blocks
     num_tokens = min(num_tokens + num_lookahead_tokens, max_model_len)
-    return cdiv(num_tokens, kvcache_spec.block_size) + num_speculative_blocks
+    return cdiv(num_tokens, block_size) + num_speculative_blocks
 
 
 def _warmup_block_counter(
@@ -72,6 +79,7 @@ def _warmup_block_counter(
     num_lookahead_tokens = model_runner.vllm_config.num_lookahead_tokens
     max_model_len = model_runner.max_model_len
     max_encoder_len = getattr(model_runner.model_state, "max_encoder_len", 0)
+    dcp_world_size = model_runner.dcp_size
 
     def block_count(num_tokens: int, kvcache_spec: KVCacheSpec) -> int:
         return _reserved_block_count(
@@ -80,6 +88,7 @@ def _warmup_block_counter(
             num_lookahead_tokens=num_lookahead_tokens,
             max_model_len=max_model_len,
             max_encoder_len=max_encoder_len,
+            dcp_world_size=dcp_world_size,
         )
 
     return block_count

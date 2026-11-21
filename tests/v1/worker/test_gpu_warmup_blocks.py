@@ -98,6 +98,7 @@ def _make_runner(
         is_last_pp_rank=True,
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
+        dcp_size=1,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
         model_state=SimpleNamespace(max_encoder_len=0),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
@@ -374,6 +375,78 @@ def test_reserved_block_count_matches_real_kv_cache_manager():
     _step(1)
     _step(decode_query_len)
 
+    manager.free(request)
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 4])
+def test_reserved_block_count_matches_real_kv_cache_manager_dcp(dcp_world_size):
+    """BUG-DPARITY-1: under DCP the scheduler's managers allocate a
+    DCP-sharded group in ``block_size * dcp_world_size``-token blocks (each
+    rank keeps its ``block_size`` share). `_reserved_block_count` must count
+    the same blocks, or warmup over-reserves up to ``dcp_world_size`` times
+    and overflows the worker's block-table row (``cdiv(max_model_len,
+    block_size * dcp)`` wide). A sharded attention group plus an unsharded
+    Mamba group, like the K3.1 DCP decode; the max_model_len gives the
+    sharded rows ``MAX_MODEL_LEN // (BLOCK_SIZE * 4)`` blocks."""
+    num_lookahead_tokens = NUM_SPEC_STEPS + 1
+    sharded = KVCacheGroupSpec(
+        ["sharded"],
+        FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            dcp_sharded=True,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=256,
+        kv_cache_tensors=[],
+        kv_cache_groups=[sharded, _mamba_group("none")],
+    )
+    specs = [g.kv_cache_spec for g in kv_cache_config.kv_cache_groups]
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=MAX_MODEL_LEN,
+        hash_block_size=BLOCK_SIZE,
+        enable_caching=False,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=BLOCK_SIZE * dcp_world_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=MAX_MODEL_LEN, block_size=BLOCK_SIZE
+    )
+    row_capacity = cdiv(MAX_MODEL_LEN, BLOCK_SIZE * dcp_world_size)
+    # Prompt chunks, then spec-decode steps up to max_model_len.
+    for num_new_tokens in (333, 4, 1, 4, 300, MAX_MODEL_LEN - 642 - 4, 4):
+        computed_blocks, num_new_computed, _ = manager.get_computed_blocks(request)
+        blocks = manager.allocate_slots(
+            request,
+            num_new_tokens,
+            num_new_computed,
+            computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+        )
+        assert blocks is not None, "block pool exhausted"
+        held = manager.get_block_ids(request.request_id)
+        num_tokens = request.num_computed_tokens + num_new_tokens
+        for spec, group_held in zip(specs, held):
+            expected = _reserved_block_count(
+                num_tokens,
+                spec,
+                num_lookahead_tokens=num_lookahead_tokens,
+                max_model_len=MAX_MODEL_LEN,
+                max_encoder_len=0,
+                dcp_world_size=dcp_world_size,
+            )
+            assert len(group_held) == expected, (
+                f"{type(spec).__name__}: real manager holds {len(group_held)} "
+                f"blocks for {num_tokens} tokens at DCP{dcp_world_size}, "
+                f"_reserved_block_count predicts {expected}"
+            )
+        assert len(held[0]) <= row_capacity
+        request.num_computed_tokens = num_tokens
+    assert len(held[0]) == row_capacity
     manager.free(request)
 
 
