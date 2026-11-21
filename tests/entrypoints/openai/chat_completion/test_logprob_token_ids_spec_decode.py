@@ -14,8 +14,8 @@ from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.logprobs import Logprob
 
-# Cached in CI; any model works, the chat template below is model independent.
-MODEL_NAME = "facebook/opt-125m"
+# Any small model works; the chat template below is model independent.
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 CHAT_TEMPLATE = "{% for m in messages %}{{ m['content'] }}\n{% endfor %}"
 # Repetitive prompt: n-gram drafts match from the first decode step on.
 PROMPT = "one two three four five six seven eight " * 8
