@@ -174,6 +174,18 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     local_block_ids = self.get_exchange_clipped_blocks(
                         unhashed_local_block_ids
                     )
+                    _rn = params.get("remote_num_tokens") or 0
+                    if _rn % 128 >= 126 or _rn % 128 <= 1:
+                        logger.warning(
+                            "PDRDBG D %s rntok=%d prompt=%d ext=%d computed=%d full_lens=%s full_tails=%s unhashed_tails=%s local_tails=%s remote_tails=%s",
+                            request.request_id, _rn, request.num_prompt_tokens,
+                            num_external_tokens, request.num_computed_tokens,
+                            [len(g) for g in blocks.blocks],
+                            [[b.block_id for b in g[-3:]] for g in blocks.blocks],
+                            [list(g[-3:]) + [len(g)] for g in unhashed_local_block_ids],
+                            [list(g[-3:]) + [len(g)] for g in local_block_ids],
+                            [list(g[-3:]) + [len(g)] for g in params["remote_block_ids"]],
+                        )
                     # Blocks covered by the local prefix cache, per KV cache group.
                     # Each count fixes where that group's DCP slice starts, which the
                     # worker needs to line up with the remote's slice.
@@ -483,9 +495,17 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             remote_num_tokens = request.num_computed_tokens
+            _raw = block_ids
             block_ids = self.get_exchange_clipped_blocks(
                 block_ids, num_tokens=remote_num_tokens
             )
+            if remote_num_tokens % 128 >= 126 or remote_num_tokens % 128 <= 1:
+                logger.warning(
+                    "PDRDBG P %s ntok=%d prompt=%d raw_lens=%s raw_tails=%s sent_tails=%s",
+                    request.request_id, remote_num_tokens, request.num_prompt_tokens,
+                    [len(g) for g in _raw], [list(g[-3:]) for g in _raw],
+                    [list(g[-3:]) + [len(g)] for g in block_ids],
+                )
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
