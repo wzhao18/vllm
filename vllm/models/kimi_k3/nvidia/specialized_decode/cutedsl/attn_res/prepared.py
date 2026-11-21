@@ -241,7 +241,8 @@ class PreparedAttnRes:
         rows = prefix.shape[0]
         if self.sharded(rows):
             return self.run_owned(None, prefix, blocks, out, aux)
-        if rows > self.ring[2][1]:  # the rings re-arm what they read: no row past cap
+        # (no tuned ring: an NVFP4 MoE layer's wide tail serves every batch)
+        if self.ring is None or rows > self.ring[2][1]:  # rings re-arm what they read
             if self.ring_rows is None or rows > self.ring_rows[2][1]:
                 raise ValueError(f"AttnRes ring input of {rows} rows: no ring holds it")
             code = self.ring_rows[0] if aux is None else self.aux[2]

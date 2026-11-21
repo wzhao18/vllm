@@ -250,10 +250,13 @@ class LatentRows:
                         )
                     words = tuple(no_neg_zero(w) for w in words)
                     push(slots, peers, slot, token, column, words)
-            if tid < chunk * per:
-                token = row0 + tid // per
+            # (a thread per owned 8-column cell; more cells than threads (TP < 16:
+            # chunk x width / 8 > 256) loop, else every row past 256 / per of an
+            # item was never reduced and NormRows polled its gather row forever)
+            for v in cutlass.range(tid, chunk * per, 256, unroll=1):
+                token = row0 + v // per
                 if token < M:
-                    column = rank * self.width + tid % per * 8
+                    column = rank * self.width + v % per * 8
                     reduce(recv, gather, gather_mc, rank, token, column, True)
 
 
