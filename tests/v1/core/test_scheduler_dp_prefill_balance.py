@@ -298,3 +298,33 @@ def test_step_token_cap_bounds_the_step():
     _finish_step(capped, out, b)
     capped.set_dp_step_token_cap(None)
     assert sum(capped.schedule().num_scheduled_tokens.values()) == 1024
+
+
+def test_demand_counts_a_connector_load_once_it_lands():
+    """A request whose KV connector load is in flight cannot run in any step
+    yet: it adds to this rank's demand only once the load has finished."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+    from vllm.v1.request import RequestStatus
+
+    from .utils import mock_kv
+
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=4 * block_size, is_async=True),
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=10 * block_size, block_size=block_size
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.dp_prefill_demand({}) == 0
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output([], finished_recving={request.request_id}),
+    )
+    left = request.num_prompt_tokens - request.num_computed_tokens
+    assert left > 0
+    assert scheduler.dp_prefill_demand({}) == left

@@ -143,6 +143,9 @@ def _cap_worker(rank, world_size, port, out):
     core = _fake_core(pg, sched)
     # Every rank sets the same cap from the group's total demand.
     got = DPEngineCoreProc._exchange_dp_prefill_tokens(core, 100 * rank, 4096 * rank)
+    # A long cold prompt on one rank counts as one full step (the budget):
+    # 16384 (clipped from 10**6) + 0 + 0 + 0 -> 4096 per rank.
+    DPEngineCoreProc._exchange_dp_prefill_tokens(core, 0, 10**6 if rank == 0 else 0)
     out[rank] = (got, sched.caps)
 
 
@@ -164,4 +167,4 @@ def test_exchange_sets_the_same_cap_on_every_rank():
             assert p.exitcode == 0
         # demand 0 + 4096 + 8192 + 12288 = 24576 -> 6144 per rank
         for rank in range(world_size):
-            assert out[rank] == (300, [6144])
+            assert out[rank] == (300, [6144, 4096])

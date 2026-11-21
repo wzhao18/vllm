@@ -2812,7 +2812,13 @@ class DPEngineCoreProc(EngineCoreProc):
             )
         self.scheduler.set_dp_step_token_cap(
             dp_step_token_cap(
-                int(counts[size : 2 * size].sum()),
+                # A rank runs at most the budget per step, so a long cold
+                # prompt counts as one full step, not all of its tokens.
+                int(
+                    counts[size : 2 * size]
+                    .clamp(max=self.scheduler.max_num_scheduled_tokens)
+                    .sum()
+                ),
                 size,
                 self.scheduler.max_num_scheduled_tokens,
                 self._dp_step_token_floor,
