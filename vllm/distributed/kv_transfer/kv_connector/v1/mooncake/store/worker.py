@@ -1837,6 +1837,7 @@ class MooncakeStoreWorker:
 
         self._vllm_config = vllm_config
         # Started with the receive threads (early_load_supported).
+        self._early_loads_on = early_load_supported(vllm_config)
         self.early_load_server: EarlyLoadServer | None = None
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
@@ -2390,7 +2391,10 @@ class MooncakeStoreWorker:
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
-        if early_load_supported(self._vllm_config) and self.early_load_server is None:
+        if (
+            getattr(self, "_early_loads_on", False)
+            and getattr(self, "early_load_server", None) is None
+        ):
             self.early_load_server = EarlyLoadServer(
                 self._vllm_config, self._issue_early_load
             )
