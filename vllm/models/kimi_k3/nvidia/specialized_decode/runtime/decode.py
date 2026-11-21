@@ -92,6 +92,9 @@ from .seams import StockAttnRes
 # and the dense down projection publishes its BF16 partials into TP slots that the
 # AttnRes sums in FP32 in rank order and rounds once.
 logger = init_logger(__name__)
+import os as _os  # DEBUG ONLY (D16MOE attribution branch)
+
+_DBG_STOCK_MOE = True
 
 # 65-256 rows too (axhb-sw3, 16 ranks, mirrored, 93 layers, 32k, us/step: B9 -11, B17
 # -19, B24 -14, B28 -37, B32 -5): the stock embedding + FlashInfer two-shot all-reduce
@@ -346,7 +349,7 @@ class SpecializedDecode:
                 if moe.rows is not None:  # wide batches: the wide tail's output ring
                     consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
-            elif isinstance(moe, Nvfp4MoE):  # every batch: the wide tail's ring
+            elif isinstance(moe, Nvfp4MoE) and not _DBG_STOCK_MOE:
                 consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
             elif layer.layer_idx in self.dense_rings:
@@ -1031,11 +1034,15 @@ class SpecializedDecode:
             if index in self.dense_rings and b not in self.dense_rings[index][1]:
                 consumer = None
             stock_moe = b in self.wide and b not in self.moe_batches
+            # DEBUG ONLY (D16MOE attribution, never merged): NVFP4 MoE layers on the
+            # stock MoE layer at every batch
+            if _DBG_STOCK_MOE and index in self.nvfp4_layers:
+                consumer, stock_moe = None, True
             if stock_moe:  # the next AttnRes reads the plain MLP output
                 consumer = None
             pre_ready = consumer is not None
             ff = self.feed_forward[index]
-            if stock_moe and isinstance(ff, PreparedMoE):
+            if stock_moe and (isinstance(ff, PreparedMoE) or _DBG_STOCK_MOE):
                 hidden = layer.mlp(moe_in)  # S4: the stock MoE layer
             elif b > GENERIC_ROWS and isinstance(ff, PreparedDenseMLP):
                 hidden = layer.mlp(moe_in)  # the stock dense MLP (cuBLAS)
