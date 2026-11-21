@@ -491,6 +491,12 @@ class StableTopKFromGatheredCandidatesKernel(
 
             threshold = threshold_bin_smem.load()
             should_include_threshold = include_threshold_bin_smem.load() != Int32(0)
+            # Emit the selected keys at fixed positions (thread-major, then key
+            # order): a block scan of the per-thread counts, not an atomic slot
+            # counter, whose order changes per call. The sparse MLA consumer is
+            # order-sensitive, so an atomic order made DCP prefill steps
+            # without ShardQ non-reproducible (BUG-DCP8-4).
+            num_selected = Int32(0)
             for key_idx in cutlass.range_constexpr(keys_per_thread):
                 key = keys[key_idx]
                 if prefix_matches(key, prefix, prefix_bits):
@@ -499,12 +505,24 @@ class StableTopKFromGatheredCandidatesKernel(
                     if should_include_threshold:
                         selected = selected or bin_idx == threshold
                     if selected:
-                        dst = cute.arch.atomic_add(
-                            committed_count_smem,
-                            Int32(1),
-                            sem="relaxed",
-                            scope="cta",
-                        )
+                        num_selected += Int32(1)
+            committed = committed_count_smem.load()
+            selected_inclusive = block_scan_inclusive_i32(
+                num_selected,
+                lane,
+                warp_id,
+                warp_totals_smem,
+                warps_per_block,
+            )
+            dst = committed + selected_inclusive - num_selected
+            for key_idx in cutlass.range_constexpr(keys_per_thread):
+                key = keys[key_idx]
+                if prefix_matches(key, prefix, prefix_bits):
+                    bin_idx = Int32((key >> Uint64(shift)) & bin_mask)
+                    selected = bin_idx > threshold
+                    if should_include_threshold:
+                        selected = selected or bin_idx == threshold
+                    if selected:
                         if dst < Int32(topk):
                             # Padding keys are 0 and decode to -1.
                             token_id = Int32(-1)
@@ -512,6 +530,10 @@ class StableTopKFromGatheredCandidatesKernel(
                                 id_key = Uint32(key >> Uint64(id_shift))
                                 token_id = recast_val(~id_key & Uint32(id_mask), Int32)
                             output[dst] = token_id
+                        dst += Int32(1)
+            # Every thread has read committed_count above (the scan synced).
+            if tid == Int32(tb_size - 1):
+                committed_count_smem.store(committed + selected_inclusive)
             cute.arch.sync_threads()
 
             pass_finished = include_threshold_bin_smem.load()
