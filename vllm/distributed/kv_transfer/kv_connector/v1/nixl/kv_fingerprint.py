@@ -362,9 +362,15 @@ def draft_fingerprint(
     view: DraftView, block_ids: Sequence[int], num_tokens: int
 ) -> int:
     """``F`` of a request's draft rows: row ``(t, h)`` (token ``t``, KV head
-    ``h``) adds ``splitmix64((t * heads + h) ^ salt) * (2 c(row) + 1)``."""
+    ``h``) adds ``splitmix64((t * heads + h) ^ salt) * (2 c(row) + 1)``.
+
+    A sliding window covers the rows the KV cache manager keeps for the next
+    token ``num_tokens``: ``[num_tokens - window + 1, num_tokens)``
+    (SlidingWindowManager.get_num_skipped_tokens). Row ``num_tokens - window``
+    may sit alone in a block the decoder's manager already released, so the
+    prefiller sends it but the decoder does not load it."""
     _, heads, block_size, _ = view.pages.shape
-    first = 0 if view.window is None else max(0, num_tokens - view.window)
+    first = 0 if view.window is None else max(0, num_tokens - view.window + 1)
     if num_tokens <= first:
         return 0
     if len(block_ids) < cdiv(num_tokens, block_size):

@@ -117,6 +117,23 @@ def _draft_f(pv, table_p, dv, table_d, num_tokens):
     return fp, fd
 
 
+def test_draft_window_ends_where_the_manager_keeps_blocks():
+    """Row ``num_tokens - window`` alone in its block: the decoder's window
+    manager released that block (it keeps ``window - 1`` rows before the next
+    token), so its rows are not loaded (zero here). The fingerprints cover the
+    kept rows only and still agree (PDRENDER 2026-11-20: K3.1 release drafter,
+    128-token slots, prompts of 128 m + 127 tokens)."""
+    num_tokens, window = 37, 10  # row 27 = 4 * 6 + 3: alone in D block 6
+    pv, tp_, dv, td = _draft_case(num_tokens, window=window, seed=7)
+    for v in dv:
+        v.pages[td[(num_tokens - window) // B_D]] = 0
+    assert len(set(_draft_f(pv, tp_, dv, td, num_tokens))) == 1
+    # The first kept row is checked.
+    first = num_tokens - window + 1
+    dv[0].pages[td[first // B_D], 0, first % B_D, 0] ^= 1
+    assert len(set(_draft_f(pv, tp_, dv, td, num_tokens))) == 2
+
+
 @pytest.mark.parametrize("num_tokens", [3, 37, 64])
 def test_draft_head_shards_sum_to_the_tp1_pages(num_tokens: int):
     pv, tp_, dv, td = _draft_case(num_tokens, window=10)

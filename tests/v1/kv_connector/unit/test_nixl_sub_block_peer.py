@@ -285,3 +285,161 @@ def test_sub_block_skew_only_fails_reads(
         local_block_ids=local_block_ids,
     )
     assert NixlPullConnectorWorker._sub_block_skew(meta, peer_sub_blocks) == skewed
+
+
+# Slot-packed groups (KVCacheGroupSpec.blocks_per_pool_block > 1): the K3.1
+# release GQA draft at --prefix-match-unit 128 has 128-token blocks on P and D,
+# packed as slots of the pool rows, whatever the pool block (16384 on DEP TP1 P,
+# 4096 on TP4/DCP4 D). BUG-STRESS-1 (2026-11-20): pair mode split them by X like
+# the pool-block regions, so every production P->D handshake failed.
+SLOTS = 64
+
+
+def _slot_decoder():
+    """Regions: 0 KDA state, 1-2 pool-block attention, 3 slot-packed draft."""
+    w = _decoder(regions=4, ssm=(0,))
+    w.block_len_per_layer = [24, 32, 32, 16]
+    w._slot_region_indices = frozenset({3})
+    return w
+
+
+def _slot_prefiller_meta(slot_region=True):
+    meta = _prefiller_meta(regions=4)
+    meta.block_lens = [96, 128, 128, 64]
+    meta.region_num_blocks = [5, 5, 5, 5 * SLOTS if slot_region else 5]
+    return meta
+
+
+def test_sub_block_remote_meta_keeps_slot_regions_whole():
+    w = _slot_decoder()
+    meta = _slot_prefiller_meta()
+    assert w._sub_block_remote_meta(meta, remote_dcp_size=1) == 4
+    assert meta.block_size == 8
+    # KDA state and slot draft keep their pages and block counts.
+    assert meta.block_lens == [96, 32, 32, 64]
+    assert meta.region_num_blocks == [5, 20, 20, 5 * SLOTS]
+
+
+@pytest.mark.parametrize("local_slots", [True, False])
+def test_sub_block_remote_meta_rejects_slot_skew(local_slots):
+    """P and D with different --prefix-match-unit (one side packs the draft as
+    slots, the other as pool blocks) fail the handshake with a clear error."""
+    w = _slot_decoder()
+    if not local_slots:
+        w._slot_region_indices = frozenset()
+    meta = _slot_prefiller_meta(slot_region=not local_slots)
+    with pytest.raises(RuntimeError, match="prefix-match-unit"):
+        w._sub_block_remote_meta(meta, remote_dcp_size=1)
+
+
+def test_slot_draft_remote_descs_read_whole_blocks_by_head():
+    """TP1 P slot draft page [16 heads, T tokens, c]; TP4 D rank 2 holds heads
+    8-11 as [4 heads, T tokens, c]: its slice of P slot k is the contiguous
+    third quarter of the page, one desc per slot (no sub-blocks)."""
+    c, T = 4, 16
+    w = _slot_decoder()
+    w.tp_rank = 2
+    local_page = 4 * T * c
+    w.block_len_per_layer = [24, 32, 32, local_page]
+    w._head_sharded_draft_regions = {3}
+    w._is_region_replicated = lambda r: r != 3
+    w._group_spec_types = (MambaSpec, MLAAttentionSpec, MLAAttentionSpec)
+    plan = SimpleNamespace(source_ranks_per_group=((0,), (0,), (0,)))
+    w.draft_tp_mappings = {
+        "P": SimpleNamespace(
+            source_ranks_per_group=((0,), (0,), (0,)), rank_offset_factor=2
+        )
+    }
+    meta = _slot_prefiller_meta()
+    meta.block_lens[3] = 16 * T * c
+    meta.block_strides = [400, 400, 400, 5000]
+    w._sub_block_peers["P"] = SubBlockPeer(
+        w._sub_block_remote_meta(meta, 1), list(meta.block_lens), 32
+    )
+    assert w._sub_block_draft_regions() == []
+    descs = _expand(w._build_fa_remote(plan, meta, 1))
+    # KDA region 0 (not an FA desc here) is read whole too; regions 1-2 split.
+    sizes = [5, 20, 20, 5 * SLOTS]
+    assert len(descs) == sum(sizes)
+    draft = descs[sum(sizes[:3]) :]
+    for k in (0, 7, 5 * SLOTS - 1):
+        addr = meta.kv_caches_base_addr[3] + k * 5000 + 2 * local_page
+        assert draft[k] == (addr, local_page)
+
+
+def test_expand_sub_blocks_passes_slot_groups_through(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import pull_scheduler
+
+    monkeypatch.setattr(
+        pull_scheduler, "get_representative_spec_type", lambda spec: spec.kind
+    )
+    s = object.__new__(pull_scheduler.NixlPullConnectorScheduler)
+    s.block_size = 8
+    s.kv_cache_config = SimpleNamespace(
+        transfer_groups=[
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(kind=MambaSpec, dcp_sharded=False),
+                blocks_per_pool_block=1,
+            ),
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(kind=MLAAttentionSpec, dcp_sharded=False),
+                blocks_per_pool_block=1,
+            ),
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(kind=MLAAttentionSpec, dcp_sharded=False),
+                blocks_per_pool_block=SLOTS,
+            ),
+        ]
+    )
+    params = {
+        "block_size": 32,
+        "remote_num_tokens": 41,
+        "dcp_size": 1,
+        "remote_block_ids": [[3], [7, 2], [100, 101, 102]],
+    }
+    s._expand_sub_blocks(params)
+    assert params["remote_sub_blocks"] == 4
+    assert params["remote_block_ids"] == [[3], [28, 29, 30, 31, 8, 9], [100, 101, 102]]
+
+
+@pytest.mark.parametrize("lookahead_block", [False, True])
+def test_unhashed_window_block_ids_drop_lookahead_block(lookahead_block):
+    """D's allocation holds the speculative lookahead slots: for a prompt of
+    128 m + 127 tokens they open one more 128-token window block. P drops its
+    lookahead blocks before sending and window blocks pair from the end, so D
+    must drop it too (else every draft block lands one block late)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import pull_scheduler
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    def blk(i, hashed=False, null=False):
+        return SimpleNamespace(
+            block_id=i, block_hash=b"h" if hashed else None, is_null=null
+        )
+
+    s = object.__new__(pull_scheduler.NixlPullConnectorScheduler)
+    window = object.__new__(SlidingWindowSpec)
+    object.__setattr__(window, "block_size", 128)
+    full = SimpleNamespace(block_size=512)
+    s.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=full),
+            SimpleNamespace(kv_cache_spec=window),
+        ]
+    )
+    num_tokens = 3 * 128 + 127  # 511: blocks 0..3 hold it
+    # Window group: block 0 out of window (null), 1 hit, 2-3 new, 4 lookahead.
+    win = [blk(0, null=True), blk(11, hashed=True), blk(12), blk(13)]
+    if lookahead_block:
+        win.append(blk(14))
+    groups = ([blk(20, hashed=True), blk(21)], win)
+    blocks = SimpleNamespace(
+        blocks=groups,
+        get_unhashed_block_ids_all_groups=lambda: [
+            [b.block_id for b in g if b.block_hash is None and not b.is_null]
+            for g in groups
+        ],
+    )
+    assert s._unhashed_window_block_ids(blocks, num_tokens) == [[21], [12, 13]]
+    # Unknown P token count: unchanged.
+    expected_win = [12, 13, 14] if lookahead_block else [12, 13]
+    assert s._unhashed_window_block_ids(blocks, None) == [[21], expected_win]
