@@ -256,7 +256,7 @@ def region_sizes(
     num_blocks_per_card: int,
     tp: int,
     num_dsa_groups: int,
-    num_shared_token_groups: int,
+    num_shared_token_groups: float,
     shared_reserve_blocks: int,
     region_blocks_override: int = 0,
 ) -> tuple[int, int]:
@@ -306,9 +306,12 @@ def apply_dsa_dp_regions(
     # Per-layer specs: a group's merged spec drops ``is_draft``.
     layer_specs = {n: sp for specs in kv_cache_specs for n, sp in specs.items()}
     groups = kv_cache_configs[0].kv_cache_groups
-    dsa_ids, shared_tok, mamba, swa_blocks = [], 0, 0, 0
+    dsa_ids, shared_tok, mamba, swa_blocks = [], 0.0, 0, 0
     for i, group in enumerate(groups):
         specs = [layer_specs[n] for n in group.layer_names]
+        # Slot-packed groups (the release drafter's KV, gqa_draft.py) take
+        # ``blocks_per_pool_block`` of their blocks per page of the shared region.
+        per_page = max(getattr(group, "blocks_per_pool_block", 1) or 1, 1)
         if all(isinstance(s, MLAAttentionSpec) and not s.is_draft for s in specs):
             dsa_ids.append(i)
         elif any(isinstance(s, MLAAttentionSpec) and not s.is_draft for s in specs):
@@ -322,9 +325,11 @@ def apply_dsa_dp_regions(
             # A sliding-window group (e.g. the SWA DSpark) holds a fixed number
             # of blocks per request, not one per block of context.
             bs = group.kv_cache_spec.block_size
-            swa_blocks += -(-specs[0].sliding_window // bs) + 1
+            slots = -(-specs[0].sliding_window // bs) + 1
+            # Packed slots: the pages a window spans, plus one partly shared page.
+            swa_blocks += slots if per_page == 1 else -(-slots // per_page) + 1
         elif all(isinstance(s, AttentionSpec) for s in specs):
-            shared_tok += 1
+            shared_tok += 1.0 / per_page
         else:
             raise ValueError(f"DSA-DP KV: unsupported cache group {i}")
     if not dsa_ids:
@@ -349,7 +354,7 @@ def apply_dsa_dp_regions(
     bs = groups[dsa_ids[0]].kv_cache_spec.block_size
     init_logger(__name__).info(
         "DSA-DP KV regions: %d pages/card = shared %d + DSA region %d (tp %d, "
-        "DSA groups %s, shared token groups %d, Mamba groups %d, reserve %d). "
+        "DSA groups %s, shared token groups %.2f, Mamba groups %d, reserve %d). "
         "Per card: DSA KV %d tokens (owned requests), shared-group KV %d tokens "
         "(all requests); TP group DSA KV %d tokens. Without regions: %d tokens "
         "of every group per card.",

@@ -771,3 +771,36 @@ def test_prefix_owner_ties_take_turns(prefix_owner):
         _run(sched, [r])
     assert owners == list(range(TP)) * 2
 
+
+@pytest.mark.parametrize("per_page", [1, 8])
+def test_apply_regions_slot_packed_draft(monkeypatch, per_page):
+    """The release drafter's sliding-window KV packed as slots of shared pages
+    (gqa_draft.py, ``blocks_per_pool_block``) reserves the pages its window
+    spans, not one page per slot."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    _dsa_dp_layout(monkeypatch)
+    swa = SlidingWindowSpec(
+        block_size=BS, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
+        sliding_window=16 * BS,
+    )
+    groups = [
+        KVCacheGroupSpec(["dsa.attn"], _mla()),
+        KVCacheGroupSpec(["draft.swa"], swa),
+    ]
+    groups[1].blocks_per_pool_block = per_page
+    cfg = KVCacheConfig(num_blocks=1001, kv_cache_tensors=[], kv_cache_groups=groups)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4, decode_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=10),
+    )
+    sched = replace(cfg)
+    dsa_dp_regions.apply_dsa_dp_regions(
+        vllm_config, [{"dsa.attn": _mla(), "draft.swa": swa}], [cfg], sched
+    )
+    # 17 window slots per request: 17 pages unpacked, ceil(17 / 8) + 1 = 4 packed.
+    per_seq = 17 if per_page == 1 else 4
+    s, d = region_sizes(1001, 4, 1, 0, 10 * per_seq)
+    assert (cfg.dsa_dp_shared_blocks, cfg.dsa_dp_region_blocks) == (s, d)
