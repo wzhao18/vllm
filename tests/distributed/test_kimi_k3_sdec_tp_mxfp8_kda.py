@@ -209,8 +209,9 @@ def _check_formats(in_proj, o_proj, qcfg, world):
     decoder.self_attn = attention
     providers.check_bf16_projections(decoder)
     assert providers.mxfp8_kda_linear(decoder, "self_attn.o_proj", o_proj)
-    # an MXFP8 linear the TP providers read as BF16 (e.g. a shared expert)
-    decoder.shared = o_proj
+    # an MXFP8 linear the TP providers read as BF16 (e.g. a shared expert; a
+    # separate module: named_modules visits each module once)
+    decoder.shared = _o_projection(world, qcfg)
     with pytest.raises(ValueError, match="needs BF16 projections"):
         providers.check_bf16_projections(decoder)
 
