@@ -253,11 +253,22 @@ class SchedulerInterface(ABC):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return 0.0
 
-    def set_dp_prefill_exchange(self, exchange: Callable[[int], int] | None) -> None:
+    def set_dp_prefill_exchange(
+        self, exchange: Callable[[int, int], int] | None
+    ) -> None:
         """DP prefill pull-up for the next schedule() (see Scheduler). A
         scheduler that does not implement it never calls `exchange`; the DP
         engine core then takes part in the exchange itself."""
         return None
+
+    def set_dp_step_token_cap(self, cap: int | None) -> None:
+        """Token budget of the next steps (DP lockstep step cap, see Scheduler);
+        a scheduler that does not implement it ignores it."""
+        return None
+
+    def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
+        """Prompt tokens still to compute after this step (see Scheduler)."""
+        return 0
 
     @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
