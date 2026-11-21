@@ -150,3 +150,69 @@ def test_selective_topk_reproducible(reqs, zero_keys):
         ok = (got == ref).all(1)
         assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
         t0 += rows
+
+
+def _tie_inputs(reqs, seed=0):
+    """Keys c * e_0 (MXFP4 c in {0, 3, 4, 6}) and one positive head: every row's
+    logit is a function of c only. Per request: 1500 keys c = 6, 1000 keys c = 4 (the
+    top-k boundary value: 548 of its 1000 ties are taken), 4500 keys c = 3 (so the
+    sampled PUBLISH threshold lands at c = 3), the rest c = 0, at random positions
+    over the whole row (ties in older, boundary and newer position bins)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    t = sum(r for r, _ in reqs)
+    index_q = torch.randn(t, 32, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+    index_q[:, 0, :2] = 2.0
+    index_w = torch.zeros(t, 32, device="cuda")
+    index_w[:, 0] = 1.0
+    q, q_scale, w = mxfp4_q_quant(index_q, index_w, (128**-0.5) * (32**-0.5), 32)
+    _, w16 = mqa_logits_mx_inputs(q.view(torch.int8), q_scale, w)
+    pads = [(kv + 127) // 128 * 128 for _, kv in reqs]
+    nk = sum(pads)
+    k8 = torch.zeros(nk, 64, device="cuda", dtype=torch.uint8)
+    ks = torch.full((nk, 4), 127, device="cuda", dtype=torch.uint8)
+    bases = [sum(pads[:i]) for i in range(len(reqs))]
+    for (_, kv), base in zip(reqs, bases):
+        perm = torch.randperm(kv, device="cuda", generator=g)
+        for code, (lo, hi) in ((7, (0, 1500)), (6, (1500, 2500)), (5, (2500, 7000))):
+            # FP4 e2m1 code in both nibbles of byte 0 (elements 0 and 1)
+            k8[base + perm[lo:hi], 0] = code | (code << 4)
+    return q, q_scale, w16, k8, ks.view(torch.int32).view(nk), bases
+
+
+@pytest.mark.parametrize(
+    "reqs",
+    [
+        # rows longer than CS2_BINS 128-key tiles (262,144 keys): 256-key position bins
+        [(48, 300000)],
+        [(16, 262144), (16, 262145), (16, 319488)],
+        # past the 256-key bitmap: still flagged, recomputed by the full path
+        [(16, 330000)],
+    ],
+)
+def test_selective_topk_long_row_ties(reqs):
+    q, q_scale, w16, k8, k_sf, bases = _tie_inputs(reqs)
+    sp = pidx.SelectivePlan(
+        [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
+    )
+    outs = []
+    for _ in range(3):
+        out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
+        row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
+        outs.append(out)
+        flagged = (row_bin[1 : 3 * sp.t : 3] != 0).cpu()
+    for i, out in enumerate(outs[1:], 1):
+        assert (out == outs[0]).all(), f"call {i}: output order differs"
+    t0 = 0
+    for (rows, kv), base in zip(reqs, bases):
+        ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
+        got = outs[0][t0 : t0 + rows].to(torch.int64)
+        got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
+        ok = (got == ref).all(1)
+        assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
+        lens = kv - rows + 1 + torch.arange(rows)
+        settled = lens <= pidx.TIE_LONG_KEYS
+        assert not flagged[t0 : t0 + rows][settled].any(), (
+            f"request ({rows}, {kv}): rows <= TIE_LONG_KEYS flagged"
+        )
+        assert flagged[t0 : t0 + rows][~settled].all()
+        t0 += rows
