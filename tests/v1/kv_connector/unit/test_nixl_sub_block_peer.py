@@ -400,3 +400,46 @@ def test_expand_sub_blocks_passes_slot_groups_through(monkeypatch):
     s._expand_sub_blocks(params)
     assert params["remote_sub_blocks"] == 4
     assert params["remote_block_ids"] == [[3], [28, 29, 30, 31, 8, 9], [100, 101, 102]]
+
+
+@pytest.mark.parametrize("lookahead_block", [False, True])
+def test_unhashed_window_block_ids_drop_lookahead_block(lookahead_block):
+    """D's allocation holds the speculative lookahead slots: for a prompt of
+    128 m + 127 tokens they open one more 128-token window block. P drops its
+    lookahead blocks before sending and window blocks pair from the end, so D
+    must drop it too (else every draft block lands one block late)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import pull_scheduler
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    def blk(i, hashed=False, null=False):
+        return SimpleNamespace(
+            block_id=i, block_hash=b"h" if hashed else None, is_null=null
+        )
+
+    s = object.__new__(pull_scheduler.NixlPullConnectorScheduler)
+    window = object.__new__(SlidingWindowSpec)
+    object.__setattr__(window, "block_size", 128)
+    full = SimpleNamespace(block_size=512)
+    s.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=full),
+            SimpleNamespace(kv_cache_spec=window),
+        ]
+    )
+    num_tokens = 3 * 128 + 127  # 511: blocks 0..3 hold it
+    # Window group: block 0 out of window (null), 1 hit, 2-3 new, 4 lookahead.
+    win = [blk(0, null=True), blk(11, hashed=True), blk(12), blk(13)]
+    if lookahead_block:
+        win.append(blk(14))
+    groups = ([blk(20, hashed=True), blk(21)], win)
+    blocks = SimpleNamespace(
+        blocks=groups,
+        get_unhashed_block_ids_all_groups=lambda: [
+            [b.block_id for b in g if b.block_hash is None and not b.is_null]
+            for g in groups
+        ],
+    )
+    assert s._unhashed_window_block_ids(blocks, num_tokens) == [[21], [12, 13]]
+    # Unknown P token count: unchanged.
+    expected_win = [12, 13, 14] if lookahead_block else [12, 13]
+    assert s._unhashed_window_block_ids(blocks, None) == [[21], expected_win]
