@@ -2990,10 +2990,14 @@ class KimiLinearForCausalLM(
         from .megamoe import prepare_megamoe
         from .megamoe_rubin.experts import prepare_rubin_megamoe
 
-        prepare_megamoe(self.model, self.vllm_config)
-        # Rubin MegaMoE: kernel-layout experts + the collective warmup, before any
-        # forward (profile run, CUDA graph capture).
-        prepare_rubin_megamoe(self.model)
+        # Expert DWDP (two engines): the non-expert DWDP below goes first, so no die
+        # holds the full non-expert copy and every expert half at once.
+        experts_late = dense_dwdp.edwdp.get() is not None
+        if not experts_late:
+            prepare_megamoe(self.model, self.vllm_config)
+            # Rubin MegaMoE: kernel-layout experts + the collective warmup, before
+            # any forward (profile run, CUDA graph capture).
+            prepare_rubin_megamoe(self.model)
         packed_moe = 0
         for module in self.model.modules():
             if isinstance(module, KimiMoE):
@@ -3066,6 +3070,9 @@ class KimiLinearForCausalLM(
         dense_dwdp.install(
             self.model.layers, self.model.start_layer, self.model.end_layer
         )
+        if experts_late:
+            prepare_megamoe(self.model, self.vllm_config)
+            prepare_rubin_megamoe(self.model)
 
     def build_specialized_decode(self) -> None:
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
