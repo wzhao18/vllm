@@ -186,6 +186,9 @@ def _walk(obj, out: list[torch.Tensor], seen: set[int], stop: set[int], depth=0)
     seen.add(id(obj))
     if isinstance(obj, torch.Tensor):
         out.append(obj)
+        base = obj._base  # a view's base holds the old storage too
+        if base is not None:
+            _walk(base, out, seen, stop, depth + 1)
         return
     if isinstance(obj, dict):
         vals = list(obj.values())
