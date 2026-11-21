@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Startup warmup of the logprobs kernel (`_topk_log_softmax_kernel`).
+"""Startup warmup of the logprobs kernels (`_topk_log_softmax_kernel`,
+`_fill_logprob_token_ids_kernel`).
 
 A request whose logprobs / prompt_logprobs / logprob_token_ids count differs
-from the startup warmup's must not compile the kernel in the serving loop.
+from the startup warmup's must not compile a kernel in the serving loop.
 """
 
 from types import SimpleNamespace
@@ -12,14 +13,16 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS
+from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.utils import jit_monitor
 from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.sample import logprob
 from vllm.v1.worker.gpu.sample.logprob import (
+    LogprobTokenIdsState,
     compute_token_logprobs,
     compute_topk_scores,
     token_logprobs_warmup_counts,
+    warmup_logprob_token_ids,
     warmup_token_logprobs,
 )
 
@@ -42,8 +45,12 @@ def test_warm_list():
     assert max(vocab_counts) < 1024
 
 
+def _events(events: list[str], kernel: str) -> list[str]:
+    return [e for e in events if kernel in e]
+
+
 def _topk_events(events: list[str]) -> list[str]:
-    return [e for e in events if "_topk_log_softmax_kernel" in e]
+    return _events(events, "_topk_log_softmax_kernel")
 
 
 def _serve_every_count(logits: torch.Tensor) -> None:
@@ -93,6 +100,47 @@ def test_warmup_compiles_every_count(dtype, vocab_size, row_offset):
     assert not _topk_events(warm)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="needs a GPU")
+def test_warmup_compiles_every_logprob_token_ids_width():
+    """Requests with `logprob_token_ids` fill [rows, 1 + max(num_logprobs,
+    longest list)] token ids; every width must be compiled at startup."""
+    num_rows = 2
+    logits = torch.randn(num_rows, 4096, device="cuda")
+    state = LogprobTokenIdsState(num_rows, torch.device("cuda"))
+    for req_idx in range(num_rows):
+        state.add_request(req_idx, SamplingParams(logprobs=1, logprob_token_ids=[1]))
+    state.apply_staged_writes()
+    sampled = torch.zeros(num_rows, dtype=torch.int64, device="cuda")
+    mapping = torch.arange(num_rows, dtype=torch.int64, device="cuda")
+
+    def serve():
+        for num_logprobs in range(MAX_LOGPROBS + 1):
+            for longest in range(1, MAX_LOGPROB_TOKEN_IDS + 1):
+                compute_topk_scores(
+                    logits,
+                    num_logprobs,
+                    sampled,
+                    logprob_token_ids_state=state,
+                    expanded_idx_mapping=mapping,
+                    max_per_req_token_ids=longest,
+                )
+        torch.accelerator.synchronize()
+
+    kernel = logprob._fill_logprob_token_ids_kernel
+    warmup_token_logprobs(logits, MAX_COUNT)
+    kernel.device_caches.clear()
+    with jit_monitor.record_jit_events() as cold:
+        serve()
+    assert _events(cold, "_fill_logprob_token_ids_kernel")
+
+    kernel.device_caches.clear()
+    warmup_logprob_token_ids(state, sampled, mapping, MAX_COUNT - 1)
+    with jit_monitor.record_jit_events() as warm:
+        serve()
+    assert not _events(warm, "_fill_logprob_token_ids_kernel")
+    assert not _topk_events(warm)
+
+
 @pytest.mark.parametrize(
     "logprobs_mode, expected",
     [
@@ -103,10 +151,12 @@ def test_warmup_compiles_every_count(dtype, vocab_size, row_offset):
     ],
 )
 def test_warmup_logprobs_kernels_layouts(monkeypatch, logprobs_mode, expected):
-    """The runner warms the compute_logits rows (raw), plus FP32 rows in the
-    processed modes; the logits modes never run the kernel."""
+    """The runner warms the logprob_token_ids fill in every mode, and the
+    log-softmax on the compute_logits rows (raw), plus FP32 rows in the
+    processed modes; the logits modes gather instead."""
     raw = torch.zeros(1, 64, dtype=torch.bfloat16)
     calls = []
+    fills = []
     monkeypatch.setattr(
         warmup, "current_platform", SimpleNamespace(is_cpu=lambda: False)
     )
@@ -117,10 +167,20 @@ def test_warmup_logprobs_kernels_layouts(monkeypatch, logprobs_mode, expected):
             (layout, max_count, max_unaligned_count)
         ),
     )
+    monkeypatch.setattr(
+        warmup,
+        "warmup_logprob_token_ids",
+        lambda state, sampled, mapping, max_num_cols: fills.append(
+            (state, sampled.dtype, mapping.dtype, max_num_cols)
+        ),
+    )
+    state = object()
     runner = SimpleNamespace(
         is_pooling_model=False,
         is_last_pp_rank=True,
-        sampler=SimpleNamespace(logprobs_mode=logprobs_mode),
+        sampler=SimpleNamespace(
+            logprobs_mode=logprobs_mode, logprob_token_ids_state=state
+        ),
         model_config=SimpleNamespace(
             max_logprobs=MAX_LOGPROBS,
             dtype=torch.bfloat16,
@@ -132,6 +192,7 @@ def test_warmup_logprobs_kernels_layouts(monkeypatch, logprobs_mode, expected):
         model=SimpleNamespace(compute_logits=lambda hidden_states: raw),
     )
     warmup._warmup_logprobs_kernels(runner)
+    assert fills == [(state, torch.int64, torch.int64, MAX_COUNT - 1)]
     assert len(calls) == len(expected)
     for (layout, max_count, unaligned), (kind, want_unaligned) in zip(calls, expected):
         assert max_count == MAX_COUNT

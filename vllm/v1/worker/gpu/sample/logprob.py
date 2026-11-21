@@ -200,22 +200,13 @@ def compute_topk_scores(
             topk_token_ids = logprob_token_ids_state.token_ids.gpu
 
         num_cols = max(num_logprobs, max_per_req_token_ids)
-        logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
-        valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
-        _fill_logprob_token_ids_kernel[(batch_size,)](
-            logprob_token_ids,
-            logprob_token_ids.stride(0),
-            valid_mask,
-            valid_mask.stride(0),
+        logprob_token_ids, valid_mask = _fill_logprob_token_ids(
             sampled_token_ids,
             topk_token_ids,
-            topk_token_ids.stride(0),
+            num_logprobs,
+            num_cols,
             expanded_idx_mapping,
-            logprob_token_ids_state.num_token_ids.gpu,
-            logprob_token_ids_state.token_ids.gpu,
-            logprob_token_ids_state.token_ids.gpu.stride(0),
-            NUM_TOPK=num_logprobs,
-            PADDED_COLS=triton.next_power_of_2(num_cols),
+            logprob_token_ids_state,
         )
         if logits_mode:
             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
@@ -242,7 +233,16 @@ def compute_topk_scores(
     )
 
 
-@triton.jit
+# The ints are not specialized, so the compile variants are PADDED_COLS only
+# (`warmup_logprob_token_ids` compiles them at startup).
+@triton.jit(
+    do_not_specialize=[
+        "out_token_ids_stride",
+        "out_valid_mask_stride",
+        "topk_indices_stride",
+        "num_topk",
+    ]
+)
 def _fill_logprob_token_ids_kernel(
     # [batch_size, 1 + num_cols]
     out_token_ids_ptr,
@@ -251,13 +251,13 @@ def _fill_logprob_token_ids_kernel(
     out_valid_mask_ptr,
     out_valid_mask_stride,
     sampled_token_ids_ptr,  # [batch_size]
-    topk_indices_ptr,  # [batch_size, NUM_TOPK] (unused when NUM_TOPK == 0)
+    topk_indices_ptr,  # [batch_size, num_topk] (unused when num_topk == 0)
     topk_indices_stride,
     expanded_idx_mapping_ptr,  # [batch_size] -> req_state_idx
     num_per_req_token_ids_ptr,  # [max_num_reqs]
     per_req_token_ids_ptr,  # [max_num_reqs, MAX_LOGPROB_TOKEN_IDS]
     per_req_token_ids_stride,
-    NUM_TOPK: tl.constexpr,
+    num_topk,
     PADDED_COLS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -279,13 +279,77 @@ def _fill_logprob_token_ids_kernel(
         src = per_req_token_ids_ptr + req_state_idx * per_req_token_ids_stride
         valid = col < num_custom
     else:
-        # Fill with topk indices (no-op when NUM_TOPK == 0).
+        # Fill with topk indices (no-op when num_topk == 0).
         src = topk_indices_ptr + batch_idx * topk_indices_stride
-        valid = col < NUM_TOPK
+        valid = col < num_topk
 
     tokens = tl.load(src + col, mask=valid, other=0).to(tl.int64)
     tl.store(tid_base + col, tokens, mask=valid)
     tl.store(mask_base + col, tl.full([PADDED_COLS], 1, tl.int1), mask=valid)
+
+
+def _fill_logprob_token_ids(
+    sampled_token_ids: torch.Tensor,
+    topk_token_ids: torch.Tensor,
+    num_logprobs: int,
+    num_cols: int,
+    expanded_idx_mapping: torch.Tensor,
+    logprob_token_ids_state: "LogprobTokenIdsState",
+    warmup: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch `_fill_logprob_token_ids_kernel`, or with `warmup` only compile it."""
+    batch_size = sampled_token_ids.shape[0]
+    logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
+    valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
+    args = (
+        logprob_token_ids,
+        logprob_token_ids.stride(0),
+        valid_mask,
+        valid_mask.stride(0),
+        sampled_token_ids,
+        topk_token_ids,
+        topk_token_ids.stride(0),
+        expanded_idx_mapping,
+        logprob_token_ids_state.num_token_ids.gpu,
+        logprob_token_ids_state.token_ids.gpu,
+        logprob_token_ids_state.token_ids.gpu.stride(0),
+        num_logprobs,
+    )
+    padded_cols = triton.next_power_of_2(num_cols)
+    if warmup:
+        _fill_logprob_token_ids_kernel.warmup(
+            *args, grid=(batch_size,), PADDED_COLS=padded_cols
+        )
+    else:
+        _fill_logprob_token_ids_kernel[(batch_size,)](*args, PADDED_COLS=padded_cols)
+    return logprob_token_ids, valid_mask
+
+
+def warmup_logprob_token_ids(
+    logprob_token_ids_state: "LogprobTokenIdsState",
+    sampled_token_ids: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    max_num_cols: int,
+) -> None:
+    """Compile, without launching, the fill of requests' `logprob_token_ids` for
+    every column count 1..max_num_cols (one variant per PADDED_COLS), with
+    sampled ids and request mapping of the dtypes the sampler passes."""
+    topk_token_ids = torch.zeros(
+        1, max_num_cols, dtype=torch.int32, device=sampled_token_ids.device
+    )
+    for padded_cols in sorted(
+        {triton.next_power_of_2(n) for n in range(1, max_num_cols + 1)}
+    ):
+        num_cols = min(padded_cols, max_num_cols)
+        _fill_logprob_token_ids(
+            sampled_token_ids[:1],
+            topk_token_ids[:, :num_cols],
+            num_cols,
+            num_cols,
+            expanded_idx_mapping[:1],
+            logprob_token_ids_state,
+            warmup=True,
+        )
 
 
 class LogprobTokenIdsState:
