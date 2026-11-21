@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -20,6 +21,8 @@ from vllm.config import (
 from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -716,6 +719,67 @@ def _shardq_chunk_rows(
     return rows
 
 
+def _tp_split_enabled(
+    dcp_world_size: int, use_pcp: bool, shardq, candidate_blocks
+) -> int:
+    """TP size to split the prefill scoring over, or 0 (TP-only attention).
+
+    Without DCP every TP rank holds the whole indexer K cache of its DP rank and
+    receives identical rows, so each rank scores a contiguous 1/TP of every
+    prefill chunk's rows and the ranks all-gather the top-k. Decided on config
+    values only (identical on all ranks of the TP group). VLLM_K3_TP_INDEXER_SPLIT=0
+    turns it off."""
+    if os.environ.get("VLLM_K3_TP_INDEXER_SPLIT", "1") != "1":
+        return 0
+    # DSA-DP: the owner card scores its own requests' rows alone.
+    if os.environ.get("VLLM_K3_TP_DSA_DP") == "1":
+        return 0
+    if dcp_world_size != 1 or use_pcp or shardq is not None:
+        return 0
+    if candidate_blocks is not None:
+        return 0
+    tp = get_tensor_model_parallel_world_size()
+    return tp if tp > 1 else 0
+
+
+def _tp_split_rows(n: int, tp: int, rank: int) -> tuple[int, int]:
+    """This rank's contiguous share [lo, hi) of n rows (the first n % tp get one
+    more)."""
+    base, extra = divmod(n, tp)
+    lo = rank * base + min(rank, extra)
+    return lo, lo + base + (1 if rank < extra else 0)
+
+
+def _tp_split_gather_topk(
+    topk_indices_buffer: torch.Tensor,
+    token_start: int,
+    token_end: int,
+    topk_tokens: int,
+    tp: int,
+) -> None:
+    """All-gather each rank's scored rows of one prefill chunk into every rank's
+    top-k buffer (rows [token_start, token_end), first topk_tokens columns)."""
+    n = token_end - token_start
+    if n == 0:
+        return
+    group = get_tp_group()
+    rank = group.rank_in_group
+    per = (n + tp - 1) // tp
+    lo, hi = _tp_split_rows(n, tp, rank)
+    send = topk_indices_buffer.new_full((per, topk_tokens), -1)
+    send[: hi - lo] = topk_indices_buffer[
+        token_start + lo : token_start + hi, :topk_tokens
+    ]
+    recv = topk_indices_buffer.new_empty((tp * per, topk_tokens))
+    dist.all_gather_into_tensor(recv, send, group=group.device_group)
+    for r in range(tp):
+        rlo, rhi = _tp_split_rows(n, tp, r)
+        if r != rank and rhi > rlo:
+            topk_indices_buffer[token_start + rlo : token_start + rhi, :topk_tokens] = (
+                recv[r * per : r * per + (rhi - rlo)]
+            )
+
+
 def _chunk_logits_schedule(
     chunk: DeepseekV32IndexerPrefillChunkMetadata,
     cu_seqlen_ks: torch.Tensor,
@@ -1065,8 +1129,12 @@ def sparse_attn_indexer(
             if mqa_logits_use_mx_scales() and not current_platform.is_xpu()
             else weights
         )
+        tp_split = _tp_split_enabled(dcp_world_size, use_pcp, shardq, candidate_blocks)
+        tp_split_rank = get_tp_group().rank_in_group if tp_split else 0
+        tp_split_chunks: list[tuple[int, int]] = []
         if (
-            prefill_chunk_iter is None
+            not tp_split
+            and prefill_chunk_iter is None
             and use_fp4_cache
             and current_platform.is_device_capability_family(100)
         ):
@@ -1126,6 +1194,17 @@ def sparse_attn_indexer(
                 topk_rows, q_rows, cu_seqlen_ks, cu_seqlen_ke = _shardq_chunk_rows(
                     chunk, shardq, q_compact
                 )
+            if tp_split:
+                # TP-only attention: score this rank's 1/TP of the chunk rows;
+                # the top-k is all-gathered over the TP group after the loop.
+                lo, hi = _tp_split_rows(
+                    chunk.token_end - chunk.token_start, tp_split, tp_split_rank
+                )
+                q_rows = slice(chunk.token_start + lo, chunk.token_start + hi)
+                topk_rows = q_rows
+                cu_seqlen_ks = cu_seqlen_ks[lo:hi]
+                cu_seqlen_ke = cu_seqlen_ke[lo:hi]
+                tp_split_chunks.append((chunk.token_start, chunk.token_end))
             q_slice = q_quant[q_rows]
             q_scale_slice = q_scale[q_rows] if q_scale is not None else None
             chunk_weights = prefill_weights[q_rows]
@@ -1181,7 +1260,7 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         k_quant_cast.shape[0],
                         q_slice_cast.shape[1],
-                        shardq is not None,
+                        shardq is not None or bool(tp_split),
                     )
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
@@ -1274,6 +1353,10 @@ def sparse_attn_indexer(
             # the profile run has one chunk, so two live chunks would exceed
             # the logits budget it reserved.
             del logits, bf16_logits
+        for token_start, token_end in tp_split_chunks:
+            _tp_split_gather_topk(
+                topk_indices_buffer, token_start, token_end, topk_tokens, tp_split
+            )
     elif prefill_chunk_iter is not None:
         # The MLA layer attends the gathered context whether or not this
         # indexer (or this rank) scored prefill rows: gather every group as

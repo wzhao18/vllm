@@ -520,6 +520,47 @@ class SingleTypeKVCacheManager(ABC):
             self._cow_num_tokens[cow_block.block_id] = num_tokens
         cow_block.ref_cnt += 1
 
+    def _cache_partial_tail_block(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> None:
+        """Cache the prompt tail when it ends inside a cache block.
+
+        Only the final prompt hash boundary is registered as a partial
+        prefix-cache entry; intermediate hash boundaries inside the same cache
+        block are intentionally skipped.
+        """
+        hash_block_size = self.block_pool.hash_block_size
+        # A resend matches at most `prompt_len - 1` tokens, but EAGLE lookups
+        # read the whole prompt before dropping a hash unit.
+        token_limit = (
+            request.num_prompt_tokens
+            if self.use_eagle
+            else request.num_prompt_tokens - 1
+        )
+        boundary_tokens = (
+            min(token_limit // hash_block_size, len(request.block_hashes))
+            * hash_block_size
+        )
+        if boundary_tokens == 0 or boundary_tokens > num_tokens:
+            return
+        if boundary_tokens % self.block_size == 0:
+            return
+
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = boundary_tokens // self.block_size
+        # A sliding-window tail block may already be freed past the window.
+        if block_idx >= len(blocks) or blocks[block_idx].is_null:
+            return
+        self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=boundary_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+
     def cache_blocks(
         self,
         request: Request,
@@ -979,46 +1020,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             return
         self._cache_partial_tail_block(request, num_tokens)
 
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
-        hash_block_size = self.block_pool.hash_block_size
-        # A resend matches at most `prompt_len - 1` tokens, but EAGLE lookups
-        # read the whole prompt before dropping a hash unit.
-        token_limit = (
-            request.num_prompt_tokens
-            if self.use_eagle
-            else request.num_prompt_tokens - 1
-        )
-        boundary_tokens = (
-            min(token_limit // hash_block_size, len(request.block_hashes))
-            * hash_block_size
-        )
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
-
 
 class RSWAManager(FullAttentionManager):
     """KV cache manager for Reference Sliding Window Attention (R-SWA).
@@ -1067,6 +1068,8 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    supports_fine_grained_hash_lookup: ClassVar[bool] = True
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
@@ -1207,9 +1210,18 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Sliding-window cache hits must stay at the group's physical block
-        # granularity. resolve_block_hashes() converts finer-grained hashes to
-        # that view when the hybrid-cache alignment is smaller than block_size.
+        block_size = kv_cache_spec.block_size
+        if alignment_tokens < block_size and block_size % alignment_tokens == 0:
+            assert isinstance(block_hashes, Sequence)
+            return cls._find_fine_grained_hit(
+                block_hashes,
+                max_length,
+                kv_cache_group_ids,
+                block_pool,
+                kv_cache_spec,
+                drop_eagle_block,
+                alignment_tokens,
+            )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1286,6 +1298,92 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     computed.pop()
         hit_length = len(computed_blocks[0]) * block_size
         return computed_blocks, hit_length
+
+    @classmethod
+    def _find_fine_grained_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: SlidingWindowSpec,
+        drop_eagle_block: bool,
+        unit: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Longest hit on a ``unit``-token (hash block) boundary.
+
+        A hit keyed at ``match`` hash units needs that key (a full block's hash,
+        or the partial-tail entry of the block it ends in) plus every block of
+        the window before the resumed length, which is one unit shorter under
+        EAGLE (as for full attention). A block's interior is probed only if the
+        block before it is cached or it is the first block: the request that
+        registered a partial tail also cached the full blocks before it.
+        """
+        block_size = kv_cache_spec.block_size
+        units_per_block = block_size // unit
+        num_units = min(max_length // unit, len(block_hashes))
+        drop = unit if drop_eagle_block else 0
+        found: dict[int, list[KVCacheBlock] | None] = {}
+
+        def cached(units: int) -> list[KVCacheBlock] | None:
+            if units not in found:
+                blk = block_pool.get_cached_block(
+                    block_hashes[units - 1], kv_cache_group_ids
+                )
+                end = cdiv(units, units_per_block) * units_per_block
+                if blk is None and end != units and end <= len(block_hashes):
+                    # No partial-tail entry: the cached full block holding
+                    # this unit holds the same prefix (the request's own
+                    # hashes match up to its end).
+                    blk = block_pool.get_cached_block(
+                        block_hashes[end - 1], kv_cache_group_ids
+                    )
+                found[units] = blk
+            return found[units]
+
+        def hit_at(match: int) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+            hit_length = match * unit - drop
+            if hit_length <= 0 or cached(match) is None:
+                return None
+            first = max(0, hit_length - kv_cache_spec.sliding_window + 1) // block_size
+            blocks = []
+            for b in range(first, cdiv(hit_length, block_size)):
+                if (blk := cached(min((b + 1) * units_per_block, match))) is None:
+                    return None
+                blocks.append(blk)
+            return tuple(
+                [block_pool.null_block] * first + [blk[i] for blk in blocks]
+                for i in range(len(kv_cache_group_ids))
+            ), hit_length
+
+        for b in range(cdiv(num_units, units_per_block) - 1, -1, -1):
+            start = b * units_per_block
+            top = min(start + units_per_block, num_units)
+            if (hit := hit_at(top)) is not None:
+                return hit
+            if b > 0 and cached(start) is None:
+                continue
+            for match in range(top - 1, start, -1):
+                if (hit := hit_at(match)) is not None:
+                    return hit
+        return tuple([] for _ in kv_cache_group_ids), 0
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
+        if self.block_size != self.block_pool.hash_block_size:
+            self._cache_partial_tail_block(request, num_tokens)
 
     @classmethod
     def reachable_block_mask(

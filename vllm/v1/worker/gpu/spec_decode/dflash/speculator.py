@@ -461,6 +461,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                 return group.map_to_kernel_slot_mapping(slots, out=out)
         return slots
 
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        # The target may then hand over sequence-shard aux states.
+        enable = getattr(target_model, "enable_sp_local_aux", None)
+        if enable is not None and hasattr(self.model, "aux_head_rows"):
+            enable()
+
     def _store_hidden_states(
         self,
         num_tokens: int,
@@ -474,11 +481,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_graph_tokens and self._aux_staging is not None:
             assert aux_hidden_states
             start = min(num_tokens, num_graph_tokens)
-            torch.cat(
-                [h[:start] for h in aux_hidden_states],
-                dim=-1,
-                out=self._aux_staging[:start],
-            )
+            # Sequence-shard aux states (models/kimi_k3/nvidia/ops/sp_local_aux.py).
+            head_rows = getattr(self.model, "aux_head_rows", None)
+            if head_rows is None or not head_rows(
+                aux_hidden_states, start, self._aux_staging[:start]
+            ):
+                torch.cat(
+                    [h[:start] for h in aux_hidden_states],
+                    dim=-1,
+                    out=self._aux_staging[:start],
+                )
         if start == num_tokens:
             return
         combine_aux_rows = getattr(self.model, "combine_aux_rows", None)

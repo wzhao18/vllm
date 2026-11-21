@@ -74,6 +74,15 @@ def _hit_unit_block(spec: AttentionSpec, hit_unit: int | None) -> AttentionSpec:
                 blocked, sliding_window=spec.sliding_window + tile - hit_unit
             )
     return blocked
+def _dsa_dp_kv(vllm_config: VllmConfig) -> bool:
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    pc = vllm_config.parallel_config
+    return (
+        dsa_dp.KV_ENABLED
+        and pc.tensor_parallel_size > 1
+        and pc.decode_context_parallel_size == 1
+    )
 
 
 class GQADraftKVCacheGrouping(SupportsKVCacheGrouping):
@@ -114,6 +123,20 @@ class GQADraftKVCacheGrouping(SupportsKVCacheGrouping):
             unify_kv_cache_spec_page_size,
         )
 
+        if _dsa_dp_kv(vllm_config):
+            # DSA-DP per-card DSA KV: the draft's MLA layers run on every card,
+            # so they must not share a block table with the owner-local DSA
+            # layers (one uniform-type group by default).
+            mla_draft = {
+                n: s
+                for n, s in kv_cache_spec.items()
+                if isinstance(s, MLAAttentionSpec) and s.is_draft
+            }
+            if mla_draft and len(mla_draft) < len(kv_cache_spec):
+                target = {n: s for n, s in kv_cache_spec.items() if n not in mla_draft}
+                return get_kv_cache_groups(vllm_config, target) + get_kv_cache_groups(
+                    vllm_config, mla_draft
+                )
         draft = {
             name: spec
             for name, spec in kv_cache_spec.items()

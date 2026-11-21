@@ -60,6 +60,8 @@ class NewRequestData:
     prefill_token_start: int = 0
     # The prompt length, set when `prompt_token_ids` is not shipped.
     num_prompt_tokens: int | None = None
+    # DSA-DP owner card in the TP group (models/kimi_k3/nvidia/ops/dsa_dp.py), or -1.
+    dsa_owner: int = -1
 
     @classmethod
     def from_request(
@@ -86,6 +88,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            dsa_owner=getattr(request, "dsa_owner", -1),
         )
 
     @property

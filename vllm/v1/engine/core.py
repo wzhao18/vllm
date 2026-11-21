@@ -56,6 +56,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.dsa_dp_regions import apply_dsa_dp_regions
 from vllm.v1.core.kv_cache_planning import (
     get_global_kv_cache_groups,
     get_kv_cache_configs,
@@ -347,6 +348,10 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        # DSA-DP per-card DSA KV (VLLM_K3_TP_DSA_DP_KV=1); no-op otherwise.
+        apply_dsa_dp_regions(
+            vllm_config, kv_cache_specs, kv_cache_configs, scheduler_kv_cache_config
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:

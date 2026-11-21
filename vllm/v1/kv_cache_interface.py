@@ -1669,6 +1669,20 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
+    dsa_dp_group_ids: tuple[int, ...] = ()
+    """DSA-DP (``VLLM_K3_TP_DSA_DP_KV=1``): groups allocated in per-card regions."""
+
+    dsa_dp_shared_blocks: int = 0
+    """DSA-DP: block ids ``[0, S)`` shared by every card (``num_blocks`` on the
+    scheduler side)."""
+
+    dsa_dp_region_blocks: int = 0
+    """DSA-DP: blocks per card region ``D``; card ``c`` owns ids
+    ``[S + c * D, S + (c + 1) * D)`` at its local pages ``[S, S + D)``. 0: off."""
+
+    dsa_dp_num_regions: int = 0
+    """DSA-DP: number of regions (the TP size)."""
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""

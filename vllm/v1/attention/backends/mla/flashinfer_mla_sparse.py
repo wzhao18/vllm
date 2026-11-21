@@ -4,6 +4,7 @@
 
 import bisect
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -292,7 +293,7 @@ class FlashInferMLASparseMetadataBuilder(
 
         num_q_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
-        )
+        ) * _dsa_dp_heads_factor(vllm_config)
         self._init_reorder_batch_threshold(
             mla_decode_query_len_threshold(num_q_heads),
             supports_spec_as_decode=True,
@@ -379,6 +380,16 @@ _TRTLLM_GEN_SOFTMAX_GUARD_BYTES = 1024 * 1024
 # Keep in sync with the VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE default in
 # vllm/envs.py.
 _DEFAULT_WORKSPACE_BUFFER_SIZE = 394 * 1024 * 1024
+
+
+def _dsa_dp_heads_factor(vllm_config) -> int:
+    """DSA-DP runs the sparse-MLA layers with all heads on each owner card."""
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    pc = vllm_config.parallel_config
+    if dsa_dp.ENABLED and pc.decode_context_parallel_size == 1:
+        return pc.tensor_parallel_size
+    return 1
 
 
 def trtllm_gen_query_heads(num_heads: int) -> int:
@@ -831,7 +842,7 @@ def reserve_trtllm_gen_buffers(
     slab holds ``trtllm_gen_lse_slab_rows`` rows."""
     num_q_heads = vllm_config.model_config.get_num_attention_heads(
         vllm_config.parallel_config
-    )
+    ) * _dsa_dp_heads_factor(vllm_config)
     max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     if dcp_world_size > 1:
         required = _required_workspace_bytes(
@@ -1102,6 +1113,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # SparseMLACommonImpl.forward_mqa, which reads dcp_local_topk_counts; only
     # prefill-sized calls take the specialized prefill kernel.
     dcp_decode_reads_topk_counts: ClassVar[bool] = True
+    # TP ShardQ (token-sharded DSA prefill without DCP) when VLLM_K3_TP_SHARDQ=1
+    # (config-wide env, the same on every rank).
+    supports_shardq: ClassVar[bool] = os.environ.get("VLLM_K3_TP_SHARDQ") == "1"
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
     # for query and kv_cache (mixed bf16+fp8 is not supported).

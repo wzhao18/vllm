@@ -2229,7 +2229,11 @@ def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary():
     assert num_computed == 4
 
 
-def test_hybrid_sliding_window_group_disables_partial_hash_hits():
+def test_hybrid_sliding_window_group_keeps_partial_hash_hits():
+    """Sliding-window groups support fine-grained lookups, so an EAGLE
+    sliding-window draft group keeps partial hits on, and its EAGLE check
+    (one hash unit past the hit) is satisfied by a cached full block when
+    no partial-tail entry exists: the hit stays at the Mamba boundary."""
     hash_block_size = 2
     sliding_window_block_size = 2 * hash_block_size
     mamba_block_size = 2 * sliding_window_block_size
@@ -2279,7 +2283,7 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
     tokens = list(range(3 * sliding_window_block_size))
     request = make_request("0", tokens, hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
-    assert not manager.coordinator.enable_partial_hash_hits
+    assert manager.coordinator.enable_partial_hash_hits
     assert (
         manager.allocate_slots(request, mamba_block_size, num_computed, computed_blocks)
         is not None
@@ -2303,8 +2307,8 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
 @pytest.mark.parametrize("with_sliding_window", [False, True])
 def test_resolved_cache_hit_alignment_matches_coordinator(with_sliding_window):
     """Workers place Mamba checkpoints on the engine-resolved alignment, so it
-    must be where the coordinator lands hits, including when a group without
-    fine-grained lookups disables partial hits."""
+    must be where the coordinator lands hits, with or without a sliding-window
+    group (which supports fine-grained lookups)."""
     hash_block_size = 2
     mamba_block_size = 4 * hash_block_size
     kv_cache_groups = [
@@ -2354,7 +2358,7 @@ def test_resolved_cache_hit_alignment_matches_coordinator(with_sliding_window):
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
 
-    assert coordinator.enable_partial_hash_hits != with_sliding_window
+    assert coordinator.enable_partial_hash_hits
     assert (
         resolve_cache_hit_alignment_tokens(
             kv_cache_config,

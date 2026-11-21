@@ -34,6 +34,12 @@ endif()
 
 cuda_archs_loose_intersection(
   FLASH_KDA_ARCHS "${FLASH_KDA_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+# On a 10.7a-only build, compile FlashKDA as SM100 family code (10.0f), as the in-tree
+# JIT FlashKDA (ops/kda_segscan.py, compute_100f) does: its bundled CUTLASS enables
+# setmaxnreg for the SM100 family only.
+if("10.7a" IN_LIST FLASH_KDA_ARCHS)
+  set(FLASH_KDA_ARCHS "10.0f")
+endif()
 
 if(FLASH_KDA_ARCHS)
   message(STATUS "FlashKDA CUDA architectures: ${FLASH_KDA_ARCHS}")

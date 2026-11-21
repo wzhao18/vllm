@@ -497,8 +497,15 @@ class KimiK3DSAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream: torch.cuda.Stream | None = None,
         run_gemm_rs_ar: bool = False,
+        local_full_heads: bool = False,
     ) -> None:
         super().__init__()
+        # DSA-DP (ops/dsa_dp.py): the owner card runs the layer with all heads and
+        # replicated weights, like a DEP rank; no TP split, no output reduction.
+        self.local_full_heads = local_full_heads
+        if local_full_heads:
+            run_gemm_rs_ar = False
+            reduce_results = False
         if config.dsa_config is None:
             raise ValueError("dsa_config is required for KimiK3DSAAttention")
         if current_platform.is_rocm():
@@ -516,7 +523,7 @@ class KimiK3DSAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = 1 if local_full_heads else get_tensor_model_parallel_world_size()
         if num_heads % tp_size > 0:
             num_padded_heads = (num_heads + tp_size - 1) // tp_size * tp_size
             logger.warning_once(
@@ -547,6 +554,7 @@ class KimiK3DSAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=local_full_heads,
             )
         else:
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -572,6 +580,7 @@ class KimiK3DSAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=local_full_heads,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -580,6 +589,7 @@ class KimiK3DSAAttention(nn.Module):
             reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=local_full_heads,
         )
         # The fused GEMM-RS/AR o_proj (as the dense Kimi-K3 MLA and KDA layers),
         # when the model initialized it for this worker.
@@ -633,6 +643,7 @@ class KimiK3DSAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
+                disable_tp=local_full_heads,
             )
 
         dsa_config = config.dsa_config

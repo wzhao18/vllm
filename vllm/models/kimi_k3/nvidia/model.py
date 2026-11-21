@@ -127,6 +127,7 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
     takes_mxfp8_activation,
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
+from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_dielocal as prefill_attn_res_dielocal,
@@ -140,6 +141,7 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
+from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 
@@ -1539,6 +1541,10 @@ class KimiDecoderLayer(nn.Module):
 
         self.is_moe = config.is_moe
         layer_idx = self.layer_idx
+        self._layer_kind = (
+            "kda" if config.is_kda_layer(self.layer_idx)
+            else ("dsa" if config.is_dsa_layer(self.layer_idx) else "mla")
+        )
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -1587,6 +1593,17 @@ class KimiDecoderLayer(nn.Module):
             assert v_head_dim is not None
             assert kv_lora_rank is not None
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
+            self._dsa_dp = (
+                config.is_dsa_layer(layer_idx)
+                and dsa_dp.ENABLED
+                and parallel_config.tensor_parallel_size > 1
+                and parallel_config.decode_context_parallel_size == 1
+            )
+            # DSA-DP input scatter (dsa_dp.push_in): this layer issues no SP
+            # all-gather, which KimiLinearModel.forward leaves out of its count.
+            self._dsa_scatter = (
+                self._dsa_dp and dsa_dp.SCATTER_IN and self.use_sequence_parallel
+            )
             if config.is_dsa_layer(layer_idx):
                 self.self_attn = KimiK3DSAAttention(
                     config=config,
@@ -1603,7 +1620,11 @@ class KimiDecoderLayer(nn.Module):
                     topk_indices_buffer=topk_indices_buffer,
                     aux_stream=aux_stream,
                     run_gemm_rs_ar=dsa_runs_gemm_rs_ar(vllm_config, run_gemm_rs_ar),
+                    local_full_heads=self._dsa_dp,
                 )
+                if self._dsa_dp:
+                    dsa_dp.DSA_LAYER_NAMES.add(self.self_attn.mla_attn.mla_attn.layer_name)
+                    dsa_dp.DSA_LAYER_NAMES.add(self.self_attn.dsa_indexer.k_cache.prefix)
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
             else:
@@ -1687,6 +1708,24 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+
+    def _run_dsa_dp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """DSA-DP: run the layer on this card's owned rows only (all heads), other
+        rows zero, so the TP reduction leaves each row with its owner's output."""
+        num_tokens = hidden_states.shape[0]
+        out = hidden_states.new_zeros((num_tokens, self.hidden_size))
+        rows = dsa_dp.rows_for(num_tokens, hidden_states.device)
+        if rows is not None and rows.numel() > 0:
+            own = self.self_attn(
+                hidden_states=hidden_states.index_select(0, rows),
+                positions=positions.index_select(0, rows),
+            )
+            out.index_copy_(0, rows, own)
+        return out
 
     def _run_self_attn(
         self,
@@ -1828,6 +1867,8 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        evs = dsa_dp.P.new_layer(self._layer_kind) if dsa_dp.PROF else None
+        dsa_dp.rec(evs)
         pre_mxfp8, post_mxfp8 = self._attn_res_mxfp8_consumers(prefix_sum)
         if pre_mxfp8:
             # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
@@ -1842,11 +1883,41 @@ class KimiDecoderLayer(nn.Module):
         assert hidden_states is not None
 
         M = None
+        if getattr(self, "_dsa_scatter", False):
+            # Owned rows only: in from, and out to, the sequence shards.
+            num_rows = positions.shape[0]
+            if dsa_dp.STEP.num_tokens >= 0:
+                own_in = dsa_dp.push_in(hidden_states, num_rows)
+                dsa_dp.rec(evs)
+                own = None
+                if own_in is not None:
+                    rows = dsa_dp.STEP.own_idx
+                    own = self.self_attn(
+                        hidden_states=own_in, positions=positions.index_select(0, rows)
+                    )
+                hidden_states = dsa_dp.push_out(
+                    own, num_rows, self.hidden_size, hidden_states.dtype,
+                    hidden_states.device,
+                )
+            else:
+                dsa_dp.rec(evs)
+                hidden_states = dsa_dp.local_rows_out(
+                    self.self_attn, hidden_states, positions, num_rows
+                )
+            dsa_dp.rec(evs)
+            dsa_dp.rec(evs)
+            hidden_states, prefix_sum, residual = self._post_attn_norm(
+                hidden_states, residual, prefix_sum
+            )
+            hidden_states = self.mlp(hidden_states)
+            dsa_dp.rec(evs)
+            return hidden_states, prefix_sum, residual
         if self.use_sequence_parallel:
             hidden_states = sp_ag.kimi_sp_all_gather(hidden_states)
             # Remove SP padding before attention.
             hidden_states = hidden_states[: positions.shape[0]]
             M = hidden_states.shape[0]
+        dsa_dp.rec(evs)
 
         # Prefill dataflow C: the KDA o_proj / MoE shared down_proj add their
         # outputs into the die-local AttnRes prefix (attn_res_resid), and the
@@ -1854,16 +1925,41 @@ class KimiDecoderLayer(nn.Module):
         resid_attn, resid_mlp = self._resid_producers(prefix_sum, residual)
 
         # Attention.
-        hidden_states = self._run_self_attn(
-            positions,
-            hidden_states,
-            (prefix_sum, not self.is_block_write_layer) if resid_attn else None,
-        )
+        if (
+            getattr(self, "_dsa_dp", False)
+            and dsa_dp.PUSH
+            and self.use_sequence_parallel
+            and dsa_dp.STEP.num_tokens >= 0
+        ):
+            # Owned rows only; outputs pushed straight to their sequence shards.
+            rows = dsa_dp.rows_for(M, hidden_states.device)
+            own = None
+            if rows is not None and rows.numel() > 0:
+                own = self.self_attn(
+                    hidden_states=hidden_states.index_select(0, rows),
+                    positions=positions.index_select(0, rows),
+                )
+            hidden_states = dsa_dp.push_out(
+                own, M, self.hidden_size, hidden_states.dtype, hidden_states.device
+            )
+            M = None
+        elif getattr(self, "_dsa_dp", False):
+            hidden_states = self._run_dsa_dp(positions, hidden_states)
+        else:
+            hidden_states = self._run_self_attn(
+                positions,
+                hidden_states,
+                (prefix_sum, not self.is_block_write_layer) if resid_attn else None,
+            )
+        dsa_dp.rec(evs)
 
         # GEMM-RS returns the local sequence shard; standard O-proj preserves M.
         if self.use_sequence_parallel and hidden_states.shape[0] == M:
             # Add SP padding if needed, and then perform reduce scatter.
             hidden_states = sp_reduce_scatter(hidden_states)
+        elif getattr(self, "_dsa_dp", False) and not self.use_sequence_parallel:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        dsa_dp.rec(evs)
 
         if post_mxfp8:
             # Prefill: the AttnRes also writes the shared experts' MXFP8
@@ -1891,6 +1987,7 @@ class KimiDecoderLayer(nn.Module):
 
         # MoE/MLP.
         hidden_states = self.mlp(hidden_states)
+        dsa_dp.rec(evs)
         return hidden_states, prefix_sum, residual
 
     def _attn_res_mxfp8_capabilities(self) -> tuple[bool, bool]:
@@ -1995,6 +2092,7 @@ class KimiDecoderLayer(nn.Module):
             bf16_out=True,
         )
         return out, qa, prefix_sum
+
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -2200,6 +2298,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             }
         )
 
+    # Set by a drafter that takes sequence-shard aux states (ops/sp_local_aux.py).
+    drafter_takes_local_aux = False
+
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         super()._set_aux_hidden_state_layers(layers)
         if self.use_attn_res and self._aux_attn_res_stream:
@@ -2318,7 +2419,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
             # One decoder-layer SP all-gather per layer: their buffer slots.
-            sp_ag.begin_forward(self.end_layer - self.start_layer)
+            sp_ag.begin_forward(
+                sum(
+                    not getattr(layer, "_dsa_scatter", False)
+                    for layer in self.layers[self.start_layer : self.end_layer]
+                )
+            )
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
@@ -2460,7 +2566,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         else:
             hidden_states = hidden_states + residual
 
-        if self.use_sequence_parallel:
+        local_aux = (
+            bool(aux_hidden_states)
+            and self.use_sequence_parallel
+            and self.drafter_takes_local_aux
+            and sp_local_aux.use_local_aux(full_num_tokens)
+        )
+        if local_aux:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif self.use_sequence_parallel:
             if aux_hidden_states:
                 hidden_size = hidden_states.shape[-1]
                 packed_hidden_states = torch.cat(
@@ -2476,7 +2590,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states = hidden_states[:full_num_tokens]
 
         # NOTE: the final norm is applied in compute_logits instead of here.
-        aux_hidden_states = remote_aux + aux_hidden_states
+        if local_aux:
+            assert not remote_aux, "SP is not supported with PP"
+            aux_hidden_states = sp_local_aux.SpLocalAux(
+                aux_hidden_states, full_num_tokens
+            )
+        else:
+            aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -2946,6 +3066,11 @@ class KimiLinearForCausalLM(
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
+    def enable_sp_local_aux(self) -> None:
+        self.model.drafter_takes_local_aux = True
+        if self.model.use_sequence_parallel:
+            logger.info_once("The drafter projects sequence-shard aux states.")
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -3409,6 +3534,9 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    def enable_sp_local_aux(self) -> None:
+        self.language_model.enable_sp_local_aux()
 
     @property
     def prefetch_step_inputs(self) -> bool:

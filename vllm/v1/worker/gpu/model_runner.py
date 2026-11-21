@@ -60,6 +60,7 @@ from vllm.model_executor.offloader import (
     set_offloader,
 )
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.models.kimi_k3.nvidia.ops import dsa_dp as _dsa_dp
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -831,10 +832,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        # DSA-DP picks the owned rows per step on the host; the target model
+        # runs eager (graphs would freeze capture-time rows). Drafter unchanged.
+        target_cg_mode = CUDAGraphMode.NONE if _dsa_dp.ENABLED else cudagraph_mode
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            target_cg_mode,
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
@@ -1336,6 +1340,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            if _dsa_dp.ENABLED and new_req_data.dsa_owner >= 0:
+                _dsa_dp.REQ_OWNER[req_id] = new_req_data.dsa_owner
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -1417,17 +1423,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        new_block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+        kv_cache_block_copies = scheduler_output.kv_cache_block_copies
+        if self.kv_cache_config.dsa_dp_region_blocks > 0:
+            # DSA-DP per-card DSA KV: this card's pages only.
+            rank = _dsa_dp._tp()[1]
+            if new_block_ids_to_zero:
+                new_block_ids_to_zero = _dsa_dp.local_block_ids(
+                    new_block_ids_to_zero, self.kv_cache_config, rank
+                )
+            if kv_cache_block_copies:
+                kv_cache_block_copies = _dsa_dp.local_block_copies(
+                    list(kv_cache_block_copies), self.kv_cache_config, rank
+                )
+        if new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self.kv_block_zeroer.zero_block_ids(new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
-        if scheduler_output.kv_cache_block_copies:
+        if kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
+                kv_cache_block_copies,
                 self.kv_block_copy_groups,
             )
 
@@ -2202,6 +2221,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            if _dsa_dp.ENABLED and _dsa_dp.DSA_LAYER_NAMES:
+                # DSA-DP: the DSA groups' metadata is built for the owned requests
+                # only (_dsa_dp.prepare_step); skip the full-batch build.
+                attn_groups = [
+                    [
+                        g
+                        for g in groups
+                        if not all(n in _dsa_dp.DSA_LAYER_NAMES for n in g.layer_names)
+                    ]
+                    for groups in attn_groups
+                ]
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -2214,6 +2244,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+
+        if _dsa_dp.ENABLED:
+            if attn_metadata is not None and block_tables is not None:
+                _dsa_dp.prepare_step(
+                    self,
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups if dummy_run else self.step_attn_groups,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                )
+            else:
+                _dsa_dp.STEP.num_tokens = -1
+        elif _dsa_dp.PROF:
+            _dsa_dp.prof_tick()
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2335,6 +2381,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+        _dsa_dp.STEP.num_tokens = -1
 
         self.kv_connector.finish_forward()
         if iterlog is not None:
