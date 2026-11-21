@@ -304,7 +304,11 @@ class Scheduler(SchedulerInterface):
         self.running: list[Request] = []
         # DP prefill pull-up: set by the DP engine core before each step (see
         # set_dp_prefill_exchange) and consumed by that step's schedule().
-        self._dp_prefill_exchange: Callable[[int], int] | None = None
+        self._dp_prefill_exchange: Callable[[int, int], int] | None = None
+        # DP lockstep step cap: the token budget of this rank's next steps, set
+        # by the DP engine core from the DP group's outstanding prefill work at
+        # each exchange (see set_dp_step_token_cap). None = no cap.
+        self._dp_step_token_cap: int | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -800,6 +804,8 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
+            if self._dp_step_token_cap is not None:
+                max_prefill_tokens = min(max_prefill_tokens, self._dp_step_token_cap)
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
@@ -911,6 +917,8 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        if self._dp_step_token_cap is not None:
+            token_budget = min(token_budget, self._dp_step_token_cap)
         # DSA-DP: each owner card of the TP group gets an equal share of the step's
         # tokens, so the cards' DSA work (owned rows only) stays balanced.
         owner_left = self._dsa_owner_budgets(token_budget)
@@ -3376,7 +3384,48 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
 
-    def set_dp_prefill_exchange(self, exchange: Callable[[int], int] | None) -> None:
+    def set_dp_step_token_cap(self, cap: int | None) -> None:
+        """Token budget of the next steps (DP lockstep step cap), None for none.
+
+        Every DP rank of an EP group waits in each MoE layer for the rank with
+        the most tokens, so a lockstep step costs the busiest rank's chunk, and
+        every request's admission (prefix lookup, connector load, its report)
+        and each of its prefill chunks waits for whole steps. While the DP
+        group's outstanding prefill work is small, steps capped near its mean
+        per rank finish the same work in shorter steps; the DP engine core sets
+        the cap from that work at each exchange (it reaches the configured
+        budget once the group is saturated).
+        """
+        self._dp_step_token_cap = cap
+
+    def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
+        """Prompt tokens this rank can compute after this step's schedule:
+        running prefills plus waiting requests whose prefix hit is known and
+        in place (resumed, or loaded by a KV connector). Requests whose prefix
+        lookup or connector load is still in flight count once it completes:
+        until then no step can run them."""
+        demand = 0
+        for request in self.running:
+            left = request.num_prompt_tokens - request.num_computed_tokens
+            if left > 0:
+                demand += max(left - num_scheduled_tokens.get(request.request_id, 0), 0)
+        for queue in (self.kv_holding_waiting, self.waiting):
+            for request in queue:
+                if request.num_computed_tokens > 0 and (
+                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or request.request_id in self.finished_recving_kv_req_ids
+                ):
+                    demand += max(
+                        request.num_prompt_tokens
+                        - request.num_computed_tokens
+                        - num_scheduled_tokens.get(request.request_id, 0),
+                        0,
+                    )
+        return demand
+
+    def set_dp_prefill_exchange(
+        self, exchange: Callable[[int, int], int] | None
+    ) -> None:
         """DP prefill pull-up for the next schedule() only.
 
         Every DP rank of an EP group waits in each MoE layer for the rank with the
@@ -3460,14 +3509,18 @@ class Scheduler(SchedulerInterface):
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
-            busiest = exchange(int(max(used)))
+            busiest = exchange(int(max(used)), self.dp_prefill_demand(num_scheduled_tokens))
             room_o = [max(busiest - u, 0.0) for u in used]
             extra = 1 << 62
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
         else:
             num_tokens = sum(num_scheduled_tokens.values())
-            extra = max(exchange(num_tokens) - num_tokens, 0)
+            extra = max(
+                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
+                - num_tokens,
+                0,
+            )
         for request_id, (request, num_unclipped) in pull_reqs.items():
             if request_id not in num_scheduled_tokens:
                 # Preempted later in the step (priority policy); its booking was
