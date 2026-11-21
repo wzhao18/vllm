@@ -12,7 +12,15 @@
 
 namespace vllm::direct_dcp {
 
-constexpr uint64_t kSpinLimit = 100000000;
+// Peer-signal waits are bounded by wall-clock time (%globaltimer), not by a
+// poll count: a poll count is a hardware-dependent time (it expired in well
+// under a minute on some VR200 nodes) and a peer can legitimately lag that long
+// while it compiles or loads kernels during startup warmup and graph capture.
+// Only a wait longer than this bound is treated as a deadlock. Same bound as
+// the CuTe DSL direct A2A combine (dcp_direct_a2a_cutedsl.py).
+constexpr uint64_t kWaitTimeoutNs = 600ull * 1000000000ull;
+// Read the timer once per this many polls (a power of two minus one).
+constexpr uint64_t kTimerPollMask = 1023;
 
 // Advance the invocation ID; its low bit selects one of two staging slots.
 static __global__ void increment_epoch_kernel(int64_t* epoch) {
@@ -72,14 +80,24 @@ __device__ __forceinline__ uint32_t load_acquire_system(const uint32_t* ptr) {
   return value;
 }
 
+__device__ __forceinline__ uint64_t globaltimer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
 __device__ __forceinline__ bool wait_for_epoch(const uint32_t* ptr,
                                                uint32_t epoch) {
-  for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
+  const uint64_t start = globaltimer_ns();
+  for (uint64_t spins = 0;; ++spins) {
     if (load_acquire_system(ptr) == epoch) {
       return true;
     }
+    if ((spins & kTimerPollMask) == 0 &&
+        globaltimer_ns() - start > kWaitTimeoutNs) {
+      return false;
+    }
   }
-  return false;
 }
 
 inline void check_cuda_launch(const char* operation) {
