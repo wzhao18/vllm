@@ -1337,14 +1337,14 @@ def safetensors_weights_iterator(
                 "parallel bulk reads.",
                 fs_name,
             )
-        elif not is_net_fs and fits_in_ram:
+        elif fits_in_ram:
             logger.info_once(
                 "Auto-prefetch is disabled because the filesystem (%s) is not a "
                 "recognized network FS (NFS/Lustre). If you want to force "
                 "prefetching, start vLLM with --safetensors-load-strategy=prefetch.",
                 fs_name,
             )
-        elif not is_net_fs and not fits_in_ram:
+        else:
             logger.info_once(
                 "Auto-prefetch is disabled because the filesystem (%s) is not a "
                 "recognized network FS (NFS/Lustre) and the checkpoint size "
