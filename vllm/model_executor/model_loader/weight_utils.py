@@ -1162,7 +1162,7 @@ class _SafetensorsBulkReader:
     WINDOW_BYTES = 4 << 30
     NUM_THREADS = 16
 
-    def __init__(self, files: list[str], local_expert_ids: set[int] | None):
+    def __init__(self, files: list[str], local_expert_ids: set[int] | LayerExpertIds | None):
         self._local_expert_ids = local_expert_ids
         self._files = files
         self._pool = concurrent.futures.ThreadPoolExecutor(
@@ -1394,7 +1394,7 @@ def _safetensors_files_iterator(
     loading_desc: str,
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None,
-    local_expert_ids: set[int] | None,
+    local_expert_ids: set[int] | LayerExpertIds | None,
     reader: _SafetensorsBulkReader | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     leftover_state_dict: dict[str, torch.Tensor] = {}
