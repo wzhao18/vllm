@@ -825,13 +825,25 @@ class KimiK3MegaMoEExperts(nn.Module):
         takes ``fused_shared=``)."""
         return self.select_bucket(num_tokens).shared is not None
 
-    def warmup_fused_shared(self, shared):
+    def home_fused_shared_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """The fused shared expert's FC1 weight rows ``[N, K]`` (contiguous, 16-row
+        gate/up stripes) homed per die (feature halves, as :meth:`warmup_fused_shared`
+        homes FC1) on die-local buckets: a die-local copy the caller swaps in for
+        ``rows``; ``rows`` itself otherwise."""
+        if self.bucket.die_sm_mask32 is None:
+            return rows
+        from .die_local import place_halves
+
+        return place_halves(rows)
+
+    def warmup_fused_shared(self, shared, placed: bool = False):
         """Collective: build, compile and warm the fused-shared runtime with one
         layer's ``session.FusedSharedArgs``; returns the arguments to launch with
-        (FC1 homed per die on die-local buckets)."""
+        (FC1 homed per die on die-local buckets, unless ``placed``: FC1 views rows
+        already homed by :meth:`home_fused_shared_rows`)."""
         if self.kernel_weights is None:
             raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
-        if self.bucket.die_sm_mask32 is not None:
+        if self.bucket.die_sm_mask32 is not None and not placed:
             from .die_local import place_halves
 
             # FC1 [1, K, N] is a K-major view of the striped [1, N, K] copy: home its

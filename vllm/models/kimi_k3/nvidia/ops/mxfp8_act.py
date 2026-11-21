@@ -910,6 +910,19 @@ class Mxfp8Buffer:
         )
         self.orig_dtype = orig_dtype
 
+    def weak_ref(self) -> "Mxfp8Buffer":
+        """This buffer over non-owning tensor references, for the replay closure of
+        a breakable CUDA graph's eager segment (``breakable_cudagraph``): a strong
+        reference there pins the buffer's graph-pool slot for every captured batch
+        size. The graph pool owns the memory, so the view is safe on replay."""
+        from vllm.utils.torch_utils import weak_ref_tensor
+
+        view = object.__new__(Mxfp8Buffer)
+        view.__dict__.update(self.__dict__)
+        view.data = weak_ref_tensor(self.data)
+        view.scale = weak_ref_tensor(self.scale)
+        return view
+
     def window(self, col: int, width: int) -> torch.Tensor:
         assert col % (4 * MXFP8_BLOCK) == 0 and col + width <= self.k
         return self.data.view(torch.uint8)[:, col : col + width]
