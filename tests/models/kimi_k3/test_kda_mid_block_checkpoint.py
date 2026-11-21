@@ -256,5 +256,118 @@ def test_mid_block_resume_exports_from_scratch_checkpoint(prompt_len: int):
     assert torch.equal(conv_state[untouched], others[1])
 
 
+STALE_SLOT, SNAPSHOT_SLOT = 6, 7
+
+
+@pytest.mark.parametrize(
+    ("start", "prompt_len"),
+    [
+        # Resumes mid-block, ends in that block (initial = running column 1).
+        (MAMBA_BLOCK + MAMBA_BLOCK // 2, MAMBA_BLOCK + MAMBA_BLOCK // 2 + 700),
+        # Ends at the block end.
+        (MAMBA_BLOCK + MAMBA_BLOCK // 2, 2 * MAMBA_BLOCK),
+        # Starts at a block boundary, ends in that block (initial column 1,
+        # running column 2).
+        (2 * MAMBA_BLOCK, 2 * MAMBA_BLOCK + 700),
+    ],
+)
+@torch.inference_mode()
+def test_running_snapshot_matches_the_split(start: int, prompt_len: int):
+    """A running request's last chunk ending in its block: the scheduler
+    rewrites the snapshot column below the initial state (the worker's
+    append-only row held a stale block id there), and the one pass exports the
+    checkpoint into it. Column and running slot hold, bit for bit, what the
+    split (stop at the checkpoint, then the tail) leaves, and the stale block is
+    never written."""
+    if not is_flashkda_supported(D, torch.bfloat16, STATE_DTYPE, LOWER_BOUND):
+        pytest.skip("FlashKDA prefill is not supported on this platform")
+    import vllm._flashkda_C  # noqa: F401
+
+    inputs = _Inputs(prompt_len)
+    checkpoint_position = (prompt_len - 1) // HASH * HASH
+    initial_col = (start - 1) // MAMBA_BLOCK
+    running_col = -(-prompt_len // MAMBA_BLOCK) - 1
+    snapshot_col = initial_col - 1
+    plan = dict(
+        hash_block_size=HASH,
+        mamba_block_size=MAMBA_BLOCK,
+        checkpoint_alignment=ALIGNMENT,
+        drop_eagle_block=False,
+        cache_hit_alignment_tokens=HASH,
+    )
+    # Not a snapshot row (no column write): no internal checkpoint, so the
+    # scheduler had to split.
+    assert compute_mamba_prefill_checkpoints(
+        [prompt_len], [prompt_len - start], first_chunk=[False], **plan
+    ) == ([0], [-1])
+    offsets, cols = compute_mamba_prefill_checkpoints(
+        [prompt_len], [prompt_len - start], first_chunk=[True], **plan
+    )
+    assert offsets == [checkpoint_position - start] and cols == [snapshot_col]
+
+    def prefix_state() -> tuple[torch.Tensor, torch.Tensor]:
+        conv_state = _conv_cache()
+        recurrent_state = torch.zeros(
+            NUM_SLOTS, H, D, D, dtype=STATE_DTYPE, device=DEVICE
+        )
+        _forward(inputs, 0, start, conv_state, recurrent_state, K_SLOT, False)
+        for i in range(NUM_SLOTS):
+            if i != K_SLOT:
+                recurrent_state[i].fill_(float(i))
+                conv_state[i].fill_(float(i))
+        return conv_state, recurrent_state
+
+    # One pass. The worker's row: the stale id in the snapshot column, then the
+    # scheduler's write of the fresh snapshot block.
+    conv_state, recurrent_state = prefix_state()
+    block_table = torch.full(
+        (1, running_col + 1), NULL_BLOCK_ID, dtype=torch.int32, device=DEVICE
+    )
+    block_table[0, snapshot_col] = STALE_SLOT
+    block_table[0, initial_col] = K_SLOT
+    block_table[0, running_col] = R_SLOT
+    block_table[0, snapshot_col] = SNAPSHOT_SLOT
+    checkpoint = MambaPrefillCheckpointMetadata(
+        torch.tensor(offsets, dtype=torch.int32, device=DEVICE),
+        _gather_checkpoint_state_indices(
+            block_table,
+            torch.zeros(1, dtype=torch.int64, device=DEVICE),
+            torch.tensor(cols, dtype=torch.int64, device=DEVICE),
+        ),
+    )
+    assert checkpoint.state_indices.tolist() == [SNAPSHOT_SLOT]
+    stale = (recurrent_state[STALE_SLOT].clone(), conv_state[STALE_SLOT].clone())
+    if running_col != initial_col:
+        recurrent_state[R_SLOT] = recurrent_state[K_SLOT]
+        conv_state[R_SLOT] = conv_state[K_SLOT]
+        slot = R_SLOT
+    else:
+        slot = K_SLOT
+    _forward(
+        inputs, start, prompt_len, conv_state, recurrent_state, slot, True, checkpoint
+    )
+
+    # The split: [start, checkpoint), then the tail on the same slot.
+    split_conv, split_recurrent = prefix_state()
+    _forward(
+        inputs, start, checkpoint_position, split_conv, split_recurrent, K_SLOT, True
+    )
+    at_checkpoint = (split_recurrent[K_SLOT].clone(), split_conv[K_SLOT].clone())
+    _forward(
+        inputs, checkpoint_position, prompt_len, split_conv, split_recurrent, K_SLOT,
+        True,
+    )
+
+    assert torch.equal(recurrent_state[SNAPSHOT_SLOT], at_checkpoint[0])
+    assert torch.equal(conv_state[SNAPSHOT_SLOT], at_checkpoint[1])
+    max_diff = (recurrent_state[slot] - split_recurrent[K_SLOT]).abs().max().item()
+    assert torch.equal(recurrent_state[slot], split_recurrent[K_SLOT]), (
+        f"final recurrent state differs from the split's (max abs diff {max_diff})"
+    )
+    assert torch.equal(conv_state[slot], split_conv[K_SLOT])
+    assert torch.equal(recurrent_state[STALE_SLOT], stale[0])
+    assert torch.equal(conv_state[STALE_SLOT], stale[1])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

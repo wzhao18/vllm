@@ -1008,6 +1008,35 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
+    def take_block_table_writes(self) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain this step's block-table column writes for running requests.
+
+        Returns ``{request_id: [(group_id, column, block_id), ...]}``: the
+        Mamba snapshot blocks placed below a running request's initial state
+        (CacheConfig.mamba_internal_snapshot). Every snapshot group places one
+        or none for a request: the worker's checkpoint export is per row, so a
+        row with a column rewritten in only some groups would write the others'
+        stale blocks.
+        """
+        writes: dict[str, list[tuple[int, int, int]]] = {}
+        snapshot_groups: set[int] = set()
+        for mgr in self.coordinator.single_type_managers:
+            if not isinstance(mgr, MambaManager) or not mgr.prefill_snapshot:
+                continue
+            snapshot_groups.add(mgr.kv_cache_group_id)
+            for req_id, col, block_id in mgr.take_pending_block_table_writes():
+                writes.setdefault(req_id, []).append(
+                    (mgr.kv_cache_group_id, col, block_id)
+                )
+        for req_id, req_writes in writes.items():
+            groups = [group_id for group_id, _, _ in req_writes]
+            if sorted(groups) != sorted(snapshot_groups):
+                raise RuntimeError(
+                    f"Mamba snapshot of {req_id} placed in groups {groups}, "
+                    f"expected each of {sorted(snapshot_groups)} once"
+                )
+        return writes
+
     def take_kv_cache_block_copies(
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:

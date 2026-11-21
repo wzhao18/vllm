@@ -129,6 +129,12 @@ class ModelState(ABC):
     def remove_request(self, req_id: str) -> None:
         return None
 
+    def block_table_rewritten(self, req_index: int, num_computed_tokens: int) -> None:
+        """The scheduler rewrote a column of this running request's block table
+        for the chunk starting at ``num_computed_tokens``
+        (SchedulerOutput.block_table_writes)."""
+        return None
+
     def apply_staged_writes(self) -> None:
         return None
 
