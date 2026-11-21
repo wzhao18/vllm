@@ -161,6 +161,17 @@ This backend never sets them; they must stay unset in serving.
 `tests/models/kimi_k3/test_k31_no_env_switches.py` excludes `src/` (vendored) from its
 scan; the backend's own modules stay covered.
 
+- **S7** (vLLM-local, BUG-E2E-3, both ``src`` and ``src_gp``): every cross-rank spin wait (the
+  ``NvlinkBarrier.arrive_and_wait`` signal word, the router ``sizes_ready`` / ``metadata_ready`` words,
+  and ``src_gp`` ``genphase_tail``'s two signal waits) is bounded by ``spin_guard``
+  (``src/sources/helpers/spin_guard.py``, ``src_gp/common/spin_guard.py``, identical): after
+  15 min on ``%globaltimer`` without reaching its target the waiting thread prints
+  ``MEGAMOE_SPIN_TIMEOUT site= observed= target= smid=`` and executes ``trap``, so an EP group whose
+  peer never publishes fails with a CUDA error and a diagnostic instead of hanging every rank with the
+  host blocked in a stream sync. The loop conditions, loads and their order are unchanged (no effect on
+  any computed value); sites: src software_sync 0, token_comm 40-42; src_gp software_sync 10,
+  token_comm_dedup 20-22, token_comm 30-32, genphase_tail 50-51.
+
 ## sha256 manifest of `src/sources`
 
 ```
@@ -169,7 +180,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 1a7715c127c74c61187ddfd0d63c171e9acc229e644f180641c74f5107dda589  sources/communication/nvlink_domain/symmetric_buffer.py
-15c482cc351a9c3a9674d26067c736f24a71e0f781cf4fba9a7e4914e758f016  sources/communication/nvlink_domain/token_comm.py
+004e65775592473ceb4bfa09516ebbb243c3d579c44880a305cfebfc5b42c9a1  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
@@ -180,7 +191,8 @@ c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3  sources/helper
 4b8a3c3e231793f87d6b1bcd5dffee8b5c19c384c3a719fbb4ed895d9929ba29  sources/helpers/iket_compat.py
 215675b7f0def6526bb3c75b385cf12ccf0a5a35e8816c68bffbda03eaeabd9c  sources/helpers/ptx_helpers.py
 91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c  sources/helpers/smem_workspace.py
-f12c4a4df541d4e80346e4cb256f788fc825283696ed69670df13c72c2811525  sources/helpers/software_sync.py
+fc131f9575b733b1f0a79a2f63d5221f810d64b4f05c2c34b47bf33842559a4f  sources/helpers/software_sync.py
+d24f445030ac0fcabed2476a5ca1f505e5ac36a2578ed6633975b28f1db1f4bf  sources/helpers/spin_guard.py
 39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22  sources/helpers/utils.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/__init__.py
 81689f9850af024d9ec22416d4c2a1535d73946d455b7e22042d321534918642  sources/kernel_src/function_mapping.py

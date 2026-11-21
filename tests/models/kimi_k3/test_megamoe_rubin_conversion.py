@@ -912,7 +912,7 @@ def test_vendored_sources_match_manifest():
         for p in src.joinpath("sources").rglob("*.py")
         if "__pycache__" not in p.parts
     }
-    assert len(manifest) == 41 and set(files) == set(manifest)
+    assert len(manifest) == 42 and set(files) == set(manifest)
     for rel, path in files.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[rel], rel
     # no FlashInfer / NVSHMEM import anywhere in the backend
