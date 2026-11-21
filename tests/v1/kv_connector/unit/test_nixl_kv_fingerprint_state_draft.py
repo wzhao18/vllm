@@ -164,7 +164,7 @@ def _worker_draft_views(
         NixlBaseConnectorWorker,
     )
 
-    name = "model.layers.24.self_attn.attn"
+    name = LAYER  # the reference views' name (the F salt)
     blocks, page = region.shape
     worker = SimpleNamespace(
         kv_caches_base_addr={"e": {rank: [region.data_ptr()]}},
