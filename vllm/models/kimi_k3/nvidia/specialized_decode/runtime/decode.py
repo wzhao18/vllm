@@ -76,7 +76,9 @@ from .providers import (
     PREPARED_MAX,
     Attention,
     attention_kind,
+    check_bf16_projections,
     inproj_note,
+    mxfp4_experts,
     pack_dsa_projection,
     pack_front,
 )
@@ -418,6 +420,12 @@ class SpecializedDecode:
         linear_beta = config.activation_situ_linear_beta
         tp, rank, device, batches = self.tp, self.rank, self.device, self.batches
         owner = self.group, device, tp, rank
+        # Formats first (before any packing): the TP providers read BF16 projections
+        # and MXFP4 routed experts only, and refuse anything else at build.
+        for d in layers:
+            check_bf16_projections(d)
+            if d.is_moe_layer:
+                mxfp4_experts(d.mlp.experts.routed_experts)
         packed = {
             d.layer_idx: pack_front(d.mlp, rank, tp) for d in layers if d.is_moe_layer
         }

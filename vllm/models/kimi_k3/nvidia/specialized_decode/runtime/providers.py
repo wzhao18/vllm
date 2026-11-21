@@ -337,6 +337,104 @@ def bf16_weight(linear):
     return weight
 
 
+# Linears of a decoder layer the TP providers never read: stock absorbs ``kv_b_proj``
+# into W_UK / W_UV at load (the decode reads those).
+UNREAD_LINEARS = ("kv_b_proj",)
+# Unquantized linears stock keeps in another dtype, read as that dtype: the KDA
+# short-convolution taps (``KimiDeltaAttention.conv1d``, FP32).
+LINEAR_DTYPES = {"conv1d": torch.float32}
+
+
+def check_bf16_projections(decoder):
+    """Every linear of a decoder layer the TP (non-SP) providers read (attention
+    projections, AttnRes, router, latent MoE down / up, shared experts, dense MLP)
+    as a BF16 [N, K] matrix (``LINEAR_DTYPES``: in its stock dtype): refuses a
+    checkpoint-quantized one (e.g. ModelOpt MXFP8 or NVFP4) at build instead of
+    programming its packed bytes as BF16."""
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    for name, module in decoder.named_modules():
+        leaf = name.rsplit(".", 1)[-1]
+        if not isinstance(module, LinearBase) or leaf in UNREAD_LINEARS:
+            continue
+        dtype = LINEAR_DTYPES.get(leaf)
+        if dtype is None:
+            bf16_weight(module)
+        elif (
+            not isinstance(module.quant_method, UnquantizedLinearMethod)
+            or module.weight.dtype != dtype
+        ):
+            raise ValueError(
+                f"Kimi K3 specialized decode needs an unquantized {dtype} {leaf}, "
+                f"got {type(module.quant_method).__name__} ({module.weight.dtype}) "
+                f"in {getattr(module, 'prefix', name)}"
+            )
+
+
+def routed_format(method) -> str:
+    """A routed-experts quant method's name and backend for refusal messages."""
+    backend = getattr(method, "mxfp4_backend", None)
+    backend = getattr(backend, "value", backend)
+    text = type(method).__name__
+    return text if backend is None else f"{text} (backend {backend})"
+
+
+def mxfp4_experts(routed):
+    """(w13, w13 scales, w2, w2 scales) of a layer's routed experts as
+    ``PersistentExperts`` reads them, which only exists for stock's MXFP4 experts:
+    ``Mxfp4MoEMethod`` on the FlashInfer TRT-LLM MXFP4 x MXFP8 backend (its weight
+    and scale layout; its MXFP8 activations), packed E2M1 weights and UE8M0 scales
+    per 32-element block, no global scales. Raises ValueError naming the format of
+    anything else (e.g. NVFP4: E4M3 scales per 16 elements plus global scales, or
+    MXFP4 on another backend's layout), which the kernels (``kind::mxf8f6f4`` over
+    32-block UE8M0 scales) would silently misread."""
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    method = getattr(routed, "quant_method", None)
+    where = getattr(routed, "layer_name", None) or type(routed).__name__
+
+    def fail(cause):
+        raise ValueError(
+            "Kimi K3 specialized decode (TP) needs MXFP4 routed experts "
+            "(Mxfp4MoEMethod, FLASHINFER_TRTLLM_MXFP4_MXFP8, UE8M0 scales per 32 "
+            f"elements), got {routed_format(method)} in {where}: {cause}"
+        )
+
+    if type(method) is not Mxfp4MoEMethod:
+        fail("not the MXFP4 experts method")
+    if method.mxfp4_backend != Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8:
+        fail("another backend's weight / scale layout")
+    for name in ("w13_weight_scale_2", "w2_weight_scale_2", "w13_weight_global_scale",
+                 "w2_weight_global_scale", "w13_input_global_scale",
+                 "w2_input_global_scale", "w13_input_scale", "w2_input_scale"):  # fmt: skip
+        if getattr(routed, name, None) is not None:
+            fail(f"global scale {name} (NVFP4-style two-level scaling)")
+    for name in ("w13_bias", "w2_bias"):  # (the kernels add no bias)
+        if getattr(routed, name, None) is not None:
+            fail(f"expert bias {name}")
+    weights = []
+    for name in ("w13", "w2"):
+        weight = getattr(routed, f"{name}_weight", None)
+        scale = getattr(routed, f"{name}_weight_scale", None)
+        if weight is None or scale is None:
+            fail(f"no {name} weight / scale")
+        if weight.dtype != torch.uint8 or weight.dim() != 3:
+            fail(f"{name} weight {weight.dtype} {tuple(weight.shape)} (packed E2M1)")
+        # (one byte each; the TRT-LLM layout keeps the UE8M0 bytes in a
+        # float8_e4m3fn view, so the dtype does not tell the format)
+        if scale.element_size() != 1:
+            fail(f"{name} scale dtype {scale.dtype} (one UE8M0 byte per block)")
+        experts, rows, half = weight.shape
+        if scale.numel() != experts * rows * (2 * half // 32) or (2 * half) % 32:
+            fail(
+                f"{name} scale numel {scale.numel()} for weight [{experts}, {rows}, "
+                f"{2 * half}] (one scale per 32 elements)"
+            )
+        weights += [weight, scale]
+    return tuple(weights)
+
+
 def pack_dsa_projection(attention):
     """One [q_a | kv_a | gate | wk | wv] weight for a K3.1 DSA layer; the stock
     projections become views of it."""

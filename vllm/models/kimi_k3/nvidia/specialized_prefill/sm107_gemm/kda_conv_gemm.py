@@ -45,6 +45,8 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_hot = "hot" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
+        # "red": the TMA store reduce-adds the BF16 tile into C (residual add).
+        self.c_store_reduce = "red" in flags
         self.l2_store_evict_first = "sef" in flags
         # die_sched: clusters claim N tiles of their die's weight half
         # (die-split weights, extra scheduler warp 10).
@@ -186,6 +188,31 @@ class PlainGemm:
         self._compiled(*args, problem, stream, *tail)
 
 
+def shape_tactic(n: int, tactic):
+    """``tactic`` fitted to an ``n``-column problem, or ValueError.
+
+    The conv epilogue stores with raw global addresses (no column bound), so
+    every N tile the persistent scheduler hands out must lie inside ``n``:
+    whole cluster columns (``n`` a multiple of tile N x cluster N), and with the
+    "m" raster a swizzle that divides the number of cluster columns (the
+    scheduler pads that count up to a multiple of the swizzle; the padded
+    clusters would run tiles past column ``n`` and write past the Q|K|V planes
+    and side rows). The swizzle drops to its largest divisor of the cluster
+    column count; it only orders tiles, the result is bit for bit the same.
+    The "n" raster pads M instead, whose rows the epilogue bounds."""
+    (_, tn), (_, cn), _, swz, raster = tactic[:5]
+    if n % (tn * cn):
+        raise ValueError(
+            f"KDA conv GEMM: N {n} is not a multiple of tile N x cluster N {tn}x{cn}"
+        )
+    if raster == "m":
+        ncl = n // (tn * cn)
+        fit = max(d for d in range(1, swz + 1) if ncl % d == 0)
+        if fit != swz:
+            tactic = (*tactic[:3], fit, *tactic[4:])
+    return tactic
+
+
 def side_rows(m: int, nseq: int) -> int:
     return 6 * ((m + 127) // 128) + 6 * nseq
 
@@ -207,7 +234,7 @@ class KdaConvGemm:
             raise ValueError(f"KDA conv GEMM: unsupported N/K {self.n}/{self.k}")
         if tuple(conv_w.shape) != (self.n, 4) or conv_w.dtype != torch.float32:
             raise ValueError(f"KDA conv GEMM: conv weight {tuple(conv_w.shape)}")
-        self.tactic = tactic or DEFAULT_TACTIC
+        self.tactic = shape_tactic(self.n, tactic or DEFAULT_TACTIC)
         self.drain = drain and self.tactic[0][0] == 2 * self.tactic[2]
         # Column-pair weight layout for the branch-free column pass:
         # [col pair][tap][col, col + 1] (aligned f32x2 operands).
@@ -242,10 +269,20 @@ class KdaConvGemm:
         self._compiled[key] = fn
         return fn
 
+    @property
+    def supports_checkpoint_halo(self) -> bool:
+        """Whether ``__call__`` takes ``checkpoint_offsets`` (the branch-free
+        column-pass epilogue, no norms)."""
+        return self._t2
+
     def __call__(
         self, x, x_scale, conv_state, qsl, lines, has_init, with_norms=False,
-        null_block_id: int | None = None,
+        null_block_id: int | None = None, checkpoint_offsets=None, halo=None,
     ):  # fmt: skip
+        """``checkpoint_offsets`` (int32, one per sequence, 0 = none) with
+        ``halo`` (BF16 ``(nseq, 3, N)``): the epilogue also writes the three
+        pre-conv (in_proj output) rows before each checkpoint offset >= 3 to
+        ``halo[s]``; other rows of ``halo`` are left untouched."""
         from cutlass.cute.runtime import from_dlpack
 
         from .conv_fixup import conv_fixup
@@ -253,6 +290,21 @@ class KdaConvGemm:
         m = x.shape[0]
         nseq = qsl.numel() - 1
         dev = x.device
+        ckpt_ptr = halo_ptr = 0
+        if checkpoint_offsets is not None:
+            if not self._t2 or with_norms:
+                raise ValueError("KDA conv GEMM: checkpoint halo needs the t2 epilogue")
+            if (
+                checkpoint_offsets.dtype != torch.int32
+                or checkpoint_offsets.numel() != nseq
+                or not checkpoint_offsets.is_contiguous()
+                or halo is None
+                or halo.dtype != torch.bfloat16
+                or tuple(halo.shape) != (nseq, 3, self.n)
+                or not halo.is_contiguous()
+            ):
+                raise ValueError("KDA conv GEMM: checkpoint offsets / halo layout")
+            ckpt_ptr, halo_ptr = checkpoint_offsets.data_ptr(), halo.data_ptr()
         out = torch.empty(3, m, self.p, dtype=torch.bfloat16, device=dev)
         side = torch.empty(side_rows(m, nseq), self.n, dtype=torch.bfloat16, device=dev)
         norms = (
@@ -275,6 +327,11 @@ class KdaConvGemm:
             cutlass.Int32(nseq),
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
+            # sched_ctr, sched_die_map (unused), then the checkpoint halo.
+            cutlass.Int64(0),
+            cutlass.Int64(0),
+            cutlass.Int64(ckpt_ptr),
+            cutlass.Int64(halo_ptr),
         )
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)

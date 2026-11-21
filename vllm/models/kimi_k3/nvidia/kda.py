@@ -73,9 +73,13 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
     compile_state_commit,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_resid,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     kda as specialized_prefill_kda,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+    CheckpointRows,
     contiguous_rows,
 )
 from vllm.platforms import current_platform
@@ -422,6 +426,27 @@ def is_flashinfer_recurrent_kda_prefill_supported(
         and input_dtype == torch.bfloat16
         and recurrent_state_dtype == torch.bfloat16
         and lower_bound is not None
+    )
+
+
+def frost_out_feeds_o_norm(
+    flashkda_out: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    frost_out: torch.Tensor,
+    o_mxfp8: Mxfp8Buffer | None,
+) -> bool:
+    """Whether a FROST / persistent prefill output may skip its copy into
+    ``core_attn_out``: only on a pure prefill step (the output covers all of
+    ``core_attn_out``) whose gated o_norm is the MXFP8 prefill kernel, the one
+    o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``).
+    Every other o_norm (the in-place ``kda_norm.rmsnorm_gated_`` that runs when
+    o_proj takes BF16 input, e.g. under the TP fused GEMM-AR o_proj) normalizes
+    ``core_attn_out`` itself, so the output must land there first: skipping the
+    copy left it uninitialized (NaN / non-reproducible TP8 + DCP8 prefill)."""
+    return (
+        o_mxfp8 is not None
+        and flashkda_out.data_ptr() == core_attn_out.data_ptr()
+        and frost_out.shape[1] == core_attn_out.shape[1]
     )
 
 
@@ -920,6 +945,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     torch.device("cuda", torch.accelerator.current_device_index())
                 )
             )
+            if self._kda_persistent:
+                specialized_prefill_kda.warm_persistent(
+                    self.local_num_heads,
+                    torch.device("cuda", torch.accelerator.current_device_index()),
+                    self.gate_lower_bound,
+                )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
@@ -1011,15 +1042,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self,
         hidden_states: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
+        resid_prefix: tuple[torch.Tensor, bool] | None = None,
     ) -> torch.Tensor:
         # A QuantizedActivation is in_proj's MXFP8 input written by the
         # prefill AttnRes (specialized_prefill.attn_res_mxfp8).
+        # resid_prefix (prefill AttnRes dataflow C, attn_res_resid): (prefix,
+        # add): the o_proj adds its output into the AttnRes prefix (add) or
+        # stores it as the new prefix, and returns the prefix.
         qa = hidden_states if isinstance(hidden_states, QuantizedActivation) else None
         act_dtype = qa.orig_dtype if qa is not None else hidden_states.dtype
         act_device = qa.data.device if qa is not None else hidden_states.device
         num_tokens = qa.data.size(0) if qa is not None else hidden_states.size(0)
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
+        checkpoint_rows = None
         if (
             qa is None
             and 0 < num_tokens <= self._projection_overlap_max_tokens
@@ -1049,7 +1085,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and (fused := self._prefill_conv_in_proj.fused(qa)) is not None
         ):
             # (3, T, P) q|k|v planes after conv + SiLU; _forward skips the conv.
-            mixed_qkv, projected_rest = fused
+            mixed_qkv, projected_rest, checkpoint_rows = fused
             g_proj_states, f_a, beta = projected_rest.split(
                 [self.local_projection_size, self.head_dim, self.local_num_heads],
                 dim=-1,
@@ -1095,7 +1131,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
             o_mxfp8=o_mxfp8,
+            checkpoint_rows=checkpoint_rows,
         )
+        if resid_prefix is not None:
+            gemm = attn_res_resid.gemm_for(self.o_proj)
+            if o_mxfp8 is None or gemm is None:
+                raise RuntimeError(
+                    "KDA o_proj: the AttnRes prefix producer needs the MXFP8 o_proj "
+                    "input and an attn_res_resid GEMM"
+                )
+            prefix, add = resid_prefix
+            qa = o_mxfp8.activation()
+            if add:
+                return gemm.add_into(qa, prefix)
+            return gemm.store_into(qa, prefix)
         if o_mxfp8 is not None:
             return self.o_proj(o_mxfp8.activation())[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
@@ -1194,6 +1243,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             out=out,
         )
 
+    def resid_capable(self) -> bool:
+        """The o_proj can add its output into the prefill AttnRes prefix
+        (forward(resid_prefix=...), specialized_prefill.attn_res_resid)."""
+        cap = getattr(self, "_resid_capable", None)
+        if cap is None:
+            from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
+
+            cap = self._resid_capable = (
+                self.gemm_rs_ar is None
+                and takes_mxfp8_activation(self.o_proj)
+                and attn_res_resid.supported(self.o_proj)
+            )
+        return cap
+
     def _o_norm_mxfp8(self, core_attn_out: torch.Tensor, g2: torch.Tensor) -> bool:
         if self._o_norm_mxfp8_ok is None:
             from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
@@ -1217,6 +1280,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
         o_mxfp8: Mxfp8Buffer | None = None,
+        checkpoint_rows: CheckpointRows | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1250,6 +1314,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         has_spec_decode = m.num_spec_decodes > 0
         # (3, T, P): q|k|v planes the prefill in_proj already convolved.
         qkv_planes = mixed_qkv.dim() == 3
+        # The checkpoint exporter's pre-conv rows: the in_proj output, or the
+        # windows the fused in_proj saved (its planes are convolved).
+        assert not qkv_planes or checkpoint is None or checkpoint_rows is not None
         mixed_qkv = (
             mixed_qkv[:, :num_actual_tokens]
             if qkv_planes
@@ -1383,6 +1450,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_spec = g1_spec = beta_spec = None
             mixed_qkv_ns, g1_ns, beta_ns = mixed_qkv, g1, beta
+
+        if checkpoint_rows is not None:
+            ckpt_raw_qkv, ckpt_cu_seqlens = checkpoint_rows
+        else:
+            ckpt_raw_qkv, ckpt_cu_seqlens = mixed_qkv_ns, non_spec_query_start_loc
 
         # Spec-decode multi-query path.
         core_attn_out_spec = None
@@ -1633,11 +1705,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             assert self._checkpoint_exporter is not None
                             self._checkpoint_exporter.export(
                                 checkpoint,
-                                raw_qkv=mixed_qkv_ns,
+                                raw_qkv=ckpt_raw_qkv,
                                 conv_state=conv_state,
                                 recurrent_checkpoint=checkpoint_state,
                                 recurrent_state=recurrent_state,
-                                cu_seqlens=non_spec_query_start_loc,
+                                cu_seqlens=ckpt_cu_seqlens,
                             )
                     elif checkpoint is not None:
                         assert non_spec_query_start_loc is not None
@@ -1668,18 +1740,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         assert self._checkpoint_exporter is not None
                         self._checkpoint_exporter.export(
                             checkpoint,
-                            raw_qkv=mixed_qkv_ns,
+                            raw_qkv=ckpt_raw_qkv,
                             conv_state=conv_state,
                             recurrent_checkpoint=checkpoint_state,
                             recurrent_state=recurrent_state,
-                            cu_seqlens=non_spec_query_start_loc,
+                            cu_seqlens=ckpt_cu_seqlens,
                         )
                     elif self._frost:
                         if (
                             self._kda_persistent
                             and m.non_spec_query_start_loc_cpu is not None
                         ):
-                            frost_out, last_recurrent_state = (
+                            # Writes the core output into its core_attn_out
+                            # rows: every o_norm reads them there.
+                            _, last_recurrent_state = (
                                 specialized_prefill_kda.persistent_prefill(
                                     q=q_ns,
                                     k=k_ns,
@@ -1697,6 +1771,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     ),
                                     state_indices=non_spec_state_indices_tensor,
                                     has_initial_state=has_initial_state,
+                                    out=flashkda_out,
                                 )
                             )
                         else:
@@ -1714,14 +1789,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     cu_seqlens=non_spec_query_start_loc,
                                 )
                             )
-                        if (
-                            flashkda_out.data_ptr() == core_attn_out.data_ptr()
-                            and frost_out.shape[1] == core_attn_out.shape[1]
-                        ):
-                            # Pure prefill: o_norm reads the FROST output.
-                            prefill_core_out = frost_out
-                        else:
-                            flashkda_out.copy_(frost_out)
+                            if frost_out_feeds_o_norm(
+                                flashkda_out, core_attn_out, frost_out, o_mxfp8
+                            ):
+                                # Pure prefill: o_norm reads the FROST output.
+                                prefill_core_out = frost_out
+                            else:
+                                flashkda_out.copy_(frost_out)
                         core_attn_out_non_spec = flashkda_out
                     else:
                         (

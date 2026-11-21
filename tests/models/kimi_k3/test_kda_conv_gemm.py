@@ -35,15 +35,16 @@ def _operands(m, n, k, dev, seed):
     return x.to(torch.float8_e4m3fn), sx, w.to(torch.float8_e4m3fn), sw
 
 
-def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32):
+def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32,
+         part=PART, k=K):  # fmt: skip
     from vllm.models.kimi_k3.nvidia.ops import kda_conv
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
         KdaConvGemm,
     )
 
     dev = torch.device("cuda")
-    n = 3 * PART
-    xq, xs, wq, ws = _operands(m, n, K, dev, seed)
+    n = 3 * part
+    xq, xs, wq, ws = _operands(m, n, k, dev, seed)
     proj = torch._scaled_mm(
         xq, wq.t(),
         scale_a=xs.view(torch.float8_e8m0fnu), scale_b=ws.view(torch.float8_e8m0fnu),
@@ -64,8 +65,8 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32)
     state0 = state0.to(torch.bfloat16).to(state_dtype)[:, :, :3]
 
     st_ref = state0.clone()
-    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, PART)
-    gemm = KdaConvGemm(wq, ws, cw, PART, tactic=tactic)
+    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, part)
+    gemm = KdaConvGemm(wq, ws, cw, part, tactic=tactic)
     st = state0.clone()
     out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID)
     torch.cuda.synchronize()
@@ -108,6 +109,50 @@ def test_kda_conv_gemm_old_column_pass():
     # The previous per-row column pass (kept for the inverse-norm variant).
     _run([1, 2, 3, 125, 128, 3, 256, 600, 5], 1300,
          tactic=((512, 256), (4, 1), 256, 8, "n", 0, 0, "ct1"))  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "part,k,m",
+    [
+        (12288, 7168, 16384),  # deployed K3.1 KDA layer (DEP prefill)
+        (1024, 1024, 16384),  # 3 cluster columns: swizzle 4 -> 3 (was an IMA)
+        (3072, 1024, 16384),  # 9 cluster columns: swizzle 4 -> 3 (was an IMA)
+        (6144, 7168, 8192),  # 18 cluster columns: swizzle 4 -> 3 (TP2 plane)
+    ],
+)
+def test_kda_conv_gemm_deployed_tactic_shapes(part, k, m):
+    """The deployed 2x4-cluster "m"-raster TACTIC at plane widths whose cluster
+    column count the swizzle (4) does not divide: the persistent scheduler
+    pads the cluster grid to a multiple of the swizzle, and the conv
+    epilogue's unbounded stores of the padded tiles wrote past the planes
+    (illegal address at P=1024 K=1024 M=16384). shape_tactic fits the swizzle
+    to the shape; output and conv state stay bitwise equal to stock."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+
+    _run([m // 3, m // 3, m - 2 * (m // 3)], m, tactic=TACTIC, part=part, k=k)
+
+
+def test_shape_tactic():
+    """Swizzle fitted to the cluster column count ("m" raster only); N that the
+    clusters cannot tile is rejected (kda_conv_in_proj.unsupported_reason)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        DEFAULT_TACTIC,
+        shape_tactic,
+    )
+
+    assert shape_tactic(3 * 12288, TACTIC) == TACTIC  # 36 cluster columns
+    assert shape_tactic(3 * 1024, TACTIC)[3] == 3
+    assert shape_tactic(3 * 2048, TACTIC)[3] == 3  # 6 columns
+    assert shape_tactic(3 * 4096, TACTIC)[3] == 4
+    assert shape_tactic(3 * 1024 * 7, TACTIC)[3] == 3  # 21 columns
+    assert shape_tactic(3 * 1024 * 5, TACTIC)[3] == 3  # 15 columns
+    fitted = shape_tactic(3 * 1024, TACTIC)
+    assert fitted[:3] == TACTIC[:3] and fitted[4:] == TACTIC[4:]
+    for p in (256, 512, 768, 1280):
+        with pytest.raises(ValueError):
+            shape_tactic(3 * p, TACTIC)
+    assert shape_tactic(3 * 512, DEFAULT_TACTIC) == DEFAULT_TACTIC  # "n" raster
 
 
 def test_contiguous_rows_bytes():
@@ -178,7 +223,161 @@ def test_fused_in_proj_never_captured(monkeypatch):
     with pytest.raises(StopIteration):
         fused.fused(qa)
     assert calls == [False]
-    # A step that exports a prefill checkpoint needs the raw q|k|v rows (stock).
-    md.checkpoint = object()
+    # A step that exports a prefill checkpoint: the fused GEMM also saves the
+    # raw q|k|v rows the exporter stores (its epilogue's checkpoint halo) ...
+    fused.p = 256
+    md.checkpoint = SimpleNamespace(
+        checkpoint_offsets=torch.tensor([16], dtype=torch.int32, device=dev),
+        offsets=[16],
+    )
+    _gemm.supports_checkpoint_halo = True
+    with pytest.raises(StopIteration):
+        fused.fused(qa)
+    assert calls == [False, False]
+    # ... unless the GEMM variant cannot (stock in_proj + conv).
+    _gemm.supports_checkpoint_halo = False
     assert fused.fused(qa) is None
-    assert calls == [False]
+    assert calls == [False, False]
+
+
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_conv_fixup_warm_covers_serving_steps(monkeypatch, dim_first):
+    """``conv_fixup.warm`` compiles every fix-up variant a prefill step of up
+    to max_num_seqs sequences launches: row / block / sequence counts and the
+    state / index strides of the serving KV cache add no compile (either conv
+    state layout)."""
+    from vllm.model_executor.layers.mamba import mamba_utils
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import conv_fixup
+
+    monkeypatch.setattr(mamba_utils, "is_conv_state_dim_first", lambda: dim_first)
+    kern = conv_fixup._conv_fixup_all_kernel
+
+    def variants() -> set:
+        return {k for caches in kern.device_caches.values() for k in caches[0]}
+
+    dev = torch.device("cuda")
+    nq = 3 * PART
+    cw = torch.zeros(nq, 4, device=dev)
+    for dtype in (torch.bfloat16, torch.float32):
+        conv_fixup.warm(PART, cw, dtype, 32, NULL_BLOCK_ID)
+        warmed = variants()
+        assert warmed
+        # A paged conv state view (row stride of the KV cache page), as the
+        # fused path passes it, and 2-D state index rows.
+        if dim_first:
+            st = torch.empty(5, nq, 7, dtype=dtype, device=dev)[:, :, :3]
+        else:
+            st = torch.empty(5, 7, nq, dtype=dtype, device=dev)[:, :3].transpose(-1, -2)
+        for nseq in (1, 2, 3, 5, 16, 17, 31, 32):
+            qsl = torch.zeros(nseq + 1, dtype=torch.int32, device=dev)
+            lines = torch.zeros(nseq, 9, dtype=torch.int32, device=dev)[:, 0]
+            init = torch.zeros(nseq, dtype=torch.bool, device=dev)
+            for rows in (2048, 2049, 2050, 6656, 12287, 12288, 16384):
+                out = torch.empty(3, 1, PART, dtype=torch.bfloat16, device=dev)
+                side = torch.empty(1, nq, dtype=torch.bfloat16, device=dev)
+                conv_fixup.conv_fixup(out.expand(3, rows, PART), side, None, cw, st,
+                                      qsl, lines, init, PART, NULL_BLOCK_ID,
+                                      compile_only=True)  # fmt: skip
+        assert variants() == warmed
+
+
+def _run_checkpoint(
+    seqlens, offsets, m, tactic=None, seed=0, host_offsets=True, part=PART, k=K
+):
+    """Prefix-hit-shaped prefill steps exporting checkpoints: the fused GEMM's
+    halo rows + the stock exporter store bit for bit the conv state the stock
+    path (in_proj, qkv_conv, exporter on the in_proj output) stores."""
+    from vllm.model_executor.layers.mamba.checkpoint import (
+        MambaPrefillCheckpointExporter,
+        MambaPrefillCheckpointMetadata,
+    )
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        KdaConvGemm,
+    )
+
+    dev = torch.device("cuda")
+    n = 3 * part
+    xq, xs, wq, ws = _operands(m, n, k, dev, seed)
+    proj = torch._scaled_mm(
+        xq, wq.t(),
+        scale_a=xs.view(torch.float8_e8m0fnu), scale_b=ws.view(torch.float8_e8m0fnu),
+        out_dtype=torch.bfloat16,
+    )  # fmt: skip
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    cw = (torch.randn(n, 4, device=dev, generator=g) * 0.5).contiguous()
+    qsl = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32,
+                       device=dev)  # fmt: skip
+    nseq = len(seqlens)
+    # Cache rows other than the null block (sequence lines must be real rows).
+    slots = torch.randperm(3 * nseq + 2, device=dev, generator=g).to(torch.int32)
+    slots = slots[slots != NULL_BLOCK_ID]
+    lines, ck_slots = slots[:nseq], slots[nseq : 2 * nseq].clone()
+    ck_slots[nseq // 2] = NULL_BLOCK_ID  # a checkpoint without a cache block
+    # Prefix hits (resumed state) mixed with fresh sequences.
+    has_init = torch.arange(nseq, device=dev) % 3 != 0
+    state0 = torch.randn(3 * nseq + 2, n, 4, device=dev, generator=g)
+    state0 = state0.to(torch.bfloat16)[:, :, :3]
+    ckpt = MambaPrefillCheckpointMetadata(
+        torch.tensor(offsets, dtype=torch.int32, device=dev),
+        ck_slots,
+        offsets=list(offsets) if host_offsets else None,
+    )
+    exporter = MambaPrefillCheckpointExporter(state_len=3)
+
+    st_ref = state0.clone()
+    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, part)
+    exporter.export(ckpt, raw_qkv=proj[:m], conv_state=st_ref, cu_seqlens=qsl)
+
+    gemm = KdaConvGemm(wq, ws, cw, part, tactic=tactic)
+    assert gemm.supports_checkpoint_halo
+    st = state0.clone()
+    halo = torch.full((nseq, 3, n), float("nan"), dtype=torch.bfloat16, device=dev)
+    out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID,
+                  checkpoint_offsets=ckpt.checkpoint_offsets, halo=halo)  # fmt: skip
+    kda_conv_in_proj._HALO_QSL[:] = [None, None]
+    rows = kda_conv_in_proj.CheckpointRows(
+        halo.view(3 * nseq, n), kda_conv_in_proj._halo_qsl(ckpt)
+    )
+    exporter.export(ckpt, raw_qkv=rows.raw, conv_state=st, cu_seqlens=rows.qsl)
+    torch.cuda.synchronize()
+    tot = int(qsl[-1])
+    assert torch.equal(out[:, :tot], ref[:, :tot])
+    # Every conv state row: sequence lines and checkpoint slots, bitwise.
+    assert torch.equal(st.view(torch.int16), st_ref.view(torch.int16))
+    for s, off in enumerate(offsets):
+        if off >= 3:
+            r = int(qsl[s]) + off
+            assert torch.equal(halo[s].view(torch.int16), proj[r - 3 : r].view(torch.int16))
+
+
+# Checkpoint offsets per sequence (0 = none, < 3 = no conv window): mid-chunk
+# multiples of 16, at the chunk end, windows across 128-row block edges and
+# sequence-start fix-up rows, offset 3 (window = the first rows).
+@pytest.mark.parametrize(
+    "seqlens,offsets,m",
+    [
+        ([1365] * 3, [1024, 1365, 0], 4096),
+        ([700, 300, 64, 900, 37], [640, 16, 64, 128, 32], 2048),
+        ([1, 2, 3, 125, 128, 3, 256, 600, 5], [1, 2, 3, 112, 128, 0, 16, 512, 5], 1300),
+        ([127, 1, 128, 129, 2], [3, 0, 48, 129, 2], 512),
+    ],
+)
+def test_kda_conv_gemm_checkpoint_bitwise(seqlens, offsets, m):
+    _run_checkpoint(seqlens, offsets, m)
+
+
+def test_kda_conv_gemm_checkpoint_device_offsets():
+    # Checkpoint metadata without host offsets: halo starts built on device.
+    _run_checkpoint([700, 300, 64, 900, 37], [640, 16, 64, 128, 32], 2048,
+                    host_offsets=False, seed=5)  # fmt: skip
+
+
+def test_kda_conv_gemm_checkpoint_prod_tactic():
+    # The deployed fused in_proj tactic (512x256 tile, 2x4 cluster) at the
+    # deployed K3.1 plane and K sizes, an F16K prefix-hit step.
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+
+    _run_checkpoint([2000, 1000, 5000, 192, 8000], [1984, 1000, 4096, 176, 7680],
+                    16384, tactic=TACTIC, seed=7, part=12288, k=7168)  # fmt: skip

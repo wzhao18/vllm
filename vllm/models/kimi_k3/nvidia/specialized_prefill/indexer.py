@@ -236,6 +236,14 @@ def tmem_ld16(taddr):
 
 
 @asm()
+def tmem_ld32(taddr):
+    """tcgen05.ld 32x32b.x32: 32 columns of this warp's 32 TMEM lanes (one per thread)."""
+    regs = ",".join(f"${i}" for i in range(32))
+    code = "tcgen05.ld.sync.aligned.32x32b.x32.b32 {" + regs + "}, [$32];"
+    return code, ",".join(["=f"] * 32) + ",r,~{memory}", (Int32(taddr),), (Float32,) * 32
+
+
+@asm()
 def tmem_wait_n(*vals):
     """tcgen05.wait::ld, with the loaded registers tied through it."""
     n = len(vals)
@@ -318,6 +326,13 @@ def _mn_layout(t):
     return cute.make_tensor(t.iterator, new)
 
 
+def _qn_layout():
+    """MMA N row n' = h' + 16 tok + 128 half -> Q row (tok, head 16 half + h') of the item,
+    as a linear index of the (16 h', 2 half, BQ tok) row mode: half-major, so a token
+    pair's 16-head half is 32 contiguous accumulator columns (one TMEM x32 load)."""
+    return cute.make_layout((16, BQ, 2), stride=(1, HEADS, 16))
+
+
 def _sigma(h: int) -> int:
     """Token 1's head paired with token 0's head h (skew within each group of 4)."""
     return h - h % 4 + (h % 4 + 1) % 4
@@ -371,7 +386,11 @@ class IndexerScore:
         nk = k8.shape[0]
         mQ = cute.make_tensor(
             cute.recast_ptr(q8.iterator, dtype=fp4),
-            cute.make_layout((nq, DIM, 1), stride=(DIM, 1, nq * DIM)),
+            # rows (16 heads, 2 halves, tokens): the B tiler gathers them half-major
+            cute.make_layout(
+                ((16, 2, nq // HEADS), DIM, 1),
+                stride=((DIM, 16 * DIM, HEADS * DIM), 1, nq * DIM),
+            ),
         )
         mK = cute.make_tensor(
             cute.recast_ptr(k8.iterator, dtype=fp4),
@@ -431,7 +450,7 @@ class IndexerScore:
             sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mma.thr_id),
             mQ,
             b_one,
-            self.tiler,
+            (TILE, _qn_layout(), DIM),
             mma,
             vmnk.shape,
         )
@@ -608,10 +627,11 @@ class IndexerScore:
                     for c in cutlass.range_constexpr(N // 128):
                         words = []
                         for i in cutlass.range_constexpr(4):
-                            r = c * 128 + 32 * i + lane
+                            r = c * 128 + 32 * i + lane  # MMA N row (half-major)
+                            q_row = (r // 16) % BQ * HEADS + 16 * (r // (16 * BQ)) + r % 16
                             v = Uint32(0)
-                            if r // HEADS < ntok:
-                                v = Uint32(q_sf[token0 * HEADS + r])
+                            if q_row // HEADS < ntok:
+                                v = Uint32(q_sf[token0 * HEADS + q_row])
                             words.append(v)
                         st_shared_v4(
                             sfb_a + (qs * SF_WORDS_B + c * 128 + 4 * lane) * 4, *words
@@ -622,7 +642,7 @@ class IndexerScore:
                         cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, self.q_bytes)
                     gQ = cute.local_tile(
                         cute.domain_offset((token0 * HEADS, 0, 0), mQ),
-                        cute.slice_(self.tiler, (0, None, None)),
+                        (_qn_layout(), DIM),
                         (None, None, None),
                     )
                     tQs, tQg = cpasync.tma_partition(
@@ -774,7 +794,7 @@ class IndexerScore:
         key_in_tile = 4 * (lt % 32) + lt // 32
         tok_a = 2 * wg
         # this warp's TMEM lane quarter, column 0 of accumulator stage 0
-        tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * HEADS
+        tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * 16
         hist0 = hist_a + tok_a * (S_BINS * 4)
         hist1 = hist0 + S_BINS * 4
         # zero the histograms once (re-zeroed after every item)
@@ -927,14 +947,14 @@ class IndexerScore:
                     cute.arch.mbarrier_arrive(acc_empty + st)
             return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
         cute.arch.mbarrier_wait(acc_full, ph)
-        h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
+        h0 = tmem_wait_n(*tmem_ld32(tmem_q))
         h0n = h0
         for st in cutlass.range_constexpr(ACC_STAGES):
             t = t_hi - st
             col = tmem_q + st * N
             if cutlass.const_expr(st > 0):
                 h0 = tmem_wait_n(*h0n)
-            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            h1 = tmem_ld32(col + 16 * BQ)
             if cutlass.const_expr(self.epi != 1):
                 ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
@@ -943,7 +963,7 @@ class IndexerScore:
                 cute.arch.mbarrier_arrive(acc_empty + st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st + 1, ph)
-                h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
+                h0n = tmem_ld32(col + N)
             if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
                 r = self.combine2(ss)
@@ -997,10 +1017,10 @@ class IndexerScore:
         for st in cutlass.range_constexpr(ACC_STAGES):
             col = tmem_q + st * N
             cute.arch.mbarrier_wait(acc_full + st, ph)
-            h0 = (*tmem_ld16(col), *tmem_ld16(col + HEADS))
+            h0 = tmem_ld32(col)
             p0, p1 = self.stage_tail(hp, w, sp, tp, p0, p1, thr)
             h0 = tmem_wait_n(*h0)
-            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            h1 = tmem_ld32(col + 16 * BQ)
             ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
             with cute.arch.elect_one():
@@ -1806,8 +1826,10 @@ class CandSelect2:
     bin each); a row whose k-th value is not resolved there (keep-all rows, a span
     of more than 2048 values) takes a min/max-ranged histogram and, when the range
     needs it, a second pass over the low bits. Keys above t are emitted (warp
-    ballots, one shared atomic per warp and slot); of the ties at t the lowest key
-    indices are emitted, found by a histogram of their tiles. Rows with fewer
+    ballots at per-warp bases from a count pass and a block scan: no atomics, the
+    output order is a fixed function of the candidates, so the order-sensitive
+    sparse MLA reproduces); of the ties at t the lowest key indices are emitted
+    at their rank among the ties, found by a histogram of their tiles. Rows with fewer
     candidates than min(k, row length), an overflowed lane or more than CS2_BINS
     ties are flagged in row_bin[3 r + 1] (recomputed by the caller). Output order
     is unspecified. Rows with a positive threshold (every candidate a positive
@@ -1889,22 +1911,40 @@ class CandSelect2:
                 ld_shared_u32(scr_a + 40))
 
     @cute.jit
-    def emit4(self, flags, poss, slot_a, out, orow, lane):
-        """Write each flagged pos at the next output slot (one shared atomic per
-        warp; all lanes of the warp call it)."""
+    def ballot_count(self, flags, n):
+        """n + the flagged lanes of the warp (warp-uniform; all lanes call it)."""
+        for f in flags:
+            n += popc(ballot(f))
+        return n
+
+    @cute.jit
+    def warp_prefix(self, n, scr_a, w, lane):
+        """The flagged count of the warps before w, from each warp's (warp-uniform)
+        count n. Every thread calls it (one block barrier; scr_a[0, WARPS) words)."""
+        if lane == 0:
+            st_shared_u32(scr_a + w * 4, n)
+        cute.arch.sync_threads()
+        pre = Uint32(0)
+        for k in cutlass.range_constexpr(CS_THREADS // 32):
+            if k < w:
+                pre += ld_shared_u32(scr_a + k * 4)
+        return pre
+
+    @cute.jit
+    def emit4(self, flags, poss, out, orow, lane, base):
+        """Write each flagged pos at output slots base, base + 1, ... in (quad,
+        lane) order; returns base advanced (warp-uniform; all lanes call it). With
+        bases from warp_prefix over the same flags the emission order is a fixed
+        function of the candidate layout: no atomics, so a row's output (and the
+        sparse MLA's key order, which its online softmax depends on) is
+        reproducible."""
         bs = [ballot(f) for f in flags]
-        tot = Uint32(0)
-        for b in bs:
-            tot += popc(b)
-        base = Uint32(0)
-        if lane == 0 and tot != Uint32(0):
-            base = atom_add_shared(slot_a, tot)
-        base = cute.arch.shuffle_sync(base, 0)
         lt = lanemask_lt()
         for k in cutlass.range_constexpr(4):
             if flags[k] != Uint32(0):
                 out[orow + Int64(base + popc(bs[k] & lt))] = poss[k]
             base += popc(bs[k])
+        return base
 
     @cute.jit
     def stage_counts(self, c, slot, cnt_a, part_a, tid, w, lane):
@@ -1946,8 +1986,8 @@ class CandSelect2:
         cnt_a = cnts.iterator.toint()
         part = smem.allocate_tensor(Uint32, cute.make_layout(2 * 4 * 4), 16)
         part_a = part.iterator.toint()
-        # 0..7 warp scan totals, 8..10 scan result, 11 boundary-tile ties, 12 out
-        # slot, 13 tie slot, 14 key min, 15 key max
+        # 0..7 warp scan totals, 8..10 scan result, 11 boundary-tile ties, 12 -,
+        # 13 tie slot, 14 key min, 15 key max
         scr = smem.allocate_tensor(Uint32, cute.make_layout(16), 16)
         scr_a = scr.iterator.toint()
         bars = smem.allocate_tensor(Int64, cute.make_layout(2), 8)
@@ -2001,7 +2041,6 @@ class CandSelect2:
             self.zero_hist(hist_a, tid)
             if tid == 0:
                 st_shared_u32(scr_a + 44, Uint32(0))
-                st_shared_u32(scr_a + 48, Uint32(0))
                 st_shared_u32(scr_a + 52, Uint32(0))
                 st_shared_u32(scr_a + 56, Uint32(0xFFFF))
                 st_shared_u32(scr_a + 60, Uint32(0))
@@ -2047,13 +2086,20 @@ class CandSelect2:
             else:
                 if bad == 0:
                     if Int32(total) <= Int32(K):
+                        nw = Uint32(0)
+                        for s in cutlass.range(w, mc, WARPS, unroll=1):
+                            fl = []
+                            for valid, pos, key in self.quad(rb_a, cnt4, q, s):
+                                fl.append(valid)
+                            nw = self.ballot_count(fl, nw)
+                        base = self.warp_prefix(nw, scr_a, w, lane)
                         for s in cutlass.range(w, mc, WARPS, unroll=1):
                             fl = []
                             ps = []
                             for valid, pos, key in self.quad(rb_a, cnt4, q, s):
                                 fl.append(valid)
                                 ps.append(pos)
-                            self.emit4(fl, ps, scr_a + 48, out, orow, lane)
+                            base = self.emit4(fl, ps, out, orow, lane, base)
                         for i in cutlass.range(Int32(total) + tid, K, CS_THREADS, unroll=1):
                             out[orow + Int64(i)] = Int32(-1)
                     else:
@@ -2191,6 +2237,22 @@ class CandSelect2:
                                 v4 = lds_v4(hist_a + i * 4)
                                 st_global_v4(orow_a + i * 4, v4[0], v4[1], v4[2], v4[3])
                         else:
+                            # takes (keys above t; every tie when all are taken) at
+                            # [0, above (+ m)) in a fixed order; ties at t placed by
+                            # their rank among the ties (below)
+                            nw = Uint32(0)
+                            for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                fl = []
+                                for valid, pos, key in self.quad(rb_a, cnt4, q, s):
+                                    take = Uint32(0)
+                                    if valid != Uint32(0):
+                                        if key > t:
+                                            take = Uint32(1)
+                                        elif key == t and all_ties != Uint32(0):
+                                            take = Uint32(1)
+                                    fl.append(take)
+                                nw = self.ballot_count(fl, nw)
+                            base = self.warp_prefix(nw, scr_a, w, lane)
                             for s in cutlass.range(w, mc, WARPS, unroll=1):
                                 fl = []
                                 ps = []
@@ -2208,7 +2270,7 @@ class CandSelect2:
                                                     st_shared_u32(hist_a + jt * 4, Uint32(pos))
                                     fl.append(take)
                                     ps.append(pos)
-                                self.emit4(fl, ps, scr_a + 48, out, orow, lane)
+                                base = self.emit4(fl, ps, out, orow, lane, base)
                         cute.arch.sync_threads()
                         n_tiles = (n + TILE - 1) // TILE
                         if staged != Uint32(0):
@@ -2225,8 +2287,7 @@ class CandSelect2:
                                         if x + k < Int32(m) and v4[k] < p:
                                             rank += Uint32(1)
                                 if rank < need:
-                                    o = atom_add_shared(scr_a + 48, Uint32(1))
-                                    out[orow + Int64(o)] = Int32(p)
+                                    out[orow + Int64(above + rank)] = Int32(p)
                         elif all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
                             if tid == 0:
                                 row_bin[3 * row + 1] = Int32(1)
@@ -2244,15 +2305,49 @@ class CandSelect2:
                             cute.arch.sync_threads()
                             tb, below, _ = self.scan(rb_a, scr_a, need, tid, w, lane)
                             tile_t = Uint32(CS2_BINS - 1) - tb
+                            # every tie of an older tile is taken, at slot above +
+                            # (ties of older tiles than its own: an exclusive suffix
+                            # sum of the bins, in place) + (ties of its tile with a
+                            # smaller key index: a 128-bit mask per tile)
+                            bm_a = rb_a + (CS2_BINS + TILE) * 4
+                            for i in cutlass.range(tid, Int32(tile_t) * 4, CS_THREADS, unroll=1):
+                                st_shared_u32(bm_a + i * 4, Uint32(0))
+                            hi = Int32(CS2_BINS - 1) - 8 * tid
+                            sm = Uint32(0)
+                            for k in cutlass.range_constexpr(8):
+                                sm += ld_shared_u32(rb_a + (hi - k) * 4)
+                            incl = warp_inclusive(sm, lane)
+                            run = incl - sm + self.warp_prefix(
+                                cute.arch.shuffle_sync(incl, 31), scr_a, w, lane
+                            )
+                            for k in cutlass.range_constexpr(8):
+                                c = ld_shared_u32(rb_a + (hi - k) * 4)
+                                st_shared_u32(rb_a + (hi - k) * 4, run)
+                                run += c
                             for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
                                 p = ld_shared_u32(hist_a + jt * 4)
                                 if (p >> Uint32(7)) < tile_t:
-                                    o = atom_add_shared(scr_a + 48, Uint32(1))
-                                    out[orow + Int64(o)] = Int32(p)
+                                    red_or_shared(
+                                        bm_a + ((p >> Uint32(5)) << Uint32(2)),
+                                        Uint32(1) << (p & Uint32(31)),
+                                    )
                                 elif (p >> Uint32(7)) == tile_t:
                                     o = atom_add_shared(scr_a + 44, Uint32(1))
                                     st_shared_u32(rb_a + (CS2_BINS + o) * 4, p)
                             cute.arch.sync_threads()
+                            for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
+                                p = ld_shared_u32(hist_a + jt * 4)
+                                tl = p >> Uint32(7)
+                                if tl < tile_t:
+                                    r = ld_shared_u32(rb_a + (Uint32(CS2_BINS - 1) - tl) * 4)
+                                    wq = (p >> Uint32(5)) & Uint32(3)
+                                    for k in cutlass.range_constexpr(4):
+                                        word = ld_shared_u32(bm_a + ((tl << Uint32(2)) + Uint32(k)) * 4)
+                                        if Uint32(k) < wq:
+                                            r += popc(word)
+                                        elif Uint32(k) == wq:
+                                            r += popc(word & ((Uint32(1) << (p & Uint32(31))) - Uint32(1)))
+                                    out[orow + Int64(above + r)] = Int32(p)
                             nt = Int32(ld_shared_u32(scr_a + 44))
                             if tid < nt:
                                 p = ld_shared_u32(rb_a + (CS2_BINS + tid) * 4)
@@ -2261,8 +2356,7 @@ class CandSelect2:
                                     if ld_shared_u32(rb_a + (CS2_BINS + x) * 4) < p:
                                         rank += Uint32(1)
                                 if rank < need - below:
-                                    o = atom_add_shared(scr_a + 48, Uint32(1))
-                                    out[orow + Int64(o)] = Int32(p)
+                                    out[orow + Int64(above + below + rank)] = Int32(p)
             cute.arch.sync_threads()
 
 

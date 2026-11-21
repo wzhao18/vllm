@@ -989,6 +989,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -1280,8 +1282,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Setup TMA store for C
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+        # c_store_reduce: the TMA store adds the BF16 tile into C in L2
+        # (cp.reduce.async.bulk.tensor .add): C <- bf16(C + bf16(acc)).
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+            cpasync.CopyReduceBulkTensorTileS2GOp()
+            if getattr(self, "c_store_reduce", False)
+            else cpasync.CopyBulkTensorTileS2GOp(),
             c_tensor,
             epi_smem_layout,
             self.epi_tile,
@@ -1388,6 +1394,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             sched_ctr,
             sched_die_map,
             drain_c_tensor,
+            conv_ckpt,
+            conv_halo,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1447,6 +1455,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
         mCg_mnl: Optional[cute.Tensor] = None,
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -2318,7 +2328,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             mC_mnl.shape[1],
                             (
                                 conv_out, conv_w, conv_side, conv_qsl, conv_norm,
-                                conv_nseq, conv_top, conv_nsteps,
+                                conv_nseq, conv_top, conv_nsteps, conv_ckpt,
+                                conv_halo,
                             ),
                             conv_smem,
                             acc_consumer_state,
@@ -2401,6 +2412,18 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
+                        # N tiles past the shared columns (a cluster N that
+                        # does not divide the tile count, or the padded
+                        # clusters of an "m" raster swizzle) must not store:
+                        # the epilogue bounds rows only and would wrap them
+                        # into the next rows / past the buffer (as the drain
+                        # form above); 0 rows = no stores.
+                        q_rows = mQ_mnl.shape[0]
+                        if (
+                            mma_tile_coord_mnl[1] - self.situ_n_lat_tiles
+                            >= cute.size(mQ_mnl, mode=[1]) // 256
+                        ):
+                            q_rows = cutlass.Int32(0)
                         acc_consumer_state = epilogue_situ_mxfp8(
                             self,
                             tidx,
@@ -2417,7 +2440,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 mma_tile_coord_mnl[1] - self.situ_n_lat_tiles,
                                 mma_tile_coord_mnl[2],
                             ),
-                            mQ_mnl.shape[0],
+                            q_rows,
                             acc_consumer_state,
                             acc_pipeline,
                         )
@@ -2552,6 +2575,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
         mCg_mnl: Optional[cute.Tensor] = None,
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2603,6 +2628,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             sched_ctr,
             sched_die_map,
             mCg_mnl,
+            conv_ckpt,
+            conv_halo,
         )
 
     @staticmethod

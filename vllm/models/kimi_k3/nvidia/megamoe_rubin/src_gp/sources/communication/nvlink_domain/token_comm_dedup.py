@@ -1619,9 +1619,16 @@ class TokenCommDedup(KernelComponent):
         return ceil_div(self.output_token_bytes, self.order_chunk_bytes)
 
     @property
+    def order_row_bytes(self) -> int:
+        """Bytes of one copy in the order buffer: the output row rounded up to the 256 B granule only (the row's last
+        chunk is stored at its own size, not padded to a whole chunk)."""
+        return round_up(self.output_token_bytes, self.order_chunk_granule_bytes)
+
+    @property
     def order_block_bytes(self) -> int:
-        """Bytes of one (src_token, src_rank) block: chunks_per_row x K x chunk."""
-        return self.order_chunks_per_row * self.topk * self.order_chunk_bytes
+        """Bytes of one (src_token, src_rank) block: K copies of ``order_row_bytes``. Chunk c of copy k sits at
+        ``c * K * chunk + k * chunk_size(c)`` with ``chunk_size(c) = min(chunk, order_row_bytes - c * chunk)``."""
+        return self.topk * self.order_row_bytes
 
     @property
     def token_back_push_sf(self) -> bool:
@@ -1810,7 +1817,8 @@ class TokenCommDedup(KernelComponent):
         workspace.register(
             self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
         )
-        # Order buffer [T, R, chunks_per_row, K, chunk]; never cleared (every byte read was written this launch).
+        # Order buffer [T, R, chunks_per_row, K, chunk_size(c)] (tight: the partial last chunk is not padded); never
+        # cleared (every byte read was written this launch).
         order_bytes = self.max_tokens_per_rank * self.world_size * self.order_block_bytes
         workspace.register(
             self.fc2_order_output_region,
@@ -1932,7 +1940,7 @@ class TokenCommDedup(KernelComponent):
     def fc2_activation_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
         """Base of the order buffer as a (T*R*K, 1, hidden) tensor. Only the base pointer and the hidden extent
         (shape[2]) are meaningful: the epilogue addresses rows through the chunked layout
-        [T, R, chunks_per_row, K, chunk] (``dedup_chunk_bytes`` / ``dedup_chunks_per_row`` in its impl_desc)."""
+        [T, R, chunks_per_row, K, chunk_size(c)] (``dedup_chunk_bytes`` / ``dedup_row_bytes`` in its impl_desc)."""
         rows = self.max_tokens_per_rank * self.world_size * self.topk
         return cute.make_tensor(
             device_workspace.ptr(self.fc2_order_output_region),
@@ -2366,6 +2374,8 @@ class TokenCommDedup(KernelComponent):
         chunk_idx = fill_idx // fills_per_chunk
         first_copy = (fill_idx - chunk_idx * fills_per_chunk) * Int32(self.token_back_copies_per_fill)
         copies = cutlass.min(Int32(self.token_back_copies_per_fill), copy_count - first_copy)
+        # Tight order layout: the row's last chunk is stored (and loaded) at its own size, copies packed at that stride.
+        chunk_size = cutlass.min(Int32(chunk_bytes), Int32(self.order_row_bytes) - chunk_idx * Int32(chunk_bytes))
         buffer_idx = sequence % Int32(self.token_back_fill_buffers)
         mbarrier = worker_mbarriers + buffer_idx
         destination = cute.make_ptr(
@@ -2374,9 +2384,10 @@ class TokenCommDedup(KernelComponent):
             AddressSpace.smem,
             assumed_align=16,
         )
-        source = block_address + (Int64(chunk_idx) * Int64(self.topk) + Int64(first_copy)) * Int64(chunk_bytes)
-        cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, copies * Int32(chunk_bytes))
-        tma_load_1d(destination, source, mbarrier, copies * Int32(chunk_bytes))
+        source = (block_address + Int64(chunk_idx) * Int64(self.topk * chunk_bytes)
+                  + Int64(first_copy) * Int64(chunk_size))
+        cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, copies * chunk_size)
+        tma_load_1d(destination, source, mbarrier, copies * chunk_size)
 
     @cute.jit
     def _reduce_and_push(
@@ -2433,6 +2444,8 @@ class TokenCommDedup(KernelComponent):
             sequence = fill_sequence + fill_idx
             buffer_base = stage_base + (sequence % Int32(self.token_back_fill_buffers)) * Int32(copies_per_fill * chunk_bytes)
             current_vectors = cutlass.min(Int32(chunk_bytes), Int32(output_token_bytes) - chunk_idx * Int32(chunk_bytes)) // Int32(16)
+            # SMEM stride of the copies in this fill = the chunk's stored size (see _issue_fill).
+            chunk_size = cutlass.min(Int32(chunk_bytes), Int32(self.order_row_bytes) - chunk_idx * Int32(chunk_bytes))
             # Prefetch fill i+1 into the other buffer. If that buffer just fed a bulk copy, wait for its READ only.
             if fill_idx + Int32(1) < fill_count:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -2455,7 +2468,7 @@ class TokenCommDedup(KernelComponent):
                         vector_idx = Int32(group * 32) + lane_idx
                         if vector_idx < current_vectors:
                             slot_vector = cute.make_tensor(
-                                cute.make_ptr(cutlass.Int32, buffer_base + Int32(copy_in_fill * chunk_bytes) + vector_idx * Int32(16),
+                                cute.make_ptr(cutlass.Int32, buffer_base + Int32(copy_in_fill) * chunk_size + vector_idx * Int32(16),
                                               AddressSpace.smem, assumed_align=16),
                                 vector_layout,
                             )

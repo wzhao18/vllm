@@ -135,6 +135,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # P side: lease renewals that arrived on the side channel.
         if lease_renewals := getattr(metadata, "lease_renewals", None):
             self._handle_heartbeat(",".join(lease_renewals))
+        # P side: D posted these reads; keep the leases until released.
+        if lease_pins := getattr(metadata, "lease_pins", None):
+            self._handle_lease_pins(lease_pins)
 
     def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
         """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
@@ -214,6 +217,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
+        self._pin_remote_lease(meta)
         if any(len(group) > 0 for group in meta.local_block_ids):
             # The scheduler waits for finished_recving from *every* worker.
             # Under DCP a rank's slice can legitimately come out empty when its

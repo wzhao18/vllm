@@ -94,6 +94,13 @@ class SharedSituGemm:
         n, k = weight_nk.shape
         if n % 256 or k % 128:
             raise ValueError(f"shared SiTU GEMM: unsupported N/K ({n}, {k})")
+        if tactic[0][1] != 256:
+            # The SiTU epilogue pairs the 128 gate and 128 up columns of one
+            # 256-wide N tile (interleave_gate_up_rows); N tiles past column N
+            # (padded clusters of the swizzled "m" raster, or a cluster N that
+            # does not divide n / 256) are dropped in the kernel, so any n that
+            # 256 divides is safe with any cluster / swizzle.
+            raise ValueError(f"shared SiTU GEMM: tile N {tactic[0][1]} (256 only)")
         self.weight, self.scale, self.tactic = weight_nk, scale, tactic
         self.n, self.k = n, k
         k_host, self.a_pow, self.clamp_up = situ_constants(beta, linear_beta)

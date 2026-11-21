@@ -109,6 +109,16 @@ class Mxfp8PreGemm:
             # the push epilogue stages its tile in the drained A ring: one tile per CTA
             # (cluster) and 128 rows per CTA
             tile, cluster = tactic[0], tactic[1]
+            from .push_epilogue import WIDTH
+
+            # The push epilogue stores tile rows with raw addresses at the receive
+            # slots' fixed row pitch WIDTH and bounds rows only: every N tile must
+            # lie inside [0, WIDTH) and the tile's rows must be tokens (no swap_ab).
+            if n != WIDTH or n % tile[1] or self.swap_ab:
+                raise ValueError(
+                    f"push: N {n} must be the receive row width {WIDTH}, a multiple "
+                    f"of tile N {tile[1]}, without swap_ab ({tactic})"
+                )
             tiles = -(-rows // tile[0]) * -(-n // tile[1])
             if tiles > _max_active_clusters(cluster[0] * cluster[1]):
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")

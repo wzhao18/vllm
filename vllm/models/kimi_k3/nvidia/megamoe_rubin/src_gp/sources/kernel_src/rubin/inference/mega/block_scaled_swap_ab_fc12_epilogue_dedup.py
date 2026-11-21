@@ -1,6 +1,6 @@
 """Dedup FC2 epilogue: SMEM-staged subtiles pushed with one ``cp.async.bulk`` per token. ``dst_token_cnt == 1``
 rows go straight to the source rank's ``pre_reduced[src_token][my_rank]``, others into the local order buffer
-``[T, R, chunks_per_row, K, chunk]`` for the combine warps. Top-k scores are applied at FC1 only."""
+``[T, R, chunks_per_row, K, chunk_size(c)]`` for the combine warps. Top-k scores are applied at FC1 only."""
 
 from __future__ import annotations
 
@@ -39,7 +39,8 @@ class GatedActEpilogueArgsDedup(GatedActEpilogueArgs):
 @dataclasses.dataclass(frozen=True)
 class Fc2DedupBulkRouter:
     """Per work tile: the bulk-copy destination of every token this thread owns. Order-buffer slot =
-    ``(((src_token * R + src_rank) * chunks_per_row + hidden_chunk) * K + dst_order_id) * chunk``; single-copy
+    ``(src_token * R + src_rank) * K * row_bytes + hidden_chunk * K * chunk + dst_order_id * chunk_size(hidden_chunk)``
+    with ``chunk_size(c) = min(chunk, row_bytes - c * chunk)`` (tight: the partial last chunk is not padded); single-copy
     tokens map to ``pre_reduced[src_token][slot][hidden_base]`` (slot = my rank, 0 under in-kernel REDG)."""
 
     metadata: cute.Tensor  # domain-offset to the tile's first pool row
@@ -54,6 +55,7 @@ class Fc2DedupBulkRouter:
     topk: int
     chunk_bytes: int
     chunks_per_row: int
+    row_bytes: int
     element_bytes: int
     reduce_topk_in_kernel: bool
     mapping: FunctionMapping  # per-issue (epi_tid, iter_idx) -> token_in_cta_tile
@@ -70,6 +72,7 @@ class Fc2DedupBulkRouter:
         hidden_base_bytes = Int64(self.hidden_base) * Int64(self.element_bytes)
         chunk_index = hidden_base_bytes // Int64(self.chunk_bytes)
         byte_in_chunk = hidden_base_bytes - chunk_index * Int64(self.chunk_bytes)
+        chunk_size = cutlass.min(Int64(self.chunk_bytes), Int64(self.row_bytes) - chunk_index * Int64(self.chunk_bytes))
         remote_slot = Int32(0) if cutlass.const_expr(self.reduce_topk_in_kernel) else self.local_rank
         for iter_idx in cutlass.range_constexpr(copy_iters):
             token_in_tile = Int32(self.mapping.evaluate(epi_tid=self.epi_tid, iter_idx=iter_idx)["token_in_cta_tile"])
@@ -88,10 +91,13 @@ class Fc2DedupBulkRouter:
                     valid[iter_idx] = Int32(2) if cutlass.const_expr(self.reduce_topk_in_kernel) else Int32(1)
                 else:
                     block_index = Int64(md.src_token) * Int64(self.world_size) + Int64(md.src_rank)
-                    slot_index = (block_index * Int64(self.chunks_per_row) + chunk_index) * Int64(self.topk) + Int64(
-                        md.dst_order_id
+                    dst_ptrs[iter_idx] = (
+                        self.order_base
+                        + block_index * Int64(self.topk * self.row_bytes)
+                        + chunk_index * Int64(self.topk * self.chunk_bytes)
+                        + Int64(md.dst_order_id) * chunk_size
+                        + byte_in_chunk
                     )
-                    dst_ptrs[iter_idx] = self.order_base + slot_index * Int64(self.chunk_bytes) + byte_in_chunk
                     valid[iter_idx] = Int32(1)
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid, copy_iters=copy_iters)
 
@@ -256,6 +262,7 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
             topk=self.dedup_topk,
             chunk_bytes=self.dedup_chunk_bytes,
             chunks_per_row=self.dedup_chunks_per_row,
+            row_bytes=self.dedup_row_bytes,
             element_bytes=self.combine_format.act_dtype.width // 8,
             reduce_topk_in_kernel=self.reduce_topk_in_kernel,
             mapping=self.process_pipeline.store_out_mapping,
@@ -315,9 +322,11 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
             **super().impl_desc_require(),
             "dedup_world_size": int,
             "dedup_topk": int,
-            # Order buffer layout [T, R, chunks_per_row, K, chunk_bytes] (from TokenCommDedup).
+            # Order buffer layout [T, R, chunks_per_row, K, chunk_size(c)] (from TokenCommDedup).
             "dedup_chunk_bytes": int,
             "dedup_chunks_per_row": int,
+            # Bytes of one stored copy (the output row rounded up to the hidden tile; no whole-chunk padding).
+            "dedup_row_bytes": int,
         }
 
     def _make_fc2_epilogue(self, *args, **kwargs) -> SwapABFc2EpilogueDedup:
@@ -329,6 +338,7 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
         self.dedup_topk = int(impl_desc["dedup_topk"])
         self.dedup_chunk_bytes = int(impl_desc["dedup_chunk_bytes"])
         self.dedup_chunks_per_row = int(impl_desc["dedup_chunks_per_row"])
+        self.dedup_row_bytes = int(impl_desc["dedup_row_bytes"])
         self.apply_topk_at_fc1 = bool(problem_desc["apply_topk_at_fc1"])
         if not self.apply_topk_at_fc1:
             raise ValueError("Combine dedup applies top-k scores at FC1 only (pre_fc1_quant); post_fc2 is not supported.")
@@ -351,6 +361,15 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
             raise ValueError(
                 f"Combine dedup needs dedup_chunk_bytes as a multiple of the {tile_bytes} B hidden tile, got "
                 f"{self.dedup_chunk_bytes}."
+            )
+        if self.dedup_row_bytes <= 0 or self.dedup_row_bytes % tile_bytes != 0 or not (
+            (self.dedup_chunks_per_row - 1) * self.dedup_chunk_bytes
+            < self.dedup_row_bytes
+            <= self.dedup_chunks_per_row * self.dedup_chunk_bytes
+        ):
+            raise ValueError(
+                f"Combine dedup needs dedup_row_bytes as a multiple of the {tile_bytes} B hidden tile within the last "
+                f"of {self.dedup_chunks_per_row} chunks of {self.dedup_chunk_bytes} B, got {self.dedup_row_bytes}."
             )
         # The base resolved fc2_use_bulk + local output as the TMA tile store; dedup stores per token with UBLK.
         self.fc2_use_tma = False

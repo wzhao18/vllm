@@ -340,6 +340,7 @@ def _launch_forward(
     gate_roll=False,
     partial_tma=True,
     srow=None,
+    compile_only=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -418,6 +419,8 @@ def _launch_forward(
         state_rows=srow is not None,
         partial_tma=partial_tma,
     )
+    if compile_only:
+        return None
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
         qf,
@@ -642,6 +645,23 @@ def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
     )
 
 
+def beta_tma_supported(beta) -> bool:
+    """The beta TMA path loads (C tokens x 8 heads) BF16 boxes from the
+    (tokens, H) beta rows: the row stride (2H bytes) and the base must be
+    16-byte multiples, i.e. H % 8 == 0. Other head counts (the TP8 shard of the
+    96-head KDA has 12; 4, 6, 20 likewise) take the per-element beta loads:
+    with TMA their output and final state were wrong (rel. RMS 0.4-0.6 vs
+    FlashKDA, BUG-DCP8-3)."""
+    H = beta.shape[-1]
+    return (
+        beta.dtype == torch.bfloat16
+        and beta.stride(-1) == 1
+        and (H * beta.element_size()) % 16 == 0
+        and all((s * beta.element_size()) % 16 == 0 for s in beta.stride()[:-1])
+        and beta.data_ptr() % 16 == 0
+    )
+
+
 def make_plan(offsets, H, dev):
     """Build private scheduling and handoff storage from validated host offsets."""
     lens = [end - start for start, end in zip(offsets, offsets[1:], strict=False)]
@@ -685,6 +705,7 @@ def fwd(
     cu_seqlens=None,
     plan=None,
     srow=None,
+    compile_only=False,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -701,6 +722,15 @@ def fwd(
         has_split,
         full_chunks,
     ) = plan
+    # The beta TMA choice depends on the head count only (H % 8 == 0): a beta
+    # view whose base or row stride is misaligned is copied, so serving launches
+    # the variant warm-up compiled for H and never JITs.
+    if (
+        beta.dtype == torch.bfloat16
+        and beta.shape[-1] % 8 == 0
+        and not beta_tma_supported(beta)
+    ):
+        beta = beta.clone(memory_format=torch.contiguous_format)
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()
@@ -732,7 +762,7 @@ def fwd(
         sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
         gate2=1 if (fixed or not full_chunks) else 0,
         has_split=has_split,
-        beta_tma=True,
+        beta_tma=beta_tma_supported(beta),
         qk_rowpair=4 if fixed else 8,
         restore_tail=False,
         reg_mode=2,
@@ -742,4 +772,37 @@ def fwd(
         gate_roll=not fixed,
         partial_tma=not fixed,
         srow=srow,
+        compile_only=compile_only,
     )
+
+
+def warm_compile(H: int, dev: torch.device, lower_bound: float) -> None:
+    """Compile (or load from the CuTe cache) every kernel variant fwd() can
+    launch for H heads: single or packed sequences, full or partial chunks,
+    with or without split chain pieces, in-place state rows or gathered
+    states. Runs fwd()'s own flag derivation on small dummies and stops
+    before the launch, so serving steps never compile."""
+    T = 2 * C_TOK
+    bf = torch.bfloat16
+    q = torch.zeros(1, T, H, D, dtype=bf, device=dev)
+    beta = torch.zeros(1, T, H, dtype=bf, device=dev)
+    A_log = torch.zeros(H, dtype=torch.float32, device=dev)
+    dt_bias = torch.zeros(H, D, dtype=torch.float32, device=dev)
+    for nseq in (1, 2):
+        offs = [0, T] if nseq == 1 else [0, C_TOK, T]
+        cu32 = torch.tensor(offs, dtype=torch.int32, device=dev)
+        state = torch.zeros(nseq, H, D, D, dtype=torch.float32, device=dev)
+        srow = torch.zeros(2 * nseq * H, dtype=torch.int64, device=dev)
+        idx = torch.zeros(nseq * H + 1, dtype=torch.int32, device=dev)
+        mid = torch.zeros(1, D, D, dtype=torch.float32, device=dev)
+        mfl = torch.zeros(1, dtype=torch.int32, device=dev)
+        for full_chunks in (False, True):
+            for has_split in (False, True):
+                plan = (cu32, idx, idx, idx, idx, idx, idx, nseq * H, mid, mfl)
+                plan += (has_split, full_chunks)
+                for rows in (None, srow):
+                    fwd(q, q, q, q, beta, D**-0.5, q, A_log, dt_bias,
+                        lower_bound, initial_state=state, final_state=state,
+                        cu_seqlens=cu32, plan=plan, srow=rows,
+                        compile_only=True)
+

@@ -1349,8 +1349,14 @@ def epilogue_kda_conv_t2(
     sequence edge row; the column pass loads all 19 rows, runs the 16 conv +
     SiLU chains, and stores them unpredicated unless the chunk crosses the
     end of the rows or some d > 2^126 (then the exact per-row path). Rows
-    0-2 of blocks and sequences are stored too and rewritten by the fix-up."""
-    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv
+    0-2 of blocks and sequences are stored too and rewritten by the fix-up.
+
+    With ``ckpt_addr`` (int32 checkpoint offset per sequence, 0 = none) the
+    drain thread also saves the three pre-conv rows before each checkpoint
+    (offset >= 3) to ``halo_addr`` rows ``3 s + j``: the window the prefix-cache
+    checkpoint exporter stores as that checkpoint's conv state."""
+    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv[:8]
+    ckpt_addr, halo_addr = conv[8], conv[9]
     g = tidx // 128
     gt = tidx % 128
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
@@ -1388,6 +1394,12 @@ def epilogue_kda_conv_t2(
     sln = ldg_s32(qsl_addr + Int64(s_t + 1) * 4) - st0
     pos = trow - st0
     rb = trow % 128
+    # Checkpoint halo row (branch-free: without checkpoints the offset load
+    # reads qsl and the predicate is 0).
+    ck_on = b2i(ckpt_addr != Int64(0))
+    ck = ldg_s32(qsl_addr + Int64(ck_on) * (ckpt_addr - qsl_addr) + Int64(s_t) * 4)
+    hj = pos - ck + 3
+    pk = ck_on * b2i(ck >= 3) * b2i(hj >= 0) * b2i(hj < 3)
 
     acc_pipeline.consumer_wait(acc_consumer_state)
     xs_all = []
@@ -1403,21 +1415,22 @@ def epilogue_kda_conv_t2(
     pb1 = b2i(rb >= 125)
     ps0 = b2i(pos < 3)
     ps1 = b2i(pos >= sln - 3)
-    if b2i(trow < row_end) * (pb0 | pb1 | ps0 | ps1) != 0:
+    if b2i(trow < row_end) * (pb0 | pb1 | ps0 | ps1 | pk) != 0:
         tb = Int64(trow // 128) * 6
         side_seq = Int64(n_blk) * 6 + Int64(s_t) * 6
         dst = (
-            tb + Int64(rb),
-            tb + Int64(rb - 122),
-            side_seq + Int64(pos),
-            side_seq + Int64(pos - sln + 6),
+            side_addr + (tb + Int64(rb)) * Int64(n_cols) * 2,
+            side_addr + (tb + Int64(rb - 122)) * Int64(n_cols) * 2,
+            side_addr + (side_seq + Int64(pos)) * Int64(n_cols) * 2,
+            side_addr + (side_seq + Int64(pos - sln + 6)) * Int64(n_cols) * 2,
+            halo_addr + (Int64(s_t) * 3 + Int64(hj)) * Int64(n_cols) * 2,
         )
-        prd = (pb0, pb1, ps0, ps1)
+        prd = (pb0, pb1, ps0, ps1, pk)
         for sni in cutlass.range_constexpr(epi_n):
             sxs = xs_all[sni]
             sc0 = tTR_cC[(None, None, None, g, sni)][0][1]
-            for sd in cutlass.range_constexpr(4):
-                sbase = side_addr + (dst[sd] * Int64(n_cols) + Int64(sc0)) * 2
+            for sd in cutlass.range_constexpr(5):
+                sbase = dst[sd] + Int64(sc0) * 2
                 for sq in cutlass.range_constexpr(4):
                     stg_v4(sbase + sq * 16, prd[sd], *sxs[4 * sq : 4 * sq + 4])
 
