@@ -148,6 +148,51 @@ class _WarmupBlocks:
         return self.alloc_counts(self.counts(num_tokens))
 
 
+
+def _owner_region_block_ids(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+) -> Callable[[SchedulerOutput], Any]:
+    """DSA-DP per-card DSA KV (``v1/core/dsa_dp_regions.py``): hand-built warmup
+    steps take block ids from this card's pages ``[0, S + D)``, but the scheduler
+    addresses a request's DSA groups in its owner card's region
+    ``[S + c * D, S + (c + 1) * D)`` and the worker maps them back by the owner
+    (``dsa_dp.localize_tables``). Give the warmup requests' DSA-group ids their
+    owner's region form (the owner every card derives from the request id), so a
+    warmup id in ``[S, S + D)`` owned by card ``c > 0`` is not read as page
+    ``id - c * D`` (another group's or a negative page: illegal address)."""
+    kv_cfg = model_runner.kv_cache_config
+    if kv_cfg.dsa_dp_region_blocks <= 0 or getattr(
+        worker_execute_model, "_dsa_dp_owner_ids", False
+    ):
+        return worker_execute_model
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    group_ids = kv_cfg.dsa_dp_group_ids
+
+    def to_owner(req_id: str, block_ids: Any) -> Any:
+        if block_ids is None:
+            return None
+        owner = int(dsa_dp.owners_of([req_id])[0])
+        ids = list(block_ids)
+        for g in group_ids:
+            ids[g] = dsa_dp.region_block_ids(ids[g], kv_cfg, owner, to_global=True)
+        return tuple(ids)
+
+    def execute(scheduler_output: SchedulerOutput) -> Any:
+        for req in scheduler_output.scheduled_new_reqs:
+            req.block_ids = to_owner(req.req_id, req.block_ids)
+        cached = scheduler_output.scheduled_cached_reqs
+        cached.new_block_ids = [
+            to_owner(req_id, block_ids)
+            for req_id, block_ids in zip(cached.req_ids, cached.new_block_ids)
+        ]
+        return worker_execute_model(scheduler_output)
+
+    execute._dsa_dp_owner_ids = True  # type: ignore[attr-defined]
+    return execute
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -158,6 +203,7 @@ def run_mixed_prefill_decode_warmup(
     req_id_prefix: str = "_v2_mixed_warmup",
 ) -> bool:
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
+    worker_execute_model = _owner_region_block_ids(model_runner, worker_execute_model)
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
 
@@ -292,6 +338,7 @@ def warmup_kernels(
     We must call the provided worker's execute_model for pipeline parallel
     coordination.
     """
+    worker_execute_model = _owner_region_block_ids(model_runner, worker_execute_model)
     # Adaptive costs are calibrated during capture, after this warmup. Exercise
     # fixed draft counts here, then restore the manager for capture and serving.
     adaptive_verification = model_runner.adaptive_verification
@@ -988,6 +1035,7 @@ def serving_shape_warmup_kernels(
 ) -> None:
     """``serving_shape_warmup`` with fixed draft counts (as ``warmup_kernels``:
     adaptive verification is calibrated during capture, after this)."""
+    worker_execute_model = _owner_region_block_ids(model_runner, worker_execute_model)
     if not current_platform.is_cuda_alike():
         return
     adaptive_verification = model_runner.adaptive_verification
