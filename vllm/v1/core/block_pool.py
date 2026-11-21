@@ -1259,6 +1259,8 @@ class SlotBlockPool(BlockPool):
         self.blocks: list[KVCacheBlock | None] = [self.null_block] + [  # type: ignore[assignment]
             None
         ] * (self.num_gpu_blocks - 1)
+        # The hash map resolves cached block ids through the slot list.
+        self.cached_block_hash_to_block = BlockHashToBlockMap(self.blocks)  # type: ignore[arg-type]
         # Held parent blocks: referenced slots in each.
         self._held: dict[int, KVCacheBlock] = {}
         self._num_used: dict[int, int] = {}
@@ -1284,7 +1286,7 @@ class SlotBlockPool(BlockPool):
         end = start + self.slots_per_block
         if self.blocks[end - 1] is None:
             for slot_id in range(start, end):
-                self.blocks[slot_id] = KVCacheBlock(slot_id, pool=self)
+                self.blocks[slot_id] = KVCacheBlock(slot_id, pool=self._weak_self)
         return self.blocks[start:end]  # type: ignore[return-value]
 
     def _take_row(self) -> None:
@@ -1388,7 +1390,7 @@ class SlotBlockPool(BlockPool):
         blocks = list(ordered_blocks)
         num_frees: dict[int, int] = {}
         for block in blocks:
-            if not block.is_null and block.pool is self:
+            if not block.is_null and block.pool is self._weak_self:
                 num_frees[block.block_id] = num_frees.get(block.block_id, 0) + 1
         emptied: list[int] = []
         for slot_id, count in num_frees.items():
@@ -1413,7 +1415,7 @@ class SlotBlockPool(BlockPool):
         for row, row_block in list(self._released.items()):
             self.drop_row(row)
             self.parent._slot_rows.pop(row_block.block_id, None)
-        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_block_hash_to_block.clear()
         self.cached_block_hashes_by_block.clear()
         self._lru_since.clear()
         return True
