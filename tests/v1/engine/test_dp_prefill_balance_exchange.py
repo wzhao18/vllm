@@ -4,6 +4,7 @@
 takes part in exactly one exchange of the step's scheduled token count over the
 engine DP group (gloo, CPU only), whether or not it schedules anything."""
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import torch.multiprocessing as mp
 
 from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.utils.network_utils import get_open_port
+from vllm.v1.core.sched.dp_step_plan import choose_step_cap, step_cap_ladder
 from vllm.v1.engine.core import DPEngineCoreProc
 
 pytestmark = pytest.mark.cpu_test
@@ -46,6 +48,7 @@ def _fake_core(pg, sched, engines_running=True, pull_up=True):
         dp_prefill_pull_up=pull_up,
         _dp_prefill_exchanged=False,
         _dp_step_token_floor=2048,
+        _dp_step_caps=Counter(),
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(cpu_distributed_timeout=None)
         ),
@@ -119,29 +122,13 @@ def test_not_armed_when_engines_idle_or_disabled():
         assert sched.got == [] and sched.exchange is None
 
 
-def test_dp_step_token_cap_policy():
-    from vllm.v1.engine.core import dp_step_token_cap
-
-    # Idle or light group: the floor (largest CUDA-graph batch).
-    assert dp_step_token_cap(0, 16, 16384, 2048) == 2048
-    assert dp_step_token_cap(16 * 1000, 16, 16384, 2048) == 2048
-    # Mean outstanding prompt tokens per rank, rounded up to 128.
-    assert dp_step_token_cap(16 * 6000, 16, 16384, 2048) == 6016
-    assert dp_step_token_cap(100_000, 16, 16384, 2048) == 6272
-    # Saturated group: no cap (the configured budget).
-    assert dp_step_token_cap(16 * 16384, 16, 16384, 2048) is None
-    assert dp_step_token_cap(10**7, 16, 16384, 2048) is None
-    # Floor never above the budget.
-    assert dp_step_token_cap(0, 4, 1024, 2048) == 1024
-
-
 def _cap_worker(rank, world_size, port, out):
     pg = stateless_init_torch_distributed_process_group(
         "127.0.0.1", port, rank, world_size, backend="gloo"
     )
     sched = _Sched([])
     core = _fake_core(pg, sched)
-    # Every rank sets the same cap from the group's total demand.
+    # Every rank sets the same cap from the per-rank demands.
     got = DPEngineCoreProc._exchange_dp_prefill_tokens(core, 100 * rank, 4096 * rank)
     out[rank] = (got, sched.caps)
 
@@ -162,6 +149,8 @@ def test_exchange_sets_the_same_cap_on_every_rank():
         for p in ps:
             p.join(timeout=120)
             assert p.exitcode == 0
-        # demand 0 + 4096 + 8192 + 12288 = 24576 -> 6144 per rank
+        # demands 0 / 4096 / 8192 / 12288: 8K covers 20480 of 24576 tokens.
+        expect = choose_step_cap([0, 4096, 8192, 12288], step_cap_ladder(2048, 16384))
+        assert expect == 8192
         for rank in range(world_size):
-            assert out[rank] == (300, [6144])
+            assert out[rank] == (300, [expect])

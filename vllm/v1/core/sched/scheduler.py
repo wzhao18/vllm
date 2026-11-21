@@ -3393,10 +3393,11 @@ class Scheduler(SchedulerInterface):
         self._dp_step_token_cap = cap
 
     def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
-        """Prompt tokens this rank still has to compute after this step's
-        schedule: running prefills plus waiting requests whose prefix hit is
-        known (resumed, or loading / loaded from a KV connector). New requests
-        whose prefix lookup is still pending count once it resolves."""
+        """Prompt tokens this rank can compute after this step's schedule:
+        running prefills plus waiting requests whose prefix hit is known and
+        in place (resumed, or loaded by a KV connector). Requests whose prefix
+        lookup or connector load is still in flight count once it completes:
+        until then no step can run them."""
         demand = 0
         for request in self.running:
             left = request.num_prompt_tokens - request.num_computed_tokens
@@ -3404,7 +3405,10 @@ class Scheduler(SchedulerInterface):
                 demand += max(left - num_scheduled_tokens.get(request.request_id, 0), 0)
         for queue in (self.kv_holding_waiting, self.waiting):
             for request in queue:
-                if request.num_computed_tokens > 0:
+                if request.num_computed_tokens > 0 and (
+                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or request.request_id in self.finished_recving_kv_req_ids
+                ):
                     demand += max(
                         request.num_prompt_tokens
                         - request.num_computed_tokens

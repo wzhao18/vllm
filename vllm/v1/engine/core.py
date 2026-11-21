@@ -6,7 +6,7 @@ import queue
 import signal
 import threading
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
@@ -70,6 +70,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
 )
+from vllm.v1.core.sched.dp_step_plan import choose_step_cap, step_cap_ladder
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -119,31 +120,8 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
-# DP lockstep step cap: floor when the model has no CUDA-graph capture sizes,
-# and the granularity the cap is rounded up to.
+# DP lockstep step cap: floor when the model has no CUDA-graph capture sizes.
 DP_STEP_TOKEN_FLOOR = 2048
-DP_STEP_TOKEN_ALIGN = 128
-
-
-def dp_step_token_cap(
-    total_demand: int, dp_size: int, max_tokens: int, floor: int
-) -> int | None:
-    """Token budget of a DP rank's next lockstep steps (None = uncapped).
-
-    The steps of an EP group's DP ranks run in lockstep and cost the busiest
-    rank's chunk, while a request's admission and each of its chunks wait for
-    whole steps. The cap is the group's outstanding prompt tokens per rank
-    (rounded up), so the group finishes that work in short steps instead of
-    one rank's full-budget chunk holding every rank; at saturation it reaches
-    the configured budget (no cap). It never goes below ``floor`` (the largest
-    CUDA-graph batch), where shorter steps stop paying off.
-    """
-    floor = min(floor, max_tokens)
-    mean = -(-total_demand // max(dp_size, 1))
-    cap = -(-mean // DP_STEP_TOKEN_ALIGN) * DP_STEP_TOKEN_ALIGN
-    if cap >= max_tokens:
-        return None
-    return max(cap, floor)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -2531,6 +2509,8 @@ class DPEngineCoreProc(EngineCoreProc):
             or DP_STEP_TOKEN_FLOOR,
             scheduler_config.max_num_batched_tokens,
         )
+        # DP lockstep step caps chosen since the last report (dp_step_plan).
+        self._dp_step_caps: Counter[int | None] = Counter()
         if (
             scheduler_config.long_prefill_token_threshold > 0
             and not self.dp_prefill_pull_up
@@ -2810,14 +2790,27 @@ class DPEngineCoreProc(EngineCoreProc):
                 "DP prefill pull-up exchange is out of step across DP ranks "
                 f"({int(counts[2 * size])} of {size} ranks)."
             )
-        self.scheduler.set_dp_step_token_cap(
-            dp_step_token_cap(
-                int(counts[size : 2 * size].sum()),
-                size,
-                self.scheduler.max_num_scheduled_tokens,
-                self._dp_step_token_floor,
-            )
+        cap = choose_step_cap(
+            counts[size : 2 * size].tolist(),
+            step_cap_ladder(
+                self._dp_step_token_floor, self.scheduler.max_num_scheduled_tokens
+            ),
         )
+        self.scheduler.set_dp_step_token_cap(cap)
+        self._dp_step_caps[cap] += 1
+        if self._dp_step_caps.total() >= 2000:
+            if self.dp_group.rank() == 0:
+                logger.info(
+                    "DP step cap over the last %d steps: %s",
+                    self._dp_step_caps.total(),
+                    {
+                        c or "none": n
+                        for c, n in sorted(
+                            self._dp_step_caps.items(), key=lambda cn: cn[0] or 1 << 62
+                        )
+                    },
+                )
+            self._dp_step_caps.clear()
         return int(counts[:size].max())
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
