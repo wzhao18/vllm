@@ -345,9 +345,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             local_ids[g], remote_ids[g] = self._pair_blocks_from_end(
                                 local_ids[g], remote_ids[g], num_blocks
                             )
-                            if sub_blocks > 1 and local_ids[g]:
+                            if (
+                                sub_blocks > 1
+                                and local_ids[g]
+                                and g not in self._slot_groups
+                            ):
                                 # A sub-block's heads are not contiguous: read
-                                # them per head (_read_draft_heads).
+                                # them per head (_read_draft_heads). Slot-packed
+                                # drafts keep whole blocks (contiguous heads).
                                 assert peer is not None
                                 assert rank in peer.draft_dst_handles
                                 draft_reads.append(
@@ -511,7 +516,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """Post the per-head READs of a sub-block peer's draft groups (see
         ``_draft_head_dlists``), without notifying P. Returns False when the
         request was routed to failure reporting."""
-        regions = sorted(self._head_sharded_draft_regions)
+        regions = self._sub_block_draft_regions()
         local_offsets = self._draft_head_region_offsets
         peer = self._sub_block_peers[engine_id]
         remote_offsets = peer.draft_region_offsets

@@ -246,10 +246,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 f"groups, this decoder has {len(groups)}; set the same "
                 "VLLM_PACKED_KV_STATE_GROUPS on both"
             )
+        # KDA states pair by state; slot-packed groups (blocks_per_pool_block >
+        # 1, e.g. the release GQA draft at the prefix-match unit) hold their own
+        # token count per block on both sides: neither is split.
         params["remote_block_ids"] = [
             ids
             if get_representative_spec_type(group.kv_cache_spec)
             in (MambaSpec, CircularBufferSpec)
+            or group.blocks_per_pool_block > 1
             else expand_sub_block_ids(
                 ids,
                 sub_blocks,
