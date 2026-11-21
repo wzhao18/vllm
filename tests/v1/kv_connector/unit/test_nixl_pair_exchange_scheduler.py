@@ -619,7 +619,9 @@ def test_deferred_admission_promotes_after_the_exchange_step(async_scheduling: b
         in_flight.append(outputs[-1])
         if len(in_flight) >= depth:
             done = in_flight.popleft()
-            engine.update(done, finished={req_id} if done is outputs[1] else None)
+            # The pull ends with the second step's output.
+            ended = len(outputs) > 1 and done is outputs[1]
+            engine.update(done, finished={req_id} if ended else None)
     [emitted_at] = engine.emissions(req_id)
     assert req_id not in outputs[emitted_at].num_scheduled_tokens
     assert engine.promoted[req_id] == emitted_at + 1
