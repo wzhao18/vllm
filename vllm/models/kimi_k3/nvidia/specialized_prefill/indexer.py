@@ -1698,6 +1698,12 @@ def key16_of_word(wd):
 
 
 TIE_RANK = 256  # threshold ties ranked directly (more: the tile histogram path)
+# Tile-histogram tie path: CS2_BINS position bins of 128 keys (rows of up to
+# CS2_BINS * 128 = 262,144 keys) or, for longer rows, of 256 keys, as long as the
+# position bitmap of the bins below the boundary bin fits the consumed candidate
+# buffer after the bins and the boundary bin's ties (up to 256 of them).
+TIE_BM_OFF = CS2_BINS + 2 * TILE  # words: bins, boundary-bin ties, then the bitmap
+TIE_LONG_KEYS = (CAP - TIE_BM_OFF) * 32  # longest row of the 256-key bins
 
 
 @asm()
@@ -2288,7 +2294,10 @@ class CandSelect2:
                                             rank += Uint32(1)
                                 if rank < need:
                                     out[orow + Int64(above + rank)] = Int32(p)
-                        elif all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
+                        elif all_ties == Uint32(0) and (
+                            m > Uint32(CS2_BINS)
+                            or (n_tiles > Int32(CS2_BINS) and n > Int32(TIE_LONG_KEYS))
+                        ):
                             if tid == 0:
                                 row_bin[3 * row + 1] = Int32(1)
                         elif all_ties == Uint32(0):
@@ -2299,9 +2308,14 @@ class CandSelect2:
                             for i in cutlass.range_constexpr(CS2_BINS // CS_THREADS):
                                 st_shared_u32(rb_a + (i * CS_THREADS + tid) * 4, Uint32(0))
                             cute.arch.sync_threads()
+                            # bin = 128 keys (one tile) up to CS2_BINS tiles, else 256 keys
+                            sh = Uint32(7)
+                            if n_tiles > Int32(CS2_BINS):
+                                sh = Uint32(8)
+                            bw = Uint32(1) << (sh - Uint32(5))  # bitmap words per bin
                             for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
                                 p = ld_shared_u32(hist_a + jt * 4)
-                                red_shared(rb_a + (Uint32(CS2_BINS - 1) - (p >> Uint32(7))) * 4, 1)
+                                red_shared(rb_a + (Uint32(CS2_BINS - 1) - (p >> sh)) * 4, 1)
                             cute.arch.sync_threads()
                             tb, below, _ = self.scan(rb_a, scr_a, need, tid, w, lane)
                             tile_t = Uint32(CS2_BINS - 1) - tb
@@ -2309,8 +2323,8 @@ class CandSelect2:
                             # (ties of older tiles than its own: an exclusive suffix
                             # sum of the bins, in place) + (ties of its tile with a
                             # smaller key index: a 128-bit mask per tile)
-                            bm_a = rb_a + (CS2_BINS + TILE) * 4
-                            for i in cutlass.range(tid, Int32(tile_t) * 4, CS_THREADS, unroll=1):
+                            bm_a = rb_a + TIE_BM_OFF * 4
+                            for i in cutlass.range(tid, Int32(tile_t * bw), CS_THREADS, unroll=1):
                                 st_shared_u32(bm_a + i * 4, Uint32(0))
                             hi = Int32(CS2_BINS - 1) - 8 * tid
                             sm = Uint32(0)
@@ -2326,27 +2340,28 @@ class CandSelect2:
                                 run += c
                             for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
                                 p = ld_shared_u32(hist_a + jt * 4)
-                                if (p >> Uint32(7)) < tile_t:
+                                if (p >> sh) < tile_t:
                                     red_or_shared(
                                         bm_a + ((p >> Uint32(5)) << Uint32(2)),
                                         Uint32(1) << (p & Uint32(31)),
                                     )
-                                elif (p >> Uint32(7)) == tile_t:
+                                elif (p >> sh) == tile_t:
                                     o = atom_add_shared(scr_a + 44, Uint32(1))
                                     st_shared_u32(rb_a + (CS2_BINS + o) * 4, p)
                             cute.arch.sync_threads()
                             for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
                                 p = ld_shared_u32(hist_a + jt * 4)
-                                tl = p >> Uint32(7)
+                                tl = p >> sh
                                 if tl < tile_t:
                                     r = ld_shared_u32(rb_a + (Uint32(CS2_BINS - 1) - tl) * 4)
-                                    wq = (p >> Uint32(5)) & Uint32(3)
-                                    for k in cutlass.range_constexpr(4):
-                                        word = ld_shared_u32(bm_a + ((tl << Uint32(2)) + Uint32(k)) * 4)
-                                        if Uint32(k) < wq:
-                                            r += popc(word)
-                                        elif Uint32(k) == wq:
-                                            r += popc(word & ((Uint32(1) << (p & Uint32(31))) - Uint32(1)))
+                                    wq = (p >> Uint32(5)) & (bw - Uint32(1))
+                                    for k in cutlass.range_constexpr(8):
+                                        if Uint32(k) < bw:
+                                            word = ld_shared_u32(bm_a + ((tl * bw) + Uint32(k)) * 4)
+                                            if Uint32(k) < wq:
+                                                r += popc(word)
+                                            elif Uint32(k) == wq:
+                                                r += popc(word & ((Uint32(1) << (p & Uint32(31))) - Uint32(1)))
                                     out[orow + Int64(above + r)] = Int32(p)
                             nt = Int32(ld_shared_u32(scr_a + 44))
                             if tid < nt:
