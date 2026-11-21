@@ -1700,7 +1700,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self._kda_persistent
                             and m.non_spec_query_start_loc_cpu is not None
                         ):
-                            frost_out, last_recurrent_state = (
+                            # Writes the core output into its core_attn_out
+                            # rows: every o_norm reads them there.
+                            _, last_recurrent_state = (
                                 specialized_prefill_kda.persistent_prefill(
                                     q=q_ns,
                                     k=k_ns,
@@ -1718,6 +1720,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     ),
                                     state_indices=non_spec_state_indices_tensor,
                                     has_initial_state=has_initial_state,
+                                    out=flashkda_out,
                                 )
                             )
                         else:
@@ -1735,13 +1738,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     cu_seqlens=non_spec_query_start_loc,
                                 )
                             )
-                        if frost_out_feeds_o_norm(
-                            flashkda_out, core_attn_out, frost_out, o_mxfp8
-                        ):
-                            # Pure prefill: o_norm reads the FROST output.
-                            prefill_core_out = frost_out
-                        else:
-                            flashkda_out.copy_(frost_out)
+                            if frost_out_feeds_o_norm(
+                                flashkda_out, core_attn_out, frost_out, o_mxfp8
+                            ):
+                                # Pure prefill: o_norm reads the FROST output.
+                                prefill_core_out = frost_out
+                            else:
+                                flashkda_out.copy_(frost_out)
                         core_attn_out_non_spec = flashkda_out
                     else:
                         (

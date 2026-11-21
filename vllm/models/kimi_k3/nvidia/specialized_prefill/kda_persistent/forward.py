@@ -642,6 +642,23 @@ def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
     )
 
 
+def beta_tma_supported(beta) -> bool:
+    """The beta TMA path loads (C tokens x 8 heads) BF16 boxes from the
+    (tokens, H) beta rows: the row stride (2H bytes) and the base must be
+    16-byte multiples, i.e. H % 8 == 0. Other head counts (the TP8 shard of the
+    96-head KDA has 12; 4, 6, 20 likewise) take the per-element beta loads:
+    with TMA their output and final state were wrong (rel. RMS 0.4-0.6 vs
+    FlashKDA, BUG-DCP8-3)."""
+    H = beta.shape[-1]
+    return (
+        beta.dtype == torch.bfloat16
+        and beta.stride(-1) == 1
+        and (H * beta.element_size()) % 16 == 0
+        and all((s * beta.element_size()) % 16 == 0 for s in beta.stride()[:-1])
+        and beta.data_ptr() % 16 == 0
+    )
+
+
 def make_plan(offsets, H, dev):
     """Build private scheduling and handoff storage from validated host offsets."""
     lens = [end - start for start, end in zip(offsets, offsets[1:], strict=False)]
@@ -701,6 +718,15 @@ def fwd(
         has_split,
         full_chunks,
     ) = plan
+    # The beta TMA choice depends on the head count only (H % 8 == 0): a beta
+    # view whose base or row stride is misaligned is copied, so serving launches
+    # the variant warm-up compiled for H and never JITs.
+    if (
+        beta.dtype == torch.bfloat16
+        and beta.shape[-1] % 8 == 0
+        and not beta_tma_supported(beta)
+    ):
+        beta = beta.clone(memory_format=torch.contiguous_format)
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()
@@ -732,7 +758,7 @@ def fwd(
         sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
         gate2=1 if (fixed or not full_chunks) else 0,
         has_split=has_split,
-        beta_tma=True,
+        beta_tma=beta_tma_supported(beta),
         qk_rowpair=4 if fixed else 8,
         restore_tail=False,
         reg_mode=2,

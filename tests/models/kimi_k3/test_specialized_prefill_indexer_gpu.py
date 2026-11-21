@@ -100,3 +100,53 @@ def test_selective_topk_matches_stock(reqs, zero_rows, recover_all):
         ok = (got == ref).all(1)
         assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
         t0 += rows
+
+
+@pytest.mark.parametrize(
+    "reqs,zero_keys",
+    [
+        # fresh prefills (row i sees i + 1 keys): kv_len < top-k, = top-k, top-k + 1
+        ([(2047, 2047)], 0),
+        ([(2048, 2048)], 0),
+        ([(2049, 2049)], 0),
+        # prefix hits (1024 cached + new rows): kv_len < top-k, = top-k, top-k + 1
+        ([(1023, 2047)], 0),
+        ([(1024, 2048)], 0),
+        ([(1025, 2049)], 0),
+        # a zero-key prefix (zero KV, as a bench's restored cache): ties at logit 0
+        # in the keep-all rows, and past top-k more threshold ties than TIE_RANK
+        # (the tile path)
+        ([(1024, 2048)], 1024),
+        ([(256, 4096)], 1800),
+        ([(37, 1000), (300, 9000), (9, 2100), (40, 40000)], 0),
+    ],
+)
+def test_selective_topk_reproducible(reqs, zero_keys):
+    """Bit-identical output (including the order) on every call: the sparse MLA's
+    online softmax depends on the key order, so an order that varies between calls
+    makes the prefill forward non-reproducible (BUG-BENCH-3)."""
+    q, q_scale, w16, k8, k_sf, bases = _inputs(reqs)
+    for base in bases:
+        k8[base : base + zero_keys] = 0
+    sp = pidx.SelectivePlan(
+        [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
+    )
+    outs = []
+    for _ in range(4):
+        out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
+        pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
+        outs.append(out)
+    for i, out in enumerate(outs[1:], 1):
+        same = (out == outs[0]).all(1)
+        assert same.all(), f"call {i}: {int((~same).sum())} of {sp.t} rows differ in order"
+    t0 = 0
+    for (rows, kv), base in zip(reqs, bases):
+        ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
+        got = outs[0][t0 : t0 + rows].to(torch.int64)
+        assert (got >= -1).all()
+        got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values
+        assert (got[:, ref.shape[1] :] == 1 << 40).all()
+        got = got[:, : ref.shape[1]]
+        ok = (got == ref).all(1)
+        assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
+        t0 += rows
