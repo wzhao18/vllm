@@ -235,3 +235,59 @@ def test_persistent_warm_covers_serving_beta_layouts(heads):
     torch.accelerator.synchronize()
     new = set(kp._COMPILED) - compiled
     assert not new, f"{len(new)} persistent-core variants compiled after warm-up"
+
+
+@pytest.mark.parametrize("lens,heads", [([300, 1, 1029], 8), ([5461] * 3, 96)])
+def test_persistent_prefill_step_memo_bitwise(lens, heads):
+    """Several KDA layers of one step through the per-step memo (plan and
+    state-row table built by the first layer, reused by the others) give
+    the same bits as each layer building its own, on separate state caches."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.persistent_supported(torch.device("cuda")):
+        pytest.skip("CuTe DSL not installed")
+    torch.manual_seed(2)
+    T, N, H = sum(lens), len(lens), heads
+    bf = torch.bfloat16
+    offs = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    cu_cpu = torch.tensor(offs, dtype=torch.int32)
+    cu = cu_cpu.cuda()
+    slots = 2 * N + 3
+    idx = torch.randperm(slots, device="cuda")[:N].to(torch.int32)
+    has = torch.ones(N, dtype=torch.bool, device="cuda")
+    has[0] = False
+    layers = []
+    for _ in range(3):
+        q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+        v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+        beta = torch.randn(1, T, H, device="cuda").to(bf)
+        A_log = torch.randn(H, device="cuda") * 0.5
+        dt_bias = torch.randn(H * D, device="cuda") * 0.1
+        init = torch.randn(slots, H, D, D, device="cuda") * 0.1
+        layers.append((q, k, v, g, beta, A_log, dt_bias, init))
+
+    def run(memo_obj):
+        outs, caches = [], []
+        for q, k, v, g, beta, A_log, dt_bias, init in layers:
+            cache = init.clone()
+            o, _ = sp_kda.persistent_prefill(
+                q, k, v, g, beta, A_log, dt_bias, -5.0, None, cu, cu_cpu,
+                state_cache=cache, state_indices=idx, has_initial_state=has,
+                step_memo=(
+                    sp_kda.step_memo_for(memo_obj) if memo_obj is not None else None
+                ),
+            )
+            outs.append(o)
+            caches.append(cache)
+        torch.accelerator.synchronize()
+        return outs, caches
+
+    class _Step:
+        pass
+
+    ref_o, ref_c = run(None)
+    o, c = run(_Step())
+    for a, b in zip(ref_o, o):
+        assert torch.equal(a, b)
+    for a, b in zip(ref_c, c):
+        assert torch.equal(a, b)

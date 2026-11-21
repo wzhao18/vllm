@@ -1776,6 +1776,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     state_indices=non_spec_state_indices_tensor,
                                     has_initial_state=has_initial_state,
                                     out=flashkda_out,
+                                    step_memo=specialized_prefill_kda.step_memo_for(m),
                                 )
                             )
                         else:

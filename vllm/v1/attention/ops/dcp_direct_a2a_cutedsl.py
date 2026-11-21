@@ -41,8 +41,15 @@ from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
     VllmCuTeDSLJitKernel,
 )
 
-# Matches kSpinLimit of the CUDA implementation.
-_SPIN_LIMIT = 100_000_000
+# The combine waits for every source by wall-clock time (%globaltimer), not by
+# a spin count: a spin count is a hardware-dependent time (it expired in well
+# under a minute on some VR200 nodes) and a peer can legitimately lag that long
+# while it compiles or loads kernels during startup warmup and graph capture.
+# A lagging peer must not kill the engine (the trap is sticky); only a wait
+# longer than this bound is treated as a deadlock.
+_WAIT_TIMEOUT_NS = 600 * 1_000_000_000
+# Read the timer once per this many polls (a power of two).
+_TIMER_POLL_MASK = 1023
 # LSE element type, a runtime argument of the push (one compile serves all).
 _LSE_KINDS = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _OUTPUT_DTYPES = (torch.bfloat16, torch.float16)
@@ -219,6 +226,13 @@ def _fetch_add_gpu(addr: Int64, *, loc=None, ip=None) -> Int32:
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def _globaltimer_ns(*, loc=None, ip=None) -> Int64:
+    return Int64(
+        _asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", loc=loc, ip=ip)
     )
 
 
@@ -586,15 +600,17 @@ class DirectDCPA2ACombineKernel(
                 signal_addr = received_signal + (slot + Int64(lane)) * Int64(4)
                 expected = Int32(next_epoch)
                 spins = Int32(0)
+                start = _globaltimer_ns()
                 while _ld_acquire_sys(signal_addr) != expected:
                     spins += Int32(1)
-                    if spins > Int32(_SPIN_LIMIT):
-                        cute.printf(
-                            "direct DCP A2A timeout source=%d epoch=%d\n",
-                            lane,
-                            expected,
-                        )
-                        _trap()
+                    if (spins & Int32(_TIMER_POLL_MASK)) == Int32(0):
+                        if _globaltimer_ns() - start > Int64(_WAIT_TIMEOUT_NS):
+                            cute.printf(
+                                "direct DCP A2A timeout source=%d epoch=%d\n",
+                                lane,
+                                expected,
+                            )
+                            _trap()
             cute.arch.sync_threads()
 
             row = cta * Int32(warps) + warp
