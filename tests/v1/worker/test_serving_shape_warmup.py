@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.utils import jit_monitor
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu import warmup
 
@@ -17,8 +18,17 @@ BUDGET = 8192
 
 
 def _runner(
-    dp_rank=0, num_spec=2, max_num_seqs=256, max_model_len=131072, num_blocks=100000
+    dp_rank=0,
+    num_spec=2,
+    max_num_seqs=256,
+    max_model_len=131072,
+    num_blocks=100000,
+    kv_cache_specs=None,
+    dcp_size=1,
+    budget=BUDGET,
 ):
+    if kv_cache_specs is None:
+        kv_cache_specs = [SimpleNamespace(block_size=64, dcp_sharded=False)]
     return SimpleNamespace(
         is_pooling_model=False,
         is_encoder_decoder=False,
@@ -26,14 +36,15 @@ def _runner(
         decode_query_len=num_spec + 1,
         num_speculative_steps=num_spec,
         max_model_len=max_model_len,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=BUDGET),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=budget),
         model_config=SimpleNamespace(get_vocab_size=lambda: 163840),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))
+                SimpleNamespace(kv_cache_spec=spec) for spec in kv_cache_specs
             ],
             num_blocks=num_blocks,
         ),
+        dcp_size=dcp_size,
         vllm_config=SimpleNamespace(
             num_lookahead_tokens=num_spec,
             is_mm_encoder_only=False,
@@ -208,3 +219,80 @@ def test_clean_verification_passes(monkeypatch):
     monkeypatch.setattr(warmup, "run_serving_shape_warmup", lambda *a: True)
     monkeypatch.setattr(jit_monitor, "record_jit_events", fake_record)
     warmup.serving_shape_warmup(None, None, None)
+
+
+def _held_blocks_per_request(steps: list[SchedulerOutput]) -> dict[str, list[int]]:
+    """Most blocks each request holds per KV group over the steps, as the
+    worker's block table accumulates them (``BlockTables.append_block_ids``)."""
+    held: dict[str, list[int]] = {}
+    peak: dict[str, list[int]] = {}
+    for step in steps:
+        for new_req in step.scheduled_new_reqs:
+            held[new_req.req_id] = [len(ids) for ids in new_req.block_ids]
+        cached = step.scheduled_cached_reqs
+        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_block_ids is not None:
+                held[req_id] = [
+                    n + len(ids) for n, ids in zip(held[req_id], new_block_ids)
+                ]
+        for req_id, counts in held.items():
+            peak[req_id] = [max(a, b) for a, b in zip(peak.get(req_id, counts), counts)]
+    return peak
+
+
+@pytest.mark.parametrize(
+    ("block_size", "max_model_len", "budget"),
+    [
+        # BUG-DPARITY-1: K3.1 DCP4 decode, attention groups at 4096-token
+        # blocks (raised to the Mamba page), --max-model-len 16384: one block
+        # per row; the 2045 + 3067-token ladder set took 2 blocks.
+        (4096, 16384, 4096),
+        (64, 4096, BUDGET),
+    ],
+)
+def test_dcp_sharded_groups_fit_the_block_table_rows(
+    block_size, max_model_len, budget, monkeypatch
+):
+    """Every warmup step set must fit the worker's block-table rows. A
+    DCP-sharded group's block holds ``block_size * dcp`` tokens of a request
+    (the scheduler allocates so, and the rows are
+    ``cdiv(max_model_len, block_size * dcp)`` wide), so the warmup must not
+    count ``block_size``-token blocks for it."""
+    dcp = 4
+    specs = [
+        SimpleNamespace(block_size=block_size, dcp_sharded=True),
+        SimpleNamespace(block_size=block_size, dcp_sharded=False),
+    ]
+    runner = _runner(
+        num_spec=3,
+        max_num_seqs=96,
+        max_model_len=max_model_len,
+        kv_cache_specs=specs,
+        dcp_size=dcp,
+        budget=budget,
+    )
+    row_capacity = [
+        cdiv(max_model_len, block_size * dcp),
+        cdiv(max_model_len, block_size),
+    ]
+    monkeypatch.setattr(warmup.torch.accelerator, "synchronize", lambda: None)
+    step_sets = [
+        dict(ladder=shapes) for shapes in warmup._serving_ladder_shapes(runner)
+    ] + [dict() for _ in range(warmup.NUM_SERVING_WARMUP_VARIANTS + 1)]
+    assert len(step_sets) > warmup.NUM_SERVING_WARMUP_VARIANTS + 1
+    longest = 0
+    for i, kwargs in enumerate(step_sets):
+        steps: list[SchedulerOutput] = []
+        if not warmup.run_serving_shape_warmup(
+            runner, steps.append, lambda grammar_output: None, 100 + i, **kwargs
+        ):
+            continue
+        for req_id, held in _held_blocks_per_request(steps).items():
+            longest = max(longest, held[1])
+            for group, (n, cap) in enumerate(zip(held, row_capacity)):
+                assert n <= cap, (
+                    f"step set {i}: request {req_id} holds {n} blocks of group "
+                    f"{group}, the block-table row holds {cap}"
+                )
+    # The ladder reaches prompts longer than one unsharded block.
+    assert longest > 1
