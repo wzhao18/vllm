@@ -1790,7 +1790,7 @@ class Scheduler(SchedulerInterface):
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
                     reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
+                        self._inflight_prefill_reserved_blocks(exclude=request)
                         + self._spec_decode_step_blocks
                     )
 
@@ -4363,16 +4363,20 @@ class Scheduler(SchedulerInterface):
         regions = coordinator.dsa_regions
         owner = getattr(request, "dsa_owner", 0)
         need = 0
-        for req in itertools.chain((request,), self._inflight_prefills):
+        others = (req for req in self._inflight_prefills if req is not request)
+        for req in itertools.chain((request,), others):
             if req is request or getattr(req, "dsa_owner", 0) == owner:
                 self._request_remaining_blocks(req)
                 need += coordinator.last_num_region_blocks
         return need <= regions.get_num_free_blocks_of(owner)
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(self, exclude: Request | None = None) -> int:
+        """Num blocks in-flight prefills other than ``exclude`` still need to
+        finish (their reservation)."""
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if req is not exclude
         )
 
     def _load_restores_replay_window(self, request: Request) -> bool:
@@ -4433,6 +4437,11 @@ class Scheduler(SchedulerInterface):
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
+                # It holds nothing now, so it no longer reserves the blocks of
+                # an in-flight prefill: kept in the set, its full sequence would
+                # be reserved against every later async load, its own retry
+                # included, and they could never be admitted.
+                self._inflight_prefills.discard(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:

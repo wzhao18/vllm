@@ -69,6 +69,39 @@ def test_failed_receive_completion_honors_failure_policy(policy):
         assert request.request_id in next_output.num_scheduled_tokens
 
 
+def test_failed_async_load_retry_is_admitted():
+    """A request whose async load failed and freed its blocks must not keep its
+    in-flight prefill reservation: retried as an async load, it would reserve
+    its own sequence and never fit (BUG-E2E-8: P rank stalled for good)."""
+    vllm_config = create_vllm_config(kv_load_failure_policy="recompute")
+    scheduler = create_scheduler(vllm_config, num_blocks=10)
+    block_size = scheduler.block_size
+    request = create_request(num_tokens=6 * block_size)
+    scheduler.add_request(request)
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        5 * block_size,
+        True,
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    output = create_model_runner_output([], finished_recving={request.request_id})
+    assert output.kv_connector_output is not None
+    output.kv_connector_output.failed_recving = {request.request_id}
+    scheduler.update_from_output(scheduler_output, output)
+
+    retry_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    output = create_model_runner_output([], finished_recving={request.request_id})
+    scheduler.update_from_output(retry_output, output)
+    final_output = scheduler.schedule()
+    assert request.request_id in final_output.num_scheduled_tokens
+
+
 @pytest.mark.parametrize(
     "num_prompt_blocks,num_external_computed_blocks,invalid_block_idxs",
     [
