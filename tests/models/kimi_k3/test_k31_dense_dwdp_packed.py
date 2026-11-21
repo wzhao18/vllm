@@ -25,6 +25,9 @@ class _Gemm:  # stands in for a fused prefill GEMM that keeps weight views
         self.weight = w
 
 
+_Gemm.__module__ = "vllm.models.kimi_k3.nvidia.test_stub"  # the walk follows vllm objects
+
+
 class _Layer(nn.Module):
     def __init__(self, seed: int):
         super().__init__()
