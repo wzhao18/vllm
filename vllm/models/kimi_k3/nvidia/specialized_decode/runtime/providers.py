@@ -530,7 +530,7 @@ class Attention:
             decoder, "self_attn.in_proj_qkvgfab", attention.in_proj_qkvgfab
         )
         mx_out = kind == "kda" and mxfp8_kda_linear(
-            decoder, "self_attn.o_proj", attention.o_proj
+            decoder, "self_attn.o_proj", getattr(attention, "o_proj", None)
         )
         self.projection: Any  # SkinnyProjection or Mxfp8Projection
         if mx_in:
