@@ -518,6 +518,9 @@ def attention_kind(attention):
 class Attention:
     """Input projection -> KDA/MLA/DSA core -> o-projection with its fused AttnRes."""
 
+    # An online-MXFP8 KDA in-projection (``Mxfp8Projection``; set per layer)
+    mx_in = False
+
     def __init__(self, decoder, runtime, prefetch, mailbox, small_batch, twoshot=None):
         attention, tp = decoder.self_attn, runtime.tp
         self.kind = kind = attention_kind(attention)
