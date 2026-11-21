@@ -20,15 +20,28 @@ from .tail_runtime import CAP, experts_push, flat
 
 
 class MoEScratch:
-    def __init__(self, tp, device, batches, owner=None):
+    def __init__(self, tp, device, batches, owner=None, *, tuned=True, rows=False):
         """``owner`` (group, device, TP, rank): with batches above the tuned ``CAP``
-        rows, the wide path's boxes at the largest of them (``rows``)."""
+        rows, or ``rows`` (every batch on the wide tail: ``nvfp4.Nvfp4MoE``), the wide
+        path's boxes at the largest of them (``rows``). ``tuned``: the tuned
+        providers' scratch (front, expanded rows, the experts' workspace and plan);
+        False when no layer builds them (only the side stream, its events and the
+        wide tail's boxes)."""
         self.tp, self.device, self.batches = tp, torch.device(device), tuple(batches)
         cap, h = max(batches), 6144 // tp
         with torch.accelerator.device_index(self.device.index):
             self.stream = torch.cuda.Stream(device=self.device)
             self.begin, self.shared_done = torch.cuda.Event(), torch.cuda.Event()
             self.gate_done = torch.cuda.Event()  # the split shared expert's front half
+        self.views, self.rows = {}, None
+        if not tuned:
+            if not rows:
+                raise ValueError("MoE scratch without tuned providers or a wide tail")
+            if owner is None:
+                raise ValueError("the wide MoE tail needs the TP group")
+            self.rows = TailRowsBox(*owner, cap)
+            return
+        with torch.accelerator.device_index(self.device.index):
             f32, i32, bf16 = torch.float32, torch.int32, torch.bfloat16
             empty = lambda s, t=bf16: torch.empty(s, dtype=t, device=self.device)
             self.latent = empty((cap, 3584))

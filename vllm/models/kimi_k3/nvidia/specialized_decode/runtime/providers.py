@@ -345,17 +345,22 @@ UNREAD_LINEARS = ("kv_b_proj",)
 LINEAR_DTYPES = {"conv1d": torch.float32}
 
 
-def check_bf16_projections(decoder):
+def check_bf16_projections(decoder, own=()):
     """Every linear of a decoder layer the TP (non-SP) providers read (attention
     projections, AttnRes, router, latent MoE down / up, shared experts, dense MLP)
     as a BF16 [N, K] matrix (``LINEAR_DTYPES``: in its stock dtype): refuses a
     checkpoint-quantized one (e.g. ModelOpt MXFP8 or NVFP4) at build instead of
-    programming its packed bytes as BF16."""
+    programming its packed bytes as BF16. ``own``: linears a provider reads in their
+    checkpoint format and checks itself (e.g. ``moe.nvfp4.Mxfp8SharedExpert``'s
+    online-MXFP8 shared expert)."""
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+    owned = {id(linear) for linear in own}
     for name, module in decoder.named_modules():
         leaf = name.rsplit(".", 1)[-1]
         if not isinstance(module, LinearBase) or leaf in UNREAD_LINEARS:
+            continue
+        if id(module) in owned:
             continue
         dtype = LINEAR_DTYPES.get(leaf)
         if dtype is None:
@@ -706,7 +711,10 @@ class Attention:
                 self.core_long = PreparedMla(attention, pitches, query, **policy)
         parity = decoder.layer_idx % 2
         front: tuple | None = None
-        if decoder.is_moe_layer:
+        # (the small-batch chain's front views; an NVFP4 MoE layer, ``moe.nvfp4``,
+        # has no chain: its stock front reads the o-projection's plain output)
+        nvfp4 = decoder.layer_idx in getattr(runtime, "nvfp4_layers", ())
+        if decoder.is_moe_layer and not nvfp4:
             front = small_batch.front_views[parity], small_batch.hint_views[parity]
             front += (small_batch.batches,)
         head_polled = self.head.polled if self.head is not None else ()

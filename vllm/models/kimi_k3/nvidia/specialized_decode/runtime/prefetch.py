@@ -215,6 +215,13 @@ class PrefetchController:
             if not layer.is_moe_layer:
                 continue
             index, moe, attention = layer.layer_idx, layer.mlp, layer.self_attn
+            if index not in packed:
+                # (NVFP4 MoE layers: no packed front, stock router + latent down and
+                # an MXFP8 shared expert; their MoE weights are not prefetched)
+                if position + 1 < len(layers):
+                    weights = attention_weights(layers[position + 1].self_attn)
+                    self._add_capped("next_attention", index, weights, following)
+                continue
             # The front GEMM reads [router shard; down shard] from the packed copy.
             if front:
                 ranges = urgent((packed[index],), grid=8)
