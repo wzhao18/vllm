@@ -1008,6 +1008,20 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
+    def mamba_snapshot_col_available(self, request: Request, col: int) -> bool:
+        """Whether every Mamba snapshot group can place ``request``'s snapshot
+        block at ``col`` in this step's allocation (see
+        ``MambaManager.snapshot_col_available``). A request scheduled from the
+        waiting queue gets its whole table, so only running requests check."""
+        if request.status != RequestStatus.RUNNING:
+            return True
+        processed = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
+        return all(
+            mgr.snapshot_col_available(request.request_id, col, processed)
+            for mgr in self.coordinator.single_type_managers
+            if isinstance(mgr, MambaManager) and mgr.prefill_snapshot
+        )
+
     def take_block_table_writes(self) -> dict[str, list[tuple[int, int, int]]]:
         """Drain this step's block-table column writes for running requests.
 
