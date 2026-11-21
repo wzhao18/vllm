@@ -868,8 +868,10 @@ class KimiK3DSAAttention(nn.Module):
         else:
             attn_out = self._fused_attention(hidden_states, x)
             gate = self.g_proj(x)[0]
-        # The fused GEMM-RS/AR takes a BF16 input: the MXFP8 fused gate only feeds
-        # an o_proj call that runs unfused (per call, as GEMM-RS/AR's should_run).
+        # The fused GEMM-RS/AR takes a BF16 tensor (an MXFP8 o_proj's input is
+        # quantized inside it with the stock mxfp8_e4m3_quantize, as the stock
+        # layer does): the MXFP8 fused gate only feeds an o_proj call that runs
+        # unfused (per call, as GEMM-RS/AR's should_run).
         if fused_gate and not self._fused_o_proj(attn_out):
             return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
         return self._o_proj(_gate_sigmoid_mul(attn_out, gate))

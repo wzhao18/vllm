@@ -436,7 +436,8 @@ def frost_out_feeds_o_norm(
     ``core_attn_out``) whose gated o_norm is the MXFP8 prefill kernel, the one
     o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``).
     Every other o_norm (the in-place ``kda_norm.rmsnorm_gated_`` that runs when
-    o_proj takes BF16 input, e.g. under the TP fused GEMM-AR o_proj) normalizes
+    o_proj takes a BF16 tensor, e.g. the TP fused GEMM-AR o_proj, which then
+    quantizes it to MXFP8 itself for the MXFP8 o_proj) normalizes
     ``core_attn_out`` itself, so the output must land there first: skipping the
     copy left it uninitialized (NaN / non-reproducible TP8 + DCP8 prefill)."""
     return (
@@ -1121,6 +1122,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return self.o_proj(o_mxfp8.activation())[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
+            # Same precision as the stock o_proj: for the MXFP8 o_proj the fused
+            # op quantizes this BF16 input with the stock mxfp8_e4m3_quantize and
+            # runs the MXFP8 MMA before the all-reduce.
             # Hand back the workspace view (bitwise; no copy): the decoder layer
             # consumes it before the next GEMM-AR, and copies it only where it
             # keeps it (AttnRes block-write layers).
