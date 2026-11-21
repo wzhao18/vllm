@@ -60,6 +60,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+from . import dwdp
 from .config import (
     DEDUP_VARIANTS,
     SHIPPED_KNOBS,
@@ -745,19 +746,35 @@ class KimiK3MegaMoEExperts(nn.Module):
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
         # The prefill-sized dedup buckets have no die-split schedule: they keep the
         # die-oblivious form and leave the decode buckets' die-local choice alone.
+        # Expert DWDP homes each half of a layer's experts on its die, so every
+        # phase-interleaved inference bucket streams die-locally, prefill included.
+        def die_streams(bucket: RubinBucket) -> bool:
+            if bucket.variant in DEDUP_VARIANTS:
+                return False
+            if dwdp.ENABLED:
+                return (
+                    bucket.variant == "inference"
+                    and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
+                )
+            return True
+
         die_mask = None
-        if die_local and not self.prefill_worker and all(
-            tuple(bucket.knobs.schedule_policy)[0]
-            == ("decode" if bucket.variant == "genphase" else "phase_interleave")
-            for bucket in self.buckets
-            if bucket.variant not in DEDUP_VARIANTS
+        if (dwdp.ENABLED and any(die_streams(b) for b in self.buckets)) or (
+            die_local
+            and not self.prefill_worker
+            and all(
+                tuple(bucket.knobs.schedule_policy)[0]
+                == ("decode" if bucket.variant == "genphase" else "phase_interleave")
+                for bucket in self.buckets
+                if bucket.variant not in DEDUP_VARIANTS
+            )
         ):
             from . import die_local
 
             die_mask = die_local.current_die_sm_mask32()
 
         def _placed(bucket: RubinBucket) -> RubinBucket:
-            mask = None if bucket.variant in DEDUP_VARIANTS else die_mask
+            mask = die_mask if die_streams(bucket) else None
             return dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
@@ -879,7 +896,10 @@ class KimiK3MegaMoEExperts(nn.Module):
                 "EP rank (see its log)."
             )
         assert weights is not None
-        if self.bucket.die_sm_mask32 is not None and _die_local_fits(
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            weights = expert_dwdp.register(self, weights)
+        elif self.bucket.die_sm_mask32 is not None and _die_local_fits(
             weights, self.num_moe_layers
         ):
             from .die_local import place_experts
@@ -891,7 +911,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         # The kernel copy replaces the checkpoint layout (the MX path may alias w2).
         for _, param in self.named_parameters(recurse=False):
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-        if self.bucket.die_sm_mask32 is not None:
+        if self.bucket.die_sm_mask32 is not None or dwdp.ENABLED:
             del weights
             torch.accelerator.empty_cache()  # the default-allocated originals
 
@@ -1032,6 +1052,9 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{self.prefix}: Rubin MegaMoE used before "
                 "process_weights_after_loading (prepare_rubin_megamoe)."
             )
+        expert_dwdp = dwdp.get()
+        if expert_dwdp is not None:
+            expert_dwdp.before_experts(self)
         num_tokens = hidden_states.shape[0]
         # Static per captured CUDA graph size (shape-only + host DP metadata).
         bucket = self.select_bucket(num_tokens)
@@ -1104,6 +1127,8 @@ class KimiK3MegaMoEExperts(nn.Module):
             y = y[0]
         if shared_experts is not None:
             y += shared_experts(hidden_states)
+        if expert_dwdp is not None:
+            expert_dwdp.after_experts(self)
         return y
 
 
@@ -1149,6 +1174,9 @@ def prepare_rubin_megamoe(model: nn.Module) -> int:
         assert module.kernel_weights is not None
         runtime.warmup(module.kernel_weights)
         warmed.add(id(runtime))
+    expert_dwdp = dwdp.get()
+    if experts and expert_dwdp is not None:
+        expert_dwdp.finalize()  # cross-engine, before any forward
     if experts:
         logger.info_once(
             "Rubin MegaMoE: %d layers in the %s kernel layout, %d runtime(s) warmed.",

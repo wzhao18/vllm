@@ -112,6 +112,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.kimi_k3.common.dsa_cache import packed_dsa_block_size
+from vllm.models.kimi_k3.nvidia import dense_dwdp
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 from vllm.models.kimi_k3.nvidia.gqa_draft import GQADraftKVCacheGrouping
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
@@ -2533,6 +2534,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # the capture as a copy and the prefix stays die-local
         # (_aux_copy_keeps_prefix).
         aux_dst: torch.Tensor | None = None
+        dense = dense_dwdp.get()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
@@ -2540,6 +2542,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if aux_dst is not None:
                 layer._aux_prefix_out = aux_dst
                 layer._aux_prefix_used = False
+            if dense is not None:
+                dense.layer_start(layer_idx)
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -3043,6 +3047,10 @@ class KimiLinearForCausalLM(
         self.dcpx = build_dcpx(self.model, self.vllm_config)
         # trtllm_gvr2: DeepSelect must rank every prefill chunk (checked).
         warm_prefill_indexer(self.model)
+        # Non-expert DWDP: after the projections are packed, before the profile run.
+        dense_dwdp.install(
+            self.model.layers, self.model.start_layer, self.model.end_layer
+        )
 
     def build_specialized_decode(self) -> None:
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
