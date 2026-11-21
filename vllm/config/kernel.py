@@ -423,15 +423,16 @@ class KernelConfig:
       without the FP32 upcast copy. Falls back to "auto" for FP32 logits.
     - "trtllm_gvr2": TensorRT-LLM's self-sampling GVR V2 top-k with native
       BF16 / FP16 logits (vendored in vllm/third_party/trtllm_gvr; SM100
-      family). Decode: the stock top-k on the BF16 decode logits ("auto"
-      under DCP > 1). Prefill follows "auto" (DeepSelect on SM100's BF16
-      logits, deterministic) wherever DeepSelect accepts the logits: the 16-bit
-      GVR V2 prefill engine breaks cutoff ties and orders each row differently
-      on every call. Elsewhere it ranks the prefill chunks (BF16, no FP32 copy);
-      its engines are compiled at model load.
-      Unsupported layouts and uncompiled shapes under CUDA graph capture fall
-      back to the FP32 kernels. Like gvr_2, its latency depends on the logit
-      distribution.
+      family). In the DSA indexer (sparse_attn_indexer) both the decode and
+      the prefill top-k are DeepSelect on SM100's BF16 logits (exact and
+      deterministic; an error where DeepSelect cannot rank the logits, checked
+      at model load): the 16-bit GVR V2 engines break cutoff ties and order
+      each row differently on every call, and the sparse MLA is
+      order-sensitive (BUG-DCP8-2 prefill, BUG-STRESS-2 decode). Called
+      directly (SparseIndexerTopk), the decode top-k is the GVR V2 engine;
+      unsupported layouts and uncompiled shapes under CUDA graph capture fall
+      back to the FP32 kernels there. Like gvr_2, its latency depends on the
+      logit distribution.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"

@@ -1486,10 +1486,11 @@ class KimiMoE(nn.Module):
 def warm_prefill_indexer(model: nn.Module) -> None:
     """Check at load, when the model has DSA layers and
     sparse_indexer_topk_backend="trtllm_gvr2", that DeepSelect ranks every
-    prefill chunk (up to max_model_len columns): that backend's prefill top-k is
-    DeepSelect, the only exact and deterministic one (the 16-bit GVR V2 prefill
-    engine changes cutoff ties and row order per call, BUG-DCP8-2). Raises
-    instead of serving with a fallback; no GVR V2 prefill engine is compiled.
+    prefill chunk and decode step (up to max_model_len columns): that backend's
+    prefill and decode top-k are DeepSelect, the only exact and deterministic
+    one (the 16-bit GVR V2 engines change cutoff ties and row order per call,
+    BUG-DCP8-2 / BUG-STRESS-2). Raises instead of serving with a fallback; no
+    GVR V2 engine is compiled.
 
     Kimi K3's DSA indexer (KimiK3DSAIndexer) is not a SparseAttnIndexer, so
     both are matched by their topk_backend attribute."""
@@ -1517,8 +1518,8 @@ def warm_prefill_indexer(model: nn.Module) -> None:
     why = deep_select_prefill_unsupported(indexer.topk_tokens, indexer.max_model_len)
     if why is not None:
         raise RuntimeError(
-            "sparse_indexer_topk_backend='trtllm_gvr2' ranks the prefill rows with "
-            f"DeepSelect, which cannot run here: {why}"
+            "sparse_indexer_topk_backend='trtllm_gvr2' ranks the prefill and "
+            f"decode rows with DeepSelect, which cannot run here: {why}"
         )
 
 
