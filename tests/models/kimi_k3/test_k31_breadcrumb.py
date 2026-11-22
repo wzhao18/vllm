@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 import torch
@@ -177,3 +178,37 @@ def test_process_exits_cleanly_after_crumbs():
     )
     assert r.returncode == 0, (r.returncode, (r.stdout + r.stderr)[-2000:])
     assert "terminate called" not in r.stdout + r.stderr
+
+
+@cuda
+def test_sigterm_shutdown_exits_cleanly_after_crumbs():
+    # Workers are stopped by SIGTERM with a handler that exits the interpreter (vLLM / srtctl teardown):
+    # the watcher must be joined on that path too, with no "terminate called" abort.
+    import signal
+
+    p = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(
+            """
+            import signal, sys, time, torch
+            from vllm.models.kimi_k3.nvidia import breadcrumb as B
+            signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+            B.crumb(B.OP_FWD_BEGIN, 0)
+            B.crumb(B.OP_LAYER, 1)
+            torch.cuda.synchronize()
+            print("READY", flush=True)
+            time.sleep(60)
+            """
+        )],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    seen = []
+    for line in p.stdout:  # warnings may come first (stderr is merged)
+        seen.append(line)
+        if line.strip().endswith("READY"):
+            break
+    assert seen and seen[-1].strip().endswith("READY"), "".join(seen)[-2000:]
+    time.sleep(6)  # at least one watcher poll in flight
+    p.send_signal(signal.SIGTERM)
+    out, _ = p.communicate(timeout=60)
+    assert p.returncode == 0, (p.returncode, out[-2000:])
+    assert "terminate called" not in out
