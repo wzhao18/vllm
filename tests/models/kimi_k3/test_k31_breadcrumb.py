@@ -156,3 +156,24 @@ def test_stall_inside_a_capture_eager_break_is_reported():
     )
     assert "K31_BREADCRUMB gpu_stuck" in text, text[-2000:]
     assert "gpu_at=size#4/layer61/layer host_at=size#4/layer61/megamoe_in" in text, text[-2000:]
+
+
+@cuda
+def test_process_exits_cleanly_after_crumbs():
+    # The watcher thread must be stopped before interpreter teardown: a daemon thread inside a torch
+    # call at exit aborted processes ("terminate called without an active exception").
+    r = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(
+            """
+            import torch
+            from vllm.models.kimi_k3.nvidia import breadcrumb as B
+            B.crumb(B.OP_FWD_BEGIN, 0)
+            B.crumb(B.OP_LAYER, 1)
+            torch.cuda.synchronize()
+            assert B._get().gpu_word() == B._get().host_code
+            """
+        )],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert r.returncode == 0, (r.returncode, (r.stdout + r.stderr)[-2000:])
+    assert "terminate called" not in r.stdout + r.stderr
