@@ -3216,7 +3216,7 @@ int64_t max_coresident_ox(int64_t D) {
 // u32 words of the v2 mailboxes: round 1, tie round, radix rounds, R2 round (2 parities each).
 std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
   const int64_t r1 = 2 * cap * W * kV2Msg, tie = 2 * cap * W * kV2Tie,
-                rad = 2 * cap * kV2RadR * W * 256,
+                rad = 2 * cap * kV2RadSlots * W * 256,
                 r2 = 2 * std::min<int64_t>(cap, kR2Rows) * W * kR2W;
   // {round 1, tie round, radix rounds, total words, the R2 round}
   return {0, r1, r1 + tie, r1 + tie + rad + r2, r1 + tie + rad};
