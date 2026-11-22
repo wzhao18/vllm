@@ -880,7 +880,16 @@ class Scheduler(SchedulerInterface):
             junction_stop if start < junction < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
-        end = min((s for s in stops if start < s < end), default=end)
+        new_end = min((s for s in stops if start < s < end), default=end)
+        # DDSA DIAGNOSTIC (never merged): which stop clipped this chunk.
+        names = ("next_block_boundary", "last_cache_position", "tail_boundary", "junction")
+        hit = [n for n, s in zip(names, stops) if start < s < end and s == new_end]
+        request._ddsa_clip = (
+            (hit[0] if hit else "none"),
+            bool(use_internal_checkpoint),
+            int(start), int(end), int(prefill_end), int(block_size),
+        )
+        end = new_end
         return _stop_mamba_chunk_at_block_end(
             request, start, max(end - start, 0), block_size
         )
@@ -1783,6 +1792,17 @@ class Scheduler(SchedulerInterface):
                             # sampler's row count stops matching its query rows,
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
+                            # DDSA DIAGNOSTIC (never merged): count by cause.
+                            clip = getattr(request, "_ddsa_clip", None)
+                            key = clip[0] if clip else "unknown"
+                            cnt = self.__dict__.setdefault("_ddsa_clip_counts", {})
+                            cnt[key] = cnt.get(key, 0) + 1
+                            if cnt[key] & (cnt[key] - 1) == 0:
+                                logger.info(
+                                    "DDSA align-clip dropped padding: %s x%d "
+                                    "(internal_ckpt=%s start=%s end=%s prefill_end=%s "
+                                    "block=%s)", key, cnt[key], *(clip[1:] if clip else ()),
+                                )
                             pad_spec_decode = False
 
                     # Schedule encoder inputs.
