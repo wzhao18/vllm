@@ -1013,7 +1013,8 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.preempted_req_ids = preempted_req_ids
         # Joined loads (join_load_in_step) of this step's new requests: the
         # worker waits for each before this step's forward.
-        self.join_wait: list[str] = []
+        # (req_id, seconds the worker may wait for it before giving up).
+        self.join_wait: list[tuple[str, float]] = []
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

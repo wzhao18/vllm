@@ -214,6 +214,17 @@ def _non_mamba_boundary_puts(
     )
 
 
+# The worker waits for a joined load at most this many times its predicted
+# time, and never longer than JOIN_WAIT_MAX_S: under DP lockstep a stuck load
+# would stall every rank. Past it the load counts as failed (recompute).
+JOIN_WAIT_FACTOR = 3.0
+JOIN_WAIT_MAX_S = 1.0
+
+
+def join_wait_bound_s(predicted_s: float) -> float:
+    return min(JOIN_WAIT_MAX_S, JOIN_WAIT_FACTOR * predicted_s)
+
+
 class LoadTimeModel:
     """Conservative load time of an early load from its token count.
 
@@ -381,7 +392,8 @@ class MooncakeStoreScheduler:
             logger.info("Mooncake early loads on (issued at schedule time)")
         # Early loads that join their request's first step (join_load_in_step),
         # until that step's metadata lists them for the worker to wait on.
-        self._joined: set[str] = set()
+        # req_id -> predicted load seconds of a joined load.
+        self._joined: dict[str, float] = {}
         # req_id -> tokens of an early load, until its time is reported.
         self._early_tokens: dict[str, int] = {}
         self._load_model = LoadTimeModel()
@@ -662,7 +674,7 @@ class MooncakeStoreScheduler:
             self._count_join("no_headroom")
             return False
         self._count_join("joined")
-        self._joined.add(request_id)
+        self._joined[request_id] = predicted
         return True
 
     def _count_join(self, outcome: str) -> None:
@@ -698,10 +710,10 @@ class MooncakeStoreScheduler:
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
 
-        joined: set[str] = getattr(self, "_joined", set())
+        joined: dict[str, float] = getattr(self, "_joined", {})
         early_tokens: dict[str, int] = getattr(self, "_early_tokens", {})
         for finished_req_id in scheduler_output.finished_req_ids:
-            joined.discard(finished_req_id)
+            joined.pop(finished_req_id, None)
             early_tokens.pop(finished_req_id, None)
             self.client.discard(finished_req_id)
             self._resume_tokens.pop(finished_req_id, None)
@@ -780,8 +792,10 @@ class MooncakeStoreScheduler:
             if request.req_id in joined:
                 # Its first step: the worker waits for its load before the
                 # forward. (Issued early, or, if the channel was down, here.)
-                joined.discard(request.req_id)
-                meta.join_wait.append(request.req_id)
+                predicted = joined.pop(request.req_id)
+                meta.join_wait.append(
+                    (request.req_id, join_wait_bound_s(predicted))
+                )
                 if req_meta is not None and load_spec is not None:
                     req_meta.join = True
             if req_meta is not None:

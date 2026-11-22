@@ -4,7 +4,7 @@ import contextlib
 import itertools
 import os
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from importlib.metadata import entry_points
@@ -44,7 +44,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -381,6 +381,16 @@ class Scheduler(SchedulerInterface):
         # yet: their requests' blocks are not cached until it is, so no other
         # request can hit KV that may still fail to load.
         self._joined_loads: set[str] = set()
+        # Joined loads whose request was preempted or finished before the load
+        # reported done: the request's blocks are parked here (the transfer
+        # may still write them) and the request is not admitted again (a new
+        # load under its id would be confused with the old one's report).
+        self._joined_parked: dict[str, list[list[KVCacheBlock]]] = {}
+        # Block hashes being loaded by joined loads (unhittable until clean),
+        # to count other requests that read the same prefix from the store.
+        self._joined_hashes: dict[str, list[BlockHash]] = {}
+        self._joined_hash_refs: Counter[BlockHash] = Counter()
+        self.joined_load_stats = {"joined": 0, "dup_reads": 0, "dup_read_blocks": 0}
         self._step_clock = InflightStepClock()
 
         # Grammar compilation failures to finish as per-request errors in
@@ -1487,6 +1497,11 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                if request_id in self._joined_parked:
+                    # Its earlier joined load has not reported yet.
+                    skip_request(request_queue)
+                    continue
+
                 if (
                     owner_decodes is not None
                     and _decodes_here(request)
@@ -2067,7 +2082,13 @@ class Scheduler(SchedulerInterface):
                     if load_ahead:
                         self._load_ahead.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
+                    self._count_joined_dup_read(
+                        request, num_new_local_computed_tokens, num_computed_tokens
+                    )
                     if join_load:
+                        self._track_joined_hashes(
+                            request, num_new_local_computed_tokens, num_computed_tokens
+                        )
                         # The connector has the load done before this step's
                         # forward reads the blocks: take it as finished now and
                         # admit it again in this pass, at the head of the
@@ -4226,6 +4247,12 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if request.request_id in self._joined_loads:
+            # A joined load still in flight writes these blocks outside the
+            # GPU stream: park them until it reports (_settle_joined_loads).
+            blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+            self._joined_parked.setdefault(request.request_id, []).append(blocks)
+            return
         if self._request_blocks_can_be_freed(request):
             if self.defer_block_free:
                 # Its last step has been processed: no GPU user is left.
@@ -4888,17 +4915,23 @@ class Scheduler(SchedulerInterface):
         """Take the reports of joined loads (join_load_in_step) out of
         ``kv_connector_output`` before anything else reads it.
 
-        A clean load caches its request's blocks (held back so far). A failed
-        one was admitted with KV that never arrived: its output is skipped and,
-        under the "recompute" policy, it is preempted (in-flight output
-        dropped) and recomputes from scratch, else it fails as any failed load
-        does; its blocks were never cached, so no other request read them. Each joined load is
-        reported in its first step's output at the latest (the worker waits
-        for it before that forward). Returns the filtered output and the ids
-        whose output this step must skip.
+        A failed load (reported by its first step's output at the latest; a
+        worker that gives up waiting reports it failed while the transfer may
+        still run) was admitted with KV that never arrived: its output is
+        skipped and, under the "recompute" policy, it is preempted (in-flight
+        output dropped) to recompute from scratch, else it fails as any failed
+        load does. Its blocks were never cached, so no other request read them,
+        and they stay parked until the load reports done.
+
+        A done report ends the load: a request still admitted gets its blocks
+        cached (held back so far); a preempted or finished one gets its parked
+        blocks freed (after the steps in flight) and may be admitted again.
+        Returns the filtered output and the ids whose output this step skips.
         """
-        failed = (kv_connector_output.failed_recving or set()) & self._joined_loads
-        done = (kv_connector_output.finished_recving or set()) & self._joined_loads
+        reported_failed = kv_connector_output.failed_recving or set()
+        reported_done = kv_connector_output.finished_recving or set()
+        failed = reported_failed & self._joined_loads
+        done = reported_done & self._joined_loads
         if not failed and not done:
             return kv_connector_output, set()
         skip: set[str] = set()
@@ -4908,8 +4941,9 @@ class Scheduler(SchedulerInterface):
             if request is None or request.is_finished():
                 continue
             skip.add(req_id)
-            if not self.recompute_kv_load_failures:
-                # Policy "fail": update_from_output finishes it with an error.
+            if req_id in self._joined_parked or not self.recompute_kv_load_failures:
+                # Already reset by an earlier report, or policy "fail":
+                # update_from_output finishes it with an error.
                 continue
             if request.status == RequestStatus.RUNNING:
                 self.running.remove(request)
@@ -4919,30 +4953,84 @@ class Scheduler(SchedulerInterface):
                 self._free_request_blocks(request)
                 self._inflight_prefills.discard(request)
                 request.num_computed_tokens = 0
-        for req_id in done - failed:
+            self._joined_parked.setdefault(req_id, [])
+        for req_id in done:
+            self._joined_loads.discard(req_id)
+            for hash_ in self._joined_hashes.pop(req_id, ()):
+                self._joined_hash_refs[hash_] -= 1
+                if self._joined_hash_refs[hash_] <= 0:
+                    del self._joined_hash_refs[hash_]
+            parked = self._joined_parked.pop(req_id, None)
+            if parked is not None:
+                for blocks in parked:
+                    self._free_parked_blocks(blocks)
+                request = self.requests.get(req_id)
+                if request is not None and request.is_finished():
+                    # Its free waited for this report.
+                    del self.requests[req_id]
+                continue
             request = self.requests.get(req_id)
             if (
                 request is not None
+                and req_id not in failed
                 and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING)
                 and request.num_computed_tokens > 0
             ):
                 self.kv_cache_manager.cache_blocks(
                     request, min(request.num_computed_tokens, request.num_tokens)
                 )
-        self._joined_loads -= failed | done
         settled = failed | done
         return (
             replace(
                 kv_connector_output,
-                finished_recving=(
-                    (kv_connector_output.finished_recving or set()) - settled
-                )
-                or None,
-                failed_recving=(kv_connector_output.failed_recving or set())
-                - settled,
+                finished_recving=(reported_done - settled) or None,
+                failed_recving=reported_failed - settled,
             ),
             skip,
         )
+
+    def _free_parked_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        """Free blocks parked for a joined load that has now reported: after
+        the steps in flight, which may still use them."""
+        if not blocks:
+            return
+        if self.defer_block_free:
+            self.deferred_frees.append((self.sched_step_seq, blocks))
+        else:
+            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
+    def _joined_range_hashes(
+        self, request: Request, start_tokens: int, end_tokens: int
+    ) -> list[BlockHash]:
+        size = self.hash_block_size
+        return list(request.block_hashes[start_tokens // size : end_tokens // size])
+
+    def _track_joined_hashes(
+        self, request: Request, start_tokens: int, end_tokens: int
+    ) -> None:
+        hashes = self._joined_range_hashes(request, start_tokens, end_tokens)
+        self._joined_hashes[request.request_id] = hashes
+        self._joined_hash_refs.update(hashes)
+        self.joined_load_stats["joined"] += 1
+
+    def _count_joined_dup_read(
+        self, request: Request, start_tokens: int, end_tokens: int
+    ) -> None:
+        """Count a store read of blocks a joined load is loading right now
+        (unhittable until it reports clean, so this request reads them too)."""
+        if not self._joined_hash_refs:
+            return
+        dup = sum(
+            1
+            for hash_ in self._joined_range_hashes(request, start_tokens, end_tokens)
+            if hash_ in self._joined_hash_refs
+        )
+        if dup:
+            stats = self.joined_load_stats
+            stats["dup_reads"] += 1
+            stats["dup_read_blocks"] += dup
+            if stats["dup_reads"] % 100 == 1:
+                logger.info("Same-step joined loads: %s", dict(stats))
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""

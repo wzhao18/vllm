@@ -35,6 +35,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     metrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+    scheduler as store_scheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as store_worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
@@ -48,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     LoadTimeModel,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.scheduler import InflightStepClock
 from vllm.v1.request import RequestStatus
 
@@ -162,6 +166,12 @@ def test_pending_blocks_are_not_hit_by_other_requests_in_the_step():
         ("a", 3 * BS),
         ("b", 3 * BS),
     ]
+    # Both read the same three blocks from the store: one duplicate read.
+    assert scheduler.joined_load_stats == {
+        "joined": 2,
+        "dup_reads": 1,
+        "dup_read_blocks": 3,
+    }
     first_blocks = set(scheduler.kv_cache_manager.get_block_ids("a")[0])
     second_blocks = set(scheduler.kv_cache_manager.get_block_ids("b")[0])
     assert not first_blocks & second_blocks
@@ -217,6 +227,65 @@ def test_report_after_the_request_ended_is_ignored():
     assert not scheduler._joined_loads
 
 
+def _num_free(scheduler) -> int:
+    return scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+
+
+def test_abort_during_joined_load_frees_blocks_only_after_its_report():
+    # (PCRIT v97 #2) The transfer writes the blocks outside the GPU stream:
+    # an abort between the join and the load's report must not return them
+    # to the pool, or the write lands in another request's blocks.
+    scheduler = _scheduler()
+    request = _request(max_tokens=4)
+    free_before = _num_free(scheduler)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    held = free_before - _num_free(scheduler)
+    assert held > 0
+
+    scheduler.finish_requests("r", RequestStatus.FINISHED_ABORTED)
+    scheduler.update_from_output(output, create_model_runner_output([]))
+    assert _num_free(scheduler) == free_before - held
+    assert "r" in scheduler._joined_parked
+
+    scheduler.update_from_output(
+        scheduler.schedule(), create_model_runner_output([], finished_recving={"r"})
+    )
+    assert _num_free(scheduler) == free_before
+    assert not scheduler._joined_parked and not scheduler._joined_loads
+    assert "r" not in scheduler.requests
+
+
+def test_given_up_joined_load_recomputes_after_its_transfer_ends():
+    # (PCRIT v97 #1/#2) The worker gave up waiting and reported the load
+    # failed while the transfer may still run: the request is preempted, its
+    # blocks stay parked and it is not admitted again (a new load under its
+    # id would be confused with the old one) until the transfer reports.
+    scheduler = _scheduler()
+    request = _request(max_tokens=4)
+    free_before = _num_free(scheduler)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    held = free_before - _num_free(scheduler)
+
+    engine_outputs = scheduler.update_from_output(
+        output, create_model_runner_output([request], failed_recving={"r"})
+    )
+    assert not [o for outs in engine_outputs.values() for o in outs.outputs]
+    assert request.status == RequestStatus.PREEMPTED
+    assert _num_free(scheduler) == free_before - held
+
+    output = scheduler.schedule()
+    assert "r" not in output.num_scheduled_tokens
+
+    scheduler.update_from_output(
+        output, create_model_runner_output([], finished_recving={"r"})
+    )
+    assert _num_free(scheduler) == free_before
+    output = scheduler.schedule()
+    assert "r" in output.num_scheduled_tokens
+
+
 # ---------------------------------------------------------------------------
 # Mooncake worker
 # ---------------------------------------------------------------------------
@@ -232,9 +301,9 @@ def _bare_worker():
     return worker
 
 
-def _meta(join_wait: list[str], requests: list[ReqMeta] = ()):
+def _meta(join_wait: list[str], requests: list[ReqMeta] = (), bound_s: float = 10.0):
     meta = MooncakeStoreConnectorMetadata(set(), set())
-    meta.join_wait = list(join_wait)
+    meta.join_wait = [(req_id, bound_s) for req_id in join_wait]
     for request in requests:
         meta.add_request(request)
     return meta
@@ -274,11 +343,36 @@ def test_bind_waits_for_a_joined_load_not_yet_registered():
     assert not worker._join_poisoned
 
 
-def test_unreported_joined_load_raises_instead_of_hanging():
+def test_stuck_joined_load_is_given_up_within_its_bound():
+    # (PCRIT v97 #1) A load that never completes must not hold the lockstep
+    # group: the bind gives up after its bound, reports the request failed
+    # with the step's output (the step itself runs), and drops the load's
+    # eventual report.
     worker = _bare_worker()
-    worker._join_wait_timeout_s = 0.05
-    with pytest.raises(RuntimeError, match="not reported"):
-        worker.wait_joined_loads(_meta(["r"]))
+    worker.can_put = False
+    worker.joined_loads.register("r")
+    start = time.monotonic()
+
+    worker.wait_joined_loads(_meta(["r"], bound_s=0.05))
+
+    assert 0.04 <= time.monotonic() - start < 1.0
+    assert worker._join_poisoned == {"r"}
+    counts = worker.kv_connector_stats.data[metrics._EVENT_COUNTS]
+    assert counts["join_wait_timeout"] == 1
+    results = worker.get_transfer_results(set(), SimpleNamespace(preempted_req_ids=set()))
+    assert results.failed_recving == {"r"}
+    assert worker.get_transfer_results(
+        set(), SimpleNamespace(preempted_req_ids=set())
+    ).failed_recving == set()
+    # The transfer ends later: nobody waits for it any more.
+    worker.joined_loads.complete("r")
+    assert not worker.joined_loads.is_joined("r")
+    assert not worker.joined_loads._done
+
+
+def test_join_wait_bound_follows_the_prediction():
+    assert store_scheduler.join_wait_bound_s(0.05) == pytest.approx(0.15)
+    assert store_scheduler.join_wait_bound_s(2.0) == store_scheduler.JOIN_WAIT_MAX_S
 
 
 def _recv_thread(worker):
@@ -382,7 +476,9 @@ def test_early_joined_load_is_not_issued_again_with_the_step():
 
     meta = scheduler.build_connector_meta(_make_new_scheduler_output())
 
-    assert meta.join_wait == ["req-0"]
+    ((req_id, bound_s),) = meta.join_wait
+    assert req_id == "req-0"
+    assert 0 < bound_s <= store_scheduler.JOIN_WAIT_MAX_S
     assert all(r.load_spec is None for r in meta.requests)
     worker = _bare_worker()
     worker.start_load_kv(meta)
@@ -439,3 +535,34 @@ def test_inflight_step_clock():
     assert clock.headroom(t + 0.05) == pytest.approx(0.15)
     clock.done(10, t + 0.1)
     assert clock.headroom(t + 0.1) == pytest.approx(0.1)
+
+
+def test_joined_load_carries_the_state_in_the_same_wait():
+    # (PCRIT v97 #4) A hybrid request's load covers its attention blocks and
+    # its KDA/conv state slot in one job under one request id: the bind's
+    # wait on that id covers the state its first chunk reads, and no separate
+    # state job is waited on or issued with the step.
+    scheduler = _join_scheduler()
+    scheduler._store_group_ids = (0, 1)
+    scheduler._group_block_sizes = [16, 16]
+    request_real, _ = scheduler._unfinished_requests["req-0"]
+    scheduler._unfinished_requests["req-0"] = (request_real, ([0, 1], [9]))
+    _warm(scheduler._load_model)
+    attention = _blocks(recent_index=None).blocks[0]
+    state = _blocks(recent_index=None).blocks[0][:1]
+    blocks = KVCacheBlocks((attention, state))
+
+    assert scheduler.join_load_in_step(
+        SimpleNamespace(request_id="req-0"), blocks, 32, headroom_s=1.0
+    )
+    scheduler._issue_load_early("req-0", blocks)
+
+    (sent,) = scheduler._early_loads.sent
+    assert sent.join and sent.block_ids == ([0, 1], [9])
+
+    worker = _bare_worker()
+    worker._issue_early_load(sent)
+    assert worker.recv_request_queue.get_nowait() is sent
+    threading.Timer(0.1, worker.joined_loads.complete, ("req-0",)).start()
+    worker.wait_joined_loads(_meta(["req-0"]))
+    assert not worker._join_poisoned
