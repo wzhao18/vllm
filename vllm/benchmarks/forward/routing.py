@@ -357,8 +357,18 @@ class _EplbFixture:
             "active experts %s | busiest-rank pairs mean %.1f",
             self.case, self.mode, tok.mean(), self.ep, q(mm), q(hot), q(act), rk.max(1).mean(),
         )
+        # active experts per EP rank (weight bytes streamed) and the largest per-expert token count
+        act_rk = (c > 0).reshape(len(self.layers), self.ep, local).sum(2)
         print(f"EPLBFIX {self.case} mode {self.mode} pairs/layer {tok.mean():.0f} EP{self.ep} rank_mm {q(mm)} "
-              f"hot {q(hot)} active {q(act)} busiest_rank_pairs {rk.max(1).mean():.1f}", flush=True)
+              f"hot {q(hot)} active {q(act)} busiest_rank_pairs {rk.max(1).mean():.1f} "
+              f"active_per_rank mean {act_rk.mean():.1f} max {act_rk.max(1).mean():.1f} "
+              f"max_tokens_per_expert {c.max(1).mean():.1f}", flush=True)
+        import os
+
+        out = os.environ.get("EPLB_FIX_DUMP")
+        if out:  # per-layer [EP rank, local expert] counts of the routes MegaMoE read, for the per-layer cost fit
+            os.makedirs(out, exist_ok=True)
+            np.save(os.path.join(out, f"{self.case}.counts.npy"), c.reshape(len(self.layers), self.ep, local))
 
     def remove(self) -> None:
         self.reg["flag"].fill_(False)
