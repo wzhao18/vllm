@@ -367,6 +367,8 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._failed_recv_reqs = queue.Queue()
         w._recv_failures = set()
         w._recving_transfers = defaultdict(list)
+        # Request-level transfer-time span (base worker __init__, 90f52b4e3c).
+        w._xfer_span_us = {}
         w._is_hma_required = False
         w.xfer_stats = NixlKVConnectorStats()
         w._has_packed_cache = False
