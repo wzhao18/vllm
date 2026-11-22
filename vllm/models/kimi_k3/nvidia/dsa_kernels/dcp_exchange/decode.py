@@ -202,7 +202,7 @@ class DcpxDecode:
         _d = _os.environ.get("DDSA_TOPK_STATS_DIR")
         if _d:
             # one stats block per DSA layer slot (prefix order of first call), 32 slots
-            self._ddsa_stats = torch.zeros(32, 192, dtype=torch.int32, device=device)  # + PIDX theta diag [128:192]
+            self._ddsa_stats = torch.zeros(32, 320, dtype=torch.int32, device=device)  # + PIDX theta diag [128:192] + DDSA per-ctx [192:320]
             self._ddsa_slot: dict[str, int] = {}
             self._ddsa_start_dumper(_d, device)
         self.global_rows = torch.zeros(self.cap, dtype=torch.int32, device=device)
@@ -325,7 +325,7 @@ class DcpxDecode:
                         h = host[i]
                         rec["slots"][p] = {"slot": i, "counts": h[:64].view(8, 8).tolist(),
                                            "time": h[64:128].view(torch.int64).view(8, 2, 2).tolist(),
-                                           "pidx_theta": h[128:192].tolist()}
+                                           "pidx_theta": h[128:192].tolist(), "theta_ctx": h[192:320].tolist()}
                     with open(path, "a") as f:
                         f.write(json.dumps(rec) + "\n")
                 except Exception as e:  # diagnostic only

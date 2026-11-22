@@ -794,6 +794,13 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // 50-57 log2 q - 6 (all rows; q < 128 in bucket 0)
       if (p.stats) {
         if (tid == 0) atomicAdd(&p.stats[128 + 50 + min(7, max(0, 31 - __clz(max(q, 1u)) - 6))], 1);
+        // DDSA thdiag2 (never merge): the same failure counters per global-ctx bucket
+        // (<32K, 32-128K, 128-256K, >=256K) at stats[192 + cb * 32 + ...]: 0 rows, 1 over,
+        // 2 under, 3-10 log2(nc / q) over, 11-18 log2(q / nc) under, 19-26 nc of over-shoots
+        // in [3072, 4608, 6144, 9216, 12288, 24576, 49152, 98304, inf) (bin 0 = 3073-4607).
+        const int tcb = Gl < (1 << 15) ? 0 : Gl < (1 << 17) ? 1 : Gl < (1 << 18) ? 2 : 3;
+        int* const tst = p.stats + 192 + tcb * 32;
+        if (tid == 0) atomicAdd(&tst[0], 1);
         const bool over = nc > kV2Cand, under = (uint32_t)nc < q;
         if (over || under) {
           if (tid == 0) s_u[13] = 0;
@@ -812,6 +819,13 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             const int e8 = cn2 > 0 ? min(7, (int)(s_u[13] * 8u / (uint32_t)cn2)) : 0;
             atomicAdd(&st[(over ? 18 : 26) + e8], 1);
             atomicAdd(&st[34 + min(15, 31 - __clz(max(q, 1u)))], 1);
+            atomicAdd(&tst[over ? 1 : 2], 1);
+            atomicAdd(&tst[(over ? 3 : 11) + min(7, 31 - __clz(max(r, 1u)))], 1);
+            if (over) {
+              const int nb = nc < 4608 ? 0 : nc < 6144 ? 1 : nc < 9216 ? 2 : nc < 12288 ? 3
+                           : nc < 24576 ? 4 : nc < 49152 ? 5 : nc < 98304 ? 6 : 7;
+              atomicAdd(&tst[19 + nb], 1);
+            }
           }
           __syncthreads();
         }
