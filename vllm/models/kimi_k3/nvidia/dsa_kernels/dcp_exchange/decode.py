@@ -201,7 +201,9 @@ class DcpxDecode:
         import os as _os
         _d = _os.environ.get("DDSA_TOPK_STATS_DIR")
         if _d:
-            self._ddsa_stats = torch.zeros(8 * 8 + 8 * 2 * 2 * 2, dtype=torch.int32, device=device)
+            # one stats block per DSA layer slot (prefix order of first call), 32 slots
+            self._ddsa_stats = torch.zeros(32, 8 * 8 + 8 * 2 * 2 * 2, dtype=torch.int32, device=device)
+            self._ddsa_slot: dict[str, int] = {}
             self._ddsa_start_dumper(_d, device)
         self.global_rows = torch.zeros(self.cap, dtype=torch.int32, device=device)
         self.offsets = torch.arange(64, dtype=torch.int32, device=device)
@@ -288,9 +290,17 @@ class DcpxDecode:
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
-            stats=self._ddsa_stats,
+            stats=self._ddsa_slot_stats(prefix),
         )
         return True
+
+    def _ddsa_slot_stats(self, prefix: str):
+        if self._ddsa_stats is None:
+            return None
+        slot = self._ddsa_slot.get(prefix)
+        if slot is None:
+            slot = self._ddsa_slot[prefix] = min(len(self._ddsa_slot), 31)
+        return self._ddsa_stats[slot]
 
     def _ddsa_start_dumper(self, out_dir: str, device: torch.device) -> None:
         import json, os, socket, threading, time
@@ -309,10 +319,14 @@ class DcpxDecode:
                 try:
                     with torch.cuda.stream(stream):
                         host = buf.to("cpu", non_blocking=False)
-                    c = host[:64].view(8, 8).tolist()
-                    t = host[64:].view(torch.int64).view(8, 2, 2).tolist()
+                    slots = {p: i for p, i in self._ddsa_slot.items()}
+                    rec = {"t": time.time(), "slots": {}}
+                    for p, i in slots.items():
+                        h = host[i]
+                        rec["slots"][p] = {"slot": i, "counts": h[:64].view(8, 8).tolist(),
+                                           "time": h[64:].view(torch.int64).view(8, 2, 2).tolist()}
                     with open(path, "a") as f:
-                        f.write(json.dumps({"t": time.time(), "counts": c, "time": t}) + "\n")
+                        f.write(json.dumps(rec) + "\n")
                 except Exception as e:  # diagnostic only
                     logger.warning("DDSA topk stats dump failed: %s", e)
 
