@@ -654,6 +654,10 @@ class Scheduler(SchedulerInterface):
         # Load-ahead: fresh waiting requests whose async KV load was started
         # while the step's token budget was used up (see the waiting loop).
         self._load_ahead: set[Request] = set()
+        # Set each step from the DP prefill exchange when another rank of the
+        # DP group reported no schedulable demand (late binding moves fresh
+        # waiting requests to it; load-ahead must not commit them first).
+        self.dp_group_has_idle_rank = False
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
@@ -1397,6 +1401,9 @@ class Scheduler(SchedulerInterface):
                         or self._pause_state != PauseState.UNPAUSED
                         or load_ahead_left <= 0
                         or not self.waiting
+                        # A DP rank of the group has spare budget: leave
+                        # this rank's fresh requests movable to it.
+                        or self.dp_group_has_idle_rank
                     ):
                         break
                     head = self.waiting.peek_request()
