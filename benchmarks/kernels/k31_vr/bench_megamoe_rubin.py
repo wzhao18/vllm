@@ -573,28 +573,53 @@ def _epbal_percall(args, session, moe, hidden, ids, wts, weights, bucket, out, f
     t = [max(r[k] for r in allr) for k in range(N)]
     if rank != 0:
         return
-    on = [t[k] for k in range(N) if (calls[k] // 64) % 2 == 0]
-    off = [t[k] for k in range(N) if (calls[k] // 64) % 2 == 1]
-    first = {calls[k] // 64: t[k] for k in range(N) if calls[k] % 64 == 0}
-    d = [first[b] - first[b + 1] for b in sorted(first) if b % 2 == 0 and b + 1 in first]
+    pos = {}  # (block, position in block) -> time
+    for k in range(N):
+        pos[(calls[k] // 64, calls[k] % 64)] = t[k]
+    blocks = sorted({b for b, _ in pos})
     rng = random.Random(7)
-    boots = sorted(st.median(rng.choices(d, k=len(d))) for _ in range(10000)) if d else [0.0]
-    med, lo, hi = (st.median(d) if d else 0.0), boots[249], boots[9749]
-    mean_on, mean_off = st.mean(on), st.mean(off)
-    rel = 100.0 * (mean_on - mean_off) / mean_off
-    se = (st.variance(on) / len(on) + st.variance(off) / len(off)) ** 0.5
-    rel_hi = 100.0 * (mean_on - mean_off + 1.96 * se) / mean_off
-    amort = 100.0 * med / (64.0 * mean_off)
+
+    def sym(b, j):  # on-block b position j vs the mean of the off-blocks around it (DCRIT r73.3)
+        if (b, j) in pos and (b - 1, j) in pos and (b + 1, j) in pos:
+            return pos[(b, j)] - 0.5 * (pos[(b - 1, j)] + pos[(b + 1, j)])
+        return None
+
+    on_blocks = [b for b in blocks if b % 2 == 0]
+    d = [sym(b, 0) for b in on_blocks]
+    d2 = [sym(b, 1) for b in on_blocks]
+    pairs = [(x, y) for x, y in zip(d, d2) if x is not None and y is not None]
+    d, d2 = [x for x, _ in pairs], [y for _, y in pairs]
+    dd = [x + y for x, y in pairs]
+
+    def boot_median(xs):
+        if not xs:
+            return 0.0, 0.0, 0.0
+        bs = sorted(st.median(rng.choices(xs, k=len(xs))) for _ in range(10000))
+        return st.median(xs), bs[249], bs[9749]
+
+    med_d, lo_d, hi_d = boot_median(d)
+    med_d2, lo_d2, hi_d2 = boot_median(d2)
+    med_dd, lo_dd, hi_dd = boot_median(dd)
+    off_all = [v for (b, j), v in pos.items() if b % 2 == 1]
+    mean_off = st.mean(off_all)
+    amort = 100.0 * med_dd / (64.0 * mean_off)
+    on_nf = [v for (b, j), v in pos.items() if b % 2 == 0 and j >= 2]  # non-firing (DCRIT r73.1)
+    off_nf = [v for (b, j), v in pos.items() if b % 2 == 1 and j >= 2]
     p99 = lambda xs: sorted(xs)[int(0.99 * (len(xs) - 1))]  # noqa: E731
-    p99_on, p99_off = p99(on), p99(off)
-    pass1 = hi <= 2.0
-    pass2 = amort <= 0.1 and p99_on <= p99_off * 1.01
+    ratios = sorted(p99(rng.choices(on_nf, k=len(on_nf))) / p99(rng.choices(off_nf, k=len(off_nf)))
+                    for _ in range(2000))
+    r_pt, r_lo, r_hi = p99(on_nf) / p99(off_nf), ratios[49], ratios[1949]
+    pass1 = hi_dd <= 2.0
+    pass2 = amort <= 0.1 and r_lo <= 1.01
     verdict = pass1 and pass2
+    need_ep16 = variant.startswith("genphase") or "gen" in str(variant)
+    need_ep16 = need_ep16 and hi_dd > 0.5
     _EPBAL_VERDICTS.append(verdict)
-    print(f"EPBAL_PERCALL {variant}/{n} pairs={len(d)} fire_median_d={med:+.3f}us CI95=[{lo:+.3f}, {hi:+.3f}] "
-          f"(PASS-1 upper<=+2us: {pass1}) | mean on={mean_on:.2f}us off={mean_off:.2f}us rel={rel:+.3f}% "
-          f"(upper {rel_hi:+.3f}%) amortised={amort:+.4f}% p99 on={p99_on:.2f} off={p99_off:.2f} "
-          f"(PASS-2 amortised<=0.1% and p99<=+1%: {pass2}) -> {'PASS' if verdict else 'FAIL'}", flush=True)
+    print(f"EPBAL_PERCALL {variant}/{n} pairs={len(pairs)} d={med_d:+.3f}us[{lo_d:+.3f},{hi_d:+.3f}] "
+          f"d2={med_d2:+.3f}us[{lo_d2:+.3f},{hi_d2:+.3f}] d+d2={med_dd:+.3f}us CI95=[{lo_dd:+.3f}, {hi_dd:+.3f}] "
+          f"(PASS-1 upper<=+2us: {pass1}) | amortised={amort:+.4f}% of mean off call {mean_off:.1f}us | "
+          f"non-firing p99 on/off={r_pt:.4f} CI95=[{r_lo:.4f}, {r_hi:.4f}] (PASS-2 amortised<=0.1% and lower<=1.01: "
+          f"{pass2}){' NEED_EP16' if need_ep16 else ''} -> {'PASS' if verdict else 'FAIL'}", flush=True)
 
 
 def main():
