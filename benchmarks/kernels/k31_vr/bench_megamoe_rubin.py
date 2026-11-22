@@ -906,6 +906,17 @@ def main():
                     f.write(text + "\n")
 
     torch.cuda.synchronize()
+    # Served EP-balance ring (int64.3 item 3): every sampled call's global routes must be one point's n x world x topk
+    # (random routing: every route valid), and the per-rank loads must add up to it.
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
+
+    recs = ep_balance.drain_all()
+    expected = {n * world * problem.top_k for _, _, n in points}
+    ok = sum(1 for r in recs if r["routes"] in expected and sum(r["rank_loads"]) == r["routes"]
+             and r["world"] == world)
+    if rank == 0:
+        mm = [round(r["max_over_mean"], 3) for r in recs]
+        print(f"EPBAL records={len(recs)} routes_ok={ok}/{len(recs)} max_over_mean={mm[:8]}", flush=True)
     moe.destroy()
     if world > 1:
         dist.destroy_process_group()

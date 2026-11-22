@@ -44,8 +44,19 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
-from ....common.spin_guard import globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
+from ....common.spin_guard import _st_sys_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
+
+
+# Served EP-balance ring (int64.3 item 3; host side megamoe_rubin/ep_balance.py, same constants): one sampled call in
+# EPBAL_PERIOD, EPBAL_SLOTS slots of [call id, t_ready lo, t_ready hi, expert_count_padded, world_size,
+# experts_per_rank, 0, 0, sizes[expert_count_padded]].
+EPBAL_SHIFT = 6
+EPBAL_PERIOD = 1 << EPBAL_SHIFT
+EPBAL_SLOTS = 256
+EPBAL_HEADER_WORDS = 8
+EPBAL_MAX_EXPERTS = 512
+EPBAL_SLOT_WORDS = EPBAL_HEADER_WORDS + EPBAL_MAX_EXPERTS
 
 
 class DedupCallTail(GenphaseTail):
@@ -74,6 +85,9 @@ class DedupCallTail(GenphaseTail):
     # Device-accessible address of this process's host spin-record buffer (spin_record.py), written once by the
     # host after the workspace is carved; 0 = no records (the guards then only print and trap).
     record_region = "nvlink.token_comm_dedup.spin_record_addr"
+    # Device-accessible address of this process's EP-balance ring (megamoe_rubin/ep_balance.py), written once by
+    # the host after the workspace is carved; 0 = no logging.
+    epbal_region = "nvlink.token_comm_dedup.epbal_ring_addr"
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
         workspace.register(
@@ -88,6 +102,10 @@ class DedupCallTail(GenphaseTail):
         )
         workspace.register(
             self.record_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
+            reset="zero_on_first_allocate",
+        )
+        workspace.register(
+            self.epbal_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
             reset="zero_on_first_allocate",
         )
         workspace.register(
@@ -309,6 +327,8 @@ class _DedupMetadataPushRouter(KernelComponent):
             raise ValueError(f"Combine dedup sorts a token's routes in registers; topk must be <= {self.router_max_topk}.")
         if self.world_size > 32:
             raise ValueError("Combine dedup keeps the destination-rank mask in an Int32; world_size must be <= 32.")
+        if self.expert_count_padded > EPBAL_MAX_EXPERTS:
+            raise ValueError(f"The EP-balance ring slot holds {EPBAL_MAX_EXPERTS} experts; got {self.expert_count_padded}.")
         if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
             raise ValueError(
                 f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "
@@ -1436,6 +1456,37 @@ class _DedupMetadataPushRouter(KernelComponent):
                 spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size), print_flag=device_workspace.ptr(self._call_tail.printed_region),
                     record=device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_warp()
+        self._log_ep_balance(device_workspace, lane_idx)
+
+    @cute.jit
+    def _log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32) -> None:
+        """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, the first CTA's waiting warp copies
+        the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``, so after
+        ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped ring, with
+        a %globaltimer stamp; the call id is written last (slot complete). Stores only, no launch, no sync: the
+        other calls and CTAs read two workspace words and skip."""
+        linear_cta_idx, _, _ = cute.arch.block_idx()
+        if linear_cta_idx == Int32(0):
+            ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
+            call = self._call_tail.read_epoch(device_workspace) + Int32(1)
+            if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
+                base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
+                sizes = device_workspace.tensor(self.sizes_region)
+                for expert_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded, 32)):
+                    expert = Int32(expert_round * 32) + lane_idx
+                    if expert < Int32(self.expert_count_padded):
+                        _st_sys_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), sizes[expert])
+                cute.arch.sync_warp()
+                if lane_idx == Int32(0):
+                    t_ready = globaltimer_ns()
+                    _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
+                    _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
+                    _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
+                    _st_sys_s32(base + Int64(16), Int32(self.world_size))
+                    _st_sys_s32(base + Int64(20), Int32(self.experts_per_rank))
+                    cute.arch.fence_acq_rel_sys()
+                    _st_sys_s32(base, call)
+                    cute.arch.fence_acq_rel_sys()
 
     @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
