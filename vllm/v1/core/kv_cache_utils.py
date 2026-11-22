@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+import base64
 import copy
 import hashlib
 import math
@@ -976,6 +977,109 @@ def resolve_cache_hit_alignment_tokens(
     return scheduler_block_size
 
 
+# P/D block-hash handover: a KV producer adds its block hashes of the prompt to
+# the kv_transfer_params it returns, so the consumer does not hash the whole
+# prompt again (a long prompt costs milliseconds of GIL-held work per request).
+REMOTE_BLOCK_HASHES_KEY = "block_hashes"
+REMOTE_BLOCK_HASH_FP_KEY = "block_hash_fp"
+_remote_hash_counts: dict[str, int] = {}
+
+
+def block_hash_fingerprint(
+    caching_hash_fn: Callable[[Any], bytes], hash_block_size: int, request: Request
+) -> str:
+    """Everything a block hash chain depends on besides the token ids and the
+    per-block extra keys that the witness check re-derives: the algorithm, the
+    block size, the chain root (NONE_HASH, from the hash seed) and the
+    first-block cache salt."""
+    name = getattr(caching_hash_fn, "__name__", repr(caching_hash_fn))
+    return f"{name}/{hash_block_size}/{NONE_HASH.hex()}/{request.cache_salt or ''}"
+
+
+def export_block_hashes(
+    request: Request, hash_block_size: int, caching_hash_fn: Callable[[Any], bytes]
+) -> dict[str, str]:
+    """kv_transfer_params entries with the request's prompt block hashes, or
+    none if it has none to give (multimodal and prompt-embeds hashes are not
+    handed over)."""
+    n = min(len(request.block_hashes), request.num_prompt_tokens // hash_block_size)
+    if n <= 0 or request.mm_features or request.prompt_embeds is not None:
+        return {}
+    return {
+        REMOTE_BLOCK_HASHES_KEY: base64.b64encode(
+            b"".join(request.block_hashes[:n])
+        ).decode("ascii"),
+        REMOTE_BLOCK_HASH_FP_KEY: block_hash_fingerprint(
+            caching_hash_fn, hash_block_size, request
+        ),
+    }
+
+
+def _remote_hashes_not_adopted(request: Request, reason: str) -> list[BlockHash]:
+    count = _remote_hash_counts.get(reason, 0) + 1
+    _remote_hash_counts[reason] = count
+    if count == 1 or count % 1000 == 0:
+        logger.warning(
+            "Not adopting the KV producer's block hashes for request %s (%s; %d "
+            "so far): computing them locally. Adopted so far: %d.",
+            request.request_id,
+            reason,
+            count,
+            _remote_hash_counts.get("adopted", 0),
+        )
+    return []
+
+
+def adopt_remote_block_hashes(
+    request: Request,
+    hash_block_size: int,
+    caching_hash_fn: Callable[[Any], bytes],
+    num_hash_lookahead_tokens: int = 0,
+) -> list[BlockHash]:
+    """The producer's block hashes of this request's prompt, if they are
+    exactly what this process computes: same fingerprint, no more blocks than
+    this request has, and the last block's hash recomputed here from its
+    parent matches. Otherwise [] (the caller hashes everything) and a warning."""
+    params = request.kv_transfer_params
+    encoded = params.get(REMOTE_BLOCK_HASHES_KEY) if params else None
+    if encoded is None:
+        return []
+    if (
+        num_hash_lookahead_tokens
+        or request.mm_features
+        or request.prompt_embeds is not None
+    ):
+        return _remote_hashes_not_adopted(request, "unsupported hash keys")
+    fingerprint = block_hash_fingerprint(caching_hash_fn, hash_block_size, request)
+    if params.get(REMOTE_BLOCK_HASH_FP_KEY) != fingerprint:
+        return _remote_hashes_not_adopted(request, "fingerprint mismatch")
+    size = len(NONE_HASH)
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return _remote_hashes_not_adopted(request, "malformed")
+    n = len(raw) // size
+    if n == 0 or len(raw) != n * size:
+        return _remote_hashes_not_adopted(request, "malformed")
+    if n * hash_block_size > request.num_tokens:
+        return _remote_hashes_not_adopted(request, "more blocks than tokens")
+    hashes = [BlockHash(raw[i * size : (i + 1) * size]) for i in range(n)]
+    start = (n - 1) * hash_block_size
+    extra_keys, _ = generate_block_hash_extra_keys(
+        request, start, start + hash_block_size, 0
+    )
+    witness = hash_block_tokens(
+        caching_hash_fn,
+        hashes[-2] if n > 1 else None,
+        request.all_token_ids[start : start + hash_block_size],
+        extra_keys,
+    )
+    if witness != hashes[-1]:
+        return _remote_hashes_not_adopted(request, "witness mismatch")
+    _remote_hash_counts["adopted"] = _remote_hash_counts.get("adopted", 0) + 1
+    return hashes
+
+
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
@@ -997,12 +1101,20 @@ def get_request_block_hasher(
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * hash_block_size
+        # P/D: a request handed over by a KV producer may carry the producer's
+        # hashes of the same prompt; adopt them once verified (exact: they are
+        # what this function computes), then hash only the blocks after them.
+        adopted: list[BlockHash] = []
+        if not request.block_hashes and request.kv_transfer_params:
+            adopted = adopt_remote_block_hashes(
+                request, hash_block_size, caching_hash_fn, num_hash_lookahead_tokens
+            )
+        start_token_idx = (len(request.block_hashes) + len(adopted)) * hash_block_size
         num_tokens = request.num_tokens - num_hash_lookahead_tokens
 
         if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
-            return []
+            return adopted
 
         curr_mm_idx = 0
         mm_features = request.mm_features
@@ -1015,10 +1127,13 @@ def get_request_block_hasher(
                     start_token_idx + hash_block_size,
                 )
 
-        prev_block_hash_value = (
-            request.block_hashes[-1] if request.block_hashes else None
-        )
-        new_block_hashes: list[BlockHash] = []
+        if adopted:
+            prev_block_hash_value = adopted[-1]
+        else:
+            prev_block_hash_value = (
+                request.block_hashes[-1] if request.block_hashes else None
+            )
+        new_block_hashes: list[BlockHash] = adopted
         while True:
             end_token_idx = start_token_idx + hash_block_size
             if end_token_idx > num_tokens:
