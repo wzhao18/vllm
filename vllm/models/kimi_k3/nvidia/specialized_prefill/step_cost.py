@@ -9,19 +9,24 @@ chunks by this cost instead of by tokens alone, so that a long-context chunk
 does not set the step for every rank (see ``Scheduler._prompt_chunk_cost``).
 
 Costs are in "short-context tokens": a token at context ``ctx`` costs
-``weight(ctx) = 1 + CTX_WEIGHT * ctx``. CTX_WEIGHT is fitted on served lockstep
-steps of the int62 build (Hecate 4n DEP16 prefill testbed, c512, 1219 steps):
-step time vs the busiest rank's sum of n * weight(ctx) is best at 1.0e-6 per
-context token (R^2 0.943, vs 0.920 for tokens alone and 0.856 for the older
-PSOL whole-step table, which overstated long context on this build: w(600K)
-1.6 here vs 2.95). Scheduling only: no computation changes, the cost only
+``weight(ctx) = 1 + CTX_WEIGHT * ctx``. CTX_WEIGHT is fitted jointly on the
+lockstep steps of two int64.2 runs (Rhea 4n DEP16 prefill testbed, c512, 2080
+steps with queued prompts): the next step interval vs the busiest rank's sum of
+n * weight(ctx) is best at 1.5e-6 per context token (R^2 0.646; profile 95% CI
+[1.25, 1.75]e-6, bootstrap [1.0, 2.25]e-6). At 1.5e-6 the fit residuals are
+flat over the busiest rank's context (within 8 ms from 32K to over 512K), where
+1.0e-6 under-prices steps above 512K by 40 ms and 2.7e-6 over-prices them by
+36 ms; it also predicts each run from the other run's fit at least as well.
+The per-rank attention cost alone is steeper (~2.7e-6); the shared MoE work
+per token dilutes it at step level, which is what a step costs.
+Scheduling only: no computation changes, the cost only
 decides how many prompt tokens a step takes.
 """
 
 from typing import Any
 
 # Cost of one prompt token per context token, relative to a short-context token.
-CTX_WEIGHT = 1.0e-6
+CTX_WEIGHT = 1.5e-6
 
 
 def weight(ctx: int) -> float:

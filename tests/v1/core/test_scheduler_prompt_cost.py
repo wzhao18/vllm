@@ -31,13 +31,13 @@ class _Cost:
 
 def test_step_cost_weight():
     assert step_cost.weight(0) == 1.0
-    assert step_cost.weight(130_000) == pytest.approx(1.13)
-    assert step_cost.weight(600_000) == pytest.approx(1.6)
+    assert step_cost.weight(130_000) == pytest.approx(1.195)
+    assert step_cost.weight(600_000) == pytest.approx(1.9)
     ws = [step_cost.weight(c) for c in range(0, 1_000_000, 10_000)]
     assert ws == sorted(ws)
-    # A 16K budget at 600K context buys 16384 / 1.6 tokens.
+    # A 16K budget at 600K context buys 16384 / 1.9 tokens.
     n = step_cost.max_tokens_for_cost(16384, 600_000)
-    assert n == int(16384 / 1.6)
+    assert n == int(16384 / 1.9)
     assert step_cost.chunk_cost(n, 600_000) <= 16384 < step_cost.chunk_cost(
         n + 1, 600_000
     )
