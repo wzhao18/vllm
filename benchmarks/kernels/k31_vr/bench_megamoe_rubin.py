@@ -610,16 +610,25 @@ def _epbal_percall(args, session, moe, hidden, ids, wts, weights, bucket, out, f
                     for _ in range(2000))
     r_pt, r_lo, r_hi = p99(on_nf) / p99(off_nf), ratios[49], ratios[1949]
     pass1 = hi_dd <= 2.0
-    pass2 = amort <= 0.1 and r_lo <= 1.01
-    verdict = pass1 and pass2
+    # p99 non-inferiority (MAIN 12:18): upper bound <= 1.01 passes; a CI straddling 1.01 is INCONCLUSIVE, not PASS
+    p99_state = "PASS" if r_hi <= 1.01 else ("FAIL" if r_lo > 1.01 else "INCONCLUSIVE")
+    pass2 = amort <= 0.1 and p99_state == "PASS"
+    if pass1 and pass2:
+        state = "PASS"
+    elif pass1 and amort <= 0.1 and p99_state == "INCONCLUSIVE":
+        state = "INCONCLUSIVE"
+    else:
+        state = "FAIL"
+    verdict = state
     need_ep16 = variant.startswith("genphase") or "gen" in str(variant)
     need_ep16 = need_ep16 and hi_dd > 0.5
     _EPBAL_VERDICTS.append(verdict)
     print(f"EPBAL_PERCALL {variant}/{n} pairs={len(pairs)} d={med_d:+.3f}us[{lo_d:+.3f},{hi_d:+.3f}] "
           f"d2={med_d2:+.3f}us[{lo_d2:+.3f},{hi_d2:+.3f}] d+d2={med_dd:+.3f}us CI95=[{lo_dd:+.3f}, {hi_dd:+.3f}] "
           f"(PASS-1 upper<=+2us: {pass1}) | amortised={amort:+.4f}% of mean off call {mean_off:.1f}us | "
-          f"non-firing p99 on/off={r_pt:.4f} CI95=[{r_lo:.4f}, {r_hi:.4f}] (PASS-2 amortised<=0.1% and lower<=1.01: "
-          f"{pass2}){' NEED_EP16' if need_ep16 else ''} -> {'PASS' if verdict else 'FAIL'}", flush=True)
+          f"non-firing p99 on/off={r_pt:.4f} CI95=[{r_lo:.4f}, {r_hi:.4f}] width={r_hi - r_lo:.4f} "
+          f"(p99 non-inferiority upper<=1.01: {p99_state}; amortised<=0.1%: {amort <= 0.1})"
+          f"{' NEED_EP16' if need_ep16 else ''} -> {state}", flush=True)
 
 
 def main():
@@ -1017,8 +1026,11 @@ def main():
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
 
     if args.epbal_percall and rank == 0:
-        print(f"EPBAL_PERCALL_ALL {'PASS' if _EPBAL_VERDICTS and all(_EPBAL_VERDICTS) else 'FAIL'} "
-              f"shapes={len(_EPBAL_VERDICTS)} passed={sum(_EPBAL_VERDICTS)}", flush=True)
+        v = _EPBAL_VERDICTS
+        overall = ("PASS" if v and all(x == "PASS" for x in v) else
+                   "FAIL" if (not v or any(x == "FAIL" for x in v)) else "INCONCLUSIVE")
+        print(f"EPBAL_PERCALL_ALL {overall} shapes={len(v)} passed={sum(x == 'PASS' for x in v)} "
+              f"inconclusive={sum(x == 'INCONCLUSIVE' for x in v)}", flush=True)
     recs = ep_balance.drain_all()
     expected = {n * world * problem.top_k for _, _, n in points}
     glob = [r for r in recs if r["local_rank"] < 0]
