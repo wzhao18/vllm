@@ -1274,6 +1274,11 @@ def _compile(inner, fn, args: tuple, kwargs: dict):
     found = _find(key)
     if found is not None:
         return _load_entry(inner, fn, args, kwargs, key, modules, name, found)
+    if os.environ.get("VLLM_KIMI_K3_CUTE_KEYDUMP_DIR"):  # DIAG
+        logger.info(
+            "CuTe keydump miss %s key %s entry dir %s", name, key[:16],
+            "EXISTS (sources differ)" if os.path.isdir(_entry_dir(key)) else "absent",
+        )  # fmt: skip
     if _claim(key):
         return _compile_claimed(inner, fn, args, kwargs, key, modules, name)
     if _phase_depth == 0:  # outside a build phase: wait for the peer's entry
