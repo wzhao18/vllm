@@ -251,6 +251,8 @@ class RoutingFixture:
 #   permr    rep under an R=16 EPLB placement emulated without extra memory: the 16 hottest experts get a replica
 #            hosted in one of the 16 coldest experts' slots, odd tokens go to the replica (pool permr/permr_rep,
 #            fitted out of sample); permrin = the same fitted in sample
+#   permact  rep under an R=0 placement balancing expected ACTIVE experts per rank (LPT on P(expert active in a
+#            768-token step)), out of sample; permactin = in sample
 # Every GPU builds every GPU's ids from (seed, layer, rank), so rank 0 can print the global skew; after the case
 # each rank's seen buffers (the ids MegaMoE read on the last replay) are all-reduced into per-layer expert counts
 # and rank 0 logs "EPLBFIX <case> ..." skew lines.
@@ -265,6 +267,8 @@ def _eplb_pool():
         d = np.load(path)
         perms = {"perm": (d["perm"], None), "permin": (d["perm_in"], None),
                  "permr": (d["permr"], d["permr_rep"]), "permrin": (d["permr_in"], d["permr_in_rep"])}
+        if "perm_act" in d:
+            perms.update(permact=(d["perm_act"], None), permactin=(d["perm_act_in"], None))
         _POOL[path] = (d["blocks"], perms)
     return _POOL[path]
 
@@ -316,7 +320,7 @@ class _EplbFixture:
                     b.data.zero_()
             if not self.saved:
                 raise RuntimeError("EPLB_ROUTE_FIX real0: no e_score_correction_bias found")
-        if mode in ("bal", "uni", "rep", "perm", "permin", "permr", "permrin"):
+        if mode in ("bal", "uni", "rep", "perm", "permin", "permr", "permrin", "permact", "permactin"):
             for col, li in enumerate(self.layers):
                 fix, _ = reg["layers"][li]
                 ids = _eplb_ids(mode, fix.shape[0], reg["E"], fix.shape[1], self.ep, seed, col, col, self.rank)
@@ -396,7 +400,7 @@ def install_routing(
         if len(parts) != 3 or not parts[2].startswith("s"):
             raise ValueError(f"EPLB_ROUTE_FIX: case {case_name!r} is not <shape>~<mode>~s<seed>")
         mode = parts[1]
-        if mode not in ("real", "real0", "bal", "uni", "rep", "perm", "permin", "permr", "permrin"):
+        if mode not in ("real", "real0", "bal", "uni", "rep", "perm", "permin", "permr", "permrin", "permact", "permactin"):
             raise ValueError(f"EPLB_ROUTE_FIX: unknown mode {mode!r}")
         return f"eplb-{mode}", _EplbFixture(runner, case_name, mode, int(parts[2][1:]))
     mode = requested
