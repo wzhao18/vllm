@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.logger import init_logger
+from vllm.models.kimi_k3.nvidia import breadcrumb
 
 from .arch import require_sm107
 from .config import (
@@ -421,6 +422,7 @@ class RubinMegaMoE:
             raise ValueError(f"hidden must be (n, {self.problem.hidden}).")
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
+        breadcrumb.crumb(breadcrumb.OP_MOE_IN)
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
         if unfused_norm is not None:
@@ -446,6 +448,7 @@ class RubinMegaMoE:
                 normed = torch.empty_like(result)
                 ops.rms_norm(normed, result, unfused_norm[0], unfused_norm[1])
                 result = normed
+        breadcrumb.crumb(breadcrumb.OP_MOE_OUT)
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
