@@ -1490,12 +1490,21 @@ class PrefillFinish:
                 st_shared_u32(fine_a + lane * 4, Uint32(0))
                 cute.arch.sync_warp()
                 if exact:
-                    for v in cutlass.range(lane, vectors, 32, unroll=1):
-                        wd = ldg_v4(address + Int64(v) * 16)
-                        for e in cutlass.range_constexpr(8):
-                            key = key_of(wd, e)
-                            if key >= low and key < high:
-                                red_shared(fine_a + (key & Uint32(31)) * 4, 1)
+                    # FIN_BATCH 16-byte loads in flight per lane (a long row is one
+                    # warp's serial walk: latency, not bandwidth, bounds it)
+                    for v0 in cutlass.range(lane, vectors, 32 * FIN_BATCH, unroll=1):
+                        wds = []
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            wd = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                            if v0 + 32 * k < vectors:
+                                wd = ldg_v4(address + Int64(v0 + 32 * k) * 16)
+                            wds.append(wd)
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            if v0 + 32 * k < vectors:
+                                for e in cutlass.range_constexpr(8):
+                                    key = key_of(wds[k], e)
+                                    if key >= low and key < high:
+                                        red_shared(fine_a + (key & Uint32(31)) * 4, 1)
                 else:
                     for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
                         xs = []
@@ -1515,36 +1524,53 @@ class PrefillFinish:
                 all_ties = ties == take
                 if exact:
                     # bound-bin keys above the threshold (and all ties) into the bitmap
-                    for v in cutlass.range(lane, vectors, 32, unroll=1):
-                        wd = ldg_v4(address + Int64(v) * 16)
-                        mk = Uint32(0)
-                        for e in cutlass.range_constexpr(8):
-                            key = key_of(wd, e)
-                            lo = key & Uint32(31)
-                            if key >= low and key < high and (lo > d or (lo == d and all_ties)):
-                                mk = mk | Uint32(1 << e)
-                        if mk != Uint32(0):
-                            red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
+                    for v0 in cutlass.range(lane, vectors, 32 * FIN_BATCH, unroll=1):
+                        wds = []
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            wd = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                            if v0 + 32 * k < vectors:
+                                wd = ldg_v4(address + Int64(v0 + 32 * k) * 16)
+                            wds.append(wd)
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            v = v0 + 32 * k
+                            mk = Uint32(0)
+                            for e in cutlass.range_constexpr(8):
+                                key = key_of(wds[k], e)
+                                lo = key & Uint32(31)
+                                if key >= low and key < high and (lo > d or (lo == d and all_ties)):
+                                    mk = mk | Uint32(1 << e)
+                            if mk != Uint32(0) and v < vectors:
+                                red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
                     if not all_ties:
                         # ties by lowest key index (the stock rule): the warp walks
                         # the keys in key order until it has taken ``take`` of them
+                        # (FIN_BATCH chunks of 32 keys loaded at once, then taken in
+                        # key order: the same walk with the loads in flight together)
                         left = take
-                        for k0 in cutlass.range(0, positions, 32, unroll=1):
+                        for k0 in cutlass.range(0, positions, 32 * FIN_BATCH, unroll=1):
                             if left > Uint32(0):
-                                k = k0 + lane
-                                p = Uint32(position_of(k))
-                                hit = Uint32(0)
-                                if k < length:
-                                    wd = ld_global_u32(address + Int64(p >> Uint32(1)) * 4)
-                                    key = (keys16x2(wd) >> ((p & Uint32(1)) * Uint32(16))) & Uint32(0xFFFF)
-                                    if key >= low and key < high and (key & Uint32(31)) == d:
-                                        hit = Uint32(1)
-                                b = ballot(hit)
-                                if hit != Uint32(0) and popc(b & lanemask_lt()) < left:
-                                    red_or_global(
-                                        brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31))
-                                    )
-                                left = left - cutlass.min(left, popc(b))
+                                wds = []
+                                for j in cutlass.range_constexpr(FIN_BATCH):
+                                    k = k0 + 32 * j + lane
+                                    p = Uint32(position_of(k))
+                                    wd = Uint32(0)
+                                    if k < length:
+                                        wd = ld_global_u32(address + Int64(p >> Uint32(1)) * 4)
+                                    wds.append(wd)
+                                for j in cutlass.range_constexpr(FIN_BATCH):
+                                    k = k0 + 32 * j + lane
+                                    p = Uint32(position_of(k))
+                                    hit = Uint32(0)
+                                    if k < length:
+                                        key = (keys16x2(wds[j]) >> ((p & Uint32(1)) * Uint32(16))) & Uint32(0xFFFF)
+                                        if key >= low and key < high and (key & Uint32(31)) == d:
+                                            hit = Uint32(1)
+                                    b = ballot(hit)
+                                    if hit != Uint32(0) and popc(b & lanemask_lt()) < left:
+                                        red_or_global(
+                                            brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31))
+                                        )
+                                    left = left - cutlass.min(left, popc(b))
                 else:
                     # keys above the threshold (and all ties when all are taken) into the
                     # bitmap; otherwise the ties' positions into a warp buffer
@@ -1589,21 +1615,76 @@ class PrefillFinish:
                                     brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31))
                                 )
                         if nt > Uint32(TIE_BUF):
-                            # many ties: rank them from the candidate list (slow, exact)
-                            for c in cutlass.range(lane, Int32(n_cand), 32, unroll=1):
-                                x = ld_global_u32(crow + c * 4)
-                                p = x >> Uint32(5)
-                                if (x & Uint32(31)) == d:
-                                    rank = Uint32(0)
-                                    for c2 in cutlass.range(Int32(0), Int32(n_cand), unroll=1):
-                                        y = ld_global_u32(crow + c2 * 4)
-                                        if (y & Uint32(31)) == d and key_rank(y >> Uint32(5)) < key_rank(p):
-                                            rank += Uint32(1)
-                                    if rank < take:
-                                        red_or_global(
-                                            brow + (p >> Uint32(5)) * 4,
-                                            Uint32(1) << (p & Uint32(31)),
-                                        )
+                            # many ties: the take-th smallest key index among them by an
+                            # exact 4 x 8-bit radix select over the candidate list (the
+                            # overflowed tie buffer is the 256-bin histogram), then every
+                            # tie at or below it. Key indices are distinct, so exactly
+                            # ``take`` ties are kept: the lowest key indices (stock rule).
+                            prefix = Uint32(0)
+                            pmask = Uint32(0)
+                            rem = take
+                            for ps in cutlass.range_constexpr(4):
+                                shift = 24 - 8 * ps
+                                for i in cutlass.range_constexpr(8):
+                                    st_shared_u32(tie_buf_a + (lane * 8 + i) * 4, Uint32(0))
+                                cute.arch.sync_warp()
+                                for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
+                                    xs = []
+                                    for k in cutlass.range_constexpr(FIN_BATCH):
+                                        x = Uint32(0xFFFFFFFF)
+                                        if c0 + 32 * k < Int32(n_cand):
+                                            x = ld_global_u32(crow + (c0 + 32 * k) * 4)
+                                        xs.append(x)
+                                    for k in cutlass.range_constexpr(FIN_BATCH):
+                                        x = xs[k]
+                                        if x != Uint32(0xFFFFFFFF) and (x & Uint32(31)) == d:
+                                            kr = key_rank(x >> Uint32(5))
+                                            if (kr & pmask) == prefix:
+                                                red_shared(
+                                                    tie_buf_a + ((kr >> Uint32(shift)) & Uint32(255)) * 4, 1
+                                                )
+                                cute.arch.sync_warp()
+                                # lane l holds bins 8 l .. 8 l + 7: the bin where the
+                                # ascending running count reaches rem
+                                s = Uint32(0)
+                                for i in cutlass.range_constexpr(8):
+                                    s += ld_shared_u32(tie_buf_a + (lane * 8 + i) * 4)
+                                incl = warp_inclusive(s, lane)
+                                running = incl - s
+                                bsel = Uint32(0)
+                                below = Uint32(0)
+                                found = Uint32(0)
+                                if running < rem and incl >= rem:
+                                    for i in cutlass.range_constexpr(8):
+                                        h = ld_shared_u32(tie_buf_a + (lane * 8 + i) * 4)
+                                        if found == Uint32(0) and running + h >= rem:
+                                            bsel = Uint32(lane * 8 + i)
+                                            below = running
+                                            found = Uint32(1)
+                                        running += h
+                                for i in cutlass.range_constexpr(5):
+                                    bsel += cute.arch.shuffle_sync_bfly(bsel, 1 << i)
+                                    below += cute.arch.shuffle_sync_bfly(below, 1 << i)
+                                rem = rem - below
+                                prefix = prefix | (bsel << Uint32(shift))
+                                pmask = pmask | Uint32(255 << shift)
+                                cute.arch.sync_warp()
+                            for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
+                                xs = []
+                                for k in cutlass.range_constexpr(FIN_BATCH):
+                                    x = Uint32(0xFFFFFFFF)
+                                    if c0 + 32 * k < Int32(n_cand):
+                                        x = ld_global_u32(crow + (c0 + 32 * k) * 4)
+                                    xs.append(x)
+                                for k in cutlass.range_constexpr(FIN_BATCH):
+                                    x = xs[k]
+                                    p = x >> Uint32(5)
+                                    if x != Uint32(0xFFFFFFFF) and (x & Uint32(31)) == d:
+                                        if key_rank(p) <= prefix:
+                                            red_or_global(
+                                                brow + (p >> Uint32(5)) * 4,
+                                                Uint32(1) << (p & Uint32(31)),
+                                            )
                 fence_acq_rel_gpu()
                 cute.arch.sync_warp()
                 # the bitmap's positions in order (each lane a contiguous run of words)
