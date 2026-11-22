@@ -85,6 +85,94 @@ PREWAIT_ROWS = (64, 96)
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
 
 
+# --- DDSA DIAGNOSTIC (never merge): served decode routing dump ------------------------------------
+# With DDSA_ROUTE_DUMP_DIR set, every SpMlp layer copies the top-k expert ids its tokens were routed to
+# (route_stage's staged ids, or the stock router's topk_ids) into a device ring of the last
+# DDSA_ROUTE_STEPS decode steps: ids[step slot][MoE layer][row][k] int16 plus rows[step slot] and
+# step[step slot]. All copies are static-shape device ops at fixed pointers (CUDA-graph safe). A host
+# thread makes no CUDA call before DDSA_ROUTE_DELAY_S (graph capture), then polls
+# <dir>/ROUTE.<tag>: on a new tag it waits 2 s and saves the ring to
+# <dir>/route-<tag>-<host>-<pid>-<dev>.pt (copy on its own stream).
+class _RouteDump:
+    def __init__(self, out_dir, device, cap, top_k):
+        import os
+        self.dir, self.cap, self.top_k = out_dir, cap, top_k
+        self.ns = int(os.environ.get("DDSA_ROUTE_STEPS", "64"))
+        self.layers = {}  # SpMlp index -> ring column
+        self.nl = 96
+        self.ids = torch.zeros(self.ns, self.nl, cap, top_k, dtype=torch.int16, device=device)
+        self.rows = torch.zeros(self.ns, dtype=torch.int32, device=device)
+        self.step = torch.zeros(self.ns, dtype=torch.int64, device=device)
+        self.counter = torch.zeros(1, dtype=torch.int64, device=device)
+        self.slot = torch.zeros(1, dtype=torch.int64, device=device)
+        self.buf = torch.zeros(1, cap, top_k, dtype=torch.int16, device=device)
+        self.first = None
+        self._start(device)
+
+    def column(self, index):
+        if index not in self.layers:
+            self.layers[index] = len(self.layers)
+            self.first = min(self.layers)
+        return self.layers[index]
+
+    def record(self, index, n, ids):
+        col = self.column(index)
+        if col >= self.nl or n > self.cap:
+            return
+        if index == self.first:
+            self.counter.add_(1)
+            torch.remainder(self.counter, self.ns, out=self.slot)
+            self.rows.index_fill_(0, self.slot, n)
+            self.step.index_copy_(0, self.slot, self.counter)
+        self.buf.zero_()
+        self.buf[0, :n].copy_(ids[:n, : self.top_k])
+        self.ids[:, col].index_copy_(0, self.slot, self.buf)
+
+    def _start(self, device):
+        import json, os, socket, threading, time
+
+        os.makedirs(self.dir, exist_ok=True)
+
+        def run():
+            time.sleep(float(os.environ.get("DDSA_ROUTE_DELAY_S", "1500")))
+            stream = torch.cuda.Stream(device=device)
+            done = set()
+            while True:
+                time.sleep(5)
+                try:
+                    tags = [f.split(".", 1)[1] for f in os.listdir(self.dir) if f.startswith("ROUTE.")]
+                    for tag in tags:
+                        if tag in done:
+                            continue
+                        done.add(tag)
+                        time.sleep(2)
+                        with torch.cuda.stream(stream):
+                            out = {"t": time.time(), "layers": dict(self.layers),
+                                   "ids": self.ids.to("cpu"), "rows": self.rows.to("cpu"),
+                                   "step": self.step.to("cpu"), "counter": self.counter.to("cpu")}
+                        path = os.path.join(self.dir, f"route-{tag}-{socket.gethostname()}-{os.getpid()}-{device.index}.pt")
+                        torch.save(out, path)
+                except Exception as e:  # diagnostic only
+                    print(f"DDSA route dump failed: {e}", flush=True)
+
+        threading.Thread(target=run, daemon=True, name="ddsa-route-dump").start()
+
+
+_ROUTE = {}
+
+
+def _route_dump(device, cap, top_k):
+    import os
+
+    d = os.environ.get("DDSA_ROUTE_DUMP_DIR")
+    if not d:
+        return None
+    if device.index not in _ROUTE:
+        _ROUTE[device.index] = _RouteDump(d, device, cap, top_k)
+    return _ROUTE[device.index]
+# ---------------------------------------------------------------------------------------------------
+
+
 class SplitKFront:
     """The router | latent down GEMM on the split-K kernel for the rows of
     ``tactics`` ({rows: tactic}); ``LtPin``'s ``plans`` / ``run`` interface."""
@@ -176,6 +264,9 @@ class SpMlp:
         if cause is not None:
             raise Unsupported("moe", None, f"layer {index}: {cause}")
         self.mlp, self.rows = mlp, tuple(sorted(set(rows)))
+        self._ddsa_index = index
+        self._ddsa_route = _route_dump(next(mlp.parameters()).device, max(self.rows),
+                                       int(getattr(mlp.experts, "top_k", 16)))
         shared, transform = mlp.shared_experts, mlp.routed_output_transform
         self.mxfp8 = bool(shared_mxfp8(mlp))
         # Router | latent down concatenation (before any GEMM reads the weights:
@@ -364,6 +455,10 @@ class SpMlp:
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
             staged = route.stage(y)
+            if self._ddsa_route is not None:
+                ex = mlp.experts
+                sess = ex.get_runtime().sessions[ex.select_bucket(n)]
+                self._ddsa_route.record(self._ddsa_index, n, sess.topk_idx)
 
             def experts(shared=None):
                 return route.launch(staged, fused_norm, shared)
@@ -376,6 +471,9 @@ class SpMlp:
                 mlp._down_proj_events[1],
                 mlp._down_proj_stream if n <= self.threshold else None,
             )
+
+            if self._ddsa_route is not None and isinstance(topk_ids, torch.Tensor):
+                self._ddsa_route.record(self._ddsa_index, n, topk_ids)
 
             def experts(shared=None):
                 kwargs = {}
