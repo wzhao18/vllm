@@ -38,7 +38,7 @@ import torch
 
 from ...shapes import Choice, Path, Unsupported
 from .projection import PreparedProjection
-from .splitk import CTA_K
+from .splitk import CTA_K, splitk_smem_bytes, splitk_smem_capacity
 from .warp_splitk import (
     _CTA_RESERVED_SMEM,
     _MAX_M,
@@ -126,6 +126,9 @@ def split_k_problem(tactic, k):
         )
     if split < 1 or stages < 1 or k % (CTA_K * split):
         return f"split-K tactic {tactic}: K = {k} not a multiple of {CTA_K} x {split}"
+    need, cap = splitk_smem_bytes(tactic), splitk_smem_capacity()
+    if need > cap:
+        return f"split-K tactic {tactic}: {need} B shared memory > {cap} B per launch"
     return None
 
 

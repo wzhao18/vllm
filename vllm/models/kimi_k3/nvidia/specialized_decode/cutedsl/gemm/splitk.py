@@ -80,6 +80,23 @@ def _smem(dtype, size, alignment, layout=None):
     return cute_ext.allocate(dtype, cute.AddressSpace.smem, layout, alignment=alignment)
 
 
+def splitk_smem_bytes(tactic) -> int:
+    """Shared memory ``SplitKGemm`` allocates for ``tactic`` = (M tile, N tile, split K,
+    stages, ...): the A / B stage rings (1024-B aligned), the split-K mailbox and the
+    barriers (r1 of the step-up bench: 64.80.4.5 = 245,896 B, this gives 245,888 + the
+    alignment slack)."""
+    m, n, split, stages = (int(v) for v in tuple(tactic)[:4])
+    ring = stages * (m + n) * CTA_K * 2
+    mailbox = (split - 1) * m * n * 4
+    barriers = (2 * stages + 3) * 8 + 4
+    return ring + mailbox + barriers + 1024  # + the rings' alignment slack
+
+
+def splitk_smem_capacity() -> int:
+    """The dynamic shared memory ``SplitKGemm`` launches with."""
+    return utils.get_smem_capacity_in_bytes("sm_100")
+
+
 class SplitKGemm:
     """BF16 GEMM with a cluster-local split-K reduction; ``a_map`` is the device
     address of A's tensor map (box {64, mma_m}, 128-byte swizzle)."""
