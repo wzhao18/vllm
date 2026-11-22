@@ -134,8 +134,10 @@ class _RouteDump:
         os.makedirs(self.dir, exist_ok=True)
 
         def run():
-            time.sleep(float(os.environ.get("DDSA_ROUTE_DELAY_S", "1500")))
-            stream = torch.cuda.Stream(device=device)
+            # No CUDA call until a trigger file appears: the trigger is written after the server is
+            # serving (graph capture done), so the side stream is created lazily at the first dump.
+            time.sleep(float(os.environ.get("DDSA_ROUTE_DELAY_S", "0")))
+            stream = None
             done = set()
             while True:
                 time.sleep(5)
@@ -146,6 +148,8 @@ class _RouteDump:
                             continue
                         done.add(tag)
                         time.sleep(2)
+                        if stream is None:
+                            stream = torch.cuda.Stream(device=device)
                         with torch.cuda.stream(stream):
                             out = {"t": time.time(), "layers": dict(self.layers),
                                    "ids": self.ids.to("cpu"), "rows": self.rows.to("cpu"),
@@ -180,7 +184,7 @@ def _start_memstats(device):
             "num_sync_all_streams")
 
     def run():
-        time.sleep(float(os.environ.get("DDSA_MEMSTATS_DELAY_S", "600")))
+        time.sleep(float(os.environ.get("DDSA_MEMSTATS_DELAY_S", "60")))
         while True:
             try:
                 st = torch.cuda.memory_stats(device)
