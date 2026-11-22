@@ -1451,24 +1451,22 @@ class Scheduler(SchedulerInterface):
                         self.connector is None
                         or self._pause_state != PauseState.UNPAUSED
                         or not self.waiting
-                        # Some DP rank of the group has no work: leave the
-                        # queued requests uncommitted so they can move there.
-                        or (
-                            self.dp_bound_here is not None
-                            and self.waiting.peek_request().request_id
-                            not in self.dp_bound_here
-                            # Moved here by a plan: bound here for good.
-                            and getattr(
-                                self.waiting.peek_request(), "dp_pinned_size", None
-                            )
-                            is None
-                        )
                     ):
-                        # Not bound here by the DP plan (it may run on another
-                        # rank or later): load nothing for it yet.
                         break
                     request_queue = self.waiting
                     head = request_queue.peek_request()
+                    if (
+                        self.dp_bound_here is not None
+                        and head.request_id not in self.dp_bound_here
+                        # Moved here by a plan: bound here for good.
+                        and getattr(head, "dp_pinned_size", None) is None
+                    ):
+                        # Not bound here by the DP plan (it may run on another
+                        # rank, or later): load nothing for it yet, and keep
+                        # scanning - bound requests behind it still get their
+                        # loads (like any request that is not ready).
+                        skip_request(request_queue)
+                        continue
                     if head.status != RequestStatus.WAITING or head.num_computed_tokens:
                         # Not fresh (e.g. preempted, or a finished load): it
                         # waits for compute; keep scanning for loads.

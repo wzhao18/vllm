@@ -248,3 +248,25 @@ def test_load_ahead_only_for_requests_the_dp_plan_bound_here():
     assert out.num_scheduled_tokens == {long.request_id: 64}
     assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler._load_ahead == {a}
+
+
+def test_unbound_head_does_not_block_loads_of_bound_requests_behind_it():
+    """int63.2 merge (LOADISSUE skip + E62 binding): an unbound request at the
+    head of the waiting queue is skipped by the load-only scan, not a stop -
+    the bound requests behind it are still loaded ahead, the unbound one stays
+    uncommitted (WAITING, movable), and queue order is kept."""
+    scheduler = _scheduler()
+    long = _fill_budget(scheduler)
+    unbound = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    b1 = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    b2 = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.connector.dp_move_tokens.side_effect = lambda r: r.num_prompt_tokens
+    scheduler.dp_bound_here = {b1.request_id, b2.request_id}
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert unbound.status == RequestStatus.WAITING
+    assert b1.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert b2.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._load_ahead == {b1, b2}
+    # The unbound request is still first among the uncommitted ones.
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [unbound.request_id]
