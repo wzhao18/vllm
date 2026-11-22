@@ -21,7 +21,7 @@ def _write(ring, call, sizes, world, epr, t=123456789):
     buf[base + 4] = world
     buf[base + 5] = epr
     buf[base + 6] = 0  # global record
-    buf[base + 7] = E.epbal_checksum(call, sum(sizes))
+    buf[base + 7] = E.epbal_checksum(call, sizes)
     buf[base] = call
 
 
@@ -75,15 +75,58 @@ def test_global_record_without_matching_checksum_waits():
 
 
 def test_checksum_matches_device_int32_arithmetic():
+    """Reference: the kernel's wrapping int32 ops (weights (i * POS_MUL + POS_ADD) | 1 as signed int32)."""
+    import numpy as np
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.src_gp.common import ep_balance_layout as L
+
+    rng = np.random.default_rng(0)
+    for call, n in ((64, 8), (1 << 30, 224), (64 * 999_999, 512)):
+        counts = rng.integers(0, 50_000, n).astype(np.int32)
+        with np.errstate(over="ignore"):
+            i = np.arange(n, dtype=np.int32)
+            w = (i * np.int32(L.EPBAL_POS_MUL_S32) + np.int32(L.EPBAL_POS_ADD)) | np.int32(1)
+            acc = np.sum(counts * w, dtype=np.int32)
+            dev = (acc ^ np.int32(L.EPBAL_CHECKSUM_SALT)) + np.int32(call) * np.int32(L.EPBAL_CHECKSUM_MUL)
+        assert E.epbal_checksum(call, counts.tolist()) == int(dev)
+
+
+def test_checksum_separates_equal_sum_records():
+    """tokens x top-k is the same for every call of one size: records with equal sums but different routing, or
+    with the same counts at swapped positions, must get different checksums."""
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
 
-    def dev(call, total):  # (total ^ SALT) + call * MUL in wrapping int32, as the kernel computes it
-        v = (((total ^ 0x5BD1E995) & 0xFFFFFFFF) + ((call * 65599) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        return v - (1 << 32) if v >= 1 << 31 else v
+    a = [5, 3, 0, 8, 2, 6, 1, 7]
+    b = [3, 5, 0, 8, 2, 6, 1, 7]  # two experts swapped
+    c = [4, 4, 1, 7, 3, 5, 2, 6]  # same sum, different distribution
+    assert sum(a) == sum(b) == sum(c)
+    assert len({E.epbal_checksum(64, a), E.epbal_checksum(64, b), E.epbal_checksum(64, c)}) == 3
+    assert E.epbal_checksum(64, a) != E.epbal_checksum(128, a)  # bound to the call id
 
-    for call, total in ((64, 0), (1 << 30, 123456), (64 * 999_999, 2_000_000_000)):
-        assert E.epbal_checksum(call, total) == dev(call, total)
-        assert -(1 << 31) <= E.epbal_checksum(call, total) < 1 << 31
+
+@cuda
+def test_torn_record_mixing_two_same_size_calls_is_rejected():
+    """Slot reuse without a fence: the slot holds call 64's record when call 64 + 64 * SLOTS (same size, same
+    sum) lands; the host reads the new call id + checksum with half of the old counts still visible."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    ring = E.EpBalanceRing("test")
+    old = [6, 2, 4, 4, 1, 7, 3, 5]
+    new = [2, 6, 4, 4, 7, 1, 5, 3]
+    assert sum(old) == sum(new)
+    _write(ring, 64, old, world=4, epr=2)
+    assert [r["call"] for r in ring.drain()] == [64]
+    nxt = 64 + 64 * E.SLOTS
+    _write(ring, nxt, new, world=4, epr=2)
+    i = (nxt >> E.SHIFT) % E.SLOTS
+    base = i * E.SLOT_WORDS + E.HEADER_WORDS
+    ring.buffer[base : base + 4] = torch.tensor(old[:4], dtype=torch.int32)  # first half still the old call's
+    ring._last = nxt - 64  # cursor just before the new call
+    assert ring.drain() == []  # torn: rejected, retried later
+    ring.buffer[base : base + 4] = torch.tensor(new[:4], dtype=torch.int32)
+    out = ring.drain()
+    assert [r["call"] for r in out] == [nxt] and out[0]["rank_loads"] == [8, 8, 8, 8]
+
 
 
 @cuda

@@ -49,7 +49,7 @@ from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
 
 
 from ....common.ep_balance_layout import (  # noqa: E402
-    EPBAL_CHECKSUM_MUL, EPBAL_CHECKSUM_SALT, EPBAL_HEADER_WORDS, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
+    EPBAL_CHECKSUM_MUL, EPBAL_CHECKSUM_SALT, EPBAL_HEADER_WORDS, EPBAL_POS_ADD, EPBAL_POS_MUL_S32, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
 )
 
 
@@ -1456,10 +1456,10 @@ class _DedupMetadataPushRouter(KernelComponent):
         so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
         ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
 
-        No fence: a system-scope fence here waits behind the kernel's in-flight NVLink/HBM traffic (~100 us
-        measured per logging call; the same stores + fence cost 2.4 us on an idle GPU). Instead word 7 carries
-        ``epbal_checksum(call, sum(counts))`` and the host takes a slot only when the call id and the checksum agree
-        (a slot read while its stores are still landing is retried on the next drain). Stores only: 16-byte
+        No system fence (the fenced record cost ~105 us per logging call in the kernel vs 2.4 us for the same stores +
+        fence on an idle GPU). Instead word 7 carries ``epbal_checksum(call, counts)``, a position-weighted sum bound
+        to the call id, and the host takes a slot only when the call id and the checksum agree (a slot read while its
+        stores are still landing, or mixing two calls' counts, is retried on the next drain). Stores only: 16-byte
         relaxed system stores, no launch, no sync; the other calls, warps and CTAs read nothing and skip."""
         linear_cta_idx, _, _ = cute.arch.block_idx()
         # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
@@ -1479,7 +1479,12 @@ class _DedupMetadataPushRouter(KernelComponent):
                             c2 = sizes[expert + Int32(2)]
                             c3 = sizes[expert + Int32(3)]
                             _st_sys_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
-                            total = total + c0 + c1 + c2 + c3
+                            # position-weighted (odd weight (i * POS_MUL + POS_ADD) | 1 per expert), wrapping int32
+                            w0 = (expert * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
+                            w1 = ((expert + Int32(1)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
+                            w2 = ((expert + Int32(2)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
+                            w3 = ((expert + Int32(3)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
+                            total = total + c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3
                     for shift in cutlass.range_constexpr(5):
                         total = total + cute.arch.shuffle_sync_bfly(total, 16 >> shift)
                     if lane_idx == Int32(0):

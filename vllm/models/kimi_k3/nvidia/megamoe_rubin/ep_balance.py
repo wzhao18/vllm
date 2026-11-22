@@ -114,13 +114,14 @@ class EpBalanceRing:
 
 def slot_complete(w: list[int]) -> bool:
     """A local record (word 6 > 0) is published behind a system fence. A global record (dedup router) is written
-    without one, so it is complete only when word 7 matches the checksum of its call id and counts."""
+    without one, so it is complete only when word 7 matches the position-weighted checksum of its call id and counts
+(a record whose counts mix two calls of the same size, equal sums, still fails)."""
     if w[6] > 0:
         return True
     entries = w[3]
     if not 0 < entries <= MAX_EXPERTS:
         return False
-    return w[7] == epbal_checksum(w[0], sum(w[HEADER_WORDS : HEADER_WORDS + entries]))
+    return w[7] == epbal_checksum(w[0], w[HEADER_WORDS : HEADER_WORDS + entries])
 
 
 def summarize(w: list[int]) -> dict:
