@@ -1052,7 +1052,8 @@ def main():
     n_rec = len(glob) + len(merged)
     if rank == 0:
         mm = [round(r["max_over_mean"], 3) for r in glob + merged]
-        print(f"EPBAL records={n_rec} routes_ok={ok}/{n_rec} max_over_mean={mm[:8]}", flush=True)
+        act = [(r["active_busiest"], round(r["active_mean"], 2)) for r in merged][:8]
+        print(f"EPBAL records={n_rec} routes_ok={ok}/{n_rec} max_over_mean={mm[:8]} active_busiest_mean={act}", flush=True)
     moe.destroy()
     if world > 1:
         dist.destroy_process_group()

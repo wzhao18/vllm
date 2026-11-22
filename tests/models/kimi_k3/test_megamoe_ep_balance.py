@@ -219,3 +219,42 @@ def test_local_decode_records_merge_by_call():
     assert [(m["call"], m["complete"]) for m in merged] == [(64, True), (128, False)]
     assert merged[0]["rank_loads"] == [4, 8] and merged[0]["routes"] == 12
     assert merged[0]["max_over_mean"] == pytest.approx(8 / 6)
+
+
+def test_active_experts_per_rank_local_and_global_and_merged():
+    """EPLB.md 15:04 (DCRIT r85): decode MegaMoE cost follows ACTIVE experts per rank (tokens > 0), so records carry
+    active_per_rank and the per-call merge carries the per-rank list, busiest and mean (host-only, from the counts)."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    def slot(call, sizes, rank, world, epr):
+        w = [0] * E.SLOT_WORDS
+        w[0], w[3], w[4], w[5], w[6] = call, len(sizes), world, epr, rank + 1
+        w[7] = E.epbal_checksum(call, sizes)
+        w[E.HEADER_WORDS : E.HEADER_WORDS + len(sizes)] = sizes
+        return w
+
+    # global record (prefill): 3 ranks x 3 experts; active per rank [2, 0, 3]
+    g = E.summarize(slot(64, [4, 0, 1, 0, 0, 0, 2, 2, 9], rank=-1, world=3, epr=3))
+    assert g["active_per_rank"] == [2, 0, 3] and g["rank_loads"] == [5, 0, 13] and g["expert_max"] == 9
+    # local records (decode): equal token loads (6 each) but different activity: rank 0 [6, 0, 0] -> 1 active,
+    # rank 1 [2, 2, 2] -> 3 active; token skew 1.0, activity busiest 3 / mean 2
+    r0 = E.summarize(slot(128, [6, 0, 0], rank=0, world=2, epr=3))
+    r1 = E.summarize(slot(128, [2, 2, 2], rank=1, world=2, epr=3))
+    assert r0["active_per_rank"] == [1] and r1["active_per_rank"] == [3]
+    for r in (r0, r1):
+        r["session"] = "genphase-128"
+    (m,) = E.merge_local([[r0], [r1]])
+    assert m["complete"] and m["max_over_mean"] == pytest.approx(1.0)
+    assert m["active_per_rank"] == [1, 3] and m["active_busiest"] == 3 and m["active_mean"] == pytest.approx(2.0)
+    assert m["expert_max"] == 6
+    # a missing rank stays None in the list and out of busiest / mean
+    (m2,) = E.merge_local([[r0], []])
+    assert not m2["complete"] and m2["active_per_rank"] == [1, None] and m2["active_busiest"] == 1
+
+
+def test_iterlog_e_line_carries_active_per_rank():
+    from vllm.v1.metrics import iterlog
+
+    assert iterlog.EP_BALANCE_FIELDS[-1] == "active_per_rank"
+    assert "active_per_rank" in iterlog.EP_BALANCE_META
+

@@ -60,11 +60,13 @@ WORKER_FIELDS = {
 # tuples, drained once per step on the worker thread after the step's own record.
 _WORKER_SOURCES: list = []
 EP_BALANCE_FIELDS = ["E", "session", "call", "layer", "local_rank", "t_ready_ns", "routes", "max_over_mean",
-                     "expert_max", "lost", "rank_loads"]
+                     "expert_max", "lost", "rank_loads", "active_per_rank"]
 EP_BALANCE_META = {"expert_placement": "contiguous per rank (static; dynamic EPLB off)",
                    "layer": "(call - 1) % moe_layers",
                    "local_rank": "-1: global counts (prefill dedup router); >= 0: this rank's experts only (decode "
-                                 "genphase), merge all ranks' E lines by (session, call); needs VLLM_ITERLOG_ALL_RANKS=1"}
+                                 "genphase), merge all ranks' E lines by (session, call); needs VLLM_ITERLOG_ALL_RANKS=1",
+                   "active_per_rank": "experts with >= 1 token per EP rank (local line: [this rank]); the decode "
+                                      "MegaMoE cost variable (weight streaming), busiest / mean over the merged ranks"}
 
 
 def register_worker_source(fn) -> None:

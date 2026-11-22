@@ -163,14 +163,18 @@ def summarize(w: list[int]) -> dict:
     """One slot -> per-EP-rank loads (experts are owned contiguously: rank r has [r*epr, (r+1)*epr))."""
     """Global record (word 6 == 0, dedup router / prefill): every expert's count, so per-rank loads and max/mean.
     Local record (word 6 == local_rank + 1, genphase / decode): this rank's experts only; rank_loads holds this rank's
-    load and max_over_mean is -1 (the host merges the ranks' records by call id, see merge_local)."""
+    load and max_over_mean is -1 (the host merges the ranks' records by call id, see merge_local).
+    ``active_per_rank``: experts with at least one token, per EP rank ([this rank] for a local record)."""
     t_ready = (w[1] & 0xFFFFFFFF) | ((w[2] & 0xFFFFFFFF) << 32)
     entries, world, epr, local = w[3], w[4], w[5], w[6]
     sizes = w[HEADER_WORDS : HEADER_WORDS + entries]
     if local > 0:
         loads, mm = [sum(sizes)], -1.0
+        active = [sum(1 for c in sizes if c > 0)]
     else:
-        loads = [sum(sizes[r * epr : (r + 1) * epr]) for r in range(world)] if world and epr else []
+        slices = [sizes[r * epr : (r + 1) * epr] for r in range(world)] if world and epr else []
+        loads = [sum(x) for x in slices]
+        active = [sum(1 for c in x if c > 0) for x in slices]
         mean = sum(loads) / len(loads) if loads else 0.0
         mm = (max(loads) / mean) if mean > 0 else 0.0
     return {
@@ -183,6 +187,9 @@ def summarize(w: list[int]) -> dict:
         "rank_loads": loads,
         "max_over_mean": mm,
         "expert_max": max(sizes) if sizes else 0,
+        # ACTIVE experts (tokens > 0) per rank: the decode MegaMoE cost variable (weight streaming, ~+1.17 us per
+        # active expert per layer; EPLB.md 15:04). Local record: [this rank's count]; global: one per EP rank.
+        "active_per_rank": active,
     }
 
 
@@ -197,10 +204,15 @@ def merge_local(records_by_rank: list[list[dict]]) -> list[dict]:
     for (session, call), ranks in sorted(by_call.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
         world = next(iter(ranks.values()))["world"]
         loads = [ranks[r]["routes"] if r in ranks else None for r in range(world)]
+        active = [ranks[r]["active_per_rank"][0] if r in ranks else None for r in range(world)]
         have = [x for x in loads if x is not None]
+        act = [x for x in active if x is not None]
         mean = sum(have) / len(have) if have else 0.0
         out.append({"session": session, "call": call, "rank_loads": loads, "complete": len(have) == world,
-                    "routes": sum(have), "max_over_mean": (max(have) / mean) if mean > 0 else 0.0})
+                    "routes": sum(have), "max_over_mean": (max(have) / mean) if mean > 0 else 0.0,
+                    "expert_max": max((ranks[r]["expert_max"] for r in ranks), default=0),
+                    "active_per_rank": active, "active_busiest": max(act, default=0),
+                    "active_mean": (sum(act) / len(act)) if act else 0.0})
     return out
 
 
@@ -228,4 +240,5 @@ def drain_all() -> list[dict]:
 
 def _iterlog_records() -> list[tuple]:
     return [("E", r["session"], r["call"], r["layer"], r["local_rank"], r["t_ready_ns"], r["routes"],
-             round(r["max_over_mean"], 4), r["expert_max"], r["lost"], r["rank_loads"]) for r in drain_all()]
+             round(r["max_over_mean"], 4), r["expert_max"], r["lost"], r["rank_loads"], r["active_per_rank"])
+            for r in drain_all()]
