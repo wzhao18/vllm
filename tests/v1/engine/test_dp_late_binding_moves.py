@@ -323,3 +323,22 @@ def test_plan_binds_requests_where_they_will_run():
     _, bound1_after_move, held1 = got[1]
     assert bound0 == ["b"] and held0 == ["b"]
     assert "a" in bound1_after_move and held1 == ["a"]
+
+
+def test_pending_handover_keeps_the_group_running():
+    """A rank holding a forwarded output (or a planned move / abort forward)
+    reports unfinished work, so the DP group keeps stepping until it is handed
+    over (Brcff warmup, 2026-11-22: outputs parked while every engine went
+    idle never reached the client)."""
+    core = object.__new__(DPEngineCoreProc)
+    core._dp_moves = []
+    core._dp_abort_forward = {}
+    core._dp_out_forward = {}
+    core._dp_abort_counts = []
+    core._dp_out_counts = []
+    assert not DPEngineCoreProc._dp_has_pending_handover(core)
+    core._dp_out_forward = {0: [("c", "out", False)]}
+    assert DPEngineCoreProc._dp_has_pending_handover(core)
+    core._dp_out_forward = {}
+    core._dp_out_counts = [[0, 1], [0, 0]]
+    assert DPEngineCoreProc._dp_has_pending_handover(core)
