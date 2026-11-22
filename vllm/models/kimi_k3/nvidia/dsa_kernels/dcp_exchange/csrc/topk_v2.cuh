@@ -394,6 +394,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
   int& s_bh = s_i[9];
   int& s_n = s_i[10];
   int& s_th = s_i[11];
+  // uniform rows: (1 << 16) | key when every position of this rank's row is valid and
+  // holds the same key (sent in round-1 word 7); s_unirow: the row takes the uniform cut
+  __shared__ int s_uni, s_unirow;
   uint32_t& s_valid = s_u[0];
   uint32_t& s_above = s_u[1];
   uint32_t& s_beyond = s_u[2];
@@ -476,7 +479,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // most kV2NR x kV2T groups are read from the SMEM copy (fast path: short loops);
     // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
-    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; }
+    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; s_uni = 0; s_unirow = 0; }
     const int head = min(L, head0);
     const int sh = (8 - head) & 7;  // == sh0 when L >= 8
     const int ng = (L + sh + 7) >> 3;
@@ -1052,6 +1055,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         });
       }
     }
+    // a uniform row: one window key holds every valid key, and every position is valid
+    if (tid < kV2Win && s_valid > 0u && s_valid == (uint32_t)L && win[tid] == s_valid)
+      s_uni = (1 << 16) | (lo + tid);
     __syncthreads();
     V2DBG(16);
     if (tid < kV2Win / 2) msg[kV2Hdr + tid] = pack2(tag, win[2 * tid], win[2 * tid + 1]);
@@ -1064,7 +1070,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // for the CG rounds: the exact q-th key and theta
       msg[5] = tagw(tag, pdone ? ((uint32_t)s_e | (1u << 16)) : 0u);
       msg[6] = tagw(tag, (uint32_t)th);
-      msg[7] = tagw(tag, 0u);
+      msg[7] = tagw(tag, (uint32_t)s_uni);
     }
     // the whole slot goes out (unused band words tagged), so one poll pass reads it
     const int words = kV2Msg;
@@ -1123,6 +1129,14 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         tv += s[4] & 0xFFFFFFu;
       }
       int rt = tv <= (uint32_t)K ? 4 : (sat || mx >= mn) ? 3 : 0;
+      // complete body: every rank's row uniform with the same key and every global position
+      // valid (gids 0 .. Gl - 1): every key ties at tau = that key, so the stock rule (ties
+      // to the lowest global id) selects exactly the gids 0 .. K - 1. Tier 3 with that id
+      // cut, without the radix rounds (the same selection the rounds would find).
+      uint32_t ukey = rx[7] & 0x1FFFFu;
+      bool uni = !kFast && rt != 4 && (ukey >> 16) && tv == (uint32_t)Gl;
+      for (int r = 1; r < W; ++r) uni = uni && (rx[r * kV2Msg + 7] & 0x1FFFFu) == ukey;
+      if (uni) rt = 6;
       int tau = -1, need = 0, qv = 0;
       V2DBG(19);
       if (rt == 0) {
@@ -1220,9 +1234,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       if (tid == 0) {
+        if (rt == 6) {
+          s_tier = 3;
+          s_tau = (int)(ukey & 0xFFFFu);
+          s_need = K;
+          s_gs = K - 1;
+          s_unirow = 1;
+        } else {
         s_tier = rt;
         if (rt != 3 || tau >= 0) { s_tau = tau; s_need = need; }
         if (qv >= 0) s_q = qv;
+        }
       }
     }
     __syncthreads();
@@ -1644,7 +1666,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
 
     // ---- T3: radix select of the K-th largest composite (key << 24 | 0xFFFFFF - gid)
-    if (!kFast && K31_RARE(tier == 3)) {
+    if (!kFast && K31_RARE(tier == 3) && !s_unirow) {
       V2STAT(3);
       if (tid == 0) { s_pref = 0ull; s_cnt = K; s_u[12] = 0; }
       __syncthreads();
@@ -1848,7 +1870,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tid == 0) a += s_above;
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
         if ((tid & 31) == 0 && a) atomicAdd(&s_gt, a);
-      } else {
+      } else if (!s_unirow) {  // uniform rows: no key above tau
         uint32_t c = 0;
         for_keys(0, ng, [&](int, const uint4& r) {
           const uint32_t valid = 0xFFu;
@@ -1868,8 +1890,18 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // selected positions -> sel[] (output index order)
       uint32_t* sel = rx;  // the exchanged words are no longer read
       int run_g = 0, run_e = 0;
-      for (int c0 = 0; c0 < L; c0 += kV2Chunk) {
-        const int n = min(kV2Chunk, L - c0), nw = (n + 31) >> 5;
+      // tier 3 with no key above tau (all-tie rows): only the ties with gid <= gs are
+      // written, and gid is increasing in the position, so the walk ends at the last
+      // position whose gid is <= gs (the same selection, without reading the rest)
+      int Lw = L;
+      if (tier == 3 && gtt == 0) {
+        const int64_t g = gs, ilw = (int64_t)IL * W, blk = g / ilw;
+        const int r = (int)((g % ilw) / IL), off = (int)(g % IL);
+        const int64_t pl = r == p.rank ? blk * IL + off : (r > p.rank ? blk * IL + IL - 1 : blk * IL - 1);
+        Lw = pl + 1 < 0 ? 0 : (pl + 1 < (int64_t)L ? (int)(pl + 1) : L);
+      }
+      for (int c0 = 0; c0 < Lw; c0 += kV2Chunk) {
+        const int n = min(kV2Chunk, Lw - c0), nw = (n + 31) >> 5;
         for (int i = tid; i < nw; i += kV2T) { bmg[i] = 0; bme[i] = 0; }
         __syncthreads();
         if (from_cand) {
