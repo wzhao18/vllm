@@ -1788,6 +1788,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                     iket.range_pop()
+                if cutlass.const_expr(hasattr(self.token_comm, "log_ep_balance")):
+                    # served EP-balance record (dedup comm): last work of these warps, before the tail reset
+                    self.token_comm.log_ep_balance()
                 finalize_barrier.arrive_and_wait()
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()

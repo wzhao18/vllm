@@ -1454,7 +1454,7 @@ class _DedupMetadataPushRouter(KernelComponent):
         """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
         CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
         so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
-        ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
+        ring, with a %globaltimer stamp. TokenCommDedup.log_ep_balance calls it at the end of the dispatch warps' work.
 
         No system fence (the fenced record cost ~105 us per logging call in the kernel vs 2.4 us for the same stores +
         fence on an idle GPU). Instead word 7 carries ``epbal_checksum(call, counts)``, a position-weighted sum bound
@@ -2249,8 +2249,6 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
-        # EP-balance log after this CTA's pulls are published: off the dispatch critical path (int64.3 item 3).
-        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode == "standalone_warps"):
             # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
             cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -2701,6 +2699,15 @@ class TokenCommDedup(KernelComponent):
                 claimed_token = cute.arch.atomic_add(schedule_counter, Int32(1), sem="relaxed", scope="gpu")
             return Int32(cute.arch.shuffle_sync(claimed_token, Int32(0)))
         return current_token + global_worker_count
+
+    @cute.jit
+    def log_ep_balance(self) -> None:
+        """Served EP-balance record (int64.3 item 3), called by the dispatch warps at the very end of their work
+        (after token_in and, when they run it, their token_back share; before the finalize barrier that precedes the
+        tail reset of ``sizes``). Only transfer warp 0 of CTA 0 writes, on one call in EPBAL_PERIOD, so nothing in
+        this call or the next waits on its loads and stores except CTA 0's own exit (task E: after the pulls it
+        still cost +3.9 us per logging call at 8192 tokens, mostly in the next call)."""
+        self._router.log_ep_balance(self._device_workspace, self._lane_idx, self._transfer_warp_idx)
 
     @cute.jit
     def reset_tail(self) -> None:
