@@ -350,9 +350,16 @@ class IndexerScore:
 
     def __init__(
         self, ctas: int, mode: int = 0, topk: int = 2048, epi: int = 0,
+        split: bool = False,
     ):
         """mode: 0 logits + per-row top-k bound (row_bin); STORE logits only;
-        PUBLISH candidates at or above the row thresholds (row_bin), no logits."""
+        PUBLISH candidates at or above the row thresholds (row_bin), no logits.
+        split (mode 0): items are [n, 7] key splits (see SplitPlan): fields 4, 5
+        the split's tile range [lo, hi) of the item's (even-rounded) tiles, field 6
+        its histogram slot (-1: the whole item, row bounds in the kernel; else the
+        rows' histograms go to ``ghist`` slot rows, finished by RowBound)."""
+        assert not split or mode == 0
+        self.split = split
         self.mode = mode
         self.ctas = ctas
         self.topk = topk
@@ -378,6 +385,7 @@ class IndexerScore:
         row_base: cute.Tensor,  # Int64 [T + 1]: row t's first element in logits (T: dummy row)
         logits: cute.Tensor,  # Int16 [*]: BF16 logits scratch
         row_bin: cute.Tensor,  # Int32 [2 * T]: per row the bound rank and the count above it
+        ghist: cute.Tensor,  # Int32 [slots * BQ * S_BINS]: split items' row histograms
         s,
     ):
         fp4 = cutlass.Float4E2M1FN
@@ -477,6 +485,7 @@ class IndexerScore:
             row_base,
             logits,
             row_bin,
+            ghist,
         ).launch(
             grid=[self.ctas, 1, 1],
             block=[THREADS, 1, 1],
@@ -508,6 +517,7 @@ class IndexerScore:
         row_base: cute.Tensor,
         logits: cute.Tensor,
         row_bin: cute.Tensor,
+        ghist: cute.Tensor,
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -584,7 +594,7 @@ class IndexerScore:
                 tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
                 logits, row_bin, (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint()),
                 warp, tidx, bid,
-                lane,
+                lane, ghist,
             )
         else:
             if warp == PRODUCER:
@@ -657,10 +667,15 @@ class IndexerScore:
                     # an even tile count (the epilogue takes the two accumulator stages
                     # per step): an odd count repeats the newest tile, fully masked
                     ntp = ntiles + (ntiles & 1)
+                    t_lo = Int32(0)
+                    t_hi = ntp
+                    if cutlass.const_expr(self.split):
+                        t_lo = items[item, 4]
+                        t_hi = items[item, 5]
                     # key bases are 128-aligned (plan): tile coordinates add up
                     kt0 = key0 >> 7
-                    for tt in cutlass.range(ntp, unroll=1):
-                        t = cutlass.min(ntp - 1 - tt, ntiles - 1)
+                    for tt in cutlass.range(t_hi - t_lo, unroll=1):
+                        t = cutlass.min(t_hi - 1 - tt, ntiles - 1)
                         cute.arch.mbarrier_wait(kv_empty + kv_stage, kv_ph ^ 1)
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -699,10 +714,13 @@ class IndexerScore:
                 jq = Int32(0)
                 for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
                     ntiles = items[item, 3]
+                    npairs = (ntiles + 1) // 2
+                    if cutlass.const_expr(self.split):
+                        npairs = (items[item, 5] - items[item, 4]) // 2
                     qs = jq % Q_STAGES
                     cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
                     cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, qs)], s2t_b[2])
-                    for _p in cutlass.range((ntiles + 1) // 2, unroll=1):
+                    for _p in cutlass.range(npairs, unroll=1):
                         for a in cutlass.range_constexpr(ACC_STAGES):
                             cute.arch.mbarrier_wait(acc_empty + a, acc_ph ^ 1)
                             cute.arch.mbarrier_wait(kv_full + kv_stage, kv_ph)
@@ -770,7 +788,7 @@ class IndexerScore:
     @cute.jit
     def epilogue(
         self, tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
-        logits, row_bin, sm, warp, tidx, bid, lane,
+        logits, row_bin, sm, warp, tidx, bid, lane, ghist,
     ):
         """Every epilogue warp reads every tile: warpgroup wg owns tokens 2 wg and
         2 wg + 1 of the item, its warp w % 4 the TMEM lane quarter (32 keys). The
@@ -816,8 +834,15 @@ class IndexerScore:
             if tok_a + 1 >= ntok:
                 row1 = n_rows
             ntp = ntiles + (ntiles & 1)
+            # the tiles [t_lo, t_hi) of this item (split items: a key range)
+            t_lo = Int32(0)
+            t_hi = ntp
+            if cutlass.const_expr(self.split):
+                t_lo = items[item, 4]
+                t_hi = items[item, 5]
+            npairs = (t_hi - t_lo) // 2
             # running pointers: position lt of the item's newest tile pair's first tile
-            first = Int64((ntp - 1) * TILE + lt) * 2
+            first = Int64((t_hi - 1) * TILE + lt) * 2
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
             thr = Uint32(0)
@@ -868,10 +893,10 @@ class IndexerScore:
             # tile pairs whose newer tile reaches past a row end (causal edge, and
             # the repeated tile of an odd count) come first (newest to oldest);
             # the rest run without masking
-            n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
+            n_edge = cutlass.min(cutlass.max(t_hi + 1 - full_tiles, 0) // 2, npairs)
             for pp in cutlass.range(n_edge, unroll=1):
                 ptr0, ptr1, p0, p1 = self.tile_pair(
-                    True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
+                    True, t_hi - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
                     w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
                     key_in_tile, hist0, hist1,
                 )
@@ -901,9 +926,9 @@ class IndexerScore:
                     hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tw, p0, p1, thr
                 )
             else:
-                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                for pp in cutlass.range(n_edge, npairs, unroll=1):
                     ptr0, ptr1, p0, p1 = self.tile_pair(
-                        False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
+                        False, t_hi - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
                         w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
                         key_in_tile, hist0, hist1,
                     )
@@ -916,8 +941,21 @@ class IndexerScore:
             elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
-                self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-                self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
+                slot = Int32(-1)
+                if cutlass.const_expr(self.split):
+                    slot = items[item, 6]
+                if slot < 0:
+                    self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
+                    self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
+                else:
+                    # a key split: add both rows' histograms into the slot's rows
+                    # (integer counts: the merged histogram is order independent)
+                    gh = ghist.iterator.toint() + Int64(slot * BQ + tok_a) * (S_BINS * 4)
+                    for i in cutlass.range_constexpr(2 * S_BINS // 128):
+                        j = i * 128 + lt
+                        c = ld_shared_u32(hist0 + j * 4)
+                        if c != Uint32(0) and tok_a + (i * 128) // S_BINS < ntok:
+                            red_global_add(gh + Int64(j) * 4, c)
                 for i in cutlass.range_constexpr(2 * S_BINS // 128):
                     st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
                 wg_sync(wg)
@@ -1266,6 +1304,11 @@ FIN_BATCH = 8  # global loads in flight per lane in the finish kernel
 def atom_add_global(address, value):
     code = "atom.global.add.u32 $0, [$1], $2;"
     return code, "=r,l,r,~{memory}", (Int64(address), Uint32(value))
+
+
+@asm()
+def red_global_add(address, value):
+    return "red.global.add.u32 [$0], $1;", "l,r,~{memory}", (Int64(address), Uint32(value))
 
 
 @asm()
@@ -2755,6 +2798,215 @@ def _rec_plan_kernel():
     return cute.compile(RecPlan(), *args, options="--enable-tvm-ffi")
 
 
+SPLIT_MIN_PAIRS = 16  # tile pairs per key split at least (4096 keys)
+
+
+class SplitPlan:
+    """Key splits of the full-path score (one CTA): when the ``n`` items (device
+    count) do not fill the GPU (n < sms), each item's tile pairs are cut into
+    splits of P = max(SPLIT_MIN_PAIRS, ceil(total pairs / (sms - n))) pairs (all
+    splits fit one wave), so the call takes about one split's time instead of one
+    whole item's; split items
+    send their rows' histograms to slot i (the item's index; ``par``: its token0
+    and token count, 0 tokens: no slot) for RowBound. Otherwise every item runs
+    whole. Output items [*, 7]: token0, ntok, key0, ntiles, tile lo, tile hi,
+    slot."""
+
+    def __init__(self, sms: int):
+        self.sms = sms
+
+    @cute.jit
+    def __call__(self, items, n_in, items_x, n_x, par, s):
+        self.kernel(items, n_in, items_x, n_x, par).launch(
+            grid=(1, 1, 1), block=(RP_THREADS, 1, 1), stream=s,
+        )
+
+    @cute.kernel
+    def kernel(self, items, n_in, items_x, n_x, par):
+        tid, _, _ = cute.arch.thread_idx()
+        w = tid // 32
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        buf = smem.allocate_tensor(Uint32, cute.make_layout(RP_THREADS // 32 + 1), 16)
+        sum_a = buf.iterator.toint()
+        tot_a = sum_a + (RP_THREADS // 32) * 4
+        n = n_in[0]
+        if n >= self.sms:
+            for i in cutlass.range(tid, n, RP_THREADS, unroll=1):
+                nt = items[i, 3]
+                for k in cutlass.range_constexpr(4):
+                    items_x[i, k] = items[i, k]
+                items_x[i, 4] = Int32(0)
+                items_x[i, 5] = nt + (nt & 1)
+                items_x[i, 6] = Int32(-1)
+            if tid == 0:
+                n_x[0] = n
+        else:
+            # n < sms <= RP_THREADS: one thread per item
+            pairs = Uint32(0)
+            if tid < n:
+                pairs = Uint32((items[tid, 3] + 1) // 2)
+            # block sum of the pairs
+            inc = warp_inclusive(pairs, lane)
+            if lane == 31:
+                st_shared_u32(sum_a + w * 4, inc)
+            cute.arch.sync_threads()
+            if w == 0:
+                v = ld_shared_u32(sum_a + lane * 4)
+                vi = warp_inclusive(v, lane)
+                if lane == 31:
+                    st_shared_u32(tot_a, vi)
+            cute.arch.sync_threads()
+            total = ld_shared_u32(tot_a)
+            cute.arch.sync_threads()
+            # sum over items of ceil(pairs / per) <= total / per + n <= sms: every
+            # split runs in one wave, none longer than per pairs (never slower
+            # than whole items, which take max pairs)
+            room = Uint32(self.sms) - Uint32(n)
+            per = cutlass.max(Uint32(SPLIT_MIN_PAIRS), (total + room - Uint32(1)) // room)
+            ns = Uint32(0)
+            if tid < n:
+                ns = cutlass.max((pairs + per - Uint32(1)) // per, Uint32(1))
+            # exclusive scan of the split counts
+            inc = warp_inclusive(ns, lane)
+            if lane == 31:
+                st_shared_u32(sum_a + w * 4, inc)
+            cute.arch.sync_threads()
+            if w == 0:
+                v = ld_shared_u32(sum_a + lane * 4)
+                vi = warp_inclusive(v, lane)
+                st_shared_u32(sum_a + lane * 4, vi - v)
+                if lane == 31:
+                    st_shared_u32(tot_a, vi)
+            cute.arch.sync_threads()
+            if tid < n:
+                dst = Int32(ld_shared_u32(sum_a + w * 4) + inc - ns)
+                nt = items[tid, 3]
+                ntp = nt + (nt & 1)
+                slot = Int32(-1)
+                if ns > Uint32(1):
+                    slot = Int32(tid)
+                    par[tid, 0] = items[tid, 0]
+                    par[tid, 1] = items[tid, 1]
+                else:
+                    par[tid, 0] = Int32(0)
+                    par[tid, 1] = Int32(0)
+                for k0 in cutlass.range(Int32(ns), unroll=1):
+                    # split k0 from the newest tiles down: [hi - 2 per, hi)
+                    hi = ntp - Int32(2 * per) * k0
+                    lo = cutlass.max(hi - Int32(2 * per), Int32(0))
+                    for k in cutlass.range_constexpr(4):
+                        items_x[dst + k0, k] = items[tid, k]
+                    items_x[dst + k0, 4] = lo
+                    items_x[dst + k0, 5] = hi
+                    items_x[dst + k0, 6] = slot
+            if tid == 0:
+                n_x[0] = Int32(ld_shared_u32(tot_a))
+
+
+class RowBound:
+    """Row bounds of key-split items' rows (one 128-thread CTA per row): the
+    IndexerScore mode-0 row_bound over the merged histogram ``ghist`` (slot c,
+    token k: row c * BQ + k), then the histogram row is cleared."""
+
+    def __init__(self, ctas: int, topk: int):
+        self.ctas = ctas
+        self.topk = topk
+
+    @cute.jit
+    def __call__(self, ghist, par, n_par, row_len, row_bin, s):
+        self.kernel(ghist, par, n_par, row_len, row_bin).launch(
+            grid=(self.ctas, 1, 1), block=(128, 1, 1), stream=s, use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(self, ghist, par, n_par, row_len, row_bin):
+        lt, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        wq = lt // 32
+        lane = lt % 32
+        smem = utils.SmemAllocator()
+        sb = smem.allocate_tensor(Uint32, cute.make_layout(4), 16)
+        scan_a = sb.iterator.toint()
+        cute.arch.griddepcontrol_wait()
+        n = n_par[0]
+        gh_a = ghist.iterator.toint()
+        per = S_BINS // 128
+        for r in cutlass.range(bid, n * BQ, self.ctas, unroll=1):
+            c = r // BQ
+            tok = r - c * BQ
+            if tok < par[c, 1]:
+                row = par[c, 0] + tok
+                length = row_len[row]
+                hist = gh_a + Int64(r) * (S_BINS * 4)
+                r_top = S_BINS - 1 - per * lt
+                counts = []
+                mine = Uint32(0)
+                for i in cutlass.range_constexpr(per):
+                    rk = r_top - i
+                    b = rk - S_BINS // 2
+                    if rk < S_BINS // 2:
+                        b = rk ^ (S_BINS - 1)
+                    cnt = ld_global_u32(hist + Int64(b) * 4)
+                    counts.append(cnt)
+                    mine += cnt
+                inclusive = warp_inclusive(mine, lane)
+                if lane == 31:
+                    st_shared_u32(scan_a + wq * 4, inclusive)
+                cute.arch.sync_threads()
+                prior = Uint32(0)
+                for i in cutlass.range_constexpr(4):
+                    x = ld_shared_u32(scan_a + i * 4)
+                    if i < wq:
+                        prior += x
+                cute.arch.sync_threads()
+                above = prior + inclusive - mine
+                need = Uint32(self.topk)
+                if length > self.topk:
+                    if above < need and above + mine >= need:
+                        running = above
+                        found = Int32(0)
+                        for i in cutlass.range_constexpr(per):
+                            if found == 0 and running + counts[i] >= need:
+                                row_bin[3 * row] = r_top - i
+                                row_bin[3 * row + 1] = Int32(running)
+                                row_bin[3 * row + 2] = Int32(0)
+                                found = Int32(1)
+                            running += counts[i]
+                for i in cutlass.range_constexpr(per):
+                    st_global_u32(hist + Int64(i * 128 + lt) * 4, Uint32(0))
+
+
+@functools.cache
+def _split_kernels(sms, topk):
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+
+    n, m, sl = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    plan_k = cute.compile(
+        SplitPlan(sms),
+        fake((n, 4), dtype=cutlass.Int32),
+        fake((1,), dtype=cutlass.Int32),
+        fake((m, 7), dtype=cutlass.Int32),
+        fake((1,), dtype=cutlass.Int32),
+        fake((sl, 2), dtype=cutlass.Int32),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+    bound_k = cute.compile(
+        RowBound(sms, topk),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((sl, 2), dtype=cutlass.Int32),
+        fake((1,), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+    return plan_k, bound_k
+
+
 class SelectivePlan:
     """Per-step layout of the selective path (sampled thresholds -> PUBLISH ->
     CandSelect) for requests r with ``row_counts[r]`` rows whose last row sees
@@ -2880,8 +3132,20 @@ def recover(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
         )
     logits = torch.empty(sp.scratch, dtype=torch.bfloat16, device=dev)
     rec_bin = torch.empty(3 * (t + 1), dtype=torch.int32, device=dev)
-    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, items, sp.row_base,
-          logits, rec_bin, ctas=ctas, n_items=n_active)
+    # key splits when the items do not fill the GPU (one item's latency otherwise)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    plan_k, bound_k = _split_kernels(sms, out.shape[1])
+    n_slots = min(items.shape[0], sms)
+    items_x = torch.empty((max(items.shape[0], 2 * sms), 7), dtype=torch.int32, device=dev)
+    n_x = torch.empty(1, dtype=torch.int32, device=dev)
+    par = torch.zeros((n_slots, 2), dtype=torch.int32, device=dev)
+    ghist = torch.zeros(n_slots * BQ * S_BINS, dtype=torch.int32, device=dev)
+    stream = torch.cuda.current_stream(dev).cuda_stream
+    plan_k(items, n_active, items_x, n_x, par, stream)
+    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, items_x, sp.row_base,
+          logits, rec_bin, ctas=ctas, n_items=n_x, ghist=ghist)
+    n_par = torch.clamp(n_active, max=n_slots)
+    bound_k(ghist, par, n_par, sp.row_len, rec_bin, stream)
     bitmap = torch.empty(t * sp.words, dtype=torch.int32, device=dev)
     rec_cand = torch.empty(t * CAND, dtype=torch.int32, device=dev)
     select(logits, sp.row_base, rec_len, rec_bin, bitmap, rec_cand, out, ctas=ctas,
@@ -2925,7 +3189,7 @@ def plan(row_counts, row_lens_last, key_bases, device):
 
 
 @functools.cache
-def _score_kernel(ctas, mode=0, topk=2048, epi=0):
+def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
@@ -2938,14 +3202,17 @@ def _score_kernel(ctas, mode=0, topk=2048, epi=0):
         fake((nk,), dtype=cutlass.Int32),
         fake((t, 16), dtype=cutlass.Int32),
         fake((t,), dtype=cutlass.Int32),
-        fake((cute.sym_int(), 4), dtype=cutlass.Int32),
+        fake((cute.sym_int(), 7 if split else 4), dtype=cutlass.Int32),
         fake((1,), dtype=cutlass.Int32),
         fake((cute.sym_int(),), dtype=cutlass.Int64),
         fake((cute.sym_int(),), dtype=cutlass.Int16),
         fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
         make_fake_stream(),
     )
-    return cute.compile(IndexerScore(ctas, mode, topk, epi), *args, options="--enable-tvm-ffi")
+    return cute.compile(
+        IndexerScore(ctas, mode, topk, epi, split), *args, options="--enable-tvm-ffi"
+    )
 
 
 @functools.cache
@@ -2986,18 +3253,23 @@ def _select_kernels(ctas, topk):
 
 
 def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
-          logits, row_bin, ctas=None, mode=0, topk=2048, n_items=None, epi=0):
+          logits, row_bin, ctas=None, mode=0, topk=2048, n_items=None, epi=0,
+          ghist=None):
     """BF16 logits of every prefill row into ``logits`` and each row's top-k bound
     into ``row_bin`` (Int32 [3 T]: bound bin rank, count above, candidate count
     zeroed for the select) (see ``plan``). ``n_items`` (Int32 [1], device): only
-    the first n_items items run (default all)."""
+    the first n_items items run (default all). ``items`` with 7 columns are key
+    splits (SplitPlan; mode 0): their rows' histograms go to ``ghist``."""
     dev = q.device
     t = q.shape[0]
     assert keys.shape[0] % TILE == 0
     ctas = ctas or torch.cuda.get_device_properties(dev).multi_processor_count
     if n_items is None:
         n_items = torch.full((1,), items.shape[0], dtype=torch.int32, device=dev)
-    _score_kernel(ctas, mode, topk, epi)(
+    split = items.shape[1] == 7
+    if ghist is None:
+        ghist = row_bin  # unused without splits
+    _score_kernel(ctas, mode, topk, epi, split)(
         q.view(t * HEADS, DIM // 2),
         q_scale.reshape(-1),
         keys,
@@ -3009,6 +3281,7 @@ def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
         row_base,
         logits.view(torch.int16),
         row_bin,
+        ghist,
         torch.cuda.current_stream(dev).cuda_stream,
     )
 
