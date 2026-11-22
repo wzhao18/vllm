@@ -109,7 +109,12 @@ ROWS = 8  # state rows per scan thread: 8 (c // 8) + [0, 8)
 LANES = 8  # scan threads per row
 CHUNKS = 4  # 4-key chunks per thread and row: keys 4 (c % 8 + 8 j)
 SLOTS = 3  # the CTA's state page ring
-MAX_ITEMS = 16  # items per CTA (tables, raw gates)
+MAX_ITEMS = 16  # items per CTA (tables, raw gates) of the default build
+# Item-capacity builds (a KdaFlow specialization parameter): 16 serves up to 141
+# requests per DP group at 24 heads on Rubin's 212 SMs (24 n / 212 <= 16); 20 serves
+# only the captured sizes above that, up to 176 (C1152 / C1280). The 16 build is
+# unchanged; ``sp.make_core`` picks the smallest build that fits per captured shape.
+ITEM_BUILDS = (16, 20)
 # Rubin's oversized shared memory mode (327 KiB per CTA; budget 320 KiB). Elsewhere
 # the opt-in limit.
 OVERSIZED_BUDGET = 320 * 1024
@@ -143,11 +148,11 @@ def group_bytes(tokens, window, conv_size):
     return block + staging + stores + 16 * 4 * 4
 
 
-def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1):
+def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS):
     pages = SLOTS * PAGE_BYTES
     heads = 2 * CONSTS * K * 4
-    gates = MAX_ITEMS * tokens * K * 2
-    tables = MAX_ITEMS * (META + 8) * 4
+    gates = items * tokens * K * 2
+    tables = items * (META + 8) * 4
     groups = GROUPS * group_bytes(tokens, window, conv_size)
     return pages + heads + gates + tables + groups + 64 * 8 + 4096  # (+ alignment)
 
@@ -161,12 +166,13 @@ def smem_budget(device):
     return limit
 
 
-def max_stages(tokens, conv_dim_first, window, conv_size, limit):
-    """1 when KdaFlow runs this layout (dim-first convolution window) within
-    ``limit`` bytes of shared memory, else 0."""
+def max_stages(tokens, conv_dim_first, window, conv_size, limit, items=MAX_ITEMS):
+    """1 when KdaFlow (an ``items``-item build) runs this layout (dim-first
+    convolution window) within ``limit`` bytes of shared memory, else 0."""
     if not conv_dim_first:
         return 0
-    return int(shared_bytes(tokens, conv_dim_first, window, conv_size) <= limit)
+    size = shared_bytes(tokens, conv_dim_first, window, conv_size, items=items)
+    return int(size <= limit)
 
 
 def page_barrier(state_full, j):
@@ -187,10 +193,21 @@ def page_parity(j):
     return (j // (2 * SLOTS)) % 2
 
 
-def max_items_per_cta(requests):
+def item_build(items, requests, sms):
+    """(persistent CTAs, items per CTA, the smallest ITEM_BUILDS capacity serving
+    them or None) for ``items`` (heads x requests) on ``sms`` SMs."""
+    ctas = min(items, sms)
+    per_cta = -(-items // ctas)
+    build = next(
+        (c for c in ITEM_BUILDS if per_cta <= max_items_per_cta(requests, c)), None
+    )
+    return ctas, per_cta, build
+
+
+def max_items_per_cta(requests, items=MAX_ITEMS):
     """KdaFlow tables the weights of two heads (a CTA's head-major item range may span
-    at most two heads) and MAX_ITEMS items."""
-    return min(requests + 1, MAX_ITEMS)
+    at most two heads) and ``items`` items (the build's capacity)."""
+    return min(requests + 1, items)
 
 
 @asm(Int64)
@@ -273,12 +290,15 @@ class KdaFlow(KdaWS):
         ctas,
         stages=1,
         mx=False,
+        items=MAX_ITEMS,
     ):
         assert 2 <= tokens <= 4 and stages == 1 and conv_dim_first
+        assert items in ITEM_BUILDS and items % 2 == 0, items
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
+        self.items = items  # items per CTA this build tables (ITEM_BUILDS)
         # MXFP8 output (``quantize_outputs``): two more operands after the others,
         # the E4M3 bytes [R, D] and the F8_128x4 scales of the online-MXFP8
         # o_proj's input.
@@ -306,7 +326,7 @@ class KdaFlow(KdaWS):
         T: cutlass.Constexpr = self.tokens
         width: cutlass.Constexpr = self.heads * K
         units: cutlass.Constexpr = T * (K // 8)  # 8-column lane units per item
-        rounds: cutlass.Constexpr = -(-MAX_ITEMS * units // THREADS)
+        rounds: cutlass.Constexpr = -(-self.items * units // THREADS)
         lanes = count * units
         # Every round's loads first (one L2 round trip), then the quantization.
         held = cute.make_rmem_tensor((rounds, 8), Float32)
@@ -497,9 +517,9 @@ class KdaFlow(KdaWS):
         smem = cutlass.utils.SmemAllocator()
         pages = alloc(smem, Float32, (SLOTS, K * K), align=1024)
         hcs = alloc(smem, Float32, (2, CONSTS, K))  # per head slot, channel
-        raw = alloc(smem, BFloat16, (MAX_ITEMS, T, K), align=16)  # raw gates
-        table = alloc(smem, Int32, (MAX_ITEMS, META))
-        betas = alloc(smem, Float32, (MAX_ITEMS, 8))  # sigmoid(beta) per token
+        raw = alloc(smem, BFloat16, (self.items, T, K), align=16)  # raw gates
+        table = alloc(smem, Int32, (self.items, META))
+        betas = alloc(smem, Float32, (self.items, 8))  # sigmoid(beta) per token
         # Per group: the 2q scan vectors (2 blocks), v (then the outputs), the fold
         # weights w_t.
         qkvd = alloc(smem, Float32, (GROUPS, 4, T, K), align=128)
@@ -534,7 +554,7 @@ class KdaFlow(KdaWS):
         )
         fas = cute.make_tensor(
             cute.recast_ptr(at(qkvd, 0, 0, 0, 0), dtype=BFloat16),
-            cute.make_layout((MAX_ITEMS, T, K), stride=(T * K, K, 1)),
+            cute.make_layout((self.items, T, K), stride=(T * K, K, 1)),
         )
 
         if tid == 0:
@@ -604,7 +624,7 @@ class KdaFlow(KdaWS):
         # synchronous loads, before the page burst they would queue behind (dozens
         # of small bulk copies cost thousands of cycles of issue).
         FA_CHUNKS: cutlass.Constexpr = K * 2 // 16
-        FA_ROUNDS: cutlass.Constexpr = MAX_ITEMS * T * FA_CHUNKS // THREADS
+        FA_ROUNDS: cutlass.Constexpr = -(-self.items * T * FA_CHUNKS // THREADS)
         fav = cute.make_rmem_tensor((FA_ROUNDS, 4), Uint32)
         for k in cutlass.range_constexpr(FA_ROUNDS):
             idx = tid + k * THREADS
@@ -691,7 +711,7 @@ class KdaFlow(KdaWS):
         lane, warp = tid % 32, tid // 32
         group_id, quarter = lane >> 2, lane & 3
         wq, half = warp % 4, warp // 4
-        PER: cutlass.Constexpr = MAX_ITEMS // 2
+        PER: cutlass.Constexpr = self.items // 2
         acc = cute.make_rmem_tensor((PER, 2, 4), Float32)
         wr = cute.make_rmem_tensor((2, 8, 4), Uint32)
         cached = Int32(-1)
