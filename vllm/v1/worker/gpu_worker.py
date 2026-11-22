@@ -762,6 +762,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - self._kv_connector_reserved_memory()
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -826,6 +827,30 @@ class Worker(WorkerBase):
             self.model_config.multimodal_config,
             getattr(self.parallel_config, "_api_process_count", 1),
         )
+
+    def _kv_connector_reserved_memory(self) -> int:
+        """Device bytes the KV connector allocates after the KV cache, taken
+        from the KV cache budget (``get_reserved_device_memory``)."""
+        config = self.vllm_config.kv_transfer_config
+        if config is None or config.kv_connector is None:
+            return 0
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        connector_cls = KVConnectorFactory.get_connector_class(config)
+        reserve = getattr(connector_cls, "get_reserved_device_memory", None)
+        if reserve is None:
+            return 0
+        reserved = reserve(self.vllm_config, self.model_runner.get_kv_cache_spec())
+        if reserved:
+            logger.info(
+                "KV connector %s reserves %s GiB of the KV cache budget for its "
+                "transfer buffers.",
+                connector_cls.__name__,
+                format_gib(reserved),
+            )
+        return reserved
 
     def get_kv_connector_handshake_metadata(
         self,

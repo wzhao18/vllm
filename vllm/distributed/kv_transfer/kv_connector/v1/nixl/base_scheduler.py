@@ -247,6 +247,18 @@ class NixlBaseConnectorScheduler:
         )
         self._pair_hidden: set[ReqId] = set()
         self._pair_release: set[ReqId] = set()
+        # Deferred mode: a step's exchanges take at most the workers' chunk
+        # slots (dcp_pair_exchange.PAIR_RING_SLOTS), so no pack of the step
+        # waits for its own swaps in front of the forward; the rest stay
+        # ready, in order, for the next steps.
+        self._pair_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self._pair_chunk_units = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "dcp_pair_exchange_chunk_units", 4
+            )
+            if self._pair_mode
+            else 4
+        )
         if self._pair_mode:
             logger.info(
                 "NIXL DCP pair mode: partner ranks exchange the blocks of "
@@ -837,7 +849,10 @@ class NixlBaseConnectorScheduler:
         if self._pair_mode and self._pair_ready:
             # This step is the first that can promote these requests, so every
             # rank exchanges their blocks before any forward reads them.
-            meta.reqs_to_pair_exchange, self._pair_ready = self._pair_ready, {}
+            if self._pair_defer:
+                meta.reqs_to_pair_exchange = self._take_pair_budget()
+            else:
+                meta.reqs_to_pair_exchange, self._pair_ready = self._pair_ready, {}
             if self._pair_defer:
                 # Their exchange is queued with this step; the next schedule()
                 # may admit them (see take_deferred_recving).
@@ -845,10 +860,17 @@ class NixlBaseConnectorScheduler:
                     r for r in meta.reqs_to_pair_exchange if r in self._pair_hidden
                 )
         if self._fingerprint:
-            # Sends go with their reqs_to_send, pulls with their plans.
+            # Sends go with their reqs_to_send, pulls with their plans (a plan
+            # the step budget deferred keeps its pull for the step emitting it).
             meta.fingerprint_sends = self._fingerprint_sends
-            meta.fingerprint_pulls = self._fingerprint_pulls_ready
-            self._fingerprint_sends, self._fingerprint_pulls_ready = {}, {}
+            pulls = self._fingerprint_pulls_ready
+            meta.fingerprint_pulls = {
+                r: v for r, v in pulls.items() if r not in self._pair_ready
+            }
+            self._fingerprint_sends = {}
+            self._fingerprint_pulls_ready = {
+                r: v for r, v in pulls.items() if r in self._pair_ready
+            }
 
         # Package heartbeats, throttled by heartbeat_interval.
         if self._heartbeat_by_engine:
@@ -864,6 +886,30 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_send = {}
 
         return meta
+
+    def _take_pair_budget(self) -> "dict[ReqId, list[PairUnit]]":
+        """Deferred mode: the oldest ready plans whose exchange fits the
+        workers' ``PAIR_RING_SLOTS`` chunk slots (always at least one); the
+        rest stay in ``_pair_ready`` in order, hidden from the scheduler until
+        a later step emits them, so no plan is dropped or reordered."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            dcp_pair_exchange as dpe,
+        )
+
+        taken: "dict[ReqId, list[PairUnit]]" = {}
+        units: "list[PairUnit]" = []
+        for req_id in list(self._pair_ready):
+            plan = self._pair_ready[req_id]
+            if taken and (
+                dpe.exchange_chunks(
+                    units + plan, self._pair_dcp_size, self._pair_chunk_units
+                )
+                > dpe.PAIR_RING_SLOTS
+            ):
+                break
+            taken[req_id] = self._pair_ready.pop(req_id)
+            units += plan
+        return taken
 
     def _hold_send_lease(self, req_id: ReqId) -> None:
         with self._held_send_leases_lock:

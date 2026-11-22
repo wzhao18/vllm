@@ -2714,8 +2714,21 @@ class NixlBaseConnectorWorker:
             interleave=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             device=device,
             chunk_units=chunk_units,
+            ring_slots=dcp_pair_exchange.PAIR_RING_SLOTS,
         )
         table = exchanger.table
+        # The buffers were reserved out of the KV cache budget at profiling
+        # (NixlBaseConnector.get_reserved_device_memory) from a bound over the
+        # layer specs, which covers these layers: a unit half above it would
+        # allocate past the budget.
+        bound = dcp_pair_exchange.pair_half_bytes_bound(
+            {region.layer_name: region.spec for region in regions}
+        )
+        if table.half_bytes > bound:
+            raise dcp_pair_exchange.NixlPairModeError(
+                f"DCP pair exchange: unit half of {table.half_bytes} B exceeds the "
+                f"{bound} B reserved at memory profiling"
+            )
         arrays = Counter((array.kind.value, array.width) for array in table.arrays)
         draft = self._draft_layer_names()
         # What a deployment exchanges, to check against the model: the regions
