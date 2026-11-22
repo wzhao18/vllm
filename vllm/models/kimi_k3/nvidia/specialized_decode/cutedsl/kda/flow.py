@@ -117,7 +117,7 @@ OVERSIZED_BUDGET = 320 * 1024
 TRACE = False
 # Diagnostics (benchmarks only): parts of the scan to leave out ("fold", "store",
 # "verify", "prep", "reduce", "epi"); results are wrong with any of them set.
-SKIP = ()
+SKIP = ("recst",)
 # Diagnostics (benchmarks only): bounded mbarrier waits that report a stuck wait.
 HANG = False
 # FP32 pair ops as packed f32x2 instructions (False: scalar; bit-identical).
