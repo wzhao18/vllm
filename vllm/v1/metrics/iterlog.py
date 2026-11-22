@@ -42,12 +42,14 @@ ENGINE_FIELDS = {
     "RF": "idx t k finish_reason n_out_tokens",
     "RX": "idx t",  # aborted
     "I": "t_idle0 t_idle1",  # engine waiting for work (no requests)
+    # PADMIT diag per schedule(): waiting requests by state
+    "RW": "k n_fresh n_lookup_pending n_loading n_loaded_ready n_other",
     # PADMIT diag, at a request's first prefill chunk: remote-KV wait timeline
     # (t_alloc = blocks allocated + load issued, t_recv = load reported done;
     # early: 1 early load sent, 2 no load, 3 channel down, 10+g blocked by a
     # recently freed block of group g; lookup_waits = schedules deferred on a
     # pending store lookup)
-    "RP": "idx k t_sched t_alloc t_recv early lookup_waits",
+    "RP": "idx k t_sched t_alloc t_recv early lookup_waits t_visit t_lk0 t_lk1",
 }
 WORKER_FIELDS = {
     "W": (
@@ -187,6 +189,27 @@ class EngineIterLog:
         """After ``schedule()`` and the dispatch of its batch."""
         requests = scheduler.requests
         reqs = self._reqs
+        try:
+            nf = nlp = nld = nrd = nox = 0
+            lps = getattr(scheduler, "_connector_lookup_pending_since", {})
+            rdy = getattr(scheduler, "finished_recving_kv_req_ids", set())
+            for q in (scheduler.waiting, getattr(scheduler, "kv_holding_waiting", ())):
+                for wr in q:
+                    st_ = wr.status.name
+                    if st_ == "WAITING_FOR_REMOTE_KVS":
+                        if wr.request_id in rdy:
+                            nrd += 1
+                        else:
+                            nld += 1
+                    elif wr.request_id in lps:
+                        nlp += 1
+                    elif st_ == "WAITING" and wr.num_computed_tokens == 0:
+                        nf += 1
+                    else:
+                        nox += 1
+            self._put(("RW", self._k, nf, nlp, nld, nrd, nox))
+        except Exception:  # diag only
+            pass
         n_dec = n_dec_tok = n_pf = n_pf_tok = 0
         prefills = None
         for rid, n in so.num_scheduled_tokens.items():
@@ -213,6 +236,9 @@ class EngineIterLog:
                             getattr(r, "padm_tr", None),
                             getattr(r, "padm_early", None),
                             getattr(r, "padm_lp", 0),
+                            getattr(r, "padm_tv", None),
+                            getattr(r, "padm_tl0", None),
+                            getattr(r, "padm_tl1", None),
                         )
                     )
             else:
