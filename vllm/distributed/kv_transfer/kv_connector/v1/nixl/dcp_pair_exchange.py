@@ -1331,20 +1331,27 @@ class DcpPairExchanger:
             arrays,
         )
 
-    def exchange(self, units: Sequence[PairUnit]) -> None:
+    def exchange(
+        self,
+        units: Sequence[PairUnit],
+        side: "torch.cuda.Stream | None" = None,
+    ) -> None:
         """Swap the units' rows with the partner and rewrite their blocks in
-        interleave-1 order, queued on the current stream without a host sync.
+        interleave-1 order, queued without a host sync.
 
         Args:
             units: The step's units of this rank's group, distinct blocks in
                 metadata order. Every rank of the DCP group passes the same
-                units: each chunk of ``chunk_units`` is one NCCL round with the
+                units: each chunk of ``chunk_units`` is one round with the
                 partner.
+            side: None: pack, swap and unpack on the current stream. Else the
+                packs run on the current stream and each chunk's swap and
+                unpack on ``side`` (see ``_run``).
 
         """
         if units:
             rows = async_tensor_h2d(_unit_rows(units), self.device, torch.int64)
-            self._run(units, rows, self._plan)
+            self._run(units, rows, self._plan, side)
 
     def record_event(self) -> torch.cuda.Event:
         """An event on the current stream, after every exchange queued so
@@ -1477,15 +1484,45 @@ class DcpPairExchanger:
         units: Sequence[PairUnit],
         rows: torch.Tensor,
         plan: _LaunchPlan,
+        side: "torch.cuda.Stream | None" = None,
     ) -> None:
         """Pack, swap and unpack the units chunk by chunk, ``rows`` being
-        their ``_unit_rows`` on the device."""
+        their ``_unit_rows`` on the device.
+
+        With ``side``, every pack kernel stays on the current stream and only
+        the swap (stream memory operations and copy-engine copies) and the
+        unpack run on ``side``. The partner's swap waits for this rank's
+        "packed" counter, so the pack must never sit behind work that can wait
+        for the partner: on the current stream it precedes this step's
+        forward, whose collectives and MegaMoE spin on the peers, so it always
+        runs, even when every SM is held by a spinning kernel or the device
+        serializes kernels (CUPTI tracing). A pack on ``side`` could be
+        starved by such a kernel while the partner's host blocks on its side
+        stream, which closes a cycle. The unpack only rewrites this rank's
+        own blocks; no peer waits for it.
+
+        Each pack first waits for ``side``: the previous chunk's swap must
+        have consumed ``send`` and its unpack read ``keep`` and ``recv``.
+        """
+        if side is None:
+            for start in range(0, len(units), self.chunk_units):
+                chunk = units[start : start + self.chunk_units]
+                chunk_rows = rows[start : start + len(chunk)]
+                self._pack(chunk, chunk_rows, plan)
+                self._communicate(len(chunk))
+                self._unpack(chunk, chunk_rows, plan)
+            return
+        compute = current_stream()
+        rows.record_stream(side)
         for start in range(0, len(units), self.chunk_units):
             chunk = units[start : start + self.chunk_units]
             chunk_rows = rows[start : start + len(chunk)]
+            compute.wait_stream(side)
             self._pack(chunk, chunk_rows, plan)
-            self._communicate(len(chunk))
-            self._unpack(chunk, chunk_rows, plan)
+            side.wait_stream(compute)
+            with torch.cuda.stream(side):
+                self._communicate(len(chunk))
+                self._unpack(chunk, chunk_rows, plan)
 
     def _pack(
         self,
@@ -1677,9 +1714,15 @@ class DcpStagedExchanger:
         for stride in sorted(self.stages, reverse=True):
             self.stages[stride].warm_up()
 
-    def exchange(self, units: Sequence[PairUnit]) -> None:
+    def exchange(
+        self,
+        units: Sequence[PairUnit],
+        side: "torch.cuda.Stream | None" = None,
+    ) -> None:
         """Run the stages of every P DCP size among ``units``, in the order
-        the sizes first appear (the same on every rank)."""
+        the sizes first appear (the same on every rank). ``side`` as in
+        ``DcpPairExchanger.exchange``: a later stage's packs wait for the
+        earlier stage's unpacks on ``side``."""
         by_remote: dict[int, list[PairUnit]] = {}
         for u in units:
             remote = u.remote_dcp_size or self.dcp_size // 2
@@ -1688,11 +1731,11 @@ class DcpStagedExchanger:
             strides = exchange_strides(self.dcp_size, remote)
             if len(strides) == 1:
                 # Ratio 2: the one-stage exchange of the units as planned.
-                self.stages[strides[0]].exchange(group_units)
+                self.stages[strides[0]].exchange(group_units, side)
                 continue
             for stride in strides:
                 self.stages[stride].exchange(
-                    stage_units(group_units, self.dcp_rank, stride, remote)
+                    stage_units(group_units, self.dcp_rank, stride, remote), side
                 )
 
     def record_event(self) -> torch.cuda.Event:
