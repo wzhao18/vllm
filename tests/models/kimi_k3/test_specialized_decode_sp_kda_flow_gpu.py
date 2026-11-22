@@ -46,7 +46,7 @@ def core_of(kind, attention, rows, records, caches, mx_out=False):
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
-    monkeypatch.setattr(flow, "max_stages", lambda *args: stages)
+    monkeypatch.setattr(flow, "max_stages", lambda *args, **kwargs: stages)
     sp.executable.cache_clear()
     rows, slots = Q * n, 2 * n + 2
     stock, ours = kda.layer(), kda.layer()  # the same weights, their own records
