@@ -26,7 +26,7 @@ from ..shapes import Choice, Path, Unsupported
 logger = init_logger(__name__)
 
 PLACE_SAMPLES, PLACE_PASSES = 8, 5
-MAX_ROWS = 128
+MAX_ROWS = dfl.MAX_ROWS  # shard rows per GPU (q x requests per DP group / TP)
 
 
 def dense_cause(mlp):

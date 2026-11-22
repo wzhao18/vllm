@@ -54,7 +54,7 @@ def _mlp(wgu, wd):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize("rows", [1, 20, 40, 96])
+@pytest.mark.parametrize("rows", [1, 20, 40, 96, 128, 144, 160, 176, 192, 256])
 def test_dense_stream_matches_stock(rows):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
         SpDenseMlp,
@@ -97,3 +97,42 @@ def test_dense_stream_layer0_shape():
     _close(y, y_ref)
     # SiTU on the BF16-rounded gate / up as the stock op: only GEMM-order flips.
     assert (dense.h[:rows] != h_ref).float().mean().item() < 0.02
+
+
+def test_dense_flow_rows_above_128_are_row_exact():
+    """A row's result does not depend on how many rows share the launch (the
+    stream-K ranges split K, not rows): the 176- and 256-row specializations give the
+    first 128 rows bitwise as the 128-row one, and every row as a 1-row run."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
+        MAX_ROWS,
+        SpDenseMlp,
+    )
+
+    assert MAX_ROWS == 256
+    dev = torch.device("cuda")
+    torch.manual_seed(7)
+    hidden, inter = 1024, 4096
+    wgu = torch.randn(2 * inter, hidden, device=dev, dtype=torch.bfloat16) * 0.03
+    wd = torch.randn(hidden, inter, device=dev, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(256, hidden, device=dev, dtype=torch.bfloat16)
+    dense = SpDenseMlp(_mlp(wgu, wd), (1, 128, 176, 256), dev, 0)
+    y128 = dense.run(x[:128]).clone()
+    y176 = dense.run(x[:176]).clone()
+    y256 = dense.run(x).clone()
+    assert torch.equal(y176[:128], y128)
+    assert torch.equal(y256[:176], y176)
+    for r in (0, 127, 128, 175, 255):
+        assert torch.equal(dense.run(x[r : r + 1]), y256[r : r + 1]), r
+
+
+def test_dense_rows_above_the_cap_raise_at_build():
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
+        SpDenseMlp,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
+
+    dev = torch.device("cuda")
+    wgu = torch.zeros(2 * 4096, 1024, device=dev, dtype=torch.bfloat16)
+    wd = torch.zeros(1024, 4096, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(Unsupported, match="shard rows"):
+        SpDenseMlp(_mlp(wgu, wd), (128, 272), dev, 0)
