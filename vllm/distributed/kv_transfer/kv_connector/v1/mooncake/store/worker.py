@@ -1372,6 +1372,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         # Every load must report back: a load that raises before reporting
         # would leave its request in WAITING_FOR_REMOTE_KVS forever.
+        t_deq = time.perf_counter()
+        _padm_load_begin()
+        try:
+            self._handle_request_orig(req_meta)
+        finally:
+            _padm_load_end(req_meta, t_deq)
+
+    def _handle_request_orig(self, req_meta: ReqMeta):
         try:
             self._handle_load(req_meta)
         except Exception:
@@ -1395,7 +1403,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         ready_event = req_meta.load_ready_event
         if ready_event is None:
             return
+        _t = time.perf_counter()
         ready_event.synchronize()
+        req_meta.padm_wait_ready = time.perf_counter() - _t
         if req_meta.load_issue_time is not None:
             self._record_operation("load_wait_ready", req_meta.load_issue_time, 0)
 
@@ -3432,3 +3442,43 @@ class EarlyLoadClient:
 
     def close(self) -> None:
         self.socket.close(linger=0)
+
+
+# PADMIT diag (never merge): per-process Mooncake load concurrency and phase split.
+_padm_lock = threading.Lock()
+_padm = {"active": 0, "n": 0, "busy_sum": 0, "busy_max": 0, "q": 0.0, "wr": 0.0,
+         "tot": 0.0, "early": 0, "t0": None}
+
+
+def _padm_load_begin() -> None:
+    with _padm_lock:
+        _padm["active"] += 1
+        a = _padm["active"]
+        _padm["busy_sum"] += a
+        _padm["busy_max"] = max(_padm["busy_max"], a)
+
+
+def _padm_load_end(req_meta, t_deq: float) -> None:
+    now = time.perf_counter()
+    issue = getattr(req_meta, "load_issue_time", None)
+    wr = getattr(req_meta, "padm_wait_ready", 0.0) or 0.0
+    with _padm_lock:
+        _padm["active"] -= 1
+        _padm["n"] += 1
+        if issue is not None:
+            _padm["q"] += max(0.0, t_deq - issue)
+        _padm["wr"] += wr
+        _padm["tot"] += now - t_deq - wr
+        if getattr(req_meta, "load_ready_event", None) is None:
+            _padm["early"] += 1
+        if _padm["n"] >= 100:
+            n = _padm["n"]
+            logger.info(
+                "PADMIT loads: n %d in-flight at start mean %.2f max %d | "
+                "queue %.0f ms wait_ready %.0f ms get %.0f ms (means) early %d",
+                n, _padm["busy_sum"] / n, _padm["busy_max"],
+                1e3 * _padm["q"] / n, 1e3 * _padm["wr"] / n,
+                1e3 * _padm["tot"] / n, _padm["early"],
+            )
+            for k in ("n", "busy_sum", "busy_max", "q", "wr", "tot", "early"):
+                _padm[k] = 0 if k not in ("q", "wr", "tot") else 0.0
