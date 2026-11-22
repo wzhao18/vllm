@@ -195,6 +195,14 @@ class DcpxDecode:
         threads = int(getattr(props, "max_threads_per_multi_processor", 1024) or 1024)
         self.topk_cap = min(self.cap, self.sms * min(TOPK_CTAS_PER_SM, threads // 256))
         self.counts = torch.zeros(self.cap, dtype=torch.int32, device=device)
+        # DDSA DIAGNOSTIC (never merge): per-length-bucket top-k tier counts and row times
+        # (csrc/topk_v2.cuh kDdsaNB), dumped by a host thread every 30 s.
+        self._ddsa_stats = None
+        import os as _os
+        _d = _os.environ.get("DDSA_TOPK_STATS_DIR")
+        if _d:
+            self._ddsa_stats = torch.zeros(8 * 8 + 8 * 2 * 2 * 2, dtype=torch.int32, device=device)
+            self._ddsa_start_dumper(_d, device)
         self.global_rows = torch.zeros(self.cap, dtype=torch.int32, device=device)
         self.offsets = torch.arange(64, dtype=torch.int32, device=device)
         self.heads, self.hpr = heads, heads // self.W
@@ -280,8 +288,32 @@ class DcpxDecode:
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
+            stats=self._ddsa_stats,
         )
         return True
+
+    def _ddsa_start_dumper(self, out_dir: str, device: torch.device) -> None:
+        import json, os, socket, threading, time
+
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"topk-{socket.gethostname()}-{os.getpid()}-{device.index}.jsonl")
+        buf = self._ddsa_stats
+
+        def run():
+            stream = torch.cuda.Stream(device=device)
+            while True:
+                time.sleep(30)
+                try:
+                    with torch.cuda.stream(stream):
+                        host = buf.to("cpu", non_blocking=False)
+                    c = host[:64].view(8, 8).tolist()
+                    t = host[64:].view(torch.int64).view(8, 2, 2).tolist()
+                    with open(path, "a") as f:
+                        f.write(json.dumps({"t": time.time(), "counts": c, "time": t}) + "\n")
+                except Exception as e:  # diagnostic only
+                    logger.warning("DDSA topk stats dump failed: %s", e)
+
+        threading.Thread(target=run, daemon=True, name="ddsa-topk-stats").start()
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
         """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch.
