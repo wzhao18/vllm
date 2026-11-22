@@ -66,8 +66,9 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     # 9.70; down R65 8.67 / 8.80 / 7.40, R96 8.50 / 7.89 / 7.43 (bitwise fi_cute). At 65+
     # rows FlashInfer's own cute-dsl pick leaves its 2-CTA M64-token tile for a 1-CTA tile
     # (in-step CUPTI n64 -> n66: gate_up 13.4 -> 20.1, down 10.9 -> 22.0 us/call).
-    (12288, 7168): ((65, 96, ((256, 128), (2, 1), True, 256), 8),),
-    (7168, 6144): ((65, 96, ((256, 128), (2, 1), True, 256), 8),),
+    # (first match wins: the other rows keep PRE_DEFAULT's tactics)
+    (12288, 7168): ((65, 96, ((256, 128), (2, 1), True, 256), 8), *PRE_DEFAULT),
+    (7168, 6144): ((65, 96, ((256, 128), (2, 1), True, 256), 8), *PRE_DEFAULT),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
     (7168, 3072): (

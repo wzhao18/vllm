@@ -73,13 +73,13 @@ def test_split_k_tables_fit_shared_memory():
     cap = splitk_smem_capacity()
     for t in tactics:
         assert splitk_smem_bytes(t) <= cap, t
-        assert split_k_problem(t, 7168) is None, t
+        assert split_k_problem(t, 128 * t[2] * 8) is None, t  # a K every split divides
 
 
 def test_over_limit_split_k_refused():
     bad = (64, 80, 4, 5)  # 245,896 B used vs 232,448 B launched: an illegal address
     assert splitk_smem_bytes(bad) > splitk_smem_capacity()
-    assert "shared memory" in split_k_problem(bad, 7168)
+    assert "shared memory" in split_k_problem(bad, 128 * 4 * 8)
     w = torch.zeros(4480, 7168, device=DEVICE, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="shared memory"):
         PreparedProjection(w, {66: bad}, output_dtype=torch.float32).prepare()
