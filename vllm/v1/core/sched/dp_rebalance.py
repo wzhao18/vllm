@@ -34,6 +34,8 @@ def plan_dp_moves(
     min_gain: int = 2048,
     node_of: list[int] | None = None,
     cross_min_gain: int | None = None,
+    bind_horizon: int | None = None,
+    bound_home: list[tuple[int, int]] | None = None,
 ) -> list[DPMove]:
     """Plan cross-rank moves of uncommitted requests.
 
@@ -52,6 +54,11 @@ def plan_dp_moves(
         cross_min_gain: the gain a move to another node must reach (default
             min_gain); a cross-node move also wins over the best same-node
             move only by more than the difference.
+        bind_horizon: with ``bound_home``, a request placed on its home rank
+            is BOUND there (appended as (rank, index)) when its rank's
+            projected load before it is below this horizon: it runs within the
+            next few steps there, so its KV may be loaded ahead now. Requests
+            placed further out stay unbound (movable, nothing loaded).
 
     Places all movable work by longest-processing-time-first on top of each
     rank's committed demand (largest request to the least-loaded rank), which
@@ -107,6 +114,12 @@ def plan_dp_moves(
             entered[best] += 1
             moves.append(DPMove(home, index, best, size))
         else:
+            if (
+                bound_home is not None
+                and bind_horizon is not None
+                and load[home] < bind_horizon
+            ):
+                bound_home.append((home, index))
             load[home] += size
     moves.sort(key=lambda m: (m.src, m.index))
     return moves

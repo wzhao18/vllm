@@ -93,3 +93,14 @@ def test_cross_node_move_needs_the_larger_gain_and_prefers_same_node():
     moves = plan_dp_moves([1000, 30000, 0, 0], [[4000], [], [], []], 16384,
                           node_of=node, cross_min_gain=8192)
     assert moves == []
+
+
+def test_binding_horizon_binds_only_near_term_home_placements():
+    bound = []
+    # Rank 0: committed 10000, queue 20000 then 30000 (planner sees LPT order);
+    # rank 1 busy (100000) so nothing moves. Horizon 40000: the first placed
+    # request (30000 at load 10000) binds, the next (20000 at load 40000) not.
+    moves = plan_dp_moves([10000, 100000], [[20000, 30000], []], 16384,
+                          bind_horizon=40000, bound_home=bound)
+    assert moves == []
+    assert bound == [(0, 1)]

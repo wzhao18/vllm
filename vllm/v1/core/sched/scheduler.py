@@ -332,12 +332,10 @@ class Scheduler(SchedulerInterface):
                 )
         except ImportError:
             pass
-        # Whether, at the last DP exchange, some DP rank of this engine's group
-        # had nothing to schedule (no scheduled tokens and no computable prompt
-        # tokens) while the group had prompt work. Work this rank holds but has
-        # not committed yet (no blocks, no load issued) is better left movable
-        # then; load-ahead stays off while it is set.
-        self.dp_group_has_idle_rank: bool = False
+        # DP late binding: the waiting requests the last DP plan bound to this
+        # rank (placed here by cost within the binding horizon, or moved in).
+        # Load-ahead loads only these; None = no DP plan (no gating).
+        self.dp_bound_here: set[str] | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1449,8 +1447,14 @@ class Scheduler(SchedulerInterface):
                         or not self.waiting
                         # Some DP rank of the group has no work: leave the
                         # queued requests uncommitted so they can move there.
-                        or self.dp_group_has_idle_rank
+                        or (
+                            self.dp_bound_here is not None
+                            and self.waiting.peek_request().request_id
+                            not in self.dp_bound_here
+                        )
                     ):
+                        # Not bound here by the DP plan (it may run on another
+                        # rank or later): load nothing for it yet.
                         break
                     head = self.waiting.peek_request()
                     if head.status != RequestStatus.WAITING or head.num_computed_tokens:
@@ -3611,10 +3615,8 @@ class Scheduler(SchedulerInterface):
                 demand += self._dp_plan_cost(left, ctx)
         for queue in (self.kv_holding_waiting, self.waiting):
             for request in queue:
-                if request.num_computed_tokens > 0 and (
-                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
-                    or request.request_id in self.finished_recving_kv_req_ids
-                ):
+                # In-flight loads count too: their compute is committed here.
+                if request.num_computed_tokens > 0:
                     ctx = request.num_computed_tokens + scheduled.get(
                         request.request_id, 0
                     )

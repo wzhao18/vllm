@@ -148,7 +148,10 @@ def dp_step_token_cap(
 
 # Uncommitted waiting prompts each DP rank reports per step for cross-rank
 # moves (see dp_rebalance.plan_dp_moves); bounds the exchange vector.
-DP_MOVE_SLOTS = 4
+DP_MOVE_SLOTS = 8
+# DP late binding: a request placed on a rank binds there (its KV may be loaded
+# ahead) when it starts within this many full steps of the rank's projected work.
+DP_BIND_HORIZON_STEPS = 3
 # Moved request ids a source rank remembers to forward client aborts.
 DP_MOVED_MEMORY = 65536
 # A move to another node's rank (its output goes back to the home node's client
@@ -2892,15 +2895,6 @@ class DPEngineCoreProc(EngineCoreProc):
                 [int(counts[of_base + s * size + d]) for d in range(size)]
                 for s in range(size)
             ]
-        sched_counts = counts[:size]
-        demands = counts[size : 2 * size]
-        # Some rank has neither scheduled tokens nor computable prompt tokens
-        # while the group still has prompt work: uncommitted work elsewhere is
-        # better left movable (see Scheduler.dp_group_has_idle_rank).
-        self.scheduler.dp_group_has_idle_rank = bool(
-            int(demands.sum()) > 0
-            and bool(((sched_counts == 0) & (demands == 0)).any())
-        )
         self.scheduler.set_dp_step_token_cap(
             dp_step_token_cap(
                 # A rank runs at most the budget per step, so a long cold
@@ -2932,13 +2926,24 @@ class DPEngineCoreProc(EngineCoreProc):
         ]
         local = self._dp_move_local_size
         self._dp_plan_demand = demand
+        bound: list[tuple[int, int]] = []
+        budget = self.scheduler.max_num_scheduled_tokens
         self._dp_moves = plan_dp_moves(
             demand,
             per_rank,
-            self.scheduler.max_num_scheduled_tokens,
+            budget,
             node_of=[r // local for r in range(size)],
             cross_min_gain=DP_CROSS_NODE_MIN_GAIN,
+            bind_horizon=DP_BIND_HORIZON_STEPS * budget,
+            bound_home=bound,
         )
+        rank = self.dp_group.rank()
+        # Bind at load-issue time: load-ahead on this rank only for the
+        # requests the plan placed here within the horizon (moved-in requests
+        # are added as they arrive).
+        self.scheduler.dp_bound_here = {
+            movable[i][0] for r, i in bound if r == rank and i < len(movable)
+        }
         self._dp_movable_ids = [rid for rid, _ in movable]
         self._dp_abort_counts = [
             [int(counts[ab_base + s * size + d]) for d in range(size)]
@@ -2992,6 +2997,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 payload = self._dp_recv_bytes(mv.src)
                 if payload:
                     req_id = self._dp_import_moved(payload)
+                    if self.scheduler.dp_bound_here is not None:
+                        self.scheduler.dp_bound_here.add(req_id)
                     if self.iterlog is not None and req_id in self.scheduler.requests:
                         self._dp_log_move(
                             self.scheduler.requests[req_id], mv, outgoing=False

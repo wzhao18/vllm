@@ -29,7 +29,7 @@ class _Sched:
         self.demand = demand
         self.requests = {r.request_id: r for r in requests}
         self.exchange = None
-        self.dp_group_has_idle_rank = False
+        self.dp_bound_here = None
         self.finished = []
 
     def set_dp_prefill_exchange(self, exchange):
@@ -288,3 +288,37 @@ def test_cross_node_move_forwards_output_to_home_rank():
     assert got[0][2] == [(0, 0, "x", [7], {"remote_engine_id": "e2"})]
     assert got[2][2] == []
     assert got[0][3] == {} and got[2][4] == {}
+
+
+def _bind_worker(rank, world_size, port, out):
+    pg = stateless_init_torch_distributed_process_group(
+        "127.0.0.1", port, rank, world_size, backend="gloo"
+    )
+    if rank == 0:
+        sched = _Sched(16000, [_request("a", 12000), _request("b", 1000)])
+    else:
+        sched = _Sched(0)
+    core = _core(pg, sched, world_size)
+    DPEngineCoreProc._process_engine_step_dp(core)
+    bound_after_plan = sorted(sched.dp_bound_here)
+    DPEngineCoreProc._process_engine_step_dp(core)
+    out.put((rank, bound_after_plan, sorted(sched.dp_bound_here), sorted(sched.requests)))
+
+
+def test_plan_binds_requests_where_they_will_run():
+    """Bind at load-issue time: the planner moves "a" to the idle rank (bound
+    there on arrival) and binds "b" at home (it starts within the horizon)."""
+    ctx = mp.get_context("spawn")
+    port = get_open_port()
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_bind_worker, args=(r, 2, port, out)) for r in range(2)]
+    for p in procs:
+        p.start()
+    got = dict((x[0], x[1:]) for x in (out.get(timeout=120) for _ in procs))
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    bound0, _, held0 = got[0]
+    _, bound1_after_move, held1 = got[1]
+    assert bound0 == ["b"] and held0 == ["b"]
+    assert "a" in bound1_after_move and held1 == ["a"]
