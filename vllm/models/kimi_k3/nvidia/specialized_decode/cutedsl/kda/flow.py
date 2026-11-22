@@ -112,9 +112,10 @@ SLOTS = 3  # the CTA's state page ring
 MAX_ITEMS = 16  # items per CTA (tables, raw gates) of the default build
 # Item-capacity builds (a KdaFlow specialization parameter): 16 serves up to 141
 # requests per DP group at 24 heads on Rubin's 212 SMs (24 n / 212 <= 16); 20 serves
-# only the captured sizes above that, up to 176 (C1152 / C1280). The 16 build is
-# unchanged; ``sp.make_core`` picks the smallest build that fits per captured shape.
-ITEM_BUILDS = (16, 20)
+# only the captured sizes above that, up to 176 (C1152 / C1280); 24 serves 177 to 212
+# (decode 192 / 208 per rank). The 16 and 20 builds are unchanged; ``sp.make_core``
+# picks the smallest build that fits per captured shape.
+ITEM_BUILDS = (16, 20, 24)
 # Rubin's oversized shared memory mode (327 KiB per CTA; budget 320 KiB). Elsewhere
 # the opt-in limit.
 OVERSIZED_BUDGET = 320 * 1024
@@ -148,13 +149,24 @@ def group_bytes(tokens, window, conv_size):
     return block + staging + stores + 16 * 4 * 4
 
 
+def fa_spill_bytes(tokens, items):
+    """Bytes of the prologue F_A scratch (``items`` x tokens x K BF16) beyond the region
+    it overlays (the q / k / v / decay blocks and the old corrections u_t, which are
+    unused until the first prep). 0 for the 16- and 20-item builds at every token
+    count; the 24-item build reserves the rest so the scratch never runs into the
+    buffers after it (D_n, couplings, staging), which are live in the prologue."""
+    covered = GROUPS * 4 * tokens * K * 4 + GROUPS * tokens * K * 4
+    return max(0, items * tokens * K * 2 - covered)
+
+
 def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS):
     pages = SLOTS * PAGE_BYTES
     heads = 2 * CONSTS * K * 4
     gates = items * tokens * K * 2
     tables = items * (META + 8) * 4
     groups = GROUPS * group_bytes(tokens, window, conv_size)
-    return pages + heads + gates + tables + groups + 64 * 8 + 4096  # (+ alignment)
+    spill = fa_spill_bytes(tokens, items)
+    return pages + heads + gates + tables + groups + spill + 64 * 8 + 4096  # (+ alignment)
 
 
 def smem_budget(device):
@@ -529,6 +541,12 @@ class KdaFlow(KdaWS):
         )
         v_s, fw_s = qkvd[None, 2, None, None], qkvd[None, 3, None, None]
         fu_s = alloc(smem, Float32, (GROUPS, T, K))  # the old corrections u_t
+        # The prologue F_A scratch (``fas`` below) overlays qkvd and fu_s; a build with
+        # more items reserves the bytes past them here, directly after fu_s, so the
+        # scratch stays off the buffers that follow (fa_spill_bytes).
+        FA_SPILL: cutlass.Constexpr = fa_spill_bytes(T, self.items)
+        if cutlass.const_expr(FA_SPILL > 0):
+            alloc(smem, Uint8, (FA_SPILL,))
         fd_s = alloc(smem, Float32, (GROUPS, K))  # D_n
         ce_s = alloc(smem, Float32, (GROUPS, T * T))  # the scan's token couplings
         g_s = alloc(smem, BFloat16, (GROUPS, T, K))

@@ -44,7 +44,7 @@ def core_of(kind, attention, rows, records, caches, mx_out=False):
 
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176])
+@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176, 177, 192, 208, 212])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
     monkeypatch.setattr(flow, "max_stages", lambda *args, **kwargs: stages)
     sp.executable.cache_clear()
@@ -196,12 +196,115 @@ def test_flow_mxfp8_output_is_the_quantized_bf16_output(n, graph):
     sp.executable.cache_clear()
 
 
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("n", [144, 160, 176])
+def test_flow_24_item_build_matches_20_item_build(n, graph, monkeypatch):
+    """The 24-item build forced at shapes the 20-item build serves equals it bit for
+    bit over folding steps: conv windows, checkpoints, records and outputs. Items
+    are independent per CTA, so only the capacity differs; any 24-item shared
+    memory overlap shows up exactly (DCRIT r68b)."""
+    sp.executable.cache_clear()
+    rows, slots = Q * n, 2 * n + 2
+    a_layer, b_layer = kda.layer(), kda.layer()  # the same weights, their own records
+    a_layer.deferred_recoverssm = b_layer.deferred_recoverssm = True
+    a_kv = kda.caches(slots)
+    b_kv = tuple(t.clone() for t in a_kv)
+    _, metadata = kda.step(n, slots)
+    record_rows = torch.randperm(MAX_REQS, generator=torch.Generator().manual_seed(6))
+    record_rows = record_rows[:n].to(torch.int32).to(kda.DEVICE)
+    pendings = [torch.zeros(MAX_REQS, dtype=torch.int32, device=kda.DEVICE) for _ in range(2)]
+    metas = [
+        kda.Module(**vars(metadata), recoverssm_deferred=kda.Module(
+            record_rows=record_rows, pending=p, flush=None))
+        for p in pendings
+    ]  # fmt: skip
+    assert flow.item_build(24 * n, n, 212)[2] == 20, n
+    a_core = core_of("flow", a_layer, rows, "deferred", a_kv)
+    real = flow.item_build
+
+    calls = []
+
+    def forced(items, requests, sms):
+        ctas, per_cta, _ = real(items, requests, sms)
+        calls.append(per_cta)
+        return ctas, per_cta, 24
+
+    sp.executable.cache_clear()  # (keyed by shape, not build: the forced core compiles anew)
+    monkeypatch.setattr(flow, "item_build", forced)
+    b_core = core_of("flow", b_layer, rows, "deferred", b_kv)
+    assert calls, "the forced 24-item build was not used"
+    monkeypatch.setattr(flow, "item_build", real)
+    projected = torch.empty(rows, kda.PITCH, dtype=torch.bfloat16, device=kda.DEVICE)
+    outs = [torch.empty(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE) for _ in range(2)]
+    caches = [list(a_kv), list(b_kv)]
+    cores = (a_core, b_core)
+
+    def verify():
+        for i in range(2):
+            cores[i].run(projected, outs[i], caches=caches[i], metadata=metas[i])
+
+    replay = None
+    if graph:
+        for i in range(2):
+            scratch = [t.clone() for t in caches[i]]
+            cores[i].run(projected, outs[i], caches=scratch, metadata=metas[i])
+        torch.cuda.synchronize()
+        replay = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(replay):
+            verify()
+    for step in range(STEPS):
+        projected.copy_(kda.step(n, slots, seed=300 + step)[0])
+        if replay is not None:
+            replay.replay()
+        else:
+            verify()
+        torch.cuda.synchronize()
+        where = f"n {n} step {step}"
+        for j, (x, y) in enumerate(zip(a_kv, b_kv)):
+            kda.assert_bitwise(f"{where} cache {j}", y, x)
+        kda.assert_bitwise(f"{where} output", outs[1], outs[0])
+        ra, rb = a_layer.recoverssm_records, b_layer.recoverssm_records
+        index = record_rows.long()
+        kda.assert_bitwise(f"{where} correction", rb.correction[index], ra.correction[index])
+        kda.assert_bitwise(f"{where} key / gate", rb.key_gate[index], ra.key_gate[index])
+        accepted = accepted_counts(n, step)
+        for p in pendings:
+            p.zero_()
+            p[index] = accepted
+    sp.executable.cache_clear()
+
+
 def test_flow_item_build_per_shape():
     """KdaFlow's item-capacity build per shape at 24 heads on Rubin's 212 SMs: the
     16-item build up to 141 requests (unchanged), the 20-item build from 142 to
-    176, none above (the SP KDA core raises Unsupported)."""
+    176 (unchanged), the 24-item build from 177 to 212, none above (the SP KDA core
+    raises Unsupported)."""
     for n in (1, 21, 96, 128, 141):
         assert flow.item_build(24 * n, n, 212)[2] == 16, n
     for n in (142, 144, 160, 176):
         assert flow.item_build(24 * n, n, 212)[2] == 20, n
-    assert flow.item_build(24 * 177, 177, 212)[2] is None
+    for n in (177, 192, 208, 212):
+        assert flow.item_build(24 * n, n, 212)[2] == 24, n
+    assert flow.item_build(24 * 213, 213, 212)[2] is None
+
+
+def test_flow_raises_above_largest_build():
+    """Above the largest item build (213 requests at 24 heads on 212 SMs) the SP KDA
+    core forced to KdaFlow raises ``Unsupported`` at build: a clean error, never a
+    silent fallback to another core."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
+
+    n = 213
+    sp.executable.cache_clear()
+    layer = kda.layer()
+    layer.deferred_recoverssm = True
+    saved = dict(sp.RECORD_KINDS)
+    sp.RECORD_KINDS[HEADS] = "1-:flow"
+    try:
+        with pytest.raises(Unsupported, match="exceed the largest build"):
+            core = sp.SpKdaCore(layer, (Q * n,), records="deferred", ctx=kda.context())
+            core.prepare_caches(list(kda.caches(2 * n + 2)))
+    finally:
+        sp.RECORD_KINDS.clear()
+        sp.RECORD_KINDS.update(saved)
+        sp.executable.cache_clear()
