@@ -234,12 +234,23 @@ def main():
     )
     ap.add_argument("--parts", default="bf16,gu,down,kdain")
     ap.add_argument("--kda-rows", default="256,260,264,272,288")  # R = 4 n
+    ap.add_argument(
+        "--pre",
+        default=None,
+        help="override the pre tactic list: a Python literal of "
+        "((tile_mn, cluster_mn, swap_ab, inst_m), prewait) pairs",
+    )
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.manual_seed(0)
     rows = [int(r) for r in args.rows.split(",")]
     props = torch.cuda.get_device_properties(0)
     print(f"{props.name} sms {props.multi_processor_count}", flush=True)
+    if args.pre:
+        import ast
+
+        global PRE, PRE_KDA
+        PRE = PRE_KDA = tuple(ast.literal_eval(args.pre))
     if args.narms:
         part = args.parts
         print(

@@ -6,9 +6,9 @@ summation order, and leave every row <= 64 on its previous tactic:
 
 * router | latent down BF16 -> FP32 split-K (``sp_mlp.ROUTER_LATENT``): the new tactic
   at every row 65-96 is bitwise the previous table's (same split, same K order);
-* shared expert gate_up / down MXFP8 (``mxfp8.MX_TUNED`` / ``PRE_TACTICS``): the
-  vendored sm_107 kernel at every row 65-96 is bitwise FlashInfer's cute-dsl GEMM (the
-  previous kind there), and kda_in at every R 257-288 is bitwise its previous tactic;
+* the MXFP8 tables (shared expert, kda_in) are unchanged: their cold-chain wins (sm_107
+  "pre" swap tiles) gave step time back in the step A/B (side-stream / in-step effects)
+  and are re-tuned by in-step replay separately;
 * the tables at rows <= 64 (R <= 256) are the previous ones;
 * split-K shared memory: every table tactic fits the launch's dynamic shared memory;
   an over-limit tactic (64.80.4.5, which faulted with an illegal address) is refused by
@@ -119,54 +119,8 @@ def test_router_latent_step_up_rows_bitwise():
         assert torch.equal(ya, yb), (r, new[r], old[r])
 
 
-def _mx(t):
-    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
-
-    buf = mxfp8_act.Mxfp8Buffer(t.shape[0], t.shape[1], t.device)
-    mxfp8_act.quantize(t, out=buf)
-    return buf
-
-
-@pytest.mark.parametrize(
-    "n,k,rows,old_kind",
-    [
-        (12288, 7168, STEP_UP, "fi_cute"),
-        (7168, 6144, STEP_UP, "fi_cute"),
-        (12448, 7168, range(257, 289), "pre"),
-    ],
-    ids=["shared_gu", "shared_down", "kda_in"],
-)
-def test_mxfp8_step_up_rows_bitwise(n, k, rows, old_kind):
-    import flashinfer
-
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
-        Mxfp8PreGemm,
-    )
-
-    torch.manual_seed(1)
-    w = _mx((torch.randn(n, k, device=DEVICE) * 0.05).bfloat16())
-    kinds = mxfp8.mxfp8_tactics(n, k, rows)
-    assert set(kinds.values()) == {"pre"}, kinds
-    proj = mxfp8.Mxfp8Projection((w.data, w.scale), rows, family=f"t_stepup_{n}")
-    old_pre = ((256, 192), (2, 1), True, 256)  # kda_in R257-384 before the change
-    for r in rows:
-        x = (torch.randn(r, k, device=DEVICE)).bfloat16()
-        out = torch.empty(r, n, device=DEVICE, dtype=torch.bfloat16)
-        proj.run(x, out)
-        q = proj.input.view(r)
-        ref = torch.empty_like(out)
-        if old_kind == "fi_cute":
-            flashinfer.mm_mxfp8(
-                q.data,
-                w.data.t(),
-                q.scale,
-                w.scale,
-                out=ref,
-                out_dtype=torch.bfloat16,
-                backend="cute-dsl",
-            )
-        else:
-            Mxfp8PreGemm(
-                n, k, r, old_pre, use_pdl=True, prewait=4, max_stages=6, device=DEVICE
-            )(q.data, q.scale, w.data, w.scale, ref)
-        assert torch.equal(out, ref), (n, r)
+def test_mxfp8_tables_unchanged():
+    for nk in ((12288, 7168), (7168, 6144)):
+        assert mxfp8.MX_TUNED[nk]["*"] == OLD_MX_TUNED
+        assert nk not in mxfp8.PRE_TACTICS
+    assert mxfp8.pre_tactic(12448, 7168, 264)[0] == ((256, 192), (2, 1), True, 256)
