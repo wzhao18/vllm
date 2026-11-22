@@ -31,6 +31,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -95,6 +97,25 @@ def _raise_printf_fifo() -> None:
     except Exception as e:  # noqa: BLE001 - diagnostics only
         logger.info("Rubin MegaMoE: printf FIFO not raised (%s)", e)
 
+
+
+# NEVER MERGE (MEGAMOEFIX spin_dump proof): K31_REPRO_INJECT_HANG="<rank>:<n>" makes that EP rank, at its n-th eager
+# MegaMoE call, launch a never-ending GPU spin (torch.cuda._sleep) before the call: a resident, unguarded, spinning
+# kernel between MoE k-1 and k, the shape of the real stall. The peers' guards then fire and spin_dump must land.
+_REPRO_INJECT_CALLS = [0]
+
+
+def _repro_inject_hang(rank: int) -> None:
+    spec = os.environ.get("K31_REPRO_INJECT_HANG", "")
+    if not spec or torch.cuda.is_current_stream_capturing():
+        return
+    r, n = (int(x) for x in spec.split(":"))
+    if rank != r:
+        return
+    _REPRO_INJECT_CALLS[0] += 1
+    if _REPRO_INJECT_CALLS[0] == n:
+        logger.warning("K31_REPRO_INJECT_HANG rank %d eager MegaMoE call %d: launching an endless GPU spin", rank, n)
+        torch.cuda._sleep(1 << 62)
 
 class RubinMegaMoE:
     def __init__(
@@ -423,6 +444,7 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         breadcrumb.crumb(breadcrumb.OP_MOE_IN)
+        _repro_inject_hang(self.rank)  # NEVER MERGE: spin_dump proof (MAIN 05:50)
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
         if unfused_norm is not None:
