@@ -120,3 +120,21 @@ def test_moved_in_requests_stay_and_count_in_demand():
     # Demand: the pinned request + reqs[2] (past the movable slots); not the
     # listed one (the planner adds it).
     assert scheduler.dp_move_demand() == 500 + 256
+
+
+def test_cost_cut_never_below_one_mamba_block():
+    """Rhea livelock (E62p prt, 2026-11-22): with a 16384-token Mamba alignment
+    block, a cost cut of a running prompt's next chunk to slightly under 16384
+    aligned to 0 tokens every step, so 32 running prompts held every slot and
+    never progressed. The cut keeps at least one whole Mamba block."""
+    scheduler = create_scheduler()
+    scheduler._prompt_cost = _Cost
+    (req,) = create_requests(num_requests=1, num_tokens=200)
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.mamba_block_size = 48
+    # ctx 64 (weight 2): 64 cost buys 32 tokens < one 48-token block -> 48.
+    assert scheduler._cut_prompt_chunk_to_cost(req, 64, 100, 64.0) == 48
+    # A smaller request remainder is never exceeded.
+    assert scheduler._cut_prompt_chunk_to_cost(req, 64, 40, 10.0) == 40
+    # Above one block the cost cut applies as before.
+    assert scheduler._cut_prompt_chunk_to_cost(req, 64, 100, 128.0) == 64
