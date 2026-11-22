@@ -169,3 +169,25 @@ def test_random_bursts_are_spread_exactly(
         for r in ready_at
     ), "no plan waited for the budget: the test did not exercise it"
     engine.assert_idle()
+
+
+def test_exchange_after_the_forward_is_bound_raises():
+    """The exchange's deadlock freedom needs its packs ahead of the step's
+    forward on the compute stream: queueing it after the forward was bound
+    (check_pair_exchanges_ran) raises."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+        NixlPullConnectorWorker,
+    )
+
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._pair_consumed = None
+    worker._pair_forward_bound = None
+    meta = NixlConnectorMetadata()
+    meta.reqs_to_pair_exchange = {"a": [PairUnit(0, 1, True)]}
+    worker._pair_consumed = meta  # finalize_loaded_kv ran
+    worker.check_pair_exchanges_ran(meta)  # the forward is bound
+    with pytest.raises(RuntimeError, match="after this step's forward"):
+        worker.run_pair_exchanges(meta)

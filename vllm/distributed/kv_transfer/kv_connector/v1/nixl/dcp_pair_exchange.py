@@ -199,10 +199,10 @@ def pair_half_bytes_bound(kv_cache_spec: Mapping[str, KVCacheSpec]) -> int:
 
 def reserved_device_bytes(half_bytes: int, chunk_units: int) -> int:
     """Device bytes of one rank's exchange buffers at a unit half of
-    ``half_bytes``: ``keep`` and ``send`` in ``PAIR_RING_SLOTS`` chunk slots,
-    ``recv`` one chunk. Taken from the KV cache budget at profiling
+    ``half_bytes``: ``keep``, ``send`` and ``recv`` in ``PAIR_RING_SLOTS``
+    chunk slots. Taken from the KV cache budget at profiling
     (``NixlBaseConnector.get_reserved_device_memory``)."""
-    return (2 * PAIR_RING_SLOTS + 1) * chunk_units * half_bytes
+    return 3 * PAIR_RING_SLOTS * chunk_units * half_bytes
 
 
 def all_exchange_strides(dcp_size: int) -> list[int]:
@@ -1273,6 +1273,14 @@ class _Ring:
         self.slots = slots
         self.next = 0
         self._events: list[torch.cuda.Event | None] = [None] * slots
+        self._swaps: "torch.cuda.Stream | None" = None
+
+    def swap_stream(self, device: torch.device) -> "torch.cuda.Stream":
+        """The stream of the swaps (copy engines and stream memory operations
+        only), one per rank."""
+        if self._swaps is None:
+            self._swaps = torch.cuda.Stream(device=device)
+        return self._swaps
 
     def take(self, stream: "torch.cuda.Stream") -> int:
         slot = self.next
@@ -1344,15 +1352,12 @@ class DcpPairExchanger:
         self._plan = _launch_plan(table, classes, layout.parity, self.device)
         if ring_slots < 1:
             raise ValueError(f"ring_slots must be positive, got {ring_slots}")
-        # ``keep`` and ``send`` hold ``ring_slots`` chunks (slot s: rows
-        # [s K, (s + 1) K)); ``recv`` one, since the side stream swaps and
-        # unpacks chunk after chunk. Inline exchanges use slot 0 only.
+        # ``keep``, ``send`` and ``recv`` hold ``ring_slots`` chunks (slot s:
+        # rows [s K, (s + 1) K)). Inline exchanges use slot 0 only.
         ring = (ring_slots * chunk_units, table.half_bytes)
         self.keep = torch.empty(ring, dtype=torch.uint8, device=self.device)
         self.send = torch.empty_like(self.keep)
-        self.recv = torch.empty(
-            (chunk_units, table.half_bytes), dtype=torch.uint8, device=self.device
-        )
+        self.recv = torch.empty_like(self.keep)
         # The kernels move 4-byte words, which every row width is made of.
         self._words = {
             name: getattr(self, name).view(torch.int32)
@@ -1432,6 +1437,13 @@ class DcpPairExchanger:
         """
         if units:
             rows = async_tensor_h2d(_unit_rows(units), self.device, torch.int64)
+            if side is not None:
+                # Partners must use the same slots (a swap reads the partner's
+                # slot at this rank's offset), but stages before this call may
+                # have taken different numbers of chunks on the two ranks: every
+                # call starts at slot 0. Safe: ``take`` still waits for each
+                # slot's last chunk.
+                self._ring.next = 0
             self._run(units, rows, self._plan, side)
 
     def record_event(self) -> torch.cuda.Event:
@@ -1496,8 +1508,8 @@ class DcpPairExchanger:
             "NIXL DCP pair exchange: DCP rank %d pairs with %d on %s over NCCL %s "
             "(%s). One unit, %.2f MB each way, swaps in %.3f ms (%.0f GB/s); "
             "NCCL_DEBUG=INFO shows the transport, which should be P2P over "
-            "multi-node NVLink, not NET/IB. Buffers: keep + send %d slots x %d "
-            "units, recv %d units, x %.2f MB = %.1f MB. Kernels: %s. Free device memory: %.2f GiB before warm-up, "
+            "multi-node NVLink, not NET/IB. Buffers: keep + send + recv %d slots "
+            "x %d units x %.2f MB = %.1f MB. Kernels: %s. Free device memory: %.2f GiB before warm-up, "
             "%.2f GiB after.",
             stamp.dcp_rank,
             peer.dcp_rank,
@@ -1508,7 +1520,6 @@ class DcpPairExchanger:
             swap_ms,
             half_mb / max(swap_ms, 1e-6),
             self._ring.slots,
-            self.chunk_units,
             self.chunk_units,
             half_mb,
             (self.keep.numel() + self.send.numel() + self.recv.numel()) / 1e6,
@@ -1578,50 +1589,60 @@ class DcpPairExchanger:
         stream, which closes a cycle. The unpack only rewrites this rank's
         own blocks; no peer waits for it.
 
-        Chunks go through ``PAIR_RING_SLOTS`` slots of ``keep`` and ``send``
-        (``_Ring``). A pack waits (on the device, ``wait_event``) only for the
-        side-stream chunk that last used its slot: that chunk's swap has
-        consumed its ``send`` rows (the partner's copy is behind the swap's
-        "consumed" wait) and its unpack has read its ``keep`` rows. ``recv``
-        is one chunk, reused in side-stream order. The ordering argument above
-        is unchanged: the packs, the only work a partner waits for, stay on
-        the current stream; the wait a pack may take is on this rank's own
-        side stream, whose swaps wait only for partners' packs, which are
-        queued ahead of their forwards.
+        Chunks go through ``PAIR_RING_SLOTS`` slots of ``keep``, ``send`` and
+        ``recv`` (``_Ring``). A pack waits (on the device, ``wait_event``) only
+        for the chunk that last used its slot: its swap has consumed ``send``
+        (the partner's copy is behind the swap's "consumed" wait) and its
+        unpack has read ``keep`` and ``recv``.
+
+        The swaps (stream memory operations and copy-engine copies, no SM
+        work) run on their own stream (``_Ring.swap_stream``), the unpacks on
+        ``side`` after their swap. A partner's swap waits for this rank's pack
+        and for this rank's copy of its ``send``; neither may sit behind an
+        unpack, which needs SMs that a spinning forward kernel can hold (with
+        the unpacks between the copies on one stream, a spin queued after the
+        packs starved unpack k and with it copy k + 1, which the partner's
+        "consumed" wait needed: the cycle ``test_side_stream_peer_copy_is_exact
+        _and_cannot_deadlock`` catches). Every wait the current stream takes
+        (a slot's last unpack) precedes this step's forward on it, so those
+        unpacks run before any of its kernels can spin.
         """
         if side is None:
             for start in range(0, len(units), self.chunk_units):
                 chunk = units[start : start + self.chunk_units]
                 chunk_rows = rows[start : start + len(chunk)]
-                self._pack(0, chunk, chunk_rows, plan)
-                self._communicate(0, len(chunk))
-                self._unpack(0, chunk, chunk_rows, plan)
+                self._pack(chunk, chunk_rows, plan)
+                self._communicate(len(chunk))
+                self._unpack(chunk, chunk_rows, plan)
             return
         compute = current_stream()
         rows.record_stream(side)
         ring = self._ring
+        swaps = ring.swap_stream(side.device)
         for start in range(0, len(units), self.chunk_units):
             chunk = units[start : start + self.chunk_units]
             chunk_rows = rows[start : start + len(chunk)]
             slot = ring.take(compute)
-            self._pack(slot, chunk, chunk_rows, plan)
-            side.wait_stream(compute)
+            self._pack(chunk, chunk_rows, plan, slot=slot)
+            swaps.wait_stream(compute)
+            with torch.cuda.stream(swaps):
+                self._communicate(len(chunk), slot=slot)
+            side.wait_stream(swaps)
             with torch.cuda.stream(side):
-                self._communicate(slot, len(chunk))
-                self._unpack(slot, chunk, chunk_rows, plan)
+                self._unpack(chunk, chunk_rows, plan, slot=slot)
                 ring.release(slot, side)
 
     def _slot(self, name: str, slot: int, num_units: int) -> torch.Tensor:
-        """Rows of slot ``slot`` of a ring buffer (``recv``: its one chunk)."""
-        first = 0 if name == "recv" else slot * self.chunk_units
+        """Rows of slot ``slot`` of a ring buffer."""
+        first = slot * self.chunk_units
         return self._words[name][first : first + num_units]
 
     def _pack(
         self,
-        slot: int,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
         plan: _LaunchPlan,
+        slot: int = 0,
     ) -> None:
         """Fill slot ``slot`` of ``keep`` and ``send`` for one chunk."""
         n = len(units)
@@ -1630,10 +1651,10 @@ class DcpPairExchanger:
 
     def _unpack(
         self,
-        slot: int,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
         plan: _LaunchPlan,
+        slot: int = 0,
     ) -> None:
         """Rewrite one chunk's blocks from slot ``slot`` of ``keep`` and
         ``recv``."""
@@ -1660,7 +1681,7 @@ class DcpPairExchanger:
             num_warps=_NUM_WARPS,
         )
 
-    def _communicate(self, slot: int, num_units: int) -> None:
+    def _communicate(self, num_units: int, slot: int = 0) -> None:
         """Swap the first ``num_units`` rows of slot ``slot`` of ``send`` into
         ``recv`` with the partner."""
         ops = self._swaps.get((slot, num_units))
@@ -1673,7 +1694,9 @@ class DcpPairExchanger:
                     self.layout.partner,
                 ),
                 _p2p_op(
-                    torch.distributed.irecv, self.recv[:num_units], self.layout.partner
+                    torch.distributed.irecv,
+                    self.recv[first : first + num_units],
+                    self.layout.partner,
                 ),
             )
         self._communicator.batch_isend_irecv(list(ops))
@@ -1712,7 +1735,7 @@ class DcpPairExchanger:
         best = float("inf")
         for _ in range(_TIMED_SWAPS):
             start.record(current_stream())
-            self._communicate(0, 1)
+            self._communicate(1)
             end.record(current_stream())
             end.synchronize()
             best = min(best, start.elapsed_time(end))
@@ -1852,7 +1875,11 @@ class DcpStagedExchanger:
                 # Ratio 2: the one-stage exchange of the units as planned.
                 self.stages[strides[0]].exchange(group_units, **kwargs)
                 continue
-            for stride in strides:
+            for i, stride in enumerate(strides):
+                if i and side is not None:
+                    # A stage rewrites the blocks the previous stage's unpacks
+                    # wrote on ``side``: its packs (current stream) read them.
+                    current_stream().wait_stream(side)
                 self.stages[stride].exchange(
                     stage_units(group_units, self.dcp_rank, stride, remote),
                     **kwargs,

@@ -212,18 +212,18 @@ def main(args) -> None:
 
             def pack(chunks=chunks, exchanger=exchanger, plan=plan):
                 for chunk, chunk_rows in chunks:
-                    exchanger._pack(0, chunk, chunk_rows, plan)
+                    exchanger._pack(chunk, chunk_rows, plan)
 
             def unpack(chunks=chunks, exchanger=exchanger, plan=plan):
                 for chunk, chunk_rows in chunks:
-                    exchanger._unpack(0, chunk, chunk_rows, plan)
+                    exchanger._unpack(chunk, chunk_rows, plan)
 
             def exchange(units=units, exchanger=exchanger):
                 exchanger.exchange(units)
 
             # The kernels must match the reference before they are timed.
             first, first_rows = chunks[0]
-            exchanger._pack(0, first, first_rows, plan)
+            exchanger._pack(first, first_rows, plan)
             keep, send = reference_pack(buf, table, layout, [u.block_id for u in first])
             n = len(first)
             assert torch.equal(exchanger.keep[:n], keep)
