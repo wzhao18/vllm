@@ -58,6 +58,8 @@ def _config(monkeypatch, *, cuda, xpu=False, elastic=False, nixl=True, comm=None
     monkeypatch.setattr(parallel_mod.current_platform, "is_xpu", lambda: xpu)
     monkeypatch.setattr(nixl_utils, "is_nixl_available", lambda: nixl)
     return ParallelConfig(
+        data_parallel_size=2,
+        enable_expert_parallel=True,
         enable_eplb=True,
         enable_elastic_ep=elastic,
         eplb_config=EPLBConfig(communicator=comm),
