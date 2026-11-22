@@ -173,5 +173,42 @@ def _worker(rank: int, init_method: str) -> None:
                 f"within {TIMEOUT_S:.0f} s while its peers spun"
             )
         dist.barrier()
+
+        # 3. The DSTEP B hang shape: rank 0 traces kernels (CUPTI, which
+        # serializes its GPU), queues a spin after its exchange that waits for
+        # its peers' exchanges, and stops the profiler (a device sync). Its
+        # pack precedes the spin on the current stream, so the peers' swaps
+        # get it and release the spin.
+        from torch.profiler import ProfilerActivity, profile
+
+        for it in range(5):
+            own_flag.zero_()
+            torch.accelerator.synchronize()
+            dist.barrier()
+            buf.copy_(orig)
+            if rank == 0:
+                with profile(activities=[ProfilerActivity.CUDA]):
+                    torch.cuda._sleep(20_000_000)
+                    peer.exchange(units_of(7), side=side)
+                    _spin_until_set[(4 * sms,)](own_flag, num_warps=16)
+                    torch.cuda.current_stream().wait_stream(side)
+                ok = True
+            else:
+                peer.exchange(units_of(7), side=side)
+                done = torch.cuda.Event()
+                done.record(side)
+                start = time.monotonic()
+                while not done.query() and time.monotonic() - start < TIMEOUT_S:
+                    time.sleep(0.001)
+                ok = done.query()
+                flags[0].fill_(1)
+                torch.accelerator.synchronize()
+            verdict = torch.tensor([int(ok)])
+            dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+            assert verdict.item() == 1, (
+                f"profiled iteration {it}: a peer's side-stream exchange did not "
+                f"finish within {TIMEOUT_S:.0f} s while rank 0 spun under CUPTI"
+            )
+        dist.barrier()
     finally:
         dist.destroy_process_group()
