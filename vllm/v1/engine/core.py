@@ -272,6 +272,10 @@ class EngineCore:
         )
         # Per-iteration log (VLLM_ITERLOG_DIR); None when off.
         self.iterlog = EngineIterLog.maybe_create(vllm_config)
+        if self.iterlog is not None:
+            set_kv_fetch_log = getattr(self.scheduler, "set_kv_fetch_log", None)
+            if set_kv_fetch_log is not None:
+                set_kv_fetch_log(self.iterlog.kv_fetch)
         if felog.ON:  # GC / RSS log of this process (VLLM_FELOG_DIR)
             felog.install_process_hooks("engine")
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
@@ -2784,10 +2788,14 @@ class DPEngineCoreProc(EngineCoreProc):
         if not self._dp_prefill_exchanged:
             # No schedule() this step (no local requests): take part with 0
             # tokens, before this rank's dummy forward.
-            self._exchange_dp_prefill_tokens(0, self.scheduler.dp_prefill_demand({}))
+            self._exchange_dp_prefill_tokens(
+                0, self.scheduler.dp_prefill_demand({}), in_sched=False
+            )
         return executed
 
-    def _exchange_dp_prefill_tokens(self, num_tokens: int, demand: int = 0) -> int:
+    def _exchange_dp_prefill_tokens(
+        self, num_tokens: int, demand: int = 0, in_sched: bool = True
+    ) -> int:
         """All-reduce this step's scheduled token count and the prompt tokens
         still to compute over the engine DP group; returns the largest count of
         any DP rank (DP prefill pull-up) and sets the DP lockstep step cap of
@@ -2800,11 +2808,21 @@ class DPEngineCoreProc(EngineCoreProc):
         # Every rank adds 1: a collective paired with a different one on some
         # rank shows up here instead of returning a wrong count.
         counts[2 * size] = 1
+        t_xchg0 = time.perf_counter()
         cpu_all_reduce_(
             counts,
             self.dp_group,
             timeout=self.vllm_config.parallel_config.cpu_distributed_timeout,
         )
+        if self.iterlog is not None:
+            self.iterlog.dp_exchange(
+                t_xchg0,
+                time.perf_counter(),
+                num_tokens,
+                demand,
+                int(counts[:size].max()),
+                in_sched,
+            )
         if int(counts[2 * size]) != size:
             raise RuntimeError(
                 "DP prefill pull-up exchange is out of step across DP ranks "
