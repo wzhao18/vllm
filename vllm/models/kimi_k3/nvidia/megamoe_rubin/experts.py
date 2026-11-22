@@ -270,6 +270,11 @@ def select_rubin_buckets(
     record, phase-interleaved, die-local) instead of the EP4 prefill records."""
     if knob_world_size is not None:
         world_size = knob_world_size
+    import os as _os
+
+    if _os.environ.get("DDSA_MOE_CAPACITY") and not prefill_worker:
+        # DDSA DIAGNOSTIC (never merge): force the decode MegaMoE bucket capacity (tokens per rank)
+        max_tokens = int(_os.environ["DDSA_MOE_CAPACITY"])
     main, notes = select_rubin_bucket(problem, world_size, max_tokens)
     caps = rubin_bucket_capacities(
         max_tokens, problem.top_k, prefill_worker=prefill_worker, world_size=world_size
