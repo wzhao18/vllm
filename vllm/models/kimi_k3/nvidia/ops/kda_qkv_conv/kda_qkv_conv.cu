@@ -16,6 +16,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 #include <torch/library.h>
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
+K31SG_DEFINE_SET_RANK(kda_qkv_conv)  // rank of the timeout line (binding: set_spin_rank)
 
 namespace k3conv {
 
@@ -43,17 +45,8 @@ __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
 }
 
-__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t phase) {
-  asm volatile(
-      "{\n"
-      ".reg .pred p;\n"
-      "WAIT_%=:\n"
-      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-      "@!p bra WAIT_%=;\n"
-      "}\n" ::"r"(smem_u32(bar)),
-      "r"(phase)
-      : "memory");
-}
+// bounded (k31_spin_guard.cuh): site = the wait's line
+#define mbar_wait(bar, phase) k31sg::mbar_wait(smem_u32(bar), (phase), "kda_qkv_conv", __LINE__)
 
 __device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
   asm volatile(
@@ -302,6 +295,7 @@ constexpr int min_blocks() {
 // FMA: FP32 weights (FP32 math, the KDA layer's case); otherwise bf16 weights with a bf16 state.
 template <typename StateT, int NC, bool FMA>
 __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kernel(const Params p) {
+  k31sg::begin_call((long long)(p.num_seqs));  // timeout lines: call index and size
   constexpr int STAGES = kStages;
   constexpr int kCtaRowBytes = NC * kRowBytes;
   constexpr int kSlotBytes = kRowsPerSlot * kCtaRowBytes;
@@ -584,6 +578,13 @@ TORCH_LIBRARY_FRAGMENT(k3_kda_conv, m) {
   m.def(
       "qkv_conv(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
       "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps) -> ()");
+  m.def("set_spin_rank(int rank, int diag=0) -> ()");  // k31_spin_guard.cuh timeout lines
 }
 
 TORCH_LIBRARY_IMPL(k3_kda_conv, CUDA, m) { m.impl("qkv_conv", &k3conv::qkv_conv); }
+static void k3conv_set_spin_rank(int64_t r, int64_t diag) {
+  k31sg_set_rank_kda_qkv_conv(static_cast<int>(r), diag);
+}
+TORCH_LIBRARY_IMPL(k3_kda_conv, CompositeExplicitAutograd, m) {
+  m.impl("set_spin_rank", &k3conv_set_spin_rank);
+}

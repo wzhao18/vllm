@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include "k2_tc.cuh"
+K31SG_DEFINE_SET_RANK(kc64_tc)  // rank of the timeout line (binding: set_spin_rank)
 
 namespace kc64tc {
 
@@ -79,18 +80,17 @@ __device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity) {
   return ok != 0;
 }
 
-// Dev watchdog: a wait still pending after 2^22 polls records (block, warp,
-// barrier id, chunk) in dbg[0] (bit 63) and gives up instead of hanging.
+// Bounded wait (k31_spin_guard.cuh): was a dev watchdog that recorded (block, warp,
+// barrier id, chunk) in dbg[0] after 2^20 polls and RETURNED, letting the kernel go on
+// with an incomplete stage (silent wrong data). Now the shared policy: the clock starts
+// after 1024 failed polls, 900 s later one K31_SPIN_TIMEOUT line names the kernel and
+// the barrier id (site), then trap. dbg / c stay in the signature (callers unchanged).
 __device__ __forceinline__ void wait_wd(uint32_t bar, uint32_t parity, int id, int c,
                                         long long* dbg) {
-  for (uint32_t i = 0; !mbar_try(bar, parity); ++i) {
-    if (i == (1u << 20)) {
-      atomicCAS(reinterpret_cast<unsigned long long*>(dbg), 0ull,
-                (1ull << 63) | (uint64_t(blockIdx.y) << 40) | (uint64_t(blockIdx.x) << 24) |
-                    (uint64_t(threadIdx.x >> 5) << 16) | (uint64_t(id) << 10) | uint64_t(c & 1023));
-      return;
-    }
-  }
+  (void)c;
+  (void)dbg;
+  k31sg::Spin s;
+  while (!mbar_try(bar, parity)) s.check("flashkda_kc64_tc", id, parity ^ 1u, parity);
 }
 
 __device__ __forceinline__ long long gtimer() {
@@ -111,6 +111,7 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
     __nv_bfloat16* __restrict__ out_ptr,        // [T][H][128]
     int const* __restrict__ cu_seqlens, int H, int N, int C_total, int flags,
     long long* __restrict__ dbg) {
+  k31sg::begin_call((long long)(C_total));  // timeout lines: call index and size
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   extern __shared__ __align__(1024) unsigned char smem[];
   const int warp = threadIdx.x >> 5;
@@ -492,6 +493,7 @@ __global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
     float* __restrict__ final_state, __nv_bfloat16* __restrict__ out_ptr,
     int const* __restrict__ cu_seqlens, int H, int N, int C_total, int flags,
     long long* __restrict__ dbg) {
+  k31sg::begin_call((long long)(C_total));  // timeout lines: call index and size
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   extern __shared__ __align__(1024) unsigned char smem[];
   const int warp = threadIdx.x >> 5;

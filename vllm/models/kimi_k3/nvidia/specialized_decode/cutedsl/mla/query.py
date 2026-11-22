@@ -13,6 +13,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
@@ -438,8 +440,10 @@ class MlaQuery:
                 row = ((self.batch - 1) * self.dcp + tid) * self.heads + head
                 ptr = mailbox.iterator + row * 576
                 words = load_volatile(ptr, count=4)
+                sgn, sgt = spin_start()
                 while not published(words, sentinel=Q_SENT):
                     words = load_volatile(ptr, count=4)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0, size=self.dcp)
             cute.arch.sync_threads()
         per_head: cutlass.Constexpr = 36 * self.q_bytes  # 16 B chunks per head row
         token: cutlass.Constexpr = self.dcp * self.heads * per_head  # per token
@@ -467,6 +471,7 @@ class MlaQuery:
                 for i in cutlass.range_constexpr(n):
                     if not published(loads[i], sentinel=Q_SENT):
                         pending |= 1 << i
+                sgn, sgt = spin_start()
                 while pending != 0:
                     again = Int32(0)
                     for i in cutlass.range_constexpr(n):
@@ -475,11 +480,20 @@ class MlaQuery:
                             if not published(words, sentinel=Q_SENT):
                                 again |= 1 << i
                     pending = again
+                    sgn, sgt = spin_tick(
+                        sgn, sgt, observed=pending,
+                        target=0, size=self.dcp
+                    )
             else:
                 for i in cutlass.range_constexpr(n):  # the loads above are in flight
                     words = loads[i]
+                    sgn, sgt = spin_start()
                     while not published(words, sentinel=Q_SENT):
                         words = load_volatile(sources[i], count=4)
+                        sgn, sgt = spin_tick(
+                            sgn, sgt, observed=0,
+                            target=0, size=self.dcp
+                        )
 
     @cute.kernel
     def kernel(self, args):
@@ -1151,14 +1165,18 @@ class MlaQuery:
         if cutlass.const_expr(self.x_uniform):  # the warp leaves the loop together
             if cutlass.const_expr(POLL_X):
                 ready = cute.arch.vote_all_sync(x_ready(words))
+                sgn, sgt = spin_start()
                 while not ready:
                     sleep_ns(64)
                     words = self.x_chunks(qkv, token, lane)
                     ready = cute.arch.vote_all_sync(x_ready(words))
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         else:
+            sgn, sgt = spin_start()
             while not x_ready(words):
                 sleep_ns(64)
                 words = self.x_chunks(qkv, token, lane)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         return words
 
     @cute.kernel

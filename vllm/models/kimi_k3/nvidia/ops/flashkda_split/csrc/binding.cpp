@@ -10,8 +10,24 @@
 
 #include "flash_kda.h"
 
+// k31_spin_guard.cuh: the rank printed by a spin-timeout line, one setter per TU
+void k31sg_set_rank_prep64_tc(int, long long);
+void k31sg_set_rank_o_norm_mx(int, long long);
+void k31sg_set_rank_fwd_launch(int, long long);
+void k31sg_set_rank_k64_tc(int, long long);
+void k31sg_set_rank_kc64_tc(int, long long);
+static void set_spin_rank(int64_t rank, int64_t diag) {
+  const int r = static_cast<int>(rank);
+  k31sg_set_rank_prep64_tc(r, diag);
+  k31sg_set_rank_o_norm_mx(r, diag);
+  k31sg_set_rank_fwd_launch(r, diag);
+  k31sg_set_rank_k64_tc(r, diag);
+  k31sg_set_rank_kc64_tc(r, diag);
+}
+
 STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
   m.def("get_workspace_size(int T_total, int H, int N=1) -> int");
+  m.def("set_spin_rank(int rank, int diag=0) -> ()");
   m.def(
       "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
       "float scale, Tensor(a!) out, Tensor(c!) workspace, Tensor A_log, "
@@ -55,6 +71,7 @@ STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CUDA, m) {
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CompositeExplicitAutograd, m) {
   m.impl("get_workspace_size", TORCH_BOX(&get_workspace_size));
+  m.impl("set_spin_rank", TORCH_BOX(&set_spin_rank));
 }
 
 static struct PyModuleDef k3_flashkda_split_module = {

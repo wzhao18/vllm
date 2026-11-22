@@ -42,8 +42,9 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.host import dynamic_fake, fake
-from ..common.resident import _smid, land, wait_landed
 from ..common.primitives import (
     alloc,
     asm,
@@ -61,6 +62,7 @@ from ..common.primitives import (
     store_words,
     wait,
 )
+from ..common.resident import _smid, land, wait_landed
 from .gqa_window import (
     HEAD,
     LOG2E,
@@ -965,8 +967,10 @@ class GqaWindowStream:
             else:
                 if tid == 0:
                     seen = counter_acquire(ctr)
+                    sgn, sgt = spin_start()
                     while seen != Uint32(p_u - 1):
                         seen = counter_acquire(ctr)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
                 named_barrier(1, SOFTMAX)
                 self.rec(c, 10, global_timer(), tid == 0)
                 for it in cutlass.range_constexpr(-(-TASKS // SOFTMAX)):

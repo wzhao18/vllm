@@ -45,6 +45,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64, Uint8, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     alloc,
     bf16,
@@ -473,6 +475,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         for slot in cutlass.range_constexpr(16):
             scale[slot] = Float32(weights[token * 16 + slot])
         ready = False
+        sgn, sgt = spin_start()
         while not ready:
             bad = False
             for slot in cutlass.range_constexpr(16):
@@ -482,6 +485,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             ready = cute.arch.vote_all_sync(not bad)
             if not ready:
                 sleep_ns(64)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         low = [Float32(0), Float32(0)]
         high = [Float32(0), Float32(0)]
         for slot in cutlass.range_constexpr(16):

@@ -26,6 +26,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Int32, Int64, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.host import architecture, fake
 from ..common.primitives import (
     alloc,
@@ -147,11 +149,16 @@ class VocabArgmax:
             if lane < self.tp:
                 entry = box.iterator + (entries + lane) * 2
                 pending = Int32(1)
+                sgn, sgt = spin_start()
                 while pending != Int32(0):
                     pair = load_words(entry, count=2, volatile=True)
                     got = (Uint64(pair[1]) << 32) | Uint64(pair[0])
                     if (pair[0] != Uint32(0)) & (pair[1] != Uint32(0)):
                         pending = Int32(0)
+                    sgn, sgt = spin_tick(
+                        sgn, sgt, observed=pending,
+                        target=0, rank=rank, size=self.tp
+                    )
                 # Consumed: clear it for this row's launch after next.
                 store_relaxed(entry, (Uint32(0), Uint32(0)))
             for offset in (1, 2, 4, 8, 16):

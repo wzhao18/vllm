@@ -25,6 +25,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     asm,
     bits_float,
@@ -725,12 +727,14 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                     source = ws + plane + index * 4
                     words = cute.make_rmem_tensor(self.width, Uint32)
                     ready = False
+                    sgn, sgt = spin_start()
                     while not ready:
                         bad = False
                         for t in cutlass.range_constexpr(self.width):
                             words[t] = load_volatile(source + t * 512)[0]
                             bad |= words[t] == Uint32(4294967295)
                         ready = cute.arch.vote_all_sync(not bad)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                     for t in cutlass.range_constexpr(self.width):
                         values[t] += bits_float(words[t])
                         store_words(source + t * 512, (Uint32(4294967295),))
@@ -775,6 +779,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         if valid_bytes < 4:
             mask = (Uint32(1) << 8 * valid_bytes) - 1
         ready = False
+        sgn, sgt = spin_start()
         while not ready:
             bad = False
             for v in cutlass.range_constexpr(chunks):
@@ -790,6 +795,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             if valid_bytes > 0:
                 bad |= has_ff_byte(scale & mask)
             ready = cute.arch.vote_all_sync(not bad)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         image = sm.iterator + self.off_h + buffer * self.hbuf + s * self.h_image_bytes
         for v in cutlass.range_constexpr(chunks):
             words = tuple(values[v, w] for w in range(4))

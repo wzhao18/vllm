@@ -34,6 +34,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common import dies, tensormap
 from ..common.primitives import asm, div_rn
 from .wide import (
@@ -438,8 +440,10 @@ class WideMlp:
                         tt = (kd - pd * half_kd) // 2
                         jf = ((tt * ks1 + 1) * npd + tot1 - 1) // tot1 - 1
                         jl = ((tt + 1) * ks1 * npd + tot1 - 1) // tot1 - 1
+                        sgn, sgt = spin_start()
                         while _ld_acquire(ready + Int64(kd) * 4) < jl - jf + 1:
                             _nanosleep()
+                            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                         _fence_proxy_global()
                         if cutlass.const_expr(self.debug & 8):
                             if step == n1:
@@ -621,8 +625,10 @@ class WideMlp:
                 me = j - jf
                 cnt = cnt0 + Int64(t * 2 + v) * 4
                 if lead:
+                    sgn, sgt = spin_start()
                     while _ld_acquire(cnt) < c:
                         _nanosleep()
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 _bar(2, 256)
                 if cutlass.const_expr(self.debug & 8):
                     if lead:

@@ -32,7 +32,15 @@ counter at window byte ``counter`` on the destination. Protocol of one exchange:
 import cutlass.cute as cute
 from cutlass import Int64, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from .primitives import asm
+
+register_poll_helper(__file__)  # timeouts report the caller's wait site
 
 _PUT = (
     "fabric.try_put.async{mm}.shared::cta.mbarrier::complete_tx::16B"
@@ -138,8 +146,10 @@ def wait_counter(address, target):
     """Spin until the counter at ``address`` reaches ``target`` (Uint64), then the
     fabric acquire fence: the counted bytes are readable with plain loads."""
     value = load_counter(address)
+    n, t0 = spin_start()
     while value < Uint64(target):
         value = load_counter(address)
+        n, t0 = spin_tick(n, t0, observed=value, target=target)
     fabric_acquire()
 
 

@@ -42,6 +42,7 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     to_cute_dynamic_m,
     warp_sum_specialized,
 )
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 _SEVEN_CTA_MAX_M = 4
 
@@ -563,6 +564,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             for word in cutlass.range_constexpr(4):
                 rank_words[self.rank, word] = local_packed[word]
             valid = False
+            sgn, sgt = spin_start()
             while not valid:
                 valid = True
                 for source_rank in cutlass.range_constexpr(self.tp_size):
@@ -582,6 +584,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                         for word in cutlass.range_constexpr(4):
                             rank_words[source_rank, word] = remote[word]
                         valid = valid & (not fragment_is_dirty(remote))
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=0,
+                    target=0, rank=self.rank, size=self.tp_size
+                )
 
             accum = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
             for element in cutlass.range_constexpr(VEC_BF16):
@@ -688,8 +694,13 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 access_counter = latent_flags.iterator + 8
                 if cutlass.const_expr(not self.single_token_geometry):
                     arrived = load_volatile_u32(access_counter)
+                    sgn, sgt = spin_start()
                     while arrived < Uint32(m):
                         arrived = load_volatile_u32(access_counter)
+                        sgn, sgt = spin_tick(
+                            sgn, sgt, observed=arrived,
+                            target=0, rank=self.rank, size=self.tp_size
+                        )
                 next_index = (current_index + Uint32(1)) % Uint32(LAMPORT_GENERATIONS)
                 actual_bytes = Uint32(m) * Uint32(self.tp_size * self.latent_dim * 2)
                 cute.arch.store((latent_flags.iterator + 0).llvm_ptr, next_index)
@@ -811,6 +822,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                             Uint32,
                         )
                         valid = False
+                        sgn, sgt = spin_start()
                         while not valid:
                             valid = True
                             for source_rank in cutlass.range_constexpr(self.tp_size):
@@ -831,6 +843,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                                 for word in cutlass.range_constexpr(4):
                                     rank_words[source_rank, word] = remote[word]
                                 valid = valid & (not fragment_is_dirty(remote))
+                            sgn, sgt = spin_tick(
+                                sgn, sgt, observed=0,
+                                target=0, rank=self.rank, size=self.tp_size
+                            )
 
                         accum = cute.make_rmem_tensor(
                             cute.make_layout((VEC_BF16,)), Float32
@@ -867,8 +883,13 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 access_counter = shared_flags.iterator + 8
                 arrived = load_volatile_u32(access_counter)
                 target = Uint32(m) * Uint32(self.shared_roles)
+                sgn, sgt = spin_start()
                 while arrived < target:
                     arrived = load_volatile_u32(access_counter)
+                    sgn, sgt = spin_tick(
+                        sgn, sgt, observed=arrived,
+                        target=0, rank=self.rank, size=self.tp_size
+                    )
                 next_index = (current_index + Uint32(1)) % Uint32(LAMPORT_GENERATIONS)
                 actual_bytes = Uint32(m) * Uint32(self.tp_size * self.shard_dim * 2)
                 cute.arch.store((shared_flags.iterator + 0).llvm_ptr, next_index)

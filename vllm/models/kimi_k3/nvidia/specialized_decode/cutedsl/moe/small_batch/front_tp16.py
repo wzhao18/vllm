@@ -13,6 +13,7 @@ from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
 from vllm.models.common.ops.moe_tail_fusion.primitives import to_cute
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ...common.primitives import (
     alloc,
@@ -107,9 +108,11 @@ class FrontPlacement:
         role = Int32(-1)
         if claimed >= 0:
             arrived = load_arrivals(pointer + 1)
+            sgn, sgt = spin_start()
             while arrived < grid:
                 sleep_ns(64)
                 arrived = load_arrivals(pointer + 1)
+                sgn, sgt = spin_tick(sgn, sgt, observed=arrived, target=0)
             count = Int32(mailbox_load(pointer)[0])
             first = Uint32(0xFFFFFFFF) - mailbox_load(pointer + 2)[0]
             if cutlass.const_expr(self.batch == 1):
@@ -446,9 +449,11 @@ class MoeFrontTP16:
                 mailbox_store(epoch.iterator + (par ^ 1) * 32, (Uint32(0),))
                 self.placement.rearm(epoch, par)
             observed = mailbox_load(epoch.iterator + par * 32)[0]
+            sgn, sgt = spin_start()
             while observed < 28 * self.batch:
                 sleep_ns(32)
                 observed = mailbox_load(epoch.iterator + par * 32)[0]
+                sgn, sgt = spin_tick(sgn, sgt, observed=observed, target=0, rank=rank)
             role, count = self.placement.role(epoch, par, cta, claimed, self.grid)
             roles[0], roles[1] = role, count
         else:
