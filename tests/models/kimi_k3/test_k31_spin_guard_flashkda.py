@@ -49,7 +49,7 @@ __global__ void flashkda_wait_wd_test(int* out, long long* dbg, int mode) {
 void setup(int64_t rank, int64_t diag) { k31sg_set_rank_k64_tc((int)rank, diag); }
 void run(torch::Tensor out, torch::Tensor dbg, int64_t mode) {
   flashkda_wait_wd_test<<<1, 64, 0, c10::cuda::getCurrentCUDAStream()>>>(
-      out.data_ptr<int>(), dbg.data_ptr<int64_t>(), (int)mode);
+      out.data_ptr<int>(), reinterpret_cast<long long*>(dbg.data_ptr<int64_t>()), (int)mode);
 }
 """
 
