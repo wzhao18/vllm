@@ -42,6 +42,9 @@ ENGINE_FIELDS = {
     "RT": "idx t k",  # first output token processed by the engine
     "RF": "idx t k finish_reason n_out_tokens",
     "RX": "idx t",  # aborted
+    # prefix-cache tokens the engine reports for the request (usage
+    # cached_tokens): total, from the local prefix cache, from KV transfer
+    "RC": "idx t n_cached n_local_cached n_external_cached",
     "I": "t_idle0 t_idle1",  # engine waiting for work (no requests)
 }
 WORKER_FIELDS = {
@@ -247,6 +250,18 @@ class EngineIterLog:
                 r = reqs.get(o.request_id)
                 if r is None:
                     continue
+                ps = o.prefill_stats
+                if ps is not None:
+                    put(
+                        (
+                            "RC",
+                            r[0],
+                            t4,
+                            ps.num_cached_tokens,
+                            ps.num_local_cached_tokens,
+                            ps.num_external_cached_tokens,
+                        )
+                    )
                 if nt and r[1] == 0:
                     put(("RT", r[0], t4, k))
                 r[1] += nt

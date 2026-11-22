@@ -58,3 +58,40 @@ def test_off_without_iterlog_dir(monkeypatch):
     monkeypatch.setenv("VLLM_ITERLOG_ALL_RANKS", "1")
     _fake_dist(monkeypatch, 3)
     assert iterlog.WorkerIterLog.maybe_create() is None
+
+
+def test_engine_iterlog_records_reported_cached_tokens(iterlog_dir):
+    """RC: the prefix-cache tokens the engine reports (usage cached_tokens),
+    split local / external, once per prefill stats output."""
+    import json
+    from types import SimpleNamespace
+
+    from vllm.v1.metrics.stats import PrefillStats
+
+    log = iterlog.EngineIterLog({})
+    req = SimpleNamespace(
+        request_id="r0",
+        session_id=None,
+        arrival_time=0.0,
+        num_prompt_tokens=100,
+        max_tokens=1,
+    )
+    log.add_request(req)
+    so = object()
+    log._pending.append([so, 0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, None])
+    ps = PrefillStats(
+        num_prompt_tokens=100,
+        num_computed_tokens=36,
+        num_cached_tokens=64,
+        num_local_cached_tokens=16,
+        num_external_cached_tokens=48,
+    )
+    out = SimpleNamespace(
+        request_id="r0", new_token_ids=[7], finish_reason=None, prefill_stats=ps
+    )
+    log.on_update(so, 1.0, 2.0, {0: SimpleNamespace(outputs=[out])})
+    log._w.close()
+
+    recs = [json.loads(line) for line in open(log._w.path)]
+    assert ["RC", 0, 2.0, 64, 16, 48] in recs
+    assert ["RT", 0, 2.0, 0] in recs
