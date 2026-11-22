@@ -884,11 +884,27 @@ class Scheduler(SchedulerInterface):
         # DDSA DIAGNOSTIC (never merged): which stop clipped this chunk.
         names = ("next_block_boundary", "last_cache_position", "tail_boundary", "junction")
         hit = [n for n, s in zip(names, stops) if start < s < end and s == new_end]
-        request._ddsa_clip = (
-            (hit[0] if hit else "none"),
-            bool(use_internal_checkpoint),
-            int(start), int(end), int(prefill_end), int(block_size),
-        )
+        col = None
+        kvm = getattr(self, "kv_cache_manager", None)
+        if getattr(self, "mamba_internal_snapshot", False) and end >= prefill_end:
+            try:
+                c = get_mamba_prefill_snapshot_col(
+                    query_start=start, query_end=end,
+                    checkpoint_position=checkpoint_position,
+                    hash_block_size=self.hash_block_size, mamba_block_size=block_size,
+                    checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                )
+                col = (c, None if kvm is None or c < 0
+                       else bool(kvm.mamba_snapshot_col_available(request, c)))
+            except Exception as e:  # noqa: BLE001
+                col = ("err", repr(e)[:60])
+        request._ddsa_clip = {
+            "cause": hit[0] if hit else "none", "internal_ckpt": bool(use_internal_checkpoint),
+            "snapshot_col(col,available)": col, "num_computed": int(start),
+            "requested_end": int(end), "stop": int(new_end), "prefill_end": int(prefill_end),
+            "checkpoint_position": int(checkpoint_position), "block": int(block_size),
+            "async_in_flight": int(request.num_output_placeholders),
+        }
         end = new_end
         return _stop_mamba_chunk_at_block_end(
             request, start, max(end - start, 0), block_size
@@ -1147,9 +1163,20 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                _ddsa_before = num_new_tokens
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+                if (num_new_tokens < _ddsa_before
+                        and request.num_computed_tokens >= request.num_prompt_tokens):
+                    # DDSA DIAGNOSTIC: a clip on a running decode step (expect 0).
+                    c2 = self.__dict__.setdefault("_ddsa_run_clips", [0])
+                    c2[0] += 1
+                    if c2[0] & (c2[0] - 1) == 0:
+                        logger.info("DDSA align-clip on a RUNNING decode step x%d: "
+                                    "req=%s %d->%d %s", c2[0], request.request_id,
+                                    _ddsa_before, num_new_tokens,
+                                    getattr(request, "_ddsa_clip", None))
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -1794,14 +1821,15 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = 1
                             # DDSA DIAGNOSTIC (never merged): count by cause.
                             clip = getattr(request, "_ddsa_clip", None)
-                            key = clip[0] if clip else "unknown"
+                            key = clip["cause"] if clip else "unknown"
                             cnt = self.__dict__.setdefault("_ddsa_clip_counts", {})
                             cnt[key] = cnt.get(key, 0) + 1
                             if cnt[key] & (cnt[key] - 1) == 0:
                                 logger.info(
-                                    "DDSA align-clip dropped padding: %s x%d "
-                                    "(internal_ckpt=%s start=%s end=%s prefill_end=%s "
-                                    "block=%s)", key, cnt[key], *(clip[1:] if clip else ()),
+                                    "DDSA align-clip dropped padding (admission): "
+                                    "req=%s requested=%d scheduled=1 cause=%s x%d %s",
+                                    request.request_id, 1 + self.num_spec_tokens, key,
+                                    cnt[key], clip,
                                 )
                             pad_spec_decode = False
 
