@@ -2545,6 +2545,8 @@ class DPEngineCoreProc(EngineCoreProc):
         self._dp_abort_counts: list[list[int]] = []
         self._dp_moved_to: dict[str, int] = {}
         self._dp_abort_forward: dict[int, list[str]] = {}
+        # Requests this rank moved away / took in, and their prompt tokens.
+        self._dp_move_stats = [0, 0, 0, 0]
         # DP lockstep step cap floor: the largest captured CUDA-graph batch
         # (steps up to it replay a graph), never above the token budget.
         self._dp_step_token_floor = min(
@@ -2936,6 +2938,7 @@ class DPEngineCoreProc(EngineCoreProc):
                         payload = self._dp_encode_moved(req, mv.dst)
                         if payload:
                             self._dp_remember_moved(req.request_id, mv.dst)
+                            self._dp_count_move(0, mv.num_tokens)
                         else:
                             # Cannot ship it: keep it here.
                             self.scheduler.add_request(req)
@@ -2944,6 +2947,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 payload = self._dp_recv_bytes(mv.src)
                 if payload:
                     self._dp_import_moved(payload)
+                    self._dp_count_move(2, mv.num_tokens)
         for src, row in enumerate(aborts):
             for dst, n in enumerate(row):
                 if not n:
@@ -3002,6 +3006,17 @@ class DPEngineCoreProc(EngineCoreProc):
             self.add_request(req, wave)
         finally:
             self._kv_connector_arrival_handled(req)
+
+    def _dp_count_move(self, i: int, num_tokens: int) -> None:
+        st = self._dp_move_stats
+        st[i] += 1
+        st[i + 1] += num_tokens
+        if st[i] == 1 or st[i] % 500 == 0:
+            logger.info(
+                "DP late binding: moved out %d requests (%d tokens to compute), "
+                "took in %d (%d tokens)",
+                *st,
+            )
 
     def _dp_remember_moved(self, request_id: str, dst: int) -> None:
         self._dp_moved_to[request_id] = dst
