@@ -44,7 +44,7 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
-from ....common.spin_guard import _st_sys_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
+from ....common.spin_guard import _st_sys_s32, _st_sys_v4_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
 
 
@@ -1448,40 +1448,46 @@ class _DedupMetadataPushRouter(KernelComponent):
                 spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size), print_flag=device_workspace.ptr(self._call_tail.printed_region),
                     record=device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_warp()
-        self._log_ep_balance(device_workspace, lane_idx)
 
     @cute.jit
-    def _log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32) -> None:
-        """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, the first CTA's waiting warp copies
-        the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``, so after
-        ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped ring, with
-        a %globaltimer stamp; the call id is written last (slot complete). Stores only, no launch, no sync: the
-        other calls and CTAs read two workspace words and skip."""
+    def log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32, warp_idx: Int32) -> None:
+        """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
+        CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
+        so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
+        ring, with a %globaltimer stamp; the call id is written last (slot complete). The caller runs it after this
+        CTA's dispatch pulls are published, so the host-memory stores and system fences sit in the window where the
+        warp waits for FC2 results, not in front of the pulls. 16-byte system stores; no launch, no sync: the other
+        calls, warps and CTAs read nothing and skip."""
         linear_cta_idx, _, _ = cute.arch.block_idx()
-        # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log)
-        if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS):
-            if linear_cta_idx == Int32(0):
+        # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
+        if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS and self.expert_count_padded % 4 == 0):
+            if (linear_cta_idx == Int32(0)) & (warp_idx == Int32(0)):
                 ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
                 call = self._call_tail.read_epoch(device_workspace) + Int32(1)
                 if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
                     base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
                     sizes = device_workspace.tensor(self.sizes_region)
-                    for expert_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded, 32)):
-                        expert = Int32(expert_round * 32) + lane_idx
+                    for vector_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded // 4, 32)):
+                        expert = (Int32(vector_round * 32) + lane_idx) * Int32(4)
                         if expert < Int32(self.expert_count_padded):
-                            _st_sys_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), sizes[expert])
+                            _st_sys_v4_s32(
+                                base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4),
+                                sizes[expert], sizes[expert + Int32(1)], sizes[expert + Int32(2)], sizes[expert + Int32(3)],
+                            )
                     cute.arch.sync_warp()
                     if lane_idx == Int32(0):
                         t_ready = globaltimer_ns()
+                        # words 1..7: t_ready lo/hi, entries, world, experts_per_rank, 0 = global record, pad
+                        _st_sys_v4_s32(
+                            base + Int64(16),
+                            Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), Int32(0),
+                        )
                         _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
                         _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
                         _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
-                        _st_sys_s32(base + Int64(16), Int32(self.world_size))
-                        _st_sys_s32(base + Int64(20), Int32(self.experts_per_rank))
-                        _st_sys_s32(base + Int64(24), Int32(0))  # global record
                         cute.arch.fence_acq_rel_sys()
                         _st_sys_s32(base, call)
-                        cute.arch.fence_acq_rel_sys()
+                    cute.arch.sync_warp()
 
     @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
@@ -2234,6 +2240,8 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
+        # EP-balance log after this CTA's pulls are published: off the dispatch critical path (int64.3 item 3).
+        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode == "standalone_warps"):
             # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
             cute.arch.cp_async_bulk_wait_group(0, read=True)
