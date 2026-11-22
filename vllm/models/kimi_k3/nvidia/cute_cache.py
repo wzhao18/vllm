@@ -607,11 +607,13 @@ _RUNTIME = "__k3_cute_runtime_argument__"
 
 
 def _runtime_marker(annotation: Any, value: Any) -> tuple[str, str, str]:
-    """Key stand-in for the value of a ``@cute.jit`` parameter annotated with a DSL
-    numeric type (``Int32``, ``Int64``, ``Float32``, ...): the DSL passes it as a
-    runtime argument of the compiled function, so the trace never reads the value
-    (e.g. WideSK's weight / activation addresses as ``Int64``). Only the annotation
-    and the Python type of the passed value are trace inputs."""
+    """Key stand-in for a DSL numeric value (``cutlass.Int32(n)``, ``Int64``,
+    ``Float32``, ...) passed to a ``@cute.jit`` parameter annotated with a DSL numeric
+    type: the DSL makes it a runtime argument of the compiled function, so the trace
+    never reads the value (measured: equal DSL module hashes across values). A plain
+    Python number passed there is NOT: the DSL folds it into the trace as a constant
+    (a different module per value), so it stays in the key by value. Only the
+    annotation and the value's type are trace inputs."""
     return (_RUNTIME, _qual(annotation), _qual(type(value)))
 
 
@@ -647,7 +649,7 @@ def _runtime_values(fn: Any, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         name: _runtime_marker(hints[name], value)
         for name, value in bound.arguments.items()
         if _numeric_annotation(hints.get(name))
-        and isinstance(value, (bool, int, float, *_dsl_numeric_types()))
+        and isinstance(value, _dsl_numeric_types())
     }
     if not runtime:
         return args, kwargs

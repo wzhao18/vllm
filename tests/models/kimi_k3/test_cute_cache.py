@@ -660,47 +660,51 @@ def _scale_runtime_kernel_class():
 
 
 def test_runtime_numeric_argument_values_are_not_in_the_key():
-    """Values bound to DSL-numeric parameters (runtime arguments, e.g. WideSK's
-    Int64 addresses) are launch values: not in the key. Their Python type, every
-    Constexpr value and the kernel object's state still are."""
+    """DSL numeric values (cutlass.Float32(v), Int64(a)) bound to DSL-numeric
+    parameters are runtime arguments: not in the key. Plain Python numbers there are
+    folded into the trace as constants, so their values stay in the key, as do every
+    Constexpr value and the kernel object's state."""
     import cutlass
     from cutlass.cute.runtime import make_fake_compact_tensor
 
-    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
-    k = _scale_runtime_kernel_class()()
-    a = _key(k, fx, fx, 2.0, 1 << 40)
-    assert a == _key(k, fx, fx, 3.5, (1 << 40) + 4096)  # other launch values
-    assert a == _key(k, fx, fx, factor=3.5, base=7)  # by keyword alike
-    assert a != _key(k, fx, fx, 2, 1 << 40)  # int vs float passed: another trace
-    assert a != _key(k, fx, fx, 2.0, 1 << 40, 256)  # a Constexpr value
-    k.tag = "x"  # kernel object state
-    assert a != _key(k, fx, fx, 2.0, 1 << 40)
-    # a DSL numeric instance passed to a numeric parameter is a launch value too
-    assert _key(k, fx, fx, cutlass.Float32(2.0), 3) == _key(
-        k, fx, fx, cutlass.Float32(9.0), 5
-    )
-    # plain functions: the same rule, no ``self`` to skip
     from vllm.models.kimi_k3.nvidia import cute_cache
 
-    def f(n: cutlass.Int32, m: cutlass.Constexpr):
+    f32, i64 = cutlass.Float32, cutlass.Int64
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    a = _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    assert a == _key(k, fx, fx, f32(3.5), i64((1 << 40) + 4096))  # launch values
+    assert a != _key(k, fx, fx, 2.0, i64(1 << 40))  # a Python float: a constant
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 3.0, 7)
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 2.0, 8)
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40), 256)  # a Constexpr value
+    k.tag = "x"  # kernel object state
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    # keyword binding follows the same rule
+    assert _key(k, fx, fx, factor=f32(1.0), base=i64(3)) == _key(
+        k, fx, fx, factor=f32(9.0), base=i64(5)
+    )
+
+    def f(n: cutlass.Int32, m: cutlass.Int32, c: cutlass.Constexpr):
         pass
 
-    assert cute_cache._runtime_values(f, (5, 6), {})[0] == (
-        cute_cache._runtime_marker(cutlass.Int32, 5), 6
+    assert cute_cache._runtime_values(f, (cutlass.Int32(5), 6, 7), {})[0] == (
+        cute_cache._runtime_marker(cutlass.Int32, cutlass.Int32(5)), 6, 7
     )
 
 
 @_needs_blackwell
 def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
-    """Two compiles that differ only in a runtime argument's value: one compile,
-    one hit; VERIFY re-traces the hit to the stored DSL module hash (exact), and
-    the hit runs with the launch value it is given."""
+    """Two compiles that differ only in the values of DSL numeric runtime arguments:
+    one compile, one hit; VERIFY re-traces the hit to the stored DSL module hash
+    (exact), and the hit runs with the launch values it is given."""
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
 
     from vllm.models.kimi_k3.nvidia import cute_cache
 
+    f32, i64 = cutlass.Float32, cutlass.Int64
     monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(cute_cache, "VERIFY", True)
     device = torch.device("cuda", 0)
@@ -709,8 +713,8 @@ def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
     fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
     k = _scale_runtime_kernel_class()()
     before = dict(vars(cute_cache.stats))
-    cute_cache._compile(inner, k, (fx, fx, 2.0, 1 << 40), {})
-    hit = cute_cache._compile(inner, k, (fx, fx, 3.0, (1 << 40) + 64), {})
+    cute_cache._compile(inner, k, (fx, fx, f32(2.0), i64(1 << 40)), {})
+    hit = cute_cache._compile(inner, k, (fx, fx, f32(3.0), i64((1 << 40) + 64)), {})
     s = vars(cute_cache.stats)
     assert s["compiled"] - before["compiled"] == 1
     assert s["loaded"] - before["loaded"] == 1
