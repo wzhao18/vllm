@@ -1313,20 +1313,23 @@ class PrefillMark:
     writes the row's position bitmap words (bit set: key above the bound bin r0 from
     the scorer's ``row_bin``) and appends the bound bin's keys (position << 5 | low
     5 key bits) to the row's candidate list (``cand``, count in row_bin[3 r + 2],
-    zeroed by the scorer). Rows with at most ``topk`` keys are skipped."""
+    zeroed by the scorer). Rows with at most ``topk`` keys are skipped. Also writes
+    each chunk's bound-bin histogram by low 5 key bits (``xh``: 32 words per (row,
+    chunk)) and appends the rows whose candidates overflow CAND to ``xl`` (count in
+    xl[0], zeroed by the caller) for PrefillExact."""
 
     def __init__(self, ctas: int, topk: int):
         self.ctas = ctas
         self.topk = topk
 
     @cute.jit
-    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, gate, s):
-        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand, gate).launch(
+    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, xh, xl, gate, s):
+        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand, xh, xl, gate).launch(
             grid=(self.ctas, 1, 1), block=(MARK_THREADS, 1, 1), stream=s, use_pdl=True,
         )
 
     @cute.kernel
-    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand, gate):
+    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand, xh, xl, gate):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -1334,8 +1337,12 @@ class PrefillMark:
         mbuf = smem.allocate_tensor(Uint32, cute.make_layout(MARK_BUF + 4), 16)
         cnt_a = mbuf.iterator.toint()
         buf_a = cnt_a + 16
+        hbuf = smem.allocate_tensor(Uint32, cute.make_layout(32), 16)
+        hist_a = hbuf.iterator.toint()
         if tid == 0:
             st_shared_u32(cnt_a, Uint32(0))
+        if tid < 32:
+            st_shared_u32(hist_a + tid * 4, Uint32(0))
         cute.arch.sync_threads()
         cute.arch.griddepcontrol_wait()
         n_rows = Int32(row_len.shape[0])
@@ -1349,6 +1356,8 @@ class PrefillMark:
         bm_a = bitmap.iterator.toint()
         cand_a = cand.iterator.toint()
         bin_a = row_bin.iterator.toint()
+        xh_a = xh.iterator.toint()
+        xl_a = xl.iterator.toint()
         for u in cutlass.range(bid, n_rows * cpr, self.ctas, unroll=1):
             row = u // cpr
             chunk = u - row * cpr
@@ -1391,6 +1400,7 @@ class PrefillMark:
                                 for e in cutlass.range_constexpr(8):
                                     key = key_of(batch[k], e)
                                     if key >= low and key < high:
+                                        red_shared(hist_a + (key & Uint32(31)) * 4, 1)
                                         if slot < Uint32(MARK_BUF):
                                             st_shared_u32(
                                                 buf_a + slot * 4,
@@ -1398,15 +1408,30 @@ class PrefillMark:
                                             )
                                         slot += Uint32(1)
                 cute.arch.sync_threads()
+                # the chunk's bound-bin histogram (PrefillExact: overflowed rows)
+                if tid < 32:
+                    st_global_u32(
+                        xh_a + ((Int64(row) * cpr + chunk) * 32 + tid) * 4,
+                        ld_shared_u32(hist_a + tid * 4),
+                    )
+                    st_shared_u32(hist_a + tid * 4, Uint32(0))
                 # one claim in the row's candidate list for the chunk's keys
                 n = ld_shared_u32(cnt_a)
                 if tid == 0:
                     first = Uint32(0)
                     if n > Uint32(0):
                         first = atom_add_global(bin_a + (Int64(row) * 3 + 2) * 4, n)
+                        over = first <= Uint32(CAND) and first + n > Uint32(CAND)
                         if n > Uint32(MARK_BUF):
                             # the chunk overflowed its buffer: force the exact path
-                            atom_add_global(bin_a + (Int64(row) * 3 + 2) * 4, Uint32(CAND + 1))
+                            f2 = atom_add_global(bin_a + (Int64(row) * 3 + 2) * 4, Uint32(CAND + 1))
+                            if f2 <= Uint32(CAND):
+                                over = True
+                        if over:
+                            # the claim that took the row's count past CAND (one per
+                            # row: the count only grows): the row into the exact list
+                            slot = atom_add_global(xl_a, Uint32(1))
+                            st_global_u32(xl_a + (Int64(slot) + 1) * 4, Uint32(row))
                     st_shared_u32(cnt_a + 4, first)
                 cute.arch.sync_threads()
                 first = ld_shared_u32(cnt_a + 4)
@@ -1422,12 +1447,166 @@ class PrefillMark:
                 cute.arch.sync_threads()
 
 
+EXACT_SCAN = 8  # key-order tie scan: 256-key steps loaded at once
+
+
+class PrefillExact:
+    """Select, part 1b (rows whose bound-bin candidates overflowed CAND, from
+    PrefillMark's ``xl``): one CTA per (row, CHUNK_V-vector chunk). The row's exact
+    threshold digit d comes from the chunks' histograms ``xh``; the chunk's keys
+    above it go into the bitmap, and its digit-d ties by the stock rule (the
+    ``take`` lowest key indices of the row): chunks with every tie taken (by the
+    ties of the chunks before) set them all, the one chunk where the count
+    crosses ``take`` scans its keys in key order. Chunks are whole 128-key tiles,
+    so chunk order is key order."""
+
+    def __init__(self, ctas: int, topk: int):
+        self.ctas = ctas
+        self.topk = topk
+
+    @cute.jit
+    def __call__(self, logits, row_base, row_len, row_bin, bitmap, xh, xl, gate, s):
+        self.kernel(logits, row_base, row_len, row_bin, bitmap, xh, xl, gate).launch(
+            grid=(self.ctas, 1, 1), block=(MARK_THREADS, 1, 1), stream=s, use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(self, logits, row_base, row_len, row_bin, bitmap, xh, xl, gate):
+        tid, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        w = tid // 32
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        # [0..7]: d, take - before (rem), mode; [8..23]: warp tie counts (2 sets)
+        sb = smem.allocate_tensor(Uint32, cute.make_layout(32), 16)
+        sb_a = sb.iterator.toint()
+        cute.arch.griddepcontrol_wait()
+        n_x = Int32(xl[0])
+        if gate[0] == 0:
+            n_x = Int32(0)
+        stride = Int32(bitmap.shape[0]) // cutlass.max(Int32(row_len.shape[0]), Int32(1))
+        cpr = (stride * 32 + CHUNK_V * 8 - 1) // (CHUNK_V * 8)
+        logits_a = logits.iterator.toint()
+        bm_a = bitmap.iterator.toint()
+        xh_a = xh.iterator.toint()
+        for u in cutlass.range(bid, n_x * cpr, self.ctas, unroll=1):
+            row = Int32(xl[1 + u // cpr])
+            chunk = u - (u // cpr) * cpr
+            length = row_len[row]
+            vectors = (length + TILE - 1) // TILE * (TILE // 8)
+            v0 = chunk * CHUNK_V
+            if v0 < vectors:
+                address = logits_a + row_base[row] * 2
+                brow = bm_a + Int64(row) * Int64(stride) * 4
+                low = Uint32(row_bin[3 * row]) << Uint32(5)
+                high = low + Uint32(32)
+                if w == 0:
+                    # row histogram (lane b: digit b) and the ties before this chunk
+                    n_ch = (vectors + CHUNK_V - 1) // CHUNK_V
+                    hrow = xh_a + (Int64(row) * cpr * 32 + lane) * 4
+                    tot = Uint32(0)
+                    pre = Uint32(0)
+                    mine = Uint32(0)
+                    for c in cutlass.range(0, n_ch, unroll=4):
+                        h = ld_global_u32(hrow + Int64(c) * 128)
+                        tot += h
+                        if c < chunk:
+                            pre += h
+                        if c == chunk:
+                            mine = h
+                    need = Uint32(self.topk) - Uint32(row_bin[3 * row + 1])
+                    d, above_d = low_digit(tot, need, lane)
+                    ties = cute.arch.shuffle_sync(tot, Int32(d))
+                    before = cute.arch.shuffle_sync(pre, Int32(d))
+                    here = cute.arch.shuffle_sync(mine, Int32(d))
+                    take = need - above_d
+                    # mode 0: no tie of the chunk taken, 1: all, 2: the first rem
+                    mode = Uint32(2)
+                    rem = Uint32(0)
+                    if ties == take or before + here <= take:
+                        mode = Uint32(1)
+                    elif before >= take:
+                        mode = Uint32(0)
+                    else:
+                        rem = take - before
+                    if lane == 0:
+                        st_shared_u32(sb_a, d)
+                        st_shared_u32(sb_a + 4, rem)
+                        st_shared_u32(sb_a + 8, mode)
+                cute.arch.sync_threads()
+                d = ld_shared_u32(sb_a)
+                rem = ld_shared_u32(sb_a + 4)
+                mode = ld_shared_u32(sb_a + 8)
+                # keys above the threshold digit (and every tie with mode 1)
+                batch = []
+                for k in cutlass.range_constexpr(MARK_LOADS):
+                    v = v0 + k * MARK_THREADS + tid
+                    words4 = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    if v < vectors:
+                        words4 = ldg_v4(address + Int64(v) * 16)
+                    batch.append(words4)
+                for k in cutlass.range_constexpr(MARK_LOADS):
+                    v = v0 + k * MARK_THREADS + tid
+                    mk = Uint32(0)
+                    for e in cutlass.range_constexpr(8):
+                        key = key_of(batch[k], e)
+                        lo = key & Uint32(31)
+                        if key >= low and key < high:
+                            if lo > d:
+                                mk = mk | Uint32(1 << e)
+                            elif lo == d and mode == Uint32(1):
+                                if key_index(v * 8 + e) < length:
+                                    mk = mk | Uint32(1 << e)
+                    if mk != Uint32(0) and v < vectors:
+                        red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
+                if mode == Uint32(2):
+                    # the crossing chunk: its first ``rem`` ties in key order (256
+                    # keys per step, EXACT_SCAN steps loaded at once)
+                    kb = v0 * 8
+                    ke = cutlass.min(kb + CHUNK_V * 8, length)
+                    run = Uint32(0)
+                    for s0 in cutlass.range(kb, ke, MARK_THREADS * EXACT_SCAN, unroll=1):
+                        if run < rem:
+                            wds = []
+                            for j in cutlass.range_constexpr(EXACT_SCAN):
+                                k = s0 + j * MARK_THREADS + tid
+                                wd = Uint32(0)
+                                if k < ke:
+                                    p = Uint32(position_of(k))
+                                    wd = ld_global_u32(address + Int64(p >> Uint32(1)) * 4)
+                                wds.append(wd)
+                            for j in cutlass.range_constexpr(EXACT_SCAN):
+                                k = s0 + j * MARK_THREADS + tid
+                                p = Uint32(position_of(k))
+                                hit = Uint32(0)
+                                if k < ke:
+                                    key = (keys16x2(wds[j]) >> ((p & Uint32(1)) * Uint32(16))) & Uint32(0xFFFF)
+                                    if key >= low and key < high and (key & Uint32(31)) == d:
+                                        hit = Uint32(1)
+                                b = ballot(hit)
+                                slot_a = sb_a + (8 + (j % 2) * 8 + w) * 4
+                                if lane == 0:
+                                    st_shared_u32(slot_a, popc(b))
+                                cute.arch.sync_threads()
+                                off = Uint32(0)
+                                tot_s = Uint32(0)
+                                for i in cutlass.range_constexpr(MARK_THREADS // 32):
+                                    c = ld_shared_u32(sb_a + (8 + (j % 2) * 8 + i) * 4)
+                                    if i < w:
+                                        off += c
+                                    tot_s += c
+                                if hit != Uint32(0) and run + off + popc(b & lanemask_lt()) < rem:
+                                    red_or_global(brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31)))
+                                run += tot_s
+                cute.arch.sync_threads()
+
+
 class PrefillFinish:
     """Select, part 2 (one warp per row): exact threshold's low 5 bits from the
     candidate list, the remaining keys of the bound bin (ties: the lowest
     positions) into the bitmap, then the bitmap's positions in order as key
     indices (-1 pads rows with at most ``topk`` keys). Rows whose candidates
-    overflowed re-read their logits (exact, slower)."""
+    overflowed CAND were completed by PrefillExact (bitmap only here)."""
 
     def __init__(self, ctas: int, topk: int):
         self.ctas = ctas
@@ -1489,23 +1668,7 @@ class PrefillFinish:
                 exact = n_cand > Uint32(CAND)
                 st_shared_u32(fine_a + lane * 4, Uint32(0))
                 cute.arch.sync_warp()
-                if exact:
-                    # FIN_BATCH 16-byte loads in flight per lane (a long row is one
-                    # warp's serial walk: latency, not bandwidth, bounds it)
-                    for v0 in cutlass.range(lane, vectors, 32 * FIN_BATCH, unroll=1):
-                        wds = []
-                        for k in cutlass.range_constexpr(FIN_BATCH):
-                            wd = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                            if v0 + 32 * k < vectors:
-                                wd = ldg_v4(address + Int64(v0 + 32 * k) * 16)
-                            wds.append(wd)
-                        for k in cutlass.range_constexpr(FIN_BATCH):
-                            if v0 + 32 * k < vectors:
-                                for e in cutlass.range_constexpr(8):
-                                    key = key_of(wds[k], e)
-                                    if key >= low and key < high:
-                                        red_shared(fine_a + (key & Uint32(31)) * 4, 1)
-                else:
+                if not exact:
                     for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
                         xs = []
                         for k in cutlass.range_constexpr(FIN_BATCH):
@@ -1523,54 +1686,7 @@ class PrefillFinish:
                 take = need - above_d
                 all_ties = ties == take
                 if exact:
-                    # bound-bin keys above the threshold (and all ties) into the bitmap
-                    for v0 in cutlass.range(lane, vectors, 32 * FIN_BATCH, unroll=1):
-                        wds = []
-                        for k in cutlass.range_constexpr(FIN_BATCH):
-                            wd = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                            if v0 + 32 * k < vectors:
-                                wd = ldg_v4(address + Int64(v0 + 32 * k) * 16)
-                            wds.append(wd)
-                        for k in cutlass.range_constexpr(FIN_BATCH):
-                            v = v0 + 32 * k
-                            mk = Uint32(0)
-                            for e in cutlass.range_constexpr(8):
-                                key = key_of(wds[k], e)
-                                lo = key & Uint32(31)
-                                if key >= low and key < high and (lo > d or (lo == d and all_ties)):
-                                    mk = mk | Uint32(1 << e)
-                            if mk != Uint32(0) and v < vectors:
-                                red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
-                    if not all_ties:
-                        # ties by lowest key index (the stock rule): the warp walks
-                        # the keys in key order until it has taken ``take`` of them
-                        # (FIN_BATCH chunks of 32 keys loaded at once, then taken in
-                        # key order: the same walk with the loads in flight together)
-                        left = take
-                        for k0 in cutlass.range(0, positions, 32 * FIN_BATCH, unroll=1):
-                            if left > Uint32(0):
-                                wds = []
-                                for j in cutlass.range_constexpr(FIN_BATCH):
-                                    k = k0 + 32 * j + lane
-                                    p = Uint32(position_of(k))
-                                    wd = Uint32(0)
-                                    if k < length:
-                                        wd = ld_global_u32(address + Int64(p >> Uint32(1)) * 4)
-                                    wds.append(wd)
-                                for j in cutlass.range_constexpr(FIN_BATCH):
-                                    k = k0 + 32 * j + lane
-                                    p = Uint32(position_of(k))
-                                    hit = Uint32(0)
-                                    if k < length:
-                                        key = (keys16x2(wds[j]) >> ((p & Uint32(1)) * Uint32(16))) & Uint32(0xFFFF)
-                                        if key >= low and key < high and (key & Uint32(31)) == d:
-                                            hit = Uint32(1)
-                                    b = ballot(hit)
-                                    if hit != Uint32(0) and popc(b & lanemask_lt()) < left:
-                                        red_or_global(
-                                            brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31))
-                                        )
-                                    left = left - cutlass.min(left, popc(b))
+                    pass  # PrefillExact filled the bitmap
                 else:
                     # keys above the threshold (and all ties when all are taken) into the
                     # bitmap; otherwise the ties' positions into a warp buffer
@@ -2848,8 +2964,14 @@ def _select_kernels(ctas, topk):
         fake((cute.sym_int(),), dtype=cutlass.Int32),
     )
     gate = fake((1,), dtype=cutlass.Int32)
+    xh = fake((cute.sym_int(),), dtype=cutlass.Int32)
+    xl = fake((cute.sym_int(),), dtype=cutlass.Int32)
     mark = cute.compile(
-        PrefillMark(ctas, topk), *common, gate, make_fake_stream(),
+        PrefillMark(ctas, topk), *common, xh, xl, gate, make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+    exact = cute.compile(
+        PrefillExact(ctas, topk), *common[:5], xh, xl, gate, make_fake_stream(),
         options="--enable-tvm-ffi",
     )
     fin = cute.compile(
@@ -2860,7 +2982,7 @@ def _select_kernels(ctas, topk):
         make_fake_stream(),
         options="--enable-tvm-ffi",
     )
-    return mark, fin
+    return mark, exact, fin
 
 
 def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
@@ -2898,10 +3020,16 @@ def select(logits, row_base, row_len, row_bin, bitmap, cand, out, ctas=None, gat
     ``cand``: Int32 [T * CAND]; ``row_bin`` Int32 [3 T] from score. ``gate``
     (Int32 [1], device): 0 skips every row."""
     ctas = ctas or torch.cuda.get_device_properties(out.device).multi_processor_count
-    mark, fin = _select_kernels(ctas * 4, out.shape[1])
+    mark, exact, fin = _select_kernels(ctas * 4, out.shape[1])
     stream = torch.cuda.current_stream(out.device).cuda_stream
     if gate is None:
         gate = torch.ones(1, dtype=torch.int32, device=out.device)
+    t = row_len.shape[0]
+    # per (row, mark chunk) bound-bin histograms and the overflowed-row list
+    chunks = (bitmap.shape[0] // max(t, 1) * 32 + CHUNK_V * 8 - 1) // (CHUNK_V * 8)
+    xh = torch.empty(t * chunks * 32, dtype=torch.int32, device=out.device)
+    xl = torch.zeros(t + 1, dtype=torch.int32, device=out.device)
     args = (logits.view(torch.int16), row_base, row_len, row_bin, bitmap, cand)
-    mark(*args, gate, stream)
+    mark(*args, xh, xl, gate, stream)
+    exact(*args[:5], xh, xl, gate, stream)
     fin(*args, out, gate, stream)
