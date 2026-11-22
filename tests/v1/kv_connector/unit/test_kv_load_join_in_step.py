@@ -568,3 +568,61 @@ def test_joined_load_carries_the_state_in_the_same_wait():
     threading.Timer(0.1, worker.joined_loads.complete, ("req-0",)).start()
     worker.wait_joined_loads(_meta(["req-0"]))
     assert not worker._join_poisoned
+
+
+def test_given_up_load_that_later_fails_is_still_reported_done():
+    # (PCRIT v98) The bind gave up on the load; the transfer then fails with a
+    # store error. The recv thread still reports it finished (not clean) and
+    # failed, per request, so the scheduler can release the parked blocks.
+    worker = _bare_worker()
+    worker.can_put = False
+    thread = _recv_thread(worker)
+    worker.joined_loads.register("r")
+    worker.wait_joined_loads(_meta(["r"], bound_s=0.01))
+
+    thread._report_load_error("r", [3, 4])
+    thread.set_finished_request("r", clean=False)
+
+    assert thread.get_and_clear_failed_requests() == {"r"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {"r"}
+    assert not worker.joined_loads.is_joined("r")
+    assert not worker.joined_loads._done
+
+
+@pytest.mark.parametrize("recompute", [True, False])
+def test_late_failure_of_a_given_up_load_frees_parked_blocks(recompute):
+    # (PCRIT v98) Given up at bind (failed report), then the transfer fails:
+    # its failed + finished report frees the parked blocks, and the request is
+    # admitted again ("recompute") or stays failed ("fail"); nothing leaks and
+    # nothing is skipped forever.
+    scheduler = _scheduler()
+    scheduler.recompute_kv_load_failures = recompute
+    request = _request(max_tokens=4)
+    free_before = _num_free(scheduler)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, create_model_runner_output([request], failed_recving={"r"})
+    )
+    assert "r" in scheduler._joined_parked
+    assert _num_free(scheduler) < free_before
+
+    output = scheduler.schedule()
+    assert "r" not in output.num_scheduled_tokens
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [], failed_recving={"r"}, finished_recving={"r"}
+        ),
+    )
+
+    assert _num_free(scheduler) == free_before
+    assert not scheduler._joined_parked and not scheduler._joined_loads
+    if recompute:
+        assert request.status == RequestStatus.PREEMPTED
+        output = scheduler.schedule()
+        assert "r" in output.num_scheduled_tokens
+    else:
+        assert request.status == RequestStatus.FINISHED_ERROR
+        assert "r" not in scheduler.requests
