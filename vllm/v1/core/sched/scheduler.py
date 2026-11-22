@@ -319,6 +319,10 @@ class Scheduler(SchedulerInterface):
 
             if step_cost.applies(vllm_config):
                 self._prompt_cost = step_cost
+                logger.info_once(
+                    "DEP prefill: prompt chunks sized by predicted step cost "
+                    "(Kimi K3 step_cost table)."
+                )
         except ImportError:
             pass
         # Whether, at the last DP exchange, some DP rank of this engine's group

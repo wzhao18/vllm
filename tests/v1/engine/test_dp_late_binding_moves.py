@@ -96,6 +96,7 @@ def _core(pg, sched, local_size):
     core._dp_abort_counts = []
     core._dp_moved_to = {}
     core._dp_abort_forward = {}
+    core._dp_move_stats = [0, 0, 0, 0]
     core.iterlog = None
     core.mm_receiver_cache = None
     core.request_block_hasher = None
