@@ -1697,11 +1697,22 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tid < 256 && ex < want && ex + hb >= want) {
           s_pref = (pref << 8) | (unsigned long long)(255 - tid);
           s_cnt = (int)(want - ex);
-          s_n = 1;
+          // After the last key-bit round (rd == 1) the prefix is the full 16-bit key tau.
+          // When every key equal to tau over all ranks is needed (the bucket count is the
+          // remaining want: no ties to break), the id rounds 2-4 would only confirm "take
+          // all": skip them. Decided from the exchanged words, so the same on every rank;
+          // the unused id-round slots stay armed (they are written only on rows that run them).
+          s_n = (rd == 1 && want - ex == hb) ? 2 : 1;
         }
         for (int i = tid; i < W * 256; i += kV2T) st_u32(p.box + rrow + i, kSent);
         __syncthreads();
-        if (tid == 0 && s_n != 1) spin_fail(p.err, 39);  // >= K distinct composites exist
+        if (tid == 0 && s_n < 1) spin_fail(p.err, 39);  // >= K distinct composites exist
+        if (s_n == 2) {
+          // composite cut = (tau << 24) | 0: every id of tau qualifies (gid <= 0xFFFFFF)
+          if (tid == 0) s_pref = s_pref << 24;
+          __syncthreads();
+          break;
+        }
       }
       if (tid == 0) {
         s_tau = (int)(s_pref >> 24);
