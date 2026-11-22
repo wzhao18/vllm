@@ -1855,13 +1855,23 @@ class SparseMlaPrefillH8:
         for b in cutlass.range_constexpr(4):
             # staging halves alternate between Q atoms 0-1 and 2-3 (block b % 2): block
             # b reuses block b - 2's buffer once its two stores have read it
-            if cutlass.const_expr(b >= 2):
-                if cutlass.const_expr(self.epw):
+            if cutlass.const_expr(self.epw):
+                # The store warp releases each use of a half (B_EPIFREE, 2 completions per
+                # token): block b waits for the previous use's release, completion 2 qi
+                # (block b - 2, parity 0) or, for b < 2, 2 qi - 1 (block b + 2 of token
+                # qi - 1, parity 1; none for the CTA's first token). Every use waits, so
+                # the producer is never two completions ahead on B_EPIFULL / B_EPIFREE and
+                # both parity waits are exact. (Waiting only for b >= 2 let a token's b < 2
+                # blocks overwrite a half before its stores read it and, two completions
+                # ahead, hang epi_store on an aliased parity: the startup stall.)
+                if cutlass.const_expr(b >= 2):
                     mbar_wait(_bar(base, B_EPIFREE + b % 2), Uint32(0))
-                else:
-                    if sp == 0 and lane == 0:
-                        bulk_wait_read2()
-                    named_bar(bid, 128)
+                elif qi > 0:
+                    mbar_wait(_bar(base, B_EPIFREE + b % 2), Uint32(1))
+            elif cutlass.const_expr(b >= 2):
+                if sp == 0 and lane == 0:
+                    bulk_wait_read2()
+                named_bar(bid, 128)
             for hh in cutlass.range_constexpr(2):
                 d0 = 32 * sp + 16 * hh  # first dim (lane) of this 16-lane half
                 ha = lane_addr + Uint32(16 * hh << 16) + Uint32(C_O + 96 * b)

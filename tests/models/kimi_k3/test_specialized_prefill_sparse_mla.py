@@ -285,3 +285,27 @@ def test_backend_prefill_takes_logical_topk():
     torch.cuda.synchronize()
     assert lse is None
     assert torch.equal(out, ref)
+
+
+_EPW, _EWSLOW = 18, 27  # SparseMlaPrefillH8 knob positions: epw (9 = off), ewslow (ns)
+
+
+@pytest.mark.parametrize("last_n", [1, 32, 64])
+def test_h8_epw_store_warp_lag_bitwise(last_n):
+    """epw (production): the softmax owner writes each epilogue block into a staging half
+    the store warp then stores. With the store warp held back (ewslow) the owner must wait
+    for every half's previous use, b < 2 included: otherwise it overwrote a half before its
+    stores read it (silent output corruption) and, two completions ahead, hung epi_store on
+    an aliased B_EPIFULL parity (the K3.1 prefill startup stall). Output must match the
+    non-epw path bit for bit, with three tokens per CTA and a short last token."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    lengths = [2048] * sms + [2048] * sms + [last_n] * sms  # CTA c: tokens c, c+sms, c+2sms
+    q8, kv, slots, lens = _problem(lengths, pool_pages=64, width=2048, seed=7)
+    scale, out_scale = 192**-0.5, 1.3
+    ref = sparse_mla_prefill_h8(q8, kv, slots, lens, scale, out_scale,
+                                knobs=(0,) * _EPW + (9,))
+    slow = (0,) * _EWSLOW + (20000,)
+    for _ in range(3):
+        out = sparse_mla_prefill_h8(q8, kv, slots, lens, scale, out_scale, knobs=slow)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
