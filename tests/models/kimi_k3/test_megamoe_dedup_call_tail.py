@@ -118,6 +118,7 @@ def test_non_dedup_router_waits_and_tail_signals(tree):
     for call in ("_router_single_cta(", "_router_multiple_ctas(", "_router_push_metadata("):
         assert wait < router.index(call), call
     tail = inspect.getsource(T.TokenCommNonDeterministic.reset_tail)
-    assert tail.index('reset_tail_space("shared"') < tail.index("arrive_and_wait") < tail.index("signal_done(")
+    # src_gp has a drain barrier before the reset: the signal must follow the LAST barrier.
+    assert tail.index('reset_tail_space("shared"') < tail.rindex("arrive_and_wait") < tail.index("signal_done(")
     ctor = inspect.getsource(T.TokenCommNonDeterministic.__init__)
     assert "call_epoch" in ctor and "call_done_signal" in ctor
