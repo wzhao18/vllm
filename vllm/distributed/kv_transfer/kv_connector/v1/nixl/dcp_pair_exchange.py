@@ -1605,7 +1605,11 @@ class DcpPairExchanger:
         "consumed" wait needed: the cycle ``test_side_stream_peer_copy_is_exact
         _and_cannot_deadlock`` catches). Every wait the current stream takes
         (a slot's last unpack) precedes this step's forward on it, so those
-        unpacks run before any of its kernels can spin.
+        unpacks run before any of its kernels can spin. The cross-rank
+        counters are written by ``PeerCopySwap.batch_isend_irecv`` on the swap
+        stream itself: "packed" when the swap starts (after the pack, which
+        the swap stream waits for), "consumed" right after the copy, before
+        any unpack; neither waits for SM work.
         """
         if side is None:
             for start in range(0, len(units), self.chunk_units):

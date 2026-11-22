@@ -153,12 +153,42 @@ def _spin_worker(rank: int, init_method: str, launch_blocking: bool) -> None:
                     f"{name} iteration {it}: rank 0's exchange did not finish "
                     f"within {TIMEOUT_S:.0f} s while its peers spun"
                 )
+            # Adversarial: EVERY rank holds all its SMs right after its packs
+            # until every rank's swaps (the only exchange work a peer waits
+            # for) are done. The swaps use no SM, so a correct design finishes;
+            # any SM dependency on a peer-visible path hangs deterministically.
+            swaps = first._ring.swap_stream(dev)
+            release = torch.cuda.Stream(device=dev)
+            one = torch.ones(8, dtype=torch.uint8).pin_memory()
+            for it in range(3):
+                flags[rank].zero_()
+                torch.accelerator.synchronize()
+                dist.barrier()
+                ring.exchange(units, side=side)
+                swapped = torch.cuda.Event()
+                swapped.record(swaps)
+                _spin_until_set[(4 * sms,)](flags[rank], num_warps=16)
+                start = time.monotonic()
+                while not swapped.query() and time.monotonic() - start < TIMEOUT_S:
+                    time.sleep(0.001)
+                verdict = torch.tensor([int(swapped.query())])
+                dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+                # Release through a copy engine on another stream: the spin
+                # holds every SM, so a fill kernel could not run.
+                with torch.cuda.stream(release):
+                    flags[rank].copy_(one, non_blocking=True)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.accelerator.synchronize()
+                assert verdict.item() == 1, (
+                    f"{name} adversarial iteration {it}: swaps did not finish within "
+                    f"{TIMEOUT_S:.0f} s while every rank held all its SMs"
+                )
         dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("seed", range(8))
 def test_random_consecutive_ring_exchanges_are_exact(tmp_path, seed: int):
     import torch.multiprocessing as mp
 
@@ -220,17 +250,63 @@ def _worker(rank: int, init_method: str, seed: int) -> None:
         # The same draws on every rank: every rank passes the same units.
         rng = random.Random(seed)
         max_units = dpe.PAIR_RING_SLOTS * chunk + 5  # past one ring of chunks
-        for round_ in range(12):
-            kind = rng.choice(("ratio2", "ratio4", "mixed"))
-            n = rng.randint(1, max_units)
+        # Odd seeds: rounds are the scheduler's step budget over random bursts
+        # of ready plans (BaseScheduler._take_pair_budget: oldest first, at most
+        # PAIR_RING_SLOTS chunks, a larger plan alone), so >16-unit bursts are
+        # deferred across rounds; even seeds: free random rounds incl. wraps.
+        from types import SimpleNamespace
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+            NixlBaseConnectorScheduler,
+        )
+
+        budget = SimpleNamespace(
+            _pair_ready={}, _pair_dcp_size=NUM_RANKS, _pair_chunk_units=chunk
+        )
+
+        def plan_units(n, kind):
             blocks = rng.sample(range(1, num_blocks), n)
-            units = []
+            out = []
             for i, b in enumerate(blocks):
                 if kind == "ratio2" or (kind == "mixed" and i % 2 == 0):
-                    units.append(dpe.PairUnit(0, b, rng.random() < 0.8))
+                    out.append(dpe.PairUnit(0, b, rng.random() < 0.8))
                 else:
                     sources = rng.randint(1, NUM_RANKS)
-                    units.append(dpe.PairUnit(0, b, sources > 1, sources, 1))
+                    out.append(dpe.PairUnit(0, b, sources > 1, sources, 1))
+            return out
+
+        def rounds():
+            if seed % 2 == 0:
+                for _ in range(12):
+                    kind = rng.choice(("ratio2", "ratio4", "mixed"))
+                    yield kind, plan_units(rng.randint(1, max_units), kind)
+                return
+            req = 0
+            for _ in range(16):
+                # A burst: plans become ready together (their blocks distinct
+                # within a step: every step's units come from one sample).
+                for _ in range(rng.choice((0, 1, 3, 5))):
+                    req += 1
+                    budget._pair_ready[f"r{req}"] = rng.randint(1, 12)
+                taken = NixlBaseConnectorScheduler._take_pair_budget(
+                    SimpleNamespace(
+                        _pair_ready={
+                            r: [dpe.PairUnit(0, 0, True)] * n
+                            for r, n in budget._pair_ready.items()
+                        },
+                        _pair_dcp_size=NUM_RANKS // 2 * 2,
+                        _pair_chunk_units=chunk,
+                    )
+                )
+                for r in taken:
+                    budget._pair_ready.pop(r)
+                n = min(sum(len(v) for v in taken.values()), num_blocks - 1)
+                if n:
+                    kind = rng.choice(("ratio2", "mixed"))
+                    yield kind, plan_units(n, kind)
+
+        for round_, (kind, units) in enumerate(rounds()):
+            n = len(units)
             reference.exchange(units)
             # As serving orders a step after the previous steps' side work.
             torch.cuda.current_stream().wait_stream(side)
