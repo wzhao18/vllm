@@ -51,11 +51,23 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
         (1, 128, ((128, 64), (1, 1), False, 128), 8),
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
-        # R257-384: swap_ab 2-CTA M256 (W) x N192 (tokens), 6 smem stages: 315 vs 361 MB
+        # R257-288 (shard rows 65-72 at q4): 2-CTA token tile 256 without swap_ab, 14.27-14.41
+        # vs swap N192 15.43-15.56 us/call (DDSA step-up bench r2, 1 GPU cold chain; R256
+        # (128 tactic band above) 10.55)
+        (257, 288, ((256, 256), (2, 1), False, 256), 4),
+        # R289-384: swap_ab 2-CTA M256 (W) x N192 (tokens), 6 smem stages: 315 vs 361 MB
         # SM-delivered at R384, cold chain 16.13 vs 16.83 us/call (D-GEMM R4-7)
-        (257, 384, ((256, 192), (2, 1), True, 256), 4, 6),
+        (289, 384, ((256, 192), (2, 1), True, 256), 4, 6),
         (385, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
+    # Shared expert gate_up / down at 65-96 shard rows: swap_ab 2-CTA M256 (W) x N128
+    # (tokens), 8 k-blocks before the wait. DDSA step-up bench r2 (1 GPU cold chain, us/call
+    # fi_cute / scaled_mm / this): gate_up R65 11.35 / 11.22 / 9.66, R96 11.46 / 11.35 /
+    # 9.70; down R65 8.67 / 8.80 / 7.40, R96 8.50 / 7.89 / 7.43 (bitwise fi_cute). At 65+
+    # rows FlashInfer's own cute-dsl pick leaves its 2-CTA M64-token tile for a 1-CTA tile
+    # (in-step CUPTI n64 -> n66: gate_up 13.4 -> 20.1, down 10.9 -> 22.0 us/call).
+    (12288, 7168): ((65, 96, ((256, 128), (2, 1), True, 256), 8),),
+    (7168, 6144): ((65, 96, ((256, 128), (2, 1), True, 256), 8),),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
     (7168, 3072): (
@@ -89,8 +101,8 @@ BLOCK = 32  # MXFP8 block along K
 MX_TUNED: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
     (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
-    (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
-    (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    (12288, 7168): {"*": "1-64:fi_cute,65-96:pre,97-:scaled_mm"},
+    (7168, 6144): {"*": "1-64:fi_cute,65-96:pre,97-:scaled_mm"},
 }  # fmt: skip
 
 
