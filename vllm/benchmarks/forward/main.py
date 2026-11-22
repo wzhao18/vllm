@@ -67,11 +67,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
     )
     parser.add_argument(
         "--routing",
-        choices=["auto", "real", "balanced", "zipf"],
+        choices=["auto", "real", "balanced", "zipf", "measured"],
         default="auto",
         help="MoE routing. balanced: fixed routing with equal load per EP rank. "
         "zipf: fixed weighted sampling without replacement (alpha=1.25), "
         "with expert popularity shuffled per layer. "
+        "measured (DIAG): per-layer expert popularity from the EPLB load dump "
+        "$VLLM_BENCH_FWD_EXPERT_LOAD (.npy [moe_layers, experts]). "
         "auto: zipf with dummy weights, else real; falls back to real when "
         "the synthetic fixture is unsupported.",
     )

@@ -76,6 +76,38 @@ def zipf_topk_ids(
     return ids
 
 
+def measured_topk_ids(
+    num_tokens: int, weights: np.ndarray, top_k: int, rng: np.random.Generator
+) -> np.ndarray:
+    """DIAG: sample distinct experts per token with probability proportional
+    to measured per-expert loads (one layer's row of the EPLB load dump)."""
+    w = np.asarray(weights, dtype=np.float64) + 1e-9
+    inverse_weights = 1.0 / w
+    ids = np.empty((num_tokens, top_k), dtype=np.int64)
+    for start in range(0, num_tokens, 1024):
+        count = min(1024, num_tokens - start)
+        scores = rng.exponential(size=(count, w.shape[0])) * inverse_weights
+        ids[start : start + count] = np.argpartition(scores, top_k - 1, axis=1)[
+            :, :top_k
+        ]
+    return ids
+
+
+_MEASURED_LOAD = None
+
+
+def _measured_load() -> np.ndarray:
+    global _MEASURED_LOAD
+    if _MEASURED_LOAD is None:
+        import os
+
+        path = os.environ.get("VLLM_BENCH_FWD_EXPERT_LOAD")
+        if not path:
+            raise ValueError("--routing measured needs VLLM_BENCH_FWD_EXPERT_LOAD")
+        _MEASURED_LOAD = np.load(path)
+    return _MEASURED_LOAD
+
+
 def _fixture_rows(fixture: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """Select this rank's rows when the model shards tokens across TP ranks."""
     descriptor = get_forward_context().batch_descriptor
@@ -149,6 +181,12 @@ class RoutingFixture:
             rng = np.random.default_rng([seed, layer_seed])
             if mode == "zipf":
                 ids = zipf_topk_ids(rows * dp_size, num_experts, top_k, rng)
+            elif mode == "measured":
+                load = _measured_load()
+                assert load.shape[1] == num_experts, (load.shape, num_experts)
+                ids = measured_topk_ids(
+                    rows * dp_size, load[layer % load.shape[0]], top_k, rng
+                )
             else:
                 ids = balanced_topk_ids(
                     rows * dp_size, num_experts, top_k, ep_size, rng
