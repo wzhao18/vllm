@@ -103,3 +103,22 @@ def test_reset_tail_signals_done_after_the_publish_barrier():
     reset = src.index('reset_tail_space("shared"')
     done = src.index("signal_done(")
     assert reset < publish < done
+
+
+# -- 3. the non-dedup comm paths (src inference kernel, src_gp TokenCommNonDeterministic) ----------
+@pytest.mark.parametrize("tree", ["src", "src_gp"])
+def test_non_dedup_router_waits_and_tail_signals(tree):
+    import importlib
+
+    T = importlib.import_module(
+        f"vllm.models.kimi_k3.nvidia.megamoe_rubin.{tree}.sources.communication.nvlink_domain.token_comm"
+    )
+    router = inspect.getsource(T._MetadataPushRouter._router_kernel)
+    wait = router.index("wait_previous_done")
+    for call in ("_router_single_cta(", "_router_multiple_ctas(", "_router_push_metadata("):
+        assert wait < router.index(call), call
+    tail = inspect.getsource(T.TokenCommNonDeterministic.reset_tail)
+    # src_gp has a drain barrier before the reset: the signal must follow the LAST barrier.
+    assert tail.index('reset_tail_space("shared"') < tail.rindex("arrive_and_wait") < tail.index("signal_done(")
+    ctor = inspect.getsource(T.TokenCommNonDeterministic.__init__)
+    assert "call_epoch" in ctor and "call_done_signal" in ctor
