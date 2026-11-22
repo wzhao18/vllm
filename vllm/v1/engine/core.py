@@ -2955,6 +2955,9 @@ class DPEngineCoreProc(EngineCoreProc):
             cross_min_gain=DP_CROSS_NODE_MIN_GAIN,
             bind_horizon=DP_BIND_HORIZON_STEPS * budget,
             bound_home=bound,
+            # A rank with less than one step of work would idle (or run a short
+            # step) next: fill it from its node's queues first.
+            fill_below=budget,
             penalties=penalties,
         )
         rank = self.dp_group.rank()

@@ -36,6 +36,7 @@ def plan_dp_moves(
     cross_min_gain: int | None = None,
     bind_horizon: int | None = None,
     bound_home: list[tuple[int, int]] | None = None,
+    fill_below: int | None = None,
     penalties: list[list[int]] | None = None,
 ) -> list[DPMove]:
     """Plan cross-rank moves of uncommitted requests.
@@ -55,6 +56,10 @@ def plan_dp_moves(
         cross_min_gain: the gain a move to another node must reach (default
             min_gain); a cross-node move also wins over the best same-node
             move only by more than the difference.
+        fill_below: a rank whose projected load is below this (it would idle
+            or run a short step next) takes a same-node move for any positive
+            gain that clears the request's penalty, and up to twice
+            ``max_moves_per_rank`` moves in or out for it.
         bind_horizon: with ``bound_home``, a request placed on its home rank
             is BOUND there (appended as (rank, index)) when its rank's
             projected load before it is below this horizon: it runs within the
@@ -95,9 +100,12 @@ def plan_dp_moves(
         # The larger of the two end loads drops by this much.
         return max(load[home] + size, load[dst]) - max(load[home], load[dst] + size)
 
+    def underfilled(r: int) -> bool:
+        return fill_below is not None and load[r] < fill_below
+
     for size, home, index in items:
         best = None
-        if left[home] < max_moves_per_rank:
+        if left[home] < 2 * max_moves_per_rank:
             # The least-loaded rank on the home node, and overall. A move off the
             # home node must clear cross_min_gain (it costs an output hop back to
             # the home node's client) and wins only by more than that premium.
@@ -107,11 +115,16 @@ def plan_dp_moves(
             anywhere = min(range(n), key=lambda r: (load[r], r))
             score = None
             for dst in (local, anywhere):
-                if dst == home or entered[dst] >= max_moves_per_rank:
+                if dst == home:
                     continue
                 cross = node[dst] != node[home]
+                fill = underfilled(dst) and not cross
+                cap = 2 * max_moves_per_rank if fill else max_moves_per_rank
+                if entered[dst] >= cap or left[home] >= cap:
+                    continue
                 g = gain(home, dst, size)
-                if g < max(cross_gain if cross else min_gain, penalty(home, index)):
+                bar = 1 if fill else (cross_gain if cross else min_gain)
+                if g < max(bar, penalty(home, index)):
                     continue
                 sc = g - (cross_gain - min_gain if cross else 0)
                 if score is None or sc > score:

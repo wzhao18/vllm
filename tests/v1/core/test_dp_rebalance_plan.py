@@ -110,3 +110,18 @@ def test_reload_penalty_keeps_gpu_hit_requests_home():
     assert plan_dp_moves([16000, 0], [[12000], []], 16384, penalties=[[20000], []]) == []
     moves = plan_dp_moves([16000, 0], [[12000], []], 16384, penalties=[[8000], []])
     assert [(m.src, m.dst) for m in moves] == [(0, 1)]
+
+
+def test_rank_that_would_idle_takes_small_requests():
+    # 1500-unit requests are below min_gain (2048): no move normally...
+    assert plan_dp_moves([3000, 0], [[1500, 1500], []], 16384) == []
+    # ...but rank 1 would idle next step: it takes both (home keeps its
+    # committed 3000; both ranks end at 3000).
+    moves = plan_dp_moves([3000, 0], [[1500, 1500], []], 16384, fill_below=16384)
+    assert [(m.src, m.dst) for m in moves] == [(0, 1), (0, 1)]
+    # Up to 2 x max_moves_per_rank into an underfilled rank.
+    moves = plan_dp_moves([20000, 0], [[1000] * 8, []], 16384, fill_below=16384)
+    assert len(moves) == 4 and {m.dst for m in moves} == {1}
+    # Never across nodes on the fill rule alone.
+    assert plan_dp_moves([3000, 0], [[1500], []], 16384, node_of=[0, 1],
+                         cross_min_gain=16384, fill_below=16384) == []
