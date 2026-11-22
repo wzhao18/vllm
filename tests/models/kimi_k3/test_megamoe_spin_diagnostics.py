@@ -183,3 +183,12 @@ def test_spin_record_watcher_logs_a_completed_record():
             break
         time.sleep(0.05)
     assert rec._logged[0]
+
+
+def test_guards_delay_the_trap():
+    """A trap from any thread kills the grid at once: an immediate trap of a non-elected thread could cut the elected
+    printer's record writes short (PIDX 2026-11-22). Every guard traps through the delayed _trap."""
+    src = (PKG / "src_gp/common/spin_guard.py").read_text()
+    body = src[src.index("def _trap() -> None:") :]
+    assert body.index("TRAP_DELAY_NS") < body.index("_trap_now()")
+    assert src.count("_trap_now()") == 1  # only the delayed _trap() traps

@@ -41,8 +41,22 @@ def _smid(*, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
-def _trap(*, loc=None, ip=None) -> None:
+def _trap_now(*, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [], "trap;", "", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
+
+
+# A trap from any thread kills the whole grid at once, including another thread's record stores or printf still in
+# flight (PIDX, 2026-11-22). Every timed-out thread therefore waits before it traps: long enough for the elected
+# printer of this site (and any other site's printer timing out in the same window) to finish its record.
+TRAP_DELAY_NS = 1000 * 1000 * 1000
+
+
+@cute.jit
+def _trap() -> None:
+    start = globaltimer_ns()
+    while globaltimer_ns() - start < cutlass.Uint64(TRAP_DELAY_NS):
+        llvm.inline_asm(None, [], "nanosleep.u32 100000;", "", has_side_effects=True, asm_dialect=0)
+    _trap_now()
 
 
 @dsl_user_op

@@ -212,6 +212,10 @@ scan; the backend's own modules stay covered.
   word ``spin_record_addr``, written at carve), writes it with system-scope stores, fences, marks it done and then
   traps. A host watcher thread logs ``K31_SPIN_RECORD ... missing=[rank r issued i entered e <verdict>]``; pinned host
   memory survives the context loss. Record 0 is the site-20 missing-rank report, record 1 the first other guard.
+  (f) Delayed trap (PIDX root cause of dropped lines): a trap from any thread kills the whole grid at once, including
+  another thread's printf or record stores in flight. Every timed-out thread waits ``TRAP_DELAY_NS`` (1 s, %globaltimer)
+  before ``trap``, so the elected printer of its site, and a printer of another site timing out in the same window,
+  completes its record first.
 
 ## sha256 manifest of `src/sources`
 
@@ -234,7 +238,7 @@ c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3  sources/helper
 215675b7f0def6526bb3c75b385cf12ccf0a5a35e8816c68bffbda03eaeabd9c  sources/helpers/ptx_helpers.py
 91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c  sources/helpers/smem_workspace.py
 fc131f9575b733b1f0a79a2f63d5221f810d64b4f05c2c34b47bf33842559a4f  sources/helpers/software_sync.py
-c1678e513aed875d17a48eaf75767fe19d42eb0aaae581bc61ed53673fa61b75  sources/helpers/spin_guard.py
+0adeab94114defa50a42981cc0c04aa716169706d2faadac36d73de3893e373d  sources/helpers/spin_guard.py
 39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22  sources/helpers/utils.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/__init__.py
 81689f9850af024d9ec22416d4c2a1535d73946d455b7e22042d321534918642  sources/kernel_src/function_mapping.py
