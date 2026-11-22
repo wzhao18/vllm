@@ -22,6 +22,8 @@ so graph replays carry no extra nodes (decode step cost unchanged). Every record
 
 from __future__ import annotations
 
+import atexit
+import ctypes
 import sys
 import threading
 import time
@@ -56,8 +58,22 @@ class _Crumbs:
         self.layer = 0
         self.ok = True
         self._main = threading.main_thread().ident
+        # The watcher never touches torch (the word is read through ctypes) and is stopped and joined at
+        # exit: a daemon thread inside a torch call during interpreter teardown aborted the process
+        # ("terminate called without an active exception", MegaMoE bench at exit, 2026-11-22).
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, name="k31-breadcrumbs", daemon=True)
         self._thread.start()
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=10.0)
+
+    def gpu_word(self) -> int:
+        """Last code the GPU stream wrote (pinned host word, plain load)."""
+        return ctypes.c_uint32.from_address(self.addr).value
 
     def write(self, op: int) -> None:
         if not self.ok or torch.cuda.is_current_stream_capturing():
@@ -80,10 +96,9 @@ class _Crumbs:
 
     def _watch(self) -> None:
         gpu_prev, gpu_t, reported = None, time.monotonic(), None
-        while True:
-            time.sleep(5.0)
+        while not self._stop.wait(5.0):
             now = time.monotonic()
-            gpu = int(self.word[0]) & 0xFFFFFFFF
+            gpu = self.gpu_word()
             if gpu != gpu_prev:
                 gpu_prev, gpu_t = gpu, now
             if gpu != self.host_code and now - gpu_t >= STALL_S:
