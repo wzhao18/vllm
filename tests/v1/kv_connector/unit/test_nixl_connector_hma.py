@@ -1962,6 +1962,12 @@ def test_derive_mamba_conv_split(
     mamba_type_enum = _TYPE_MAP[mamba_type]
 
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    # get_conv_state_layout() is lru_cached: an earlier test in the session may
+    # have cached "SD", so the env alone is ignored. Production uses DS.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+        lambda: "DS",
+    )
     spec = MambaSpec(
         block_size=64,
         shapes=((conv_dim_local, conv_rows), temporal_shape),
