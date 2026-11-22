@@ -911,6 +911,14 @@ class Scheduler(SchedulerInterface):
         # Frees from here until this call returns are "recent" for connector
         # loads issued during the next call (BlockFreeClock).
         BLOCK_FREE_CLOCK.tick()
+        if self.connector is not None and (
+            deferred := self.connector.take_deferred_recving()
+        ):
+            # Loads the connector reported finished late (e.g. NIXL DCP pair
+            # mode, once their block exchange is queued).
+            self._update_from_kv_xfer_finished(
+                KVConnectorOutput(finished_recving=deferred)
+            )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and

@@ -529,6 +529,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._extra_async_saves = {}
         return metadata
 
+    def take_deferred_recving(self) -> set[str]:
+        ready: set[str] = set()
+        for c in self._connectors:
+            ready |= c.take_deferred_recving()
+        return ready
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
         if connector_output.kv_connector_worker_meta is not None:
