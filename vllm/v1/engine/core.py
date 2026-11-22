@@ -152,10 +152,12 @@ DP_MOVE_SLOTS = 4
 # Moved request ids a source rank remembers to forward client aborts.
 DP_MOVED_MEMORY = 65536
 # A move to another node's rank (its output goes back to the home node's client
-# over the DP group, one lockstep step later) must lower the larger end load by
-# at least this much (planner units: short-context tokens), and beats the best
-# same-node move only by more than its premium over the same-node bar.
-DP_CROSS_NODE_MIN_GAIN = 8192
+# over the DP group, one lockstep step later, ~0.36 s) must lower the larger end
+# load by at least this much (planner units: short-context tokens), and beats
+# the best same-node move only by more than its premium over the same-node bar.
+# 16384 = one full 16K step at short context (~0.77 s on the DEP16 prefill, PSOL),
+# about twice the output hop.
+DP_CROSS_NODE_MIN_GAIN = 16384
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
