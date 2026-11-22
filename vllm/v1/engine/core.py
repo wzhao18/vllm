@@ -3179,6 +3179,9 @@ class DPEngineCoreProc(EngineCoreProc):
             self.scheduler.dp_listed_local_hit.get(req.request_id, -1)
             if outgoing
             else -1,
+            # The plan's in-plan gain and the request's penalty for this move.
+            getattr(mv, "gain", -1),
+            getattr(mv, "penalty", -1),
         )
 
     def _dp_remember_moved(self, request_id: str, dst: int) -> None:

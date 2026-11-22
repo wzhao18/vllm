@@ -24,6 +24,10 @@ class DPMove:
     index: int
     dst: int
     num_tokens: int
+    # The gain the plan credited this move with (the drop of the larger end
+    # load at decision time) and the request's penalty: for logging only.
+    gain: int = 0
+    penalty: int = 0
 
 
 def plan_dp_moves(
@@ -97,6 +101,7 @@ def plan_dp_moves(
 
     for size, home, index in items:
         best = None
+        best_gain = 0
         if left[home] < max_moves_per_rank:
             # The least-loaded rank on the home node, and overall. A move off the
             # home node must clear cross_min_gain (it costs an output hop back to
@@ -115,13 +120,15 @@ def plan_dp_moves(
                     continue
                 sc = g - (cross_gain - min_gain if cross else 0)
                 if score is None or sc > score:
-                    best, score = dst, sc
+                    best, score, best_gain = dst, sc, g
         move_ok = best is not None
         if move_ok:
             load[best] += size
             left[home] += 1
             entered[best] += 1
-            moves.append(DPMove(home, index, best, size))
+            moves.append(
+                DPMove(home, index, best, size, best_gain, penalty(home, index))
+            )
         else:
             if (
                 bound_home is not None
