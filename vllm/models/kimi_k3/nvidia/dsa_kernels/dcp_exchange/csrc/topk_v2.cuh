@@ -32,6 +32,7 @@
 // radix words are re-armed after their poll (written only on rows that take the tier).
 
 namespace k31dcpx {
+constexpr int kDdsaNB = 8;  // DDSA diagnostic length buckets
 
 #define K31_RARE(c) __builtin_expect(!!(c), 0)
 #define K31_LIKELY(c) __builtin_expect(!!(c), 1)
@@ -549,8 +550,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       for (int z = 0; z < 30; ++z) p.dbg[(int64_t)row * kV2Dbg + 32 + z] = s_dbg[z]; \
     }                                                                                \
   }
+// DDSA DIAGNOSTIC (never merge): stats = int32[kDdsaNB * 8] tier counts per global-length bucket,
+// then uint64[kDdsaNB * 2 * 2] (instance hot/complete) x (ns sum, calls) per bucket.
 #define V2STAT(i) \
-  if (p.stats && tid == 0) atomicAdd(&p.stats[i], 1);
+  if (p.stats && tid == 0) atomicAdd(&p.stats[ddsa_b * 8 + (i)], 1);
 
   {
     V2DBG(0);
@@ -573,6 +576,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     const int L = p.local_len[row];
     const int Gl = p.global_len[row];
+    const int ddsa_b = Gl < (1 << 16) ? 0 : Gl < (1 << 17) ? 1 : Gl < (1 << 18) ? 2 : Gl < 393216 ? 3
+                     : Gl < (1 << 19) ? 4 : Gl < 786432 ? 5 : Gl < (1 << 20) ? 6 : 7;
+    const long long ddsa_t0 = p.stats ? now_ns() : 0;
+    auto ddsa_done = [&]() {
+      if (p.stats && tid == 0) {
+        auto* acc = reinterpret_cast<unsigned long long*>(p.stats + kDdsaNB * 8);
+        const int s2 = (ddsa_b * 2 + (kFast ? 0 : 1)) * 2;
+        atomicAdd(&acc[s2], (unsigned long long)(now_ns() - ddsa_t0));
+        atomicAdd(&acc[s2 + 1], 1ull);
+      }
+    };
     int* orow = p.out + (int64_t)row * p.ostride;
     const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
     const int* btrow = p.block_table != nullptr ? p.block_table + (int64_t)req * p.bt_stride : nullptr;
@@ -593,6 +607,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       for (int i = tid; i < L; i += kV2T) orow[i] = slot_of(i);
       for (int i = L + tid; i < K; i += kV2T) orow[i] = -1;
       if (tid == 0) p.out_count[row] = L;
+      ddsa_done();
       __syncthreads();
       return 0;
     }
@@ -1683,6 +1698,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
                 V2STAT(2);
                 V2DBG(17);
                 V2DBG(8);
+                ddsa_done();
                 __syncthreads();  // SMEM reused by the next row
                 return 0;
               }
@@ -1693,6 +1709,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
       if (tier != 1 && tier != 2) {  // the same on every rank: the complete body takes the row
+        ddsa_done();
         __syncthreads();
         return 1 + ep;
       }
@@ -2045,6 +2062,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
     V2DBG(8);
+    ddsa_done();
     __syncthreads();  // SMEM reused by the next row
   }
   return 0;
