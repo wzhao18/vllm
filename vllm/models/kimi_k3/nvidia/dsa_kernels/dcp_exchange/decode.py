@@ -301,6 +301,9 @@ class DcpxDecode:
 
         def run():
             stream = torch.cuda.Stream(device=device)
+            # no CUDA call from this thread while the engine captures its graphs (global
+            # capture mode: any copy here would be 'not permitted when stream is capturing')
+            time.sleep(float(os.environ.get("DDSA_TOPK_STATS_DELAY_S", "1500")))
             while True:
                 time.sleep(30)
                 try:
