@@ -577,12 +577,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t run = ab;
         for (int i = kV2PB - 1; i >= 0; --i) {
           run += hist[bb * kV2PB + i];
-          if (run >= want) {
-            s_th = (bb * kV2PB + i) * 16;
-            s_u[13] = run;                       // sample keys >= theta's coarse bin
-            s_u[14] = hist[bb * kV2PB + i];      // sample keys in that bin
-            break;
-          }
+          if (run >= want) { s_th = (bb * kV2PB + i) * 16; break; }
         }
       }
       // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
@@ -597,52 +592,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       __syncthreads();
-      if (tid == 0 && s_th == 0) { s_th = 1; s_u[13] = 0u; }  // short / sparse sample: every valid key
+      if (tid == 0 && s_th == 0) s_th = 1;  // short / sparse sample: every valid key
       __syncthreads();
-      // fine theta: when the sample predicts more candidates than the list holds
-      // (kV2SampleStride x the sample keys >= theta), theta's coarse bin (16 keys) is
-      // resolved from the same sample groups at key resolution and theta moves up to the
-      // largest key whose sample suffix count still reaches `want`. theta only bounds
-      // the candidate set; every later check is unchanged (exact either way).
-      const int cb = s_th >> 4;
-      if (s_th > 1 && s_u[13] * (uint32_t)kV2SampleStride > (uint32_t)kV2Cand) {
-        // the bin's 16 key counters in warp_sums (free between CTA scans)
-        if (tid < 16) warp_sums[tid] = 0u;
-        __syncthreads();
-        auto fine_add = [&](const uint4& r) {
-          const Keys8 k8(r);
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            const uint32_t k = k8.key(j);
-            if (k && (int)(k >> 4) == cb) atomicAdd(&warp_sums[k & 15u], 1u);
-          }
-        };
-        if (K31_LIKELY(regp)) {
-#pragma unroll 1
-          for (int g = tid * kV2SampleStride + (tid & 7); g < min(ng, kCap); g += kV2T * kV2SampleStride)
-            fine_add(sgroup(g));
-          if constexpr (kFast) {
-            if (K31_RARE(ng > kCap))
-#pragma unroll 1
-              for (int g = kCap + tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride)
-                fine_add(load_group(g));
-          }
-        } else if constexpr (!kFast) {
-          const int step = kV2T * kV2SampleStride;
-#pragma unroll 1
-          for (int g0 = tid * kV2SampleStride; g0 < ng; g0 += 4 * step)
-            for (int i = 0; i < 4; ++i) fine_add(load_group(g0 + i * step));
-        }
-        __syncthreads();
-        if (tid == 0) {
-          uint32_t run = s_u[13] - s_u[14];  // sample keys above theta's coarse bin
-          for (int t = 15; t >= 0; --t) {
-            run += warp_sums[t];
-            if (run >= want) { s_th = max(s_th, (cb << 4) + t); break; }
-          }
-        }
-        __syncthreads();
-      }
     }
     int th = s_th;
     V2DBG(1);
