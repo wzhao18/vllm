@@ -912,11 +912,19 @@ def main():
 
     recs = ep_balance.drain_all()
     expected = {n * world * problem.top_k for _, _, n in points}
-    ok = sum(1 for r in recs if r["routes"] in expected and sum(r["rank_loads"]) == r["routes"]
-             and r["world"] == world)
+    glob = [r for r in recs if r["local_rank"] < 0]
+    ok = sum(1 for r in glob if r["routes"] in expected and sum(r["rank_loads"]) == r["routes"] and r["world"] == world)
+    # local (decode genphase) records: every rank logs its own experts; merge by call across ranks
+    gathered = [recs]
+    if world > 1 and group is not None:
+        gathered = [None] * world
+        dist.all_gather_object(gathered, recs, group=group)
+    merged = ep_balance.merge_local(gathered)
+    ok += sum(1 for m in merged if m["complete"] and m["routes"] in expected)
+    n_rec = len(glob) + len(merged)
     if rank == 0:
-        mm = [round(r["max_over_mean"], 3) for r in recs]
-        print(f"EPBAL records={len(recs)} routes_ok={ok}/{len(recs)} max_over_mean={mm[:8]}", flush=True)
+        mm = [round(r["max_over_mean"], 3) for r in glob + merged]
+        print(f"EPBAL records={n_rec} routes_ok={ok}/{n_rec} max_over_mean={mm[:8]}", flush=True)
     moe.destroy()
     if world > 1:
         dist.destroy_process_group()

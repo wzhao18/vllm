@@ -48,15 +48,9 @@ from ....common.spin_guard import _st_sys_s32, globaltimer_ns, red_or_relaxed_sy
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
 
 
-# Served EP-balance ring (int64.3 item 3; host side megamoe_rubin/ep_balance.py, same constants): one sampled call in
-# EPBAL_PERIOD, EPBAL_SLOTS slots of [call id, t_ready lo, t_ready hi, expert_count_padded, world_size,
-# experts_per_rank, 0, 0, sizes[expert_count_padded]].
-EPBAL_SHIFT = 6
-EPBAL_PERIOD = 1 << EPBAL_SHIFT
-EPBAL_SLOTS = 256
-EPBAL_HEADER_WORDS = 8
-EPBAL_MAX_EXPERTS = 512
-EPBAL_SLOT_WORDS = EPBAL_HEADER_WORDS + EPBAL_MAX_EXPERTS
+from ....common.ep_balance_layout import (  # noqa: E402
+    EPBAL_HEADER_WORDS, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
+)
 
 
 class DedupCallTail(GenphaseTail):
@@ -327,8 +321,6 @@ class _DedupMetadataPushRouter(KernelComponent):
             raise ValueError(f"Combine dedup sorts a token's routes in registers; topk must be <= {self.router_max_topk}.")
         if self.world_size > 32:
             raise ValueError("Combine dedup keeps the destination-rank mask in an Int32; world_size must be <= 32.")
-        if self.expert_count_padded > EPBAL_MAX_EXPERTS:
-            raise ValueError(f"The EP-balance ring slot holds {EPBAL_MAX_EXPERTS} experts; got {self.expert_count_padded}.")
         if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
             raise ValueError(
                 f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "
@@ -1466,27 +1458,30 @@ class _DedupMetadataPushRouter(KernelComponent):
         a %globaltimer stamp; the call id is written last (slot complete). Stores only, no launch, no sync: the
         other calls and CTAs read two workspace words and skip."""
         linear_cta_idx, _, _ = cute.arch.block_idx()
-        if linear_cta_idx == Int32(0):
-            ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
-            call = self._call_tail.read_epoch(device_workspace) + Int32(1)
-            if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
-                base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
-                sizes = device_workspace.tensor(self.sizes_region)
-                for expert_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded, 32)):
-                    expert = Int32(expert_round * 32) + lane_idx
-                    if expert < Int32(self.expert_count_padded):
-                        _st_sys_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), sizes[expert])
-                cute.arch.sync_warp()
-                if lane_idx == Int32(0):
-                    t_ready = globaltimer_ns()
-                    _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
-                    _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
-                    _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
-                    _st_sys_s32(base + Int64(16), Int32(self.world_size))
-                    _st_sys_s32(base + Int64(20), Int32(self.experts_per_rank))
-                    cute.arch.fence_acq_rel_sys()
-                    _st_sys_s32(base, call)
-                    cute.arch.fence_acq_rel_sys()
+        # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log)
+        if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS):
+            if linear_cta_idx == Int32(0):
+                ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
+                call = self._call_tail.read_epoch(device_workspace) + Int32(1)
+                if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
+                    base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
+                    sizes = device_workspace.tensor(self.sizes_region)
+                    for expert_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded, 32)):
+                        expert = Int32(expert_round * 32) + lane_idx
+                        if expert < Int32(self.expert_count_padded):
+                            _st_sys_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), sizes[expert])
+                    cute.arch.sync_warp()
+                    if lane_idx == Int32(0):
+                        t_ready = globaltimer_ns()
+                        _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
+                        _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
+                        _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
+                        _st_sys_s32(base + Int64(16), Int32(self.world_size))
+                        _st_sys_s32(base + Int64(20), Int32(self.experts_per_rank))
+                        _st_sys_s32(base + Int64(24), Int32(0))  # global record
+                        cute.arch.fence_acq_rel_sys()
+                        _st_sys_s32(base, call)
+                        cute.arch.fence_acq_rel_sys()
 
     @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:

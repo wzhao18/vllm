@@ -73,6 +73,10 @@ from ......common.ptx_helpers import (
     red_async_add_release_gpu_s32,
     tma_load_1d,
 )
+from ......common.ep_balance_layout import (
+    EPBAL_HEADER_WORDS, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
+)
+from ......common.spin_guard import _st_sys_s32, globaltimer_ns
 from ......common.utils import ceil_div, round_up
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import padded_expert_rows
@@ -2293,6 +2297,35 @@ class GenphaseTokenComm(KernelComponent):
         iket.range_pop()
 
     @cute.jit
+    def _log_ep_balance(self, device_workspace: DeviceWorkspace, local_rank: Int32, thread_idx: Int32) -> None:
+        """Served EP-balance log (int64.3 item 3), decode: genphase only folds THIS rank's per-expert counts, so on one
+        call in EPBAL_PERIOD the helper CTA copies its local ``expert_sizes`` (after releasing sizes_ready: off the
+        main kernel's path) into a slot of the session's host-mapped ring, marked local (word 6 = local_rank + 1);
+        the host merges the ranks' records by call id. Stores only, no launch, no sync beyond the helper CTA."""
+        if cutlass.const_expr(self.experts_per_rank <= EPBAL_MAX_EXPERTS):
+            ring = cute.arch.load(device_workspace.ptr(self._tail.epbal_region), Int64, sem="relaxed", scope="gpu")
+            call = self._tail.read_epoch(device_workspace) + Int32(1)
+            if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
+                base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
+                expert_sizes = device_workspace.tensor(self.expert_sizes_region)
+                for expert_round in cutlass.range_constexpr(ceil_div(self.experts_per_rank, self.threads_per_cta)):
+                    expert = Int32(expert_round * self.threads_per_cta) + thread_idx
+                    if expert < Int32(self.experts_per_rank):
+                        _st_sys_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), expert_sizes[expert])
+                cute.arch.sync_threads()
+                if thread_idx == Int32(0):
+                    t_ready = globaltimer_ns()
+                    _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
+                    _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
+                    _st_sys_s32(base + Int64(12), Int32(self.experts_per_rank))
+                    _st_sys_s32(base + Int64(16), Int32(self.world_size))
+                    _st_sys_s32(base + Int64(20), Int32(self.experts_per_rank))
+                    _st_sys_s32(base + Int64(24), local_rank + Int32(1))  # local record
+                    cute.arch.fence_acq_rel_sys()
+                    _st_sys_s32(base, call)
+                    cute.arch.fence_acq_rel_sys()
+
+    @cute.jit
     def _run_helper(
         self, device_workspace: DeviceWorkspace, local_rank: Int32, smem_base: cute.Pointer, thread_idx: Int32
     ) -> None:
@@ -2359,6 +2392,7 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(device_workspace.ptr(self.sizes_ready_region), Int32(1))
+        self._log_ep_balance(device_workspace, local_rank, thread_idx)
         iket.range_pop()
 
         iket.range_push("helper.prefix")

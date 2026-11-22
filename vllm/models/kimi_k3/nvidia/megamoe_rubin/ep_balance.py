@@ -111,21 +111,47 @@ class EpBalanceRing:
 
 def summarize(w: list[int]) -> dict:
     """One slot -> per-EP-rank loads (experts are owned contiguously: rank r has [r*epr, (r+1)*epr))."""
+    """Global record (word 6 == 0, dedup router / prefill): every expert's count, so per-rank loads and max/mean.
+    Local record (word 6 == local_rank + 1, genphase / decode): this rank's experts only; rank_loads holds this rank's
+    load and max_over_mean is -1 (the host merges the ranks' records by call id, see merge_local)."""
     t_ready = (w[1] & 0xFFFFFFFF) | ((w[2] & 0xFFFFFFFF) << 32)
-    padded, world, epr = w[3], w[4], w[5]
-    sizes = w[HEADER_WORDS : HEADER_WORDS + padded]
-    loads = [sum(sizes[r * epr : (r + 1) * epr]) for r in range(world)] if world and epr else []
-    mean = sum(loads) / len(loads) if loads else 0.0
+    entries, world, epr, local = w[3], w[4], w[5], w[6]
+    sizes = w[HEADER_WORDS : HEADER_WORDS + entries]
+    if local > 0:
+        loads, mm = [sum(sizes)], -1.0
+    else:
+        loads = [sum(sizes[r * epr : (r + 1) * epr]) for r in range(world)] if world and epr else []
+        mean = sum(loads) / len(loads) if loads else 0.0
+        mm = (max(loads) / mean) if mean > 0 else 0.0
     return {
         "call": w[0],
         "t_ready_ns": t_ready,
         "world": world,
         "experts_per_rank": epr,
+        "local_rank": local - 1,
         "routes": sum(sizes),
         "rank_loads": loads,
-        "max_over_mean": (max(loads) / mean) if mean > 0 else 0.0,
+        "max_over_mean": mm,
         "expert_max": max(sizes) if sizes else 0,
     }
+
+
+def merge_local(records_by_rank: list[list[dict]]) -> list[dict]:
+    """Merge local (decode) records of all ranks by (session, call): per-rank loads, routes and max/mean."""
+    by_call: dict = {}
+    for recs in records_by_rank:
+        for r in recs:
+            if r["local_rank"] >= 0:
+                by_call.setdefault((r.get("session"), r["call"]), {})[r["local_rank"]] = r
+    out = []
+    for (session, call), ranks in sorted(by_call.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        world = next(iter(ranks.values()))["world"]
+        loads = [ranks[r]["routes"] if r in ranks else None for r in range(world)]
+        have = [x for x in loads if x is not None]
+        mean = sum(have) / len(have) if have else 0.0
+        out.append({"session": session, "call": call, "rank_loads": loads, "complete": len(have) == world,
+                    "routes": sum(have), "max_over_mean": (max(have) / mean) if mean > 0 else 0.0})
+    return out
 
 
 def new_ring(tag: str) -> EpBalanceRing:
@@ -151,5 +177,5 @@ def drain_all() -> list[dict]:
 
 
 def _iterlog_records() -> list[tuple]:
-    return [("E", r["session"], r["call"], r["layer"], r["t_ready_ns"], r["routes"], round(r["max_over_mean"], 4),
-             r["expert_max"], r["lost"], r["rank_loads"]) for r in drain_all()]
+    return [("E", r["session"], r["call"], r["layer"], r["local_rank"], r["t_ready_ns"], r["routes"],
+             round(r["max_over_mean"], 4), r["expert_max"], r["lost"], r["rank_loads"]) for r in drain_all()]

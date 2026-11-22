@@ -85,3 +85,25 @@ def test_call_id_reset_resyncs_after_rescan():
         assert ring.drain() == []
     out = ring.drain()  # the rescan resyncs the cursor; the restarted sequence drains from the next call
     assert [r["call"] for r in out] == [64] and out[0]["rank_loads"] == [3, 1]
+
+
+def test_local_decode_records_merge_by_call():
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    def slot(call, sizes, rank, world=2):
+        w = [0] * E.SLOT_WORDS
+        w[0], w[3], w[4], w[5], w[6] = call, len(sizes), world, len(sizes), rank + 1
+        w[E.HEADER_WORDS : E.HEADER_WORDS + len(sizes)] = sizes
+        return w
+
+    r0 = E.summarize(slot(64, [3, 1], rank=0))
+    r1 = E.summarize(slot(64, [6, 2], rank=1))
+    assert r0["local_rank"] == 0 and r0["rank_loads"] == [4] and r0["max_over_mean"] == -1.0
+    for r in (r0, r1):
+        r["session"] = "genphase-128"
+    lone = E.summarize(slot(128, [1, 1], rank=0))
+    lone["session"] = "genphase-128"
+    merged = E.merge_local([[r0, lone], [r1]])
+    assert [(m["call"], m["complete"]) for m in merged] == [(64, True), (128, False)]
+    assert merged[0]["rank_loads"] == [4, 8] and merged[0]["routes"] == 12
+    assert merged[0]["max_over_mean"] == pytest.approx(8 / 6)
