@@ -202,3 +202,27 @@ def test_load_ahead_only_for_requests_the_dp_plan_bound_here():
     assert out.num_scheduled_tokens == {long.request_id: 64}
     assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler._load_ahead == {a}
+
+
+def test_moved_in_request_is_not_herded_onto_or_moved_again():
+    """B'/C regression (move thrash): a request moved to this rank restarts its
+    prefix lookup here. While that lookup is in flight it must still count in
+    this rank's planning demand (else the rank looks idle and the planner
+    herds more work onto it), and once its lookup is done it must not be
+    offered for another move (ping-pong)."""
+    scheduler = _scheduler()
+    moved = _add(scheduler, 20 * BS)
+    other = _add(scheduler, 6 * BS)
+    in_flight = {moved.request_id}
+    scheduler.connector.dp_move_tokens.side_effect = (
+        lambda r: None if r.request_id in in_flight else r.num_prompt_tokens
+    )
+    moved.dp_pinned_size = 20 * BS  # set by the engine when it took it in
+    listed = scheduler.dp_movable_requests(4)
+    assert listed == [(other.request_id, 6 * BS)]
+    # Herding: the in-flight moved-in request counts at its planned size.
+    assert scheduler.dp_move_demand() == 20 * BS
+    # Ping-pong: lookup done, still not offered again.
+    in_flight.clear()
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [other.request_id]
+    assert scheduler.dp_move_demand() == 20 * BS
