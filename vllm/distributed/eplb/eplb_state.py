@@ -65,6 +65,32 @@ from .rebalance_execute import (
 logger = init_logger(__name__)
 
 
+def _eplb_diag_dump(kind: str, step: int, tensors: dict) -> None:
+    """DIAGNOSTIC ONLY (wzhao/k31ws-eplb-diag, never merge): dump EPLB expert
+    loads under $VLLM_ITERLOG_DIR/eplb/ on EP rank 0 for offline balance
+    projection (regrouping to other EP sizes)."""
+    import os
+    import socket
+
+    d = os.environ.get("VLLM_ITERLOG_DIR")
+    if not d:
+        return
+    try:
+        d = os.path.join(d, "eplb")
+        os.makedirs(d, exist_ok=True)
+        fn = os.path.join(
+            d, f"{socket.gethostname()}_{os.getpid()}_{kind}_{step:08d}.pt"
+        )
+        with gpu_sync_allowed():
+            obj = {k: v.detach().cpu() for k, v in tensors.items()}
+        obj["wall"] = time.time()
+        obj["step"] = step
+        torch.save(obj, fn + ".tmp")
+        os.replace(fn + ".tmp", fn)
+    except Exception as e:  # diag must never break serving
+        logger.warning("EPLB diag dump failed: %s", e)
+
+
 def _compute_eplb_load_stats(
     num_tokens_per_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -641,6 +667,17 @@ class EplbState:
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
                 if ep_group.rank() == 0:
+                    self._diag_step = getattr(self, "_diag_step", 0) + 1
+                    _eplb_diag_dump(
+                        f"pass_{eplb_model_state.model_name.replace('/', '_')}",
+                        self._diag_step,
+                        {
+                            "physical_load": expert_load_pass.to(torch.int32),
+                            "physical_to_logical": (
+                                eplb_model_state.physical_to_logical_map.to(torch.int16)
+                            ),
+                        },
+                    )
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
@@ -810,7 +847,7 @@ class EplbState:
                 )
                 continue
             expert_load_window = eplb_model_state.expert_load_window
-            physical_to_logical = eplb_model_state.physical_to_logical_map
+            physical_to_logical = eplb_model_state.physical_to_logical_map.to(torch.int16)
             invalid_idx = eplb_model_state.model.num_logical_experts
             logical_expert_load_window = torch.zeros(
                 self.expert_load_window_size,
@@ -834,6 +871,16 @@ class EplbState:
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        if is_main_rank and not is_profile:
+            for i, (ms, w) in enumerate(
+                zip(self.model_states.values(), global_expert_load_windows)
+            ):
+                _eplb_diag_dump(
+                    f"rearrange{i}",
+                    getattr(self, "_diag_step", 0),
+                    {"logical_load_window": w,
+                     "physical_to_logical_before": ms.physical_to_logical_map},
+                )
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
@@ -926,7 +973,7 @@ class EplbState:
                         return (loads_per_rank.max() / mean_load).item()
 
                     current_imbalance = rank_load_imbalance(
-                        eplb_model_state.physical_to_logical_map
+                        eplb_model_state.physical_to_logical_map.to(torch.int16)
                     )
                     proposed_imbalance = rank_load_imbalance(
                         new_physical_to_logical_map
@@ -1133,7 +1180,7 @@ class EplbState:
             expanded_physical_to_logical
         )
         eplb_model_state.expert_load_pass.zero_()
-        physical_to_logical_map = eplb_model_state.physical_to_logical_map
+        physical_to_logical_map = eplb_model_state.physical_to_logical_map.to(torch.int16)
 
         (logical_to_physical_map_cpu, logical_replica_count_cpu) = compute_logical_maps(
             physical_to_logical_map.cpu(),
