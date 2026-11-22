@@ -66,7 +66,7 @@ def test_queued_prompt_moves_to_idle_rank():
     # Rank 0 has 8K committed and a queued 12K prompt; rank 1 is idle: the
     # 12K prompt goes to rank 1 (larger end load 20K -> 12K).
     moves = plan_dp_moves([8000, 0], [[12000], []], step_budget=16384)
-    assert moves == [DPMove(src=0, index=0, dst=1, num_tokens=12000)]
+    assert moves == [DPMove(src=0, index=0, dst=1, num_tokens=12000, gain=8000, penalty=0)]
 
 
 def test_one_huge_prompt_alone_stays():
