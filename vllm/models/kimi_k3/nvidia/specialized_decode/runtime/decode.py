@@ -199,6 +199,21 @@ def is_uniform_verify(md, q, b):
     return full and not md.num_decodes and tokens == md.num_spec_decodes * q
 
 
+def sp_stock_cause() -> str:
+    """Why an SP serving step runs the stock forward (``SpStep.plan`` plans FULL
+    decode captures only)."""
+    if not is_forward_context_available():
+        return "no forward context"
+    context = get_forward_context()
+    if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        return "PIECEWISE graph (non-uniform verify shape)"
+    rows = context.attn_metadata
+    rows = list(rows.values()) if isinstance(rows, dict) else []
+    if any(getattr(md, "num_prefills", 0) for md in rows):
+        return "prompt rows (mixed prefill + decode)"
+    return "eager step (outside a FULL graph capture)"
+
+
 def caches_of(attention):
     cache = getattr(attention_layer(attention), "kv_cache", ())
     return [cache] if isinstance(cache, torch.Tensor) else list(cache)
@@ -412,6 +427,9 @@ class SpecializedDecode:
         )
         self.sp = SpStep(self)
         self.coverage = self.sp.coverage()
+        # NQ-NOFALLBACK: serving steps the SP step does not plan (eager, PIECEWISE:
+        # the stock forward on this backbone), counted and logged per cause (``plan``).
+        self.stock_steps = StockSteps("decode", self.rank)
 
     def build_providers(self):
         """Every layer's attention and feed-forward providers, the model's mailboxes
@@ -834,7 +852,10 @@ class SpecializedDecode:
         decode need every rank to take the same path.
         """
         if self.sp is not None:  # raises for a FULL capture it cannot serve
-            return self.sp.plan(positions, intermediate_tensors)
+            step = self.sp.plan(positions, intermediate_tensors)
+            if step is None and not torch.cuda.is_current_stream_capturing():
+                self.stock_steps.count(sp_stock_cause(), positions.shape[0])
+            return step
         b = positions.shape[0]
         step, why = self.plan_step(positions, intermediate_tensors)
         if step is not None:
