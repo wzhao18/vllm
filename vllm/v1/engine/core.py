@@ -2931,6 +2931,7 @@ class DPEngineCoreProc(EngineCoreProc):
             for r in range(size)
         ]
         local = self._dp_move_local_size
+        self._dp_plan_demand = demand
         self._dp_moves = plan_dp_moves(
             demand,
             per_rank,
@@ -2982,6 +2983,7 @@ class DPEngineCoreProc(EngineCoreProc):
                         if payload:
                             self._dp_remember_moved(req.request_id, mv.dst)
                             self._dp_count_move(0, mv.num_tokens)
+                            self._dp_log_move(req, mv, outgoing=True)
                         else:
                             # Cannot ship it: keep it here.
                             self.scheduler.add_request(req)
@@ -2990,6 +2992,10 @@ class DPEngineCoreProc(EngineCoreProc):
                 payload = self._dp_recv_bytes(mv.src)
                 if payload:
                     req_id = self._dp_import_moved(payload)
+                    if self.iterlog is not None and req_id in self.scheduler.requests:
+                        self._dp_log_move(
+                            self.scheduler.requests[req_id], mv, outgoing=False
+                        )
                     if mv.src // self._dp_move_local_size != (
                         rank // self._dp_move_local_size
                     ):
@@ -3122,6 +3128,21 @@ class DPEngineCoreProc(EngineCoreProc):
                 "took in %d (%d tokens)",
                 *st,
             )
+
+    def _dp_log_move(self, req, mv, outgoing: bool) -> None:
+        if self.iterlog is None:
+            return
+        demand = getattr(self, "_dp_plan_demand", None) or []
+        self.iterlog.move(
+            req,
+            mv.src,
+            mv.dst,
+            mv.num_tokens,
+            getattr(req, "dp_move_fresh_tokens", -1),
+            demand[mv.src] if mv.src < len(demand) else -1,
+            demand[mv.dst] if mv.dst < len(demand) else -1,
+            outgoing,
+        )
 
     def _dp_remember_moved(self, request_id: str, dst: int) -> None:
         self._dp_moved_to[request_id] = dst

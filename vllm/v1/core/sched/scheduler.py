@@ -3636,6 +3636,13 @@ class Scheduler(SchedulerInterface):
         self.waiting.remove_request(request)
         del self.requests[request_id]
         self.kv_cache_manager.forget_conversation_turn(request)
+        # Tokens left to compute (prompt minus the external hit), recorded by
+        # the engine's iteration log before the connector drops the lookup.
+        request.dp_move_fresh_tokens = (
+            request.num_prompt_tokens
+            if self.connector is None
+            else (self.connector.dp_move_tokens(request) or request.num_prompt_tokens)
+        )
         if self.connector is not None:
             self.connector.on_request_moved_away(request)
         return request
