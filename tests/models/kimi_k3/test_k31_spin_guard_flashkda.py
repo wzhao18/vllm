@@ -57,16 +57,24 @@ _CPP = "void setup(int64_t rank, int64_t diag); void run(torch::Tensor out, torc
 
 
 def _load(guard_ns: int):
+    import flashinfer
     from torch.utils.cpp_extension import load_inline
 
+    # the include paths and flags of the production build (ops/kda_segscan.load_extension)
+    cutlass = os.path.join(os.path.dirname(flashinfer.__file__), "data", "cutlass", "include")
     return load_inline(
         name=f"k31_flashkda_wait_wd_test_{guard_ns}",
         cpp_sources=_CPP,
         cuda_sources=_CUDA,
         functions=["setup", "run"],
-        extra_include_paths=[_NV, _SMXX],
-        extra_cuda_cflags=["-O3", f"-DK31_SPIN_GUARD_NS={guard_ns}ull",
-                           "-gencode", "arch=compute_100f,code=sm_100f"],
+        extra_include_paths=[_NV, _SMXX, os.path.dirname(_SMXX), cutlass],
+        extra_cuda_cflags=[
+            "-O3", f"-DK31_SPIN_GUARD_NS={guard_ns}ull",
+            "--expt-relaxed-constexpr", "--expt-extended-lambda", "--use_fast_math",
+            "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-gencode", "arch=compute_100f,code=sm_100f",
+        ],
         verbose=False,
     )
 
