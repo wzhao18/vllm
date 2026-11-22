@@ -590,12 +590,16 @@ def _split_heads(chunks, full, nslots, span_limit):
     return best
 
 
-def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
+def _piece_items(lens, H: int, nslots: int):
     """Pack the (sequence, head) chains onto at most ``nslots`` persistent CTAs.
 
     Whole-chain LPT is used unless cutting chains lowers the modelled
     makespan. Split schedules use wrap-around packing, with exact FP32 state
     handoffs between the pieces of a chain.
+
+    Returns ``(items, nbuf)``: per slot, its pieces ``(chain, t0, tn, src,
+    dst)`` in execution order (token window [t0, t0 + tn) of the chain;
+    ``src``/``dst`` the handoff buffer it seeds from / exports to, or -1).
     """
     nchains = len(lens) * H
     chunks = [(lens[c // H] + C_TOK - 1) // C_TOK for c in range(nchains)]
@@ -632,6 +636,10 @@ def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
                 for slot in packed
             ]
             nbuf = len(buffer_of)
+    return items, nbuf
+
+
+def _tensorize(items, dev: torch.device):
     fc, ft0, ftn, fsrc, fdst, off = [], [], [], [], [], [0]
     for slot in items:
         for c, t0, tn, src, dst in slot:
@@ -650,8 +658,119 @@ def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
         i32(fsrc),
         i32(fdst),
         len(items),
-        nbuf,
     )
+
+
+def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
+    items, nbuf = _piece_items(lens, H, nslots)
+    return (*_tensorize(items, dev), nbuf)
+
+
+def _cut_items(items, lens, cuts, H: int, nbuf: int):
+    """Re-express a schedule with checkpoint cuts as sequence boundaries.
+
+    ``cuts[s]`` (0 = none, else 0 < cut < lens[s]) splits sequence ``s`` into a
+    prefix pseudo-sequence [0, cut) and a suffix pseudo-sequence [cut, len).
+    The prefix ends like any sequence (a partial last chunk is allowed) and
+    exports its FP32 state to buffer ``s * H + h`` instead of storing a final
+    state; the suffix seeds from that buffer. Both keep their own 32-token
+    chunk grid, so the prefix computes exactly as a run of [0, cut) alone and
+    the suffix exactly as a run of [cut, len) seeded with that state.
+
+    A chain is split by the planner at most once (a producer head and a
+    consumer remainder). A planner boundary inside the suffix moves up to the
+    suffix's chunk grid (or vanishes past its end), and the piece covering the
+    cut becomes two consecutive pieces of the same slot, so every new wait is
+    on the piece just before it in the same CTA: the handoff graph keeps the
+    planner's deadlock-free shape. The planner's own buffers move to
+    ``nseq * H + b``.
+
+    Returns ``(items, pseudo_lens, pseudo_of, nbuf_total)``: pieces in
+    pseudo-sequence chains and coordinates, the pseudo-sequence lengths, and
+    per original sequence its (prefix, suffix) pseudo indices (suffix -1 when
+    uncut)."""
+    nseq = len(lens)
+    shift = nseq * H
+    pseudo_of, pseudo_lens = [], []
+    for s, length in enumerate(lens):
+        x = cuts[s]
+        if x:
+            if not 0 < x < length:
+                raise ValueError(
+                    f"checkpoint offset {x} outside sequence {s} of length {length}"
+                )
+            pseudo_of.append((len(pseudo_lens), len(pseudo_lens) + 1))
+            pseudo_lens += [x, length - x]
+        else:
+            pseudo_of.append((len(pseudo_lens), -1))
+            pseudo_lens.append(length)
+
+    def sh(b):
+        return b + shift if b >= 0 else -1
+
+    # Per-chain planner pieces: chain -> [(slot, index)] in token order.
+    where: dict = {}
+    for si, slot in enumerate(items):
+        for ii, (c, t0, _tn, _src, _dst) in enumerate(slot):
+            where.setdefault(c, []).append((t0, si, ii))
+    # Planner buffers move past the cut buffers first, so the two never alias.
+    new = [[(c, t0, tn, sh(src), sh(dst)) for c, t0, tn, src, dst in slot]
+           for slot in items]
+    drop = set()
+    insert: dict = {}
+    for c, locs in where.items():
+        s, h = divmod(c, H)
+        x = cuts[s]
+        if not x:
+            continue
+        length = lens[s]
+        locs.sort()
+        if len(locs) > 2:
+            raise RuntimeError(f"chain {c} has {len(locs)} planner pieces (max 2)")
+        cb = s * H + h
+        if len(locs) == 2:
+            (_, sa, ia), (_, sb, ib) = locs
+            ca, a0, an, asrc, adst = new[sa][ia]
+            cbb, b0, bn, bsrc, bdst = new[sb][ib]
+            p = b0
+            if p > x:
+                p = x + -(-(p - x) // C_TOK) * C_TOK
+                if p >= length:
+                    # boundary vanishes: the head covers the whole chain
+                    new[sa][ia] = (ca, a0, length - a0, asrc, -1)
+                    drop.add((sb, ib))
+                    locs = [(a0, sa, ia)]
+                else:
+                    new[sa][ia] = (ca, a0, p - a0, asrc, adst)
+                    new[sb][ib] = (cbb, p, length - p, bsrc, bdst)
+            if len(locs) == 2 and p == x:
+                new[sa][ia] = (ca, a0, x - a0, asrc, cb)
+                new[sb][ib] = (cbb, x, length - x, cb, bdst)
+                continue
+        for _, si, ii in locs:
+            cc, t0, tn, src, dst = new[si][ii]
+            if t0 < x < t0 + tn:
+                new[si][ii] = (cc, t0, x - t0, src, cb)
+                insert[(si, ii)] = (cc, x, t0 + tn - x, cb, dst)
+                break
+    out = []
+    for si, slot in enumerate(new):
+        row = []
+        for ii, (c, t0, tn, src, dst) in enumerate(slot):
+            if (si, ii) in drop:
+                continue
+            pieces = [(c, t0, tn, src, dst)]
+            if (si, ii) in insert:
+                pieces.append(insert[(si, ii)])
+            for c2, t2, n2, src2, dst2 in pieces:
+                s, h = divmod(c2, H)
+                pre, suf = pseudo_of[s]
+                if suf >= 0 and t2 >= cuts[s]:
+                    row.append((suf * H + h, t2 - cuts[s], n2, src2, dst2))
+                else:
+                    row.append((pre * H + h, t2, n2, src2, dst2))
+        out.append(row)
+    return out, pseudo_lens, pseudo_of, shift + nbuf
 
 
 def beta_tma_supported(beta) -> bool:
@@ -695,6 +814,44 @@ def make_plan(offsets, H, dev):
         nbuf > 0,
         all(length % C_TOK == 0 for length in lens),
     )
+
+
+def make_cut_plan(offsets, cuts, H, dev):
+    """``make_plan`` with prefill checkpoints: ``cuts[s]`` (0 = none) is the
+    token offset into sequence ``s`` whose FP32 state is exported.
+
+    The schedule is planned on the uncut sequences and the cuts become
+    sequence boundaries (``_cut_items``). Returns ``(plan, meta)``: the plan's
+    handoff storage slot is None; the caller passes ``mid`` (at least
+    ``meta["nbuf"]`` (D, D) FP32 rows) whose first ``nseq * H`` rows receive
+    the checkpoint states, row ``s * H + h`` for sequence ``s``, head ``h``.
+    ``meta["pseudo_of"]`` maps each sequence to its (prefix, suffix) pseudo
+    sequences (suffix -1 when uncut) and ``meta["cu"]`` holds the
+    pseudo-sequence offsets."""
+    lens = [end - start for start, end in zip(offsets, offsets[1:], strict=False)]
+    items, nbuf = _piece_items(lens, H, _sm_count(dev))
+    items, pseudo_lens, pseudo_of, nbuf_total = _cut_items(items, lens, cuts, H, nbuf)
+    pcu = [offsets[0]]
+    for length in pseudo_lens:
+        pcu.append(pcu[-1] + length)
+    soff, schain, spt0, sptn, ssrc, sdst, G = _tensorize(items, dev)
+    flags = torch.zeros(nbuf_total, dtype=torch.int32, device=dev)
+    plan = (
+        torch.tensor(pcu, dtype=torch.int32, device=dev),
+        soff,
+        schain,
+        spt0,
+        sptn,
+        ssrc,
+        sdst,
+        G,
+        None,
+        flags,
+        True,
+        all(length % C_TOK == 0 for length in pseudo_lens),
+    )
+    meta = {"nbuf": nbuf_total, "pseudo_of": pseudo_of, "cu": pcu, "nseq": len(lens)}
+    return plan, meta
 
 
 @torch.no_grad()
