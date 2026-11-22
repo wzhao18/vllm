@@ -313,6 +313,22 @@ class Scheduler(SchedulerInterface):
         # by the DP engine core from the DP group's outstanding prefill work at
         # each exchange (see set_dp_step_token_cap). None = no cap.
         self._dp_step_token_cap: int | None = None
+        # Prompt chunk cost model of a DEP prefill rank (Kimi K3 DSA): a step's
+        # prompt chunks are sized by predicted cost, not tokens alone, so a
+        # long-context chunk does not set every rank's lockstep step. None =
+        # tokens only (see _prompt_chunk_cost).
+        self._prompt_cost = None
+        try:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
+
+            if step_cost.applies(vllm_config):
+                self._prompt_cost = step_cost
+                logger.info_once(
+                    "DEP prefill: prompt chunks sized by predicted step cost "
+                    "(Kimi K3 step_cost)."
+                )
+        except ImportError:
+            pass
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -963,6 +979,9 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        # The step's prompt cost budget (short-context tokens): the token budget,
+        # charged by predicted cost for prompt chunks (see _prompt_chunk_cost).
+        cost_left = float(token_budget)
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -1108,6 +1127,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._cut_prompt_chunk_to_cost(
+                request, request.num_computed_tokens, num_new_tokens, cost_left
+            )
             if (
                 owner_left is not None
                 and request.num_computed_tokens < request.num_prompt_tokens
@@ -1213,6 +1235,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                cost_left -= self._prompt_chunk_cost(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
                 if owner_left is not None:
                     self._dsa_owner_charge(
                         owner_left, request, request.num_computed_tokens, num_new_tokens
@@ -1269,6 +1294,11 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
+                            cost_left += self._prompt_chunk_cost(
+                                preempted_req,
+                                preempted_req.num_computed_tokens,
+                                restored,
+                            )
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -1327,6 +1357,9 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            cost_left -= self._prompt_chunk_cost(
+                request, request.num_computed_tokens, num_new_tokens
+            )
             if owner_left is not None:
                 self._dsa_owner_charge(
                     owner_left, request, request.num_computed_tokens, num_new_tokens
@@ -1761,6 +1794,12 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._cut_prompt_chunk_to_cost(
+                        request, num_computed_tokens, num_new_tokens, cost_left
+                    )
+                    if num_new_tokens == 0:
+                        # The step's prompt cost budget is used up.
+                        break
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -2025,6 +2064,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                cost_left -= self._prompt_chunk_cost(
+                    request, num_computed_tokens, num_new_tokens
+                )
                 if owner_left is not None:
                     self._dsa_owner_charge(
                         owner_left, request, num_computed_tokens, num_new_tokens
@@ -2089,6 +2131,7 @@ class Scheduler(SchedulerInterface):
                 input_budget,
                 draft_slots,
                 owner_left=owner_left,
+                cost_left=cost_left,
             )
             drafts_needed = drafts_needed or pulled_drafts_needed
 
@@ -3581,6 +3624,7 @@ class Scheduler(SchedulerInterface):
         input_budget: int,
         draft_slots: int,
         owner_left: list[float] | None = None,
+        cost_left: float | None = None,
     ) -> tuple[int, int, bool]:
         """Exchange this step's token count with the DP peers, then allocate the
         deferred running prefill chunks, pulled up toward the busiest rank's
@@ -3592,6 +3636,7 @@ class Scheduler(SchedulerInterface):
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
         drafts_needed = False
+        room_cost: float | None = None
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
@@ -3600,6 +3645,16 @@ class Scheduler(SchedulerInterface):
             extra = 1 << 62
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
+        elif self._prompt_cost is not None and cost_left is not None:
+            # Prompt cost model: the exchanged quantity is the step's predicted
+            # cost (short-context tokens), and the deferred chunks are pulled up
+            # toward the costliest rank's step by cost.
+            used = self._step_cost(num_scheduled_tokens)
+            busiest = exchange(
+                int(used + 0.5), self.dp_prefill_demand(num_scheduled_tokens)
+            )
+            room_cost = max(float(busiest) - used, 0.0)
+            extra = 1 << 62
         else:
             num_tokens = sum(num_scheduled_tokens.values())
             extra = max(
@@ -3625,6 +3680,14 @@ class Scheduler(SchedulerInterface):
                             dsa_dp.chunk_cost(num_stock, ctx) + room_o[o], ctx
                         ),
                     )
+                elif room_cost is not None:
+                    want = min(
+                        want,
+                        num_stock
+                        + self._prompt_cost.max_tokens_for_cost(
+                            room_cost, request.num_computed_tokens + num_stock
+                        ),
+                    )
                 # The stock clamps decide the pulled chunk too; both it and the
                 # stock chunk are chunks the stock rules can produce.
                 pulled = self._dp_pull_chunk(
@@ -3637,6 +3700,11 @@ class Scheduler(SchedulerInterface):
                     room_o[o] -= dsa_dp.chunk_cost(
                         num_new_tokens, ctx
                     ) - dsa_dp.chunk_cost(num_stock, ctx)
+                if room_cost is not None and num_new_tokens > num_stock:
+                    room_cost -= self._prompt_cost.chunk_cost(
+                        num_new_tokens - num_stock,
+                        request.num_computed_tokens + num_stock,
+                    )
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -3781,6 +3849,43 @@ class Scheduler(SchedulerInterface):
                 )
                 self._dsa_prepaid.add(r.request_id)
         return left
+
+    def _prompt_chunk_cost(self, request: Request, ctx: int, num_tokens: int) -> float:
+        """Predicted cost (short-context tokens) of scheduling ``num_tokens`` of
+        ``request`` from position ``ctx``: prompt tokens by the prompt cost
+        model (see ``step_cost``), other tokens (decode, drafts) 1 each."""
+        if self._prompt_cost is None or num_tokens <= 0:
+            return float(max(num_tokens, 0))
+        prompt = max(min(num_tokens, request.num_prompt_tokens - ctx), 0)
+        return self._prompt_cost.chunk_cost(prompt, ctx) + (num_tokens - prompt)
+
+    def _cut_prompt_chunk_to_cost(
+        self, request: Request, ctx: int, num_tokens: int, cost_left: float
+    ) -> int:
+        """``num_tokens`` cut so that the chunk's predicted cost fits the step's
+        prompt cost budget ``cost_left`` (unchanged without a cost model and for
+        chunks with no prompt tokens). Prompt tokens are the chunk's first
+        tokens, so the cut keeps a prefix of them."""
+        if self._prompt_cost is None or num_tokens <= 0:
+            return num_tokens
+        if ctx >= request.num_prompt_tokens:
+            return num_tokens
+        if self._prompt_chunk_cost(request, ctx, num_tokens) <= cost_left:
+            return num_tokens
+        return min(num_tokens, self._prompt_cost.max_tokens_for_cost(cost_left, ctx))
+
+    def _step_cost(self, num_scheduled_tokens: dict[str, int]) -> float:
+        """Predicted cost of this step's scheduled work (short-context tokens)."""
+        total = 0.0
+        for request_id, n in num_scheduled_tokens.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                total += n
+            else:
+                total += self._prompt_chunk_cost(
+                    request, request.num_computed_tokens, n
+                )
+        return total
 
     def _dsa_owner_take(
         self,
