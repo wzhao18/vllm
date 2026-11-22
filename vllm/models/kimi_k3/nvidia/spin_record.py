@@ -33,6 +33,7 @@ Record 0 is reserved for the MegaMoE missing-rank report; record 1 takes the fir
 from __future__ import annotations
 
 import atexit
+import ctypes
 import sys
 import threading
 
@@ -90,9 +91,24 @@ class SpinRecords:
             self.buffer[r * RECORD_WORDS + 3] = rank
         self._logged = [False] * NUM_RECORDS
         self._poll_s = poll_s
+        # The watcher never touches torch (records are read through ctypes) and is stopped and joined at exit,
+        # after a last check: a daemon thread inside a torch call during interpreter teardown can abort the
+        # process ("terminate called without an active exception"; same fix as breadcrumb.py, 2026-11-22).
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, name="k31-spin-records", daemon=True)
         self._thread.start()
-        atexit.register(self.check)
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=10.0)
+        self.check()
+
+    def _words(self, r: int) -> list[int]:
+        """Record r as int32 words: a plain load of the pinned buffer, no torch op."""
+        base = self.buffer.data_ptr() + 4 * r * RECORD_WORDS
+        return list((ctypes.c_int32 * RECORD_WORDS).from_address(base))
 
     @property
     def address(self) -> int:
@@ -105,7 +121,7 @@ class SpinRecords:
         for r in range(NUM_RECORDS):
             if self._logged[r]:
                 continue
-            words = self.buffer[r * RECORD_WORDS : (r + 1) * RECORD_WORDS].tolist()
+            words = self._words(r)
             if words[0] != DONE:
                 continue
             self._logged[r] = True
@@ -116,10 +132,7 @@ class SpinRecords:
         return lines
 
     def _watch(self) -> None:
-        import time
-
-        while not all(self._logged):
-            time.sleep(self._poll_s)
+        while not all(self._logged) and not self._stop.wait(self._poll_s):
             self.check()
 
 
