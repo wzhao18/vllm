@@ -47,7 +47,7 @@ ENGINE_FIELDS = {
     # early: 1 early load sent, 2 no load, 3 channel down, 10+g blocked by a
     # recently freed block of group g; lookup_waits = schedules deferred on a
     # pending store lookup)
-    "RP": "idx k t_sched t_alloc t_recv early lookup_waits",
+    "RP": "idx k t_sched t_alloc t_recv early lookup_waits load_ahead",
 }
 WORKER_FIELDS = {
     "W": (
@@ -213,6 +213,7 @@ class EngineIterLog:
                             getattr(r, "padm_tr", None),
                             getattr(r, "padm_early", None),
                             getattr(r, "padm_lp", 0),
+                            getattr(r, "padm_la", 0),
                         )
                     )
             else:

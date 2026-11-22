@@ -1988,6 +1988,7 @@ class Scheduler(SchedulerInterface):
                     self._inflight_prefills.add(request)
                     if load_ahead:
                         self._load_ahead.add(request)
+                        request.padm_la = 1
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
                     skip_request(request_queue)
                     continue
