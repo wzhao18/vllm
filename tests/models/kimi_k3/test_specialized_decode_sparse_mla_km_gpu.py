@@ -98,3 +98,44 @@ def test_keys_on_m_matches_trtllm_gen(rows, kernel):
                                rtol=0)  # fmt: skip
     assert bool(torch.isneginf(lse_k[empty, :REAL]).all())
     assert bool((lat_k[empty, :REAL] == 0).all())
+
+
+@pytest.mark.parametrize("rows", [256, 384])
+def test_ts_last_token_staging_bitwise(rows):
+    """rows > grid: a CTA's last token (one short subtile) follows a 2048-key token whose
+    epilogue blocks 2-3 may still be in flight through the shared staging. Production
+    grid (SM count) must match the race-free grid = rows launch (one row per CTA) bit
+    for bit, latent and lse."""
+    import cuda.bindings.driver as cuda
+    from cutlass import Float32, Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import sparse_mla_ts as ts
+
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    query, kv, slots, valid = _case(rows, gen)
+    for r in range(rows):  # each CTA: earlier rows full width, the last row one subtile
+        n = 17 if r + sms >= rows else WIDTH
+        idx = torch.randperm(CTX, generator=gen, device="cuda")[:n]
+        slots[r] = -1
+        slots[r, :n] = (idx + (r // 4) * CTX).int()
+        valid[r] = n
+
+    def run(grid):
+        lat = torch.zeros((rows, HEADS, 512), dtype=torch.bfloat16, device="cuda")
+        lse = torch.zeros((rows, HEADS), dtype=torch.float32, device="cuda")
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        ts._compiled(grid)(
+            Int64(query.data_ptr()), Int32(rows), Int64(kv.data_ptr()), Int32(64),
+            Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(valid.data_ptr()),
+            Int64(lat.data_ptr()), Int64(lse.data_ptr()), Float32(BMM1 * ts.LOG2E),
+            Float32(BMM2), Int32(kv.shape[0]), Int64(0), Int64(0), Int64(0), Int32(1),
+            Int32(1), Int32(6), stream,
+        )  # fmt: skip
+        return lat, lse
+
+    ref = run(rows)
+    for _ in range(20):
+        got = run(sms)
+        torch.cuda.synchronize()
+        assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])

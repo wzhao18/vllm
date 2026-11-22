@@ -887,6 +887,13 @@ class ReqMeta:
     # Other resume states to remove, as (prefix length, delay in seconds), for
     # policies other than the default (``prune_policy``).
     prune_targets: tuple[tuple[int, float], ...] = ()
+    # lag1: resume states whose producer ran on another rank, as (prefix length,
+    # delay in seconds): the worker reads the producer's resume point from the
+    # state's origin object and removes that state after the delay.
+    prune_origin_lookups: tuple[tuple[int, float], ...] = ()
+    # lag1: the prefix length this request resumed from, stored as the origin
+    # object of every boundary state it stores (0 = none).
+    state_origin_tokens: int = 0
 
     @staticmethod
     def from_request_tracker(
