@@ -73,3 +73,75 @@ def test_stuck_stream_is_reported_with_its_position():
     text = r.stdout + r.stderr
     assert "K31_BREADCRUMB gpu_stuck" in text, text[-2000:]
     assert "gpu_at=size#-/layer3/layer host_at=size#-/layer4/megamoe_in" in text, text[-2000:]
+
+
+@cuda
+def test_stamps_land_in_an_eager_break_of_a_breakable_capture():
+    """DCRIT r46 (a): the no-op keys on the stream actually capturing, so an eager break inside a
+    PIECEWISE (breakable) capture forward still stamps; the 90758 stall sat in such a break."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.kimi_k3.nvidia import breadcrumb as B
+
+    x = torch.zeros(4, device="cuda")
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        x.add_(1)
+        torch.cuda.synchronize()
+        with BreakableCUDAGraphCapture() as cap:
+            x.add_(1)  # captured segment
+            B.crumb(B.OP_LAYER, 5)  # captured: no stamp
+            cap.add_eager(lambda: B.crumb(B.OP_MOE_IN, 42))  # eager break: stamps
+            x.add_(1)  # captured segment
+    torch.cuda.synchronize()
+    assert int(B._get().word[0]) & 0xFFFFFFFF == (42 << 8) | B.OP_MOE_IN
+
+
+def _run(code: str) -> str:
+    r = subprocess.run([sys.executable, "-c", textwrap.dedent(code)], capture_output=True, text=True, timeout=300)
+    return r.stdout + r.stderr
+
+
+@cuda
+def test_host_stuck_inside_a_forward_is_reported_with_its_stack():
+    text = _run(
+        """
+        import time, torch
+        from vllm.models.kimi_k3.nvidia import breadcrumb as B
+        B.STALL_S = 2.0
+        def blocked_in_host():
+            time.sleep(15)  # the host stops issuing inside the forward; the GPU has caught up
+        B.crumb(B.OP_FWD_BEGIN, 0)
+        B.crumb(B.OP_LAYER, 9)
+        torch.cuda.synchronize()
+        blocked_in_host()
+        """
+    )
+    assert "K31_BREADCRUMB host_stuck" in text and "at=size#-/layer9/layer" in text, text[-2000:]
+    assert "blocked_in_host" in text, text[-2000:]  # the main thread's stack names where the host waits
+
+
+@cuda
+def test_stall_inside_a_capture_eager_break_is_reported():
+    text = _run(
+        """
+        import time, torch
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.models.kimi_k3.nvidia import breadcrumb as B
+        B.STALL_S = 2.0
+        B.capture_size(4)
+        x = torch.zeros(4, device="cuda")
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            x.add_(1); torch.cuda.synchronize()
+            with BreakableCUDAGraphCapture() as cap:
+                x.add_(1)
+                def eager_break():
+                    B.crumb(B.OP_LAYER, 61)
+                    torch.cuda._sleep(20_000_000_000)  # the break's GPU work never finishes in time
+                    B.crumb(B.OP_MOE_IN, 61)
+                cap.add_eager(eager_break)
+                time.sleep(12)
+        """
+    )
+    assert "K31_BREADCRUMB gpu_stuck" in text, text[-2000:]
+    assert "gpu_at=size#4/layer61/layer host_at=size#4/layer61/megamoe_in" in text, text[-2000:]
