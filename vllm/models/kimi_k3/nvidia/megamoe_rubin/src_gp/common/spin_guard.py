@@ -17,7 +17,7 @@ from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
 
 # 15 min: far above any legitimate wait (peers compiling or loading before their first
 # launch take minutes at most), far below a forever-hang.
-SPIN_GUARD_NS = 900 * 1000 * 1000 * 1000
+SPIN_GUARD_NS = 30 * 1000 * 1000 * 1000  # TEST ONLY (injected-hang check), never merge
 
 
 @dsl_user_op
