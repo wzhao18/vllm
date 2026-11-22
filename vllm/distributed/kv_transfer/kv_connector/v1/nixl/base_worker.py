@@ -5230,7 +5230,10 @@ class NixlBaseConnectorWorker:
         # side stream, the swaps and unpacks run beside the forward
         # (DcpPairExchanger._run: no peer ever waits for an SM kernel queued
         # behind a spinning one).
-        exchanger.exchange(units, side=side)
+        if side is None:
+            exchanger.exchange(units)
+        else:
+            exchanger.exchange(units, side=side)
         with contextlib.nullcontext() if side is None else torch.cuda.stream(side):
             if times is not None:
                 times.end(len(metadata.reqs_to_pair_exchange), len(units))

@@ -1723,6 +1723,8 @@ class DcpStagedExchanger:
         the sizes first appear (the same on every rank). ``side`` as in
         ``DcpPairExchanger.exchange``: a later stage's packs wait for the
         earlier stage's unpacks on ``side``."""
+        # Without a side stream, stages are called as before (``exchange(units)``).
+        kwargs = {} if side is None else {"side": side}
         by_remote: dict[int, list[PairUnit]] = {}
         for u in units:
             remote = u.remote_dcp_size or self.dcp_size // 2
@@ -1731,11 +1733,12 @@ class DcpStagedExchanger:
             strides = exchange_strides(self.dcp_size, remote)
             if len(strides) == 1:
                 # Ratio 2: the one-stage exchange of the units as planned.
-                self.stages[strides[0]].exchange(group_units, side)
+                self.stages[strides[0]].exchange(group_units, **kwargs)
                 continue
             for stride in strides:
                 self.stages[stride].exchange(
-                    stage_units(group_units, self.dcp_rank, stride, remote), side
+                    stage_units(group_units, self.dcp_rank, stride, remote),
+                    **kwargs,
                 )
 
     def record_event(self) -> torch.cuda.Event:
