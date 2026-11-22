@@ -270,3 +270,17 @@ def test_unbound_head_does_not_block_loads_of_bound_requests_behind_it():
     assert scheduler._load_ahead == {b1, b2}
     # The unbound request is still first among the uncommitted ones.
     assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [unbound.request_id]
+
+
+def test_unbound_request_is_still_admitted_for_compute():
+    """Liveness of the bind gate: binding only decides EARLY loads (the
+    load-only scan). An unbound request is admitted through the normal path
+    as soon as compute budget is free, like without a DP plan."""
+    scheduler = _scheduler()
+    unbound = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.connector.dp_move_tokens.side_effect = lambda r: r.num_prompt_tokens
+    scheduler.dp_bound_here = set()  # the plan never binds it here
+    scheduler.schedule()
+    # Budget was free: its load is issued at normal admission (not load-ahead).
+    assert unbound.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._load_ahead == set()
