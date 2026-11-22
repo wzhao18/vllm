@@ -28,6 +28,17 @@ from typing import Any
 # Cost of one prompt token per context token, relative to a short-context token.
 CTX_WEIGHT = 1.5e-6
 
+# Per-rank (pre-MoE) cost of one prompt token per context token: the work the DP
+# lockstep's imbalance lives in. Served K3.1 DEP16 per-rank CUPTI fit (int61+,
+# 652 rank-steps, non-MoE kernels only): 18.2 ms per 1K tokens + 49.2 ms per
+# 1e9 token x context, i.e. 2.7e-6 per context token (PSTEP v2.scost). It caps
+# how far a lighter rank is filled toward the busiest rank's work (the DP
+# prefill pull-up), where over-pricing long context is the safe direction: at
+# step level 2.7e-6 over-prices steps above 512K context by 36 ms (PBIND's
+# residual table), so a filled rank stays below the busiest. Whole-step
+# accounting uses CTX_WEIGHT.
+RANK_CTX_WEIGHT = 2.7e-6
+
 
 def weight(ctx: int) -> float:
     """Cost of one prompt token computed at context ``ctx`` (>= 1.0)."""

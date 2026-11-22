@@ -104,8 +104,9 @@ class EPLBConfig:
     - "pynccl": Use PyNccl send/recv
     - "symm_mem": Push expert rows over CUDA symmetric memory; needs all EP
       ranks in one NVLink domain
-    - None: Auto-select backend ("torch_xccl" on XPU, prefers "nixl" 
-      on CUDA, falls back to "torch_gloo")
+    - None: Auto-select backend: "torch_xccl" on XPU; on CUDA "symm_mem" when
+      all EP ranks share one NVLink domain (MNNVL included), else "nixl",
+      else "torch_gloo" (sync EPLB only; raises for async)
     """
 
     layer_group_transfers: bool = True
@@ -1178,24 +1179,27 @@ class ParallelConfig:
             )
 
         if self.enable_eplb and self.eplb_config.communicator is None:
-            # Prefer NIXL when available: zero-copy RDMA reads, compatible
-            # with both async EPLB and elastic EP.
-            # Fallbacks: pynccl for elastic EP (stateless groups need it),
-            # torch_gloo for static EP.  torch_nccl is avoided because NCCL
-            # is incompatible with async EPLB (multi-stream conflicts) and
-            # batched isend/irecv hangs under high load.
+            # torch_nccl is never auto-selected: NCCL is incompatible with
+            # async EPLB (multi-stream conflicts) and batched isend/irecv
+            # hangs under high load.
             # See https://github.com/pytorch/pytorch/issues/174288
             from vllm.distributed.nixl_utils import is_nixl_available
 
             if current_platform.is_xpu():
                 # On XPU, use the device-native XCCL P2P backend.
                 self.eplb_config.communicator = "torch_xccl"
-            elif is_nixl_available():
-                self.eplb_config.communicator = "nixl"
             elif self.enable_elastic_ep:
-                self.eplb_config.communicator = "pynccl"
-            else:
-                self.eplb_config.communicator = "torch_gloo"
+                # Stateless (elastic EP) groups: NIXL, else pynccl.
+                self.eplb_config.communicator = (
+                    "nixl" if is_nixl_available() else "pynccl"
+                )
+            elif not current_platform.is_cuda():
+                self.eplb_config.communicator = (
+                    "nixl" if is_nixl_available() else "torch_gloo"
+                )
+            # Static EP on CUDA stays None here: EplbState resolves it once the
+            # EP group exists (symm_mem in one NVLink domain, see
+            # select_eplb_communicator).
 
     @property
     def use_ray(self) -> bool:

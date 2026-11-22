@@ -86,10 +86,14 @@ FORMAT = 4
 VERIFY = False
 
 _MAX_NODES = 200_000  # fingerprint object-graph size limit (uncached above)
-# Per-run environment (paths, hosts, ports, timeouts): never read by a trace.
+# Per-run environment (paths, hosts, ports, timeouts, the launcher's container name,
+# node list and time budget: K31_CNAME / K31_NODES / K31_MIN_LEFT_S): never read by a
+# trace. K31_CNAME carries the launch timestamp, so keying on it missed every entry on
+# each restart (CUTECACHE keydiff of two decode starts on one hold, 2026-11-22).
 _RUN_ENV_SUFFIXES = (
     "_DIR", "_PATH", "_ROOT", "_HOST", "_PORT", "_ADDR", "_FILE", "_TIMEOUT",
-    "_TIMEOUT_S", "_TIMEOUT_SECONDS", "_URL", "_IP", "_ID", "_NAME",
+    "_TIMEOUT_S", "_TIMEOUT_SECONDS", "_URL", "_IP", "_ID", "_NAME", "_CNAME",
+    "_NODES", "_NODELIST", "_LEFT_S",
 )  # fmt: skip
 _ENV_PREFIXES = ("CUTE_DSL_", "CUTLASS_", "VLLM_", "K3", "K31", "KIMI")
 _PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -603,10 +607,77 @@ def _compile_target(compile_fn: Any, fn: Any, kwargs: dict) -> str:
     return f"arch {arch}\noptions {' '.join(flags)}"
 
 
+_RUNTIME = "__k3_cute_runtime_argument__"
+
+
+def _runtime_marker(annotation: Any, value: Any) -> tuple[str, str, str]:
+    """Key stand-in for a DSL numeric value (``cutlass.Int32(n)``, ``Int64``,
+    ``Float32``, ...) passed to a ``@cute.jit`` parameter annotated with a DSL numeric
+    type: the DSL makes it a runtime argument of the compiled function, so the trace
+    never reads the value (measured: equal DSL module hashes across values). A plain
+    Python number passed there is NOT: the DSL folds it into the trace as a constant
+    (a different module per value), so it stays in the key by value. Only the
+    annotation and the value's type are trace inputs."""
+    return (_RUNTIME, _qual(annotation), _qual(type(value)))
+
+
+def _numeric_annotation(annotation: Any) -> bool:
+    try:
+        from cutlass.cutlass_dsl import Numeric
+    except ImportError:
+        return False
+    return isinstance(annotation, type) and issubclass(annotation, Numeric)
+
+
+def _runtime_values(fn: Any, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """``args`` / ``kwargs`` with the values bound to DSL-numeric parameters of the
+    compiled ``@cute.jit`` function replaced by ``_runtime_marker`` (anything the binding
+    cannot place keeps its value: a conservative key, never a wrong hit)."""
+    import inspect
+    import typing
+
+    target = _jit_function(fn)
+    try:
+        sig = inspect.signature(target)
+        hints = typing.get_type_hints(target)
+    except Exception:
+        return args, kwargs
+    params = list(sig.parameters.values())
+    if params and params[0].name == "self" and not isinstance(fn, types.FunctionType):
+        params = params[1:]  # a bound method or a callable kernel object
+    try:
+        bound = inspect.Signature(params).bind_partial(*args, **kwargs)
+    except TypeError:
+        return args, kwargs
+    runtime = {
+        name: _runtime_marker(hints[name], value)
+        for name, value in bound.arguments.items()
+        if _numeric_annotation(hints.get(name))
+        and isinstance(value, _dsl_numeric_types())
+    }
+    if not runtime:
+        return args, kwargs
+    names = [p.name for p in params]
+    new_args = tuple(
+        runtime.get(names[i], a) if i < len(names) else a for i, a in enumerate(args)
+    )
+    new_kwargs = {k: runtime.get(k, v) for k, v in kwargs.items()}
+    return new_args, new_kwargs
+
+
+def _dsl_numeric_types() -> tuple[type, ...]:
+    try:
+        from cutlass.cutlass_dsl import Numeric
+    except ImportError:
+        return ()
+    return (Numeric,)
+
+
 def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp = _Fingerprint()
     fp.add(getattr(compile_fn, "_compile_options", None))
     fp.add(fn)
+    args, kwargs = _runtime_values(fn, args, kwargs)
     fp.add(args)
     fp.add(kwargs)
     target = _compile_target(compile_fn, fn, kwargs)

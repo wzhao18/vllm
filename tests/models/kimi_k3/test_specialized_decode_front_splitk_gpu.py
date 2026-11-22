@@ -3,7 +3,9 @@
 """The SP MoE front's router | latent down GEMM on the split-K kernel
 (``sp_mlp.SplitKFront``) and its per-rows dispatch (``sp_mlp.FrontGemms``): FP32
 outputs within FP32-accumulation noise of an FP64 reference, for every split-K row
-of ``sp_mlp.ROUTER_LATENT``, and deterministic across calls."""
+of ``sp_mlp.ROUTER_LATENT``, and deterministic across calls; the router top-k picked
+from them is the FP64 reference's wherever the reference's selection margin exceeds
+that noise (only summation order differs from stock's cuBLAS router)."""
 
 import pytest
 import torch
@@ -20,11 +22,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 N, K = 4480, 7168  # [router 896 | latent down 3584] x hidden
+E, TOPK = 896, 16
 
 
 def split_rows():
     table = batch_table(sp_mlp.ROUTER_LATENT["*"])
-    rows = [r for r in (32, 64, 96) if isinstance(table.get(r), tuple)]
+    rows = [r for r in (1, 8, 16, 24, 32, 64, 96) if isinstance(table.get(r), tuple)]
     return {r: sp_mlp.rows_policy(sp_mlp.ROUTER_LATENT, Shape(r, 1)) for r in rows}
 
 
@@ -46,3 +49,14 @@ def test_split_k_front_matches_fp64(rows):
     again = torch.empty_like(y)
     front.run(packed, x, again)
     assert torch.equal(y, again)  # fixed split-K summation order
+    # Router top-k (sigmoid + bias selection score) vs the FP64 reference: equal sets
+    # on every row whose 16th / 17th reference score gap is above the noise bound.
+    bias = torch.randn(E, device=dev, dtype=torch.float64) * 0.1
+    score = torch.sigmoid(y[:, :E].double()) + bias
+    ref_score = torch.sigmoid(ref[:, :E]) + bias
+    top = ref_score.topk(TOPK + 1, dim=1).values
+    clear = (top[:, TOPK - 1] - top[:, TOPK]) > 4 * err * ref.abs().max().item()
+    got_ids = score.topk(TOPK, dim=1).indices.sort(dim=1).values
+    ref_ids = ref_score.topk(TOPK, dim=1).indices.sort(dim=1).values
+    assert clear.any()
+    assert torch.equal(got_ids[clear], ref_ids[clear])

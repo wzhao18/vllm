@@ -801,8 +801,11 @@ class PreparedWideMlp:
             a_t = self._t(a)
             ws_t = from_dlpack(ws, assumed_align=16)
             flags_t = from_dlpack(flags, assumed_align=16)
-            args = (self.g0, self.g1, self.d0, self.d1, x.data_ptr(), x.data_ptr(),
-                    a.data_ptr(), a_t, self._t(y), ws_t, flags_t, self.table_c)  # fmt: skip
+            # Addresses as DSL Int64 values: runtime arguments of the compiled kernel
+            # (``run`` passes them every call), not constants folded into its code.
+            args = (*(Int64(v) for v in (self.g0, self.g1, self.d0, self.d1,
+                                         x.data_ptr(), x.data_ptr(), a.data_ptr())),
+                    a_t, self._t(y), ws_t, flags_t, self.table_c)  # fmt: skip
             key = (rows, self.h, self.i, self.pairs, self.opts)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)

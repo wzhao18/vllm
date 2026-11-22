@@ -735,6 +735,71 @@ class PyNcclEplbCommunicator(EplbCommunicator):
             self._group_started = False
 
 
+def eplb_group_in_nvlink_domain(
+    group_coordinator: GroupCoordinator, device: torch.device
+) -> bool:
+    """Whether all ranks of the EPLB group share one NVLink domain: fully
+    NVLink-connected GPUs on one node, or one MNNVL domain across nodes.
+    Collective over the group's CPU process group."""
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        _group_can_attempt_mnnvl,
+    )
+
+    if not current_platform.is_cuda():
+        return False
+    cpu_group = group_coordinator.cpu_group
+    if all(in_the_same_node_as(cpu_group, source_rank=0)):
+        physical_ids = [0] * cpu_group.size()
+        torch.distributed.all_gather_object(
+            physical_ids,
+            current_platform.visible_device_id_to_physical_device_id(device.index),
+            group=cpu_group,
+        )
+        return current_platform.is_fully_connected(physical_ids)
+    return _group_can_attempt_mnnvl(cpu_group, device)
+
+
+def select_eplb_communicator(
+    *,
+    in_nvlink_domain: bool,
+    nixl_available: bool,
+    use_async: bool,
+    nixl_eplb_broken: bool = False,
+) -> str:
+    """Automatic EPLB communicator for a static (non-elastic) CUDA EP group.
+
+    - One NVLink domain (incl. MNNVL): ``symm_mem``; senders push expert rows
+      straight into the receivers' buffers over NVLink.
+    - Otherwise ``nixl`` (RDMA reads) when NIXL is available and its EPLB
+      transfers work on this platform. On Rubin (VR, sm_107) the first real
+      NIXL/UCX expert-weight read segfaults in UCX, so there it raises.
+    - Otherwise ``torch_gloo`` for synchronous EPLB only: async gloo transfers
+      never land under serving load.
+    Raises when no working communicator exists instead of picking one that
+    cannot work.
+    """
+    if in_nvlink_domain:
+        return "symm_mem"
+    if nixl_eplb_broken:
+        raise ValueError(
+            "No working EPLB communicator: the EP group spans more than one "
+            "NVLink domain (symm_mem needs one) and NIXL EPLB transfers crash "
+            "on this platform (UCX segfault on the first expert-weight read, "
+            "Rubin/VR). Keep all EP ranks in one NVLink domain (MNNVL), or set "
+            "eplb_config.communicator explicitly."
+        )
+    if nixl_available:
+        return "nixl"
+    if not use_async:
+        return "torch_gloo"
+    raise ValueError(
+        "No working EPLB communicator for async EPLB: the EP group spans "
+        "more than one NVLink domain (symm_mem needs one) and NIXL is not "
+        "available. Install NIXL, set eplb_config.use_async=false, or set "
+        "eplb_config.communicator explicitly."
+    )
+
+
 class SymmMemEplbCommunicator(EplbCommunicator):
     """Push expert rows into peers' receive buffers over symmetric memory.
 
@@ -751,26 +816,11 @@ class SymmMemEplbCommunicator(EplbCommunicator):
     ) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            _group_can_attempt_mnnvl,
-        )
-
         ep_group = group_coordinator.device_group
-        cpu_group = group_coordinator.cpu_group
         device = layer[0].device
         if not current_platform.is_cuda():
             raise ValueError("symm_mem EPLB requires CUDA")
-        if all(in_the_same_node_as(cpu_group, source_rank=0)):
-            physical_ids = [0] * cpu_group.size()
-            torch.distributed.all_gather_object(
-                physical_ids,
-                current_platform.visible_device_id_to_physical_device_id(device.index),
-                group=cpu_group,
-            )
-            in_nvlink_domain = current_platform.is_fully_connected(physical_ids)
-        else:
-            in_nvlink_domain = _group_can_attempt_mnnvl(cpu_group, device)
-        if not in_nvlink_domain:
+        if not eplb_group_in_nvlink_domain(group_coordinator, device):
             raise ValueError(
                 "symm_mem EPLB requires all EP ranks in one NVLink domain "
                 "(MNNVL across nodes); use nixl or torch_gloo instead."

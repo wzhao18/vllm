@@ -43,7 +43,7 @@ def _buffers(nvfp4, dev):
 
 
 @pytest.mark.parametrize("nvfp4", [True, False])
-@pytest.mark.parametrize("n", [32, 96, 128])
+@pytest.mark.parametrize("n", [1, 8, 24, 32, 96, 128])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("ties", [False, True])
 def test_route_stage_bitwise(nvfp4, n, padded, ties):

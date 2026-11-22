@@ -80,7 +80,7 @@ from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
-from .sp_dense import MAX_ROWS, SpDenseMlp
+from .sp_dense import SpDenseMlp
 from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
@@ -161,6 +161,17 @@ def sp_boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
         gather_mx=gather_mx, out_mx=out_mx, delta_parts=delta_parts,
     )  # fmt: skip
 
+
+
+def dense_mlps(layers, shards, device) -> dict:
+    """The SP decode's dense (non-MoE) layers as SpDenseMlp for every captured shard
+    row count ``shards``; above sp_dense.MAX_ROWS SpDenseMlp raises Unsupported at
+    build (no stock dense module on a captured shape)."""
+    return {
+        d.layer_idx: SpDenseMlp(d.mlp, shards, device, d.layer_idx)
+        for d in layers
+        if not d.is_moe_layer
+    }
 
 class SpAttentionBlock:
     """One DSA / KDA layer's all-gather -> in-projection -> core -> o_proj with its
@@ -471,12 +482,10 @@ class SpStep:
             for d in layers
             if d.is_moe_layer
         }
-        # The layer-0 dense MLP (replicated weights) as one die-local weight stream.
-        self.dense_mlps = {
-            d.layer_idx: SpDenseMlp(d.mlp, shards, self.device, d.layer_idx)
-            for d in layers
-            if not d.is_moe_layer and shards[-1] <= MAX_ROWS
-        }
+        # The layer-0 dense MLP (replicated weights) as one die-local weight stream,
+        # for every captured shard size: SpDenseMlp raises Unsupported at build above
+        # sp_dense.MAX_ROWS (never the stock dense module on a captured shape).
+        self.dense_mlps = dense_mlps(layers, shards, self.device)
         # MoE layers whose latent up leaves FP32 split partials that the next layer's
         # all-gather boundary sums (``SpMlp.parts``): not the last layer (the final
         # AttnRes) nor one whose output is also a BF16 aux hidden state.

@@ -66,7 +66,13 @@ SHARED = ("shared_gu", "shared_down")
 # -68.5 (another node), r24 unchanged. n96 (64.96.2.5; 1 GPU 11.58 us vs ~9.9 for the
 # router || latent down pair, but in-step the concat also moves r24 onto route_stage):
 # r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
-ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Shard rows 1-24 (SP DCP4 decode at <= 24 requests per DP rank) take the n32
+# tactic too (one 64-row M tile; TMA zero-fills the rows past n). Without it they
+# kept the stock router || latent down pair, the stock top-k and the unstaged
+# MegaMoE launch: DC (DCP4 x DP4 EP16) B24 per DP rank 17.53 ms vs B28 14.78 ms
+# per step (CUPTI, per rank: MegaMoE GenPhase 9.33 vs 6.18 ms, nvjet router/latent
+# GEMMs +1.2 ms, single_group_topk +0.37 ms).
+ROUTER_LATENT = {"*": "1-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
 # Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
 # slice, split-K front vs prewait (fastab xy1/xy2/x96, Rhea): n32 split-K faster

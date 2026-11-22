@@ -1431,6 +1431,14 @@ class SparseMlaDecodeTS:
             if owner:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+                elif qi > 0:
+                    # Last token: no QLFREE(qi + 1) orders this epilogue after the previous
+                    # token's TMA stores out of the same staging (the other WG may own it, and
+                    # bulk_wait_read is per issuing thread): wait for its B_EPIDONE, completion
+                    # qi - 1, parity (qi - 1) & 1 (qi - 2 is behind the Q warp's wait; qi is
+                    # ours). Without it the first blocks could overwrite the previous token's
+                    # blocks 2-3 before they were stored (rows > grid only).
+                    mbar_wait(_bar(base, B_EPIDONE), Uint32((qi - 1) & 1))
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
 
     @cute.jit

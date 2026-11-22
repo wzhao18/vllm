@@ -142,6 +142,16 @@ def fits_fused_ws(specs, tokens, device):
     return size <= min(fused_ws.SMEM_LIMIT, smem_limit(device))
 
 
+def _log_build(shape, build, per_cta):
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "Kimi K3 SP KDA: KdaFlow %d-item build at %s (%d items per CTA; the %d-item "
+        "build serves the smaller captured shapes)", build, shape, per_cta,
+        flow.MAX_ITEMS, scope="local",
+    )  # fmt: skip
+
+
 def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
     """The kernel object of ``kind`` for a step's operand layouts ``specs`` (no GPU
     work); raises ``Unsupported`` where the kind cannot run them."""
@@ -176,15 +186,23 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
             cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
             raise Unsupported("kda", shape, cause)
         budget = flow.smem_budget(device)
-        stages = flow.max_stages(tokens, *streamed, conv_size, budget)
+        # The smallest item-capacity build that serves this shape (flow.ITEM_BUILDS:
+        # 16 up to 141 requests at 24 heads on 212 SMs, unchanged; 20 above).
+        ctas, per_cta, build = flow.item_build(items, requests, sms)
+        if build is None:
+            raise Unsupported(
+                "kda", shape,
+                f"KdaFlow: {per_cta} items per CTA exceed the largest build "
+                f"({flow.ITEM_BUILDS[-1]}) or span three heads",
+            )  # fmt: skip
+        stages = flow.max_stages(tokens, *streamed, conv_size, budget, items=build)
         if not stages:
-            cause = "KdaFlow needs a dim-first window and its shared memory"
+            cause = f"KdaFlow ({build}-item build) needs a dim-first window and its shared memory"
             raise Unsupported("kda", shape, cause)
-        ctas = min(items, sms)
-        if -(-items // ctas) > flow.max_items_per_cta(requests):
-            raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
+        if build != flow.MAX_ITEMS:
+            _log_build(shape, build, per_cta)
         return flow.KdaFlow(
-            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx
+            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build
         )
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)

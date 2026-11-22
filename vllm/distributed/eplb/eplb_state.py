@@ -52,7 +52,12 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 
 from .async_worker import start_async_worker
-from .eplb_communicator import EplbCommunicator, create_eplb_communicator
+from .eplb_communicator import (
+    EplbCommunicator,
+    create_eplb_communicator,
+    eplb_group_in_nvlink_domain,
+    select_eplb_communicator,
+)
 from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
@@ -491,10 +496,7 @@ class EplbState:
             logical_replica_count,
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
-        backend = self.parallel_config.eplb_config.communicator
-        assert backend is not None, (
-            "EPLB communicator backend must be set by ParallelConfig"
-        )
+        backend = self._resolve_communicator(model)
         expert_buffer = (
             None
             if backend == "symm_mem"
@@ -1181,6 +1183,27 @@ class EplbState:
         model_state.expert_load_window = torch.nn.functional.pad(
             model_state.expert_load_window, (0, pad_size)
         )
+
+    def _resolve_communicator(self, model: MixtureOfExperts) -> str:
+        """The EPLB communicator backend; resolves an unset one on CUDA once
+        the EP group exists and records it in the config."""
+        eplb_config = self.parallel_config.eplb_config
+        if eplb_config.communicator is None:
+            from vllm.distributed.nixl_utils import is_nixl_available
+
+            eplb_config.communicator = select_eplb_communicator(
+                in_nvlink_domain=eplb_group_in_nvlink_domain(
+                    get_eplb_group(), model.expert_weights[0][0].device
+                ),
+                nixl_available=is_nixl_available(),
+                use_async=eplb_config.use_async,
+                # Rubin (VR): NIXL/UCX EPLB reads segfault (BUG-EPLB-NIXL-UCX).
+                nixl_eplb_broken=current_platform.is_device_capability(107),
+            )
+            logger.info_once(
+                "EPLB communicator (auto): %s", eplb_config.communicator
+            )
+        return eplb_config.communicator
 
     def create_communicator(
         self, model_config: ModelConfig, group_coordinator: GroupCoordinator

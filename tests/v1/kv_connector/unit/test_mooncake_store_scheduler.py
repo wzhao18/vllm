@@ -1999,7 +1999,8 @@ def _store_state_at_48(scheduler):
         # The state resumed from (32) was produced by a request that resumed
         # from 16: prune 16 now, keep 32 for the lag TTL.
         (16, 330.0, ((16, 6.0), (32, 330.0))),
-        # Unknown producer: only the delayed removal of the resume point.
+        # Producer not on this rank: the delayed removal of the resume point
+        # here, the producer's resume point through its origin object.
         (None, 330.0, ((32, 330.0),)),
         # TTL 0: the resume point stays until its successor's prune.
         (16, 0.0, ((16, 6.0),)),
@@ -2017,8 +2018,14 @@ def test_lag1_prunes_the_resume_point_of_the_state_resumed_from(
 
     assert req_meta.prune_resume_tokens == 0
     assert req_meta.prune_targets == expected
-    # The new state remembers that its producer resumed from 32.
+    # A producer on another rank: the worker reads the origin object instead.
+    assert req_meta.prune_origin_lookups == (
+        () if producer_resume is not None else ((32, 6.0),)
+    )
+    # The new state remembers that its producer resumed from 32, locally and
+    # as an origin object for the other ranks.
     assert scheduler._state_origin[bytes(hashes[48 // 4 - 1])] == 32
+    assert req_meta.state_origin_tokens == 32
 
 
 def test_resume_policy_keeps_the_legacy_prune():

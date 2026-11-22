@@ -297,16 +297,19 @@ def drafter_unsupported(vllm_config, sp) -> str | None:
     return None
 
 
-# The SP topology's verify rows: max_num_seqs x q (the shared scratch, the DSA box
-# and the o_proj mailboxes are sized for 512 rows, 128 per SP shard).
-SP_MAX_ROWS = 512
+# The SP topology's verify rows: max_num_seqs x q. The shared scratch, the DSA box,
+# the SP mailboxes and the per-family kernels are sized at build from the captured
+# rows (rows[-1]); a family that cannot serve a captured shape raises Unsupported at
+# build. The bound here is the layer-0 DenseFlow's (dense_flow.MAX_ROWS shard rows
+# per GPU x TP 4 = 1024 verify rows); above it the SP topology is refused at load.
+SP_MAX_ROWS = 1024
 
 
 def sp_unsupported(vllm_config) -> str | None:
     """Why the SP topology (``sp_topology``) is not C512's decode role, the one the
     SP specialized decode covers: Rubin, K3.1 DSA layers on a per-tensor FP8 KV cache
     under FlashInfer sparse's trtllm-gen kernel, a BF16 conv / FP32 recurrent KDA
-    state, DSpark q4, at most 512 verify rows and DCP = TP. (The stock unfused
+    state, DSpark q4, at most SP_MAX_ROWS verify rows and DCP = TP. (The stock unfused
     reduce-scatter o_proj it also needs is a model policy, checked per layer at
     build: ``sp_attention.sp_layer``.)"""
     import torch
