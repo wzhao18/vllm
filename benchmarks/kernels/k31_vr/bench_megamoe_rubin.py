@@ -215,6 +215,14 @@ def parse_args():
     )
     p.add_argument("--ref-samples", type=int, default=64, help="0 disables references")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--hostop-ab", default=None, choices=("none", "crumb", "poll", "stamp", "idx"),
+        help="PCRIT v99 audit: per-call A/B of one served host-memory op around eager moe.forward under MegaMoE load "
+             "(64-call blocks, op on in even blocks): none = A/A control; crumb = 3 breadcrumb cuStreamWriteValue32 "
+             "(layer, moe_in, moe_out); poll = the 16 B route-error D2H + event; stamp = the issued-count H2D on its "
+             "side stream; idx = 4 x 4 KiB pinned D2H + event (indexer prefetch_host)",
+    )
+    p.add_argument("--hostop-calls", type=int, default=16384)
     p.add_argument("--json", default=None, help="append result lines to this file")
     p.add_argument(
         "--weights",
@@ -520,6 +528,77 @@ def env_identity(pkg_dir):
 # ---------------------------------------------------------------------------------
 
 
+def _hostop_ab(args, session, moe, hidden, ids, wts, weights, bucket, out, fused, rms, n, rank, world, group):
+    """PCRIT v99 audit: cost of one served host-memory op class per eager MegaMoE call, measured under MegaMoE load.
+    Events bracket [ops + forward]; d = on-call minus the mean of the same position in the off-blocks on both sides;
+    max over ranks per call. Prints HOSTOP <arm> <variant>/<n> d_median [95 % CI] per_op."""
+    import random
+    import statistics as st
+
+    from vllm.models.kimi_k3.nvidia import breadcrumb
+
+    arm = args.hostop_ab
+    crumbs = breadcrumb._get()
+    orig_poll = moe.poll_route_errors
+    orig_stamp = session._stamp_issued
+    dev_src = torch.zeros(4 * 1024, dtype=torch.int32, device=hidden.device)
+    host_dst = [torch.empty(4 * 1024, dtype=torch.int32, pin_memory=True) for _ in range(4)]
+    ops_per_call = {"none": 0, "crumb": 3, "poll": 1, "stamp": 1, "idx": 4}[arm]
+
+    def set_on(on: bool) -> None:
+        crumbs.ok = on and arm == "crumb"
+        moe.poll_route_errors = orig_poll if (on and arm == "poll") else (lambda: None)
+        session._stamp_issued = orig_stamp if (on and arm == "stamp") else (lambda: None)
+
+    def pre(on: bool) -> None:
+        if on and arm == "crumb":
+            breadcrumb.crumb(breadcrumb.OP_LAYER, 1)
+        if on and arm == "idx":
+            for h in host_dst:
+                h.copy_(dev_src, non_blocking=True)
+            torch.cuda.Event().record()
+
+    fwd = lambda: moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms)  # noqa: E731
+    set_on(False)
+    for _ in range(8):
+        fwd()
+    torch.cuda.synchronize()
+    N = args.hostop_calls
+    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(N)]
+    for k in range(N):
+        on = (k // 64) % 2 == 0
+        if k % 64 == 0:
+            set_on(on)
+        ev[k][0].record()
+        pre(on)
+        fwd()
+        ev[k][1].record()
+    torch.cuda.synchronize()
+    set_on(True)
+    crumbs.ok = True
+    moe.poll_route_errors, session._stamp_issued = orig_poll, orig_stamp
+    mine = [ev[k][0].elapsed_time(ev[k][1]) * 1000.0 for k in range(N)]
+    allr = [mine]
+    if world > 1 and group is not None:
+        allr = [None] * world
+        dist.all_gather_object(allr, mine, group=group)
+    t = [max(r[k] for r in allr) for k in range(N)]
+    if rank != 0:
+        return
+    d = []
+    for k in range(N):
+        b, j = k // 64, k % 64
+        if b % 2 == 0 and (b + 1) * 64 + j < N and b >= 2:
+            d.append(t[k] - 0.5 * (t[k - 64] + t[k + 64]))
+    rng = random.Random(7)
+    bs = sorted(st.median(rng.choices(d, k=len(d))) for _ in range(4000))
+    med, lo, hi = st.median(d), bs[99], bs[3899]
+    off = st.mean(t[k] for k in range(N) if (k // 64) % 2 == 1)
+    per = f"{med / ops_per_call:+.3f}us [{lo / ops_per_call:+.3f}, {hi / ops_per_call:+.3f}]" if ops_per_call else "-"
+    print(f"HOSTOP arm={arm} {args.variant}/{n} calls={len(d)} d_median={med:+.3f}us CI95=[{lo:+.3f}, {hi:+.3f}] "
+          f"ops_per_call={ops_per_call} per_op={per} mean_off_call={off:.1f}us", flush=True)
+
+
 def main():
     args = parse_args()
     rank, world, device = init_distributed()
@@ -802,6 +881,10 @@ def main():
             # noise floor: the stock chain and the kernel vs an unquantized activation
             result["shared_rel_l2_stock_vs_exact_act"] = rel(want, exact)
             result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
+
+        if args.hostop_ab is not None:
+            _hostop_ab(args, session, moe, hidden, ids, wts, weights, bucket, out, fused, rms, n, rank, world, group)
+            continue
 
         def launch():
             session.launch(weights, target, rmsnorm=rms, shared=fused)
