@@ -3001,6 +3001,12 @@ class DPEngineCoreProc(EngineCoreProc):
                     ):
                         self._dp_foreign[req_id] = mv.src
                     self._dp_count_move(2, mv.num_tokens)
+                    moved_in = self.scheduler.requests.get(req_id)
+                    if moved_in is not None:
+                        # Pinned here with its planned size: never moved again,
+                        # and counted in this rank's demand while its lookup
+                        # restarts here.
+                        moved_in.dp_pinned_size = mv.num_tokens
         for src, row in enumerate(aborts):
             for dst, n in enumerate(row):
                 if not n:
@@ -3060,7 +3066,7 @@ class DPEngineCoreProc(EngineCoreProc):
             return b""
         return bytes(frames[0])
 
-    def _dp_import_moved(self, payload: bytes) -> None:
+    def _dp_import_moved(self, payload: bytes) -> str:
         """Take in a request another rank of this engine handed over, exactly
         like a client ADD (arrival hooks, then add, then arrival handled)."""
         ecr = MsgpackDecoder(EngineCoreRequest).decode([payload])
