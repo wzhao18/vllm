@@ -45,6 +45,64 @@ def _key(fn, *args, compile_fn=None, **kwargs):
     return cute_cache.key_of(compile_fn, fn, args, kwargs)
 
 
+class _DecodeKernel:
+    """Stand-in for a specialized decode kernel object: the codegen-relevant launch
+    configuration lives in its attributes (as on the real kernel classes)."""
+
+    def __init__(self, world=16, ep=16, dcp=8, tp=4, rows=128, knobs=None):
+        self.world, self.ep, self.dcp, self.tp, self.rows = world, ep, dcp, tp, rows
+        self.knobs = knobs if knobs is not None else {
+            "mma_tiler_mnk": (256, 128, 256), "cluster_shape_mn": (2, 1),
+            "epi_flag_batches": (1, 4), "schedule_policy": ("decode", None),
+        }
+
+
+def test_key_separates_every_codegen_relevant_setting(monkeypatch, tmp_path):
+    """Safety: a key that is too coarse would load a kernel compiled for another
+    shape (wrong output, no error). Starts that differ in any codegen-relevant
+    setting get different keys; starts that differ only in the launcher's
+    per-start identity get the same key."""
+    for name in ("K31_CNAME", "K31_NODES", "K31_MIN_LEFT_S"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_107a")
+    x = torch.empty(128, 3584, dtype=torch.bfloat16)
+    knob_file = tmp_path / "knobs.json"
+    knob_file.write_text(json.dumps({"epi_flag_batches": [1, 4]}))
+
+    def key(kernel=None, arg=x, **kw):
+        return _key(kernel or _DecodeKernel(**kw), arg, 3, options="--opt-level 3")
+
+    base = key()
+    variants = {
+        "world size": key(world=32),
+        "EP size": key(ep=32),
+        "DCP layout": key(dcp=16),
+        "TP layout": key(tp=8),
+        "row bucket": key(rows=176),
+        "knob record": key(knobs={**_DecodeKernel().knobs, "epi_flag_batches": (2, 4)}),
+        "knob file": key(knobs=json.loads(knob_file.read_text())),
+        "argument rows": key(arg=torch.empty(176, 3584, dtype=torch.bfloat16)),
+        "argument dtype": key(arg=torch.empty(128, 3584, dtype=torch.float16)),
+        "argument width": key(arg=torch.empty(128, 7168, dtype=torch.bfloat16)),
+    }
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    variants["arch"] = key()
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_107a")
+    assert key() == base
+    for what, k in variants.items():
+        assert k != base, f"{what} does not change the key"
+    assert len(set(variants.values())) == len(variants), "two settings share a key"
+    # the launcher's per-start identity is not a trace input
+    monkeypatch.setenv("K31_CNAME", "k31e2e-105921-1121222010")
+    monkeypatch.setenv("K31_NODES", "rhea0073,rhea0074")
+    monkeypatch.setenv("K31_MIN_LEFT_S", "2700")
+    first = key()
+    monkeypatch.setenv("K31_CNAME", "k31e2e-107336-1122001106")
+    monkeypatch.setenv("K31_NODES", "rhea0109,rhea0113")
+    monkeypatch.setenv("K31_MIN_LEFT_S", "1200")
+    assert key() == first == base
+
+
 def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     from vllm.models.kimi_k3.nvidia import cute_cache
 
@@ -66,6 +124,15 @@ def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     c = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
     monkeypatch.setenv("VLLM_ITERLOG_DIR", "/tmp/b")
     assert c == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+    # the launcher's per-start identity (container name with its timestamp, node list,
+    # time budget) is not a trace input either
+    for name, a1, a2 in (("K31_CNAME", "k31e2e-105921-1121222010", "k31e2e-105921-1121232827"),
+                         ("K31_NODES", "rhea0073,rhea0074", "rhea0055,rhea0056"),
+                         ("K31_MIN_LEFT_S", "2700", "900")):
+        monkeypatch.setenv(name, a1)
+        d = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+        monkeypatch.setenv(name, a2)
+        assert d == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3"), name
     # sources are not in the key (each entry records its own files)
     assert not hasattr(cute_cache, "_source_digest")
 
@@ -633,6 +700,134 @@ def test_warm_start_loads_every_kernel_bitwise(tmp_path):
     assert (s["compiled"], s["loaded"]) == (1, 2), s
     for name, ref in cold_out["reference"].items():
         assert _bitwise(broken_out["cached"][name], ref), f"rebuilt {name}"
+
+
+def _scale_runtime_kernel_class():
+    """A kernel object whose ``factor`` is a runtime ``Float32`` argument and whose
+    ``rows`` is a ``Constexpr`` (traced)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    class ScaleRt:
+        @cute.jit
+        def __call__(self, x: cute.Tensor, y: cute.Tensor, factor: cutlass.Float32,
+                     base: cutlass.Int64, rows: cutlass.Constexpr = 128):  # fmt: skip
+            self.kernel(x, y, factor).launch(
+                grid=[x.shape[0] // rows, 1, 1], block=[rows, 1, 1]
+            )
+
+        @cute.kernel
+        def kernel(self, x: cute.Tensor, y: cute.Tensor, factor: cutlass.Float32):
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, _, _ = cute.arch.block_idx()
+            i = bidx * 128 + tidx
+            y[i] = x[i] * factor
+
+    return ScaleRt
+
+
+def test_runtime_numeric_argument_values_are_not_in_the_key():
+    """DSL numeric values (cutlass.Float32(v), Int64(a)) bound to DSL-numeric
+    parameters are runtime arguments: not in the key. Plain Python numbers there are
+    folded into the trace as constants, so their values stay in the key, as do every
+    Constexpr value and the kernel object's state."""
+    import cutlass
+    from cutlass.cute.runtime import make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    f32, i64 = cutlass.Float32, cutlass.Int64
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    a = _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    assert a == _key(k, fx, fx, f32(3.5), i64((1 << 40) + 4096))  # launch values
+    assert a != _key(k, fx, fx, 2.0, i64(1 << 40))  # a Python float: a constant
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 3.0, 7)
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 2.0, 8)
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40), 256)  # a Constexpr value
+    k.tag = "x"  # kernel object state
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    # keyword binding follows the same rule
+    assert _key(k, fx, fx, factor=f32(1.0), base=i64(3)) == _key(
+        k, fx, fx, factor=f32(9.0), base=i64(5)
+    )
+
+    def f(n: cutlass.Int32, m: cutlass.Int32, c: cutlass.Constexpr):
+        pass
+
+    assert cute_cache._runtime_values(f, (cutlass.Int32(5), 6, 7), {})[0] == (
+        cute_cache._runtime_marker(cutlass.Int32, cutlass.Int32(5)), 6, 7
+    )
+
+
+@_needs_blackwell
+def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
+    """Two compiles that differ only in the values of DSL numeric runtime arguments:
+    one compile, one hit; VERIFY re-traces the hit to the stored DSL module hash
+    (exact), and the hit runs with the launch values it is given."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    f32, i64 = cutlass.Float32, cutlass.Int64
+    monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    before = dict(vars(cute_cache.stats))
+    cute_cache._compile(inner, k, (fx, fx, f32(2.0), i64(1 << 40)), {})
+    hit = cute_cache._compile(inner, k, (fx, fx, f32(3.0), i64((1 << 40) + 64)), {})
+    s = vars(cute_cache.stats)
+    assert s["compiled"] - before["compiled"] == 1
+    assert s["loaded"] - before["loaded"] == 1
+    assert s["verified"] - before["verified"] == 1
+    assert s["mismatched"] == before["mismatched"]
+    x = torch.arange(4096, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+    hit(from_dlpack(x, assumed_align=16), from_dlpack(y, assumed_align=16), 5.0, 0)
+    torch.cuda.synchronize()
+    assert torch.equal(y, x * 5.0)
+
+
+@_needs_blackwell
+def test_verify_flags_a_too_coarse_key(tmp_path, monkeypatch):
+    """Negative control for the restart check: with a deliberately too-coarse key
+    (the 13ed4cd676 bug: Python numbers keyed as runtime arguments although the DSL
+    folds them into the trace as constants), a compile with another constant hits
+    the first entry, and VERIFY's re-trace flags the module-hash mismatch instead
+    of returning the wrong kernel."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    torch.cuda.set_device(0)
+
+    def too_coarse(fn, args, kwargs):  # every numeric-annotated value as a marker
+        marked = tuple(
+            cute_cache._runtime_marker(cutlass.Float32, cutlass.Float32(0.0))
+            if isinstance(a, float) else a for a in args
+        )
+        return marked, kwargs
+
+    monkeypatch.setattr(cute_cache, "_runtime_values", too_coarse)
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    before = dict(vars(cute_cache.stats))
+    cute_cache._compile(inner, k, (fx, fx, 2.0, cutlass.Int64(0)), {})
+    assert vars(cute_cache.stats)["compiled"] - before["compiled"] == 1
+    with pytest.raises(cute_cache.VerifyMismatch):
+        cute_cache._compile(inner, k, (fx, fx, 3.0, cutlass.Int64(0)), {})
+    assert vars(cute_cache.stats)["mismatched"] - before["mismatched"] == 1
 
 
 def _scale_kwargs_kernel_class():

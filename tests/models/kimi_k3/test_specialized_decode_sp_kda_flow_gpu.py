@@ -44,9 +44,9 @@ def core_of(kind, attention, rows, records, caches, mx_out=False):
 
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("n", [3, 33, 96, 128])
+@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
-    monkeypatch.setattr(flow, "max_stages", lambda *args: stages)
+    monkeypatch.setattr(flow, "max_stages", lambda *args, **kwargs: stages)
     sp.executable.cache_clear()
     rows, slots = Q * n, 2 * n + 2
     stock, ours = kda.layer(), kda.layer()  # the same weights, their own records
@@ -194,3 +194,14 @@ def test_flow_mxfp8_output_is_the_quantized_bf16_output(n, graph):
         pending.zero_()
         pending[record_rows.long()] = accepted_counts(n, step)
     sp.executable.cache_clear()
+
+
+def test_flow_item_build_per_shape():
+    """KdaFlow's item-capacity build per shape at 24 heads on Rubin's 212 SMs: the
+    16-item build up to 141 requests (unchanged), the 20-item build from 142 to
+    176, none above (the SP KDA core raises Unsupported)."""
+    for n in (1, 21, 96, 128, 141):
+        assert flow.item_build(24 * n, n, 212)[2] == 16, n
+    for n in (142, 144, 160, 176):
+        assert flow.item_build(24 * n, n, 212)[2] == 20, n
+    assert flow.item_build(24 * 177, 177, 212)[2] is None

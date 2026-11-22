@@ -513,11 +513,7 @@ def test_abort_after_emission_keeps_the_emitted_units(promoted: bool):
 
 @pytest.mark.parametrize("defer", [False, True], ids=["inline", "deferred"])
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
-# Seeds whose draws cover >= 1 failed pull and >= 1 abort in every variant (sync / async,
-# inline / deferred) under the current load-issue timing (the scan keeps issuing loads
-# past a compute stop, which moves the per-pull failure draws): 1 and 3 no longer drew a
-# failed pull there. Re-pick from a sweep when the pin below fails after a timing change.
-@pytest.mark.parametrize("seed", [0, 2, 4, 5])
+@pytest.mark.parametrize("seed", range(4))
 def test_random_lifecycles(seed: int, async_scheduling: bool, defer: bool):
     """A4 invariants over random arrivals, pull times, failures, aborts and
     paused (0-token) steps, with one running slot to defer promotions. A plan

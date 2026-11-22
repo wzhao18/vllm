@@ -190,10 +190,16 @@ def die_blocks(nb, s1):
     return nb // 2 if s1 else nb
 
 
+# Shard rows of one DenseFlow (M128 x N = rows 1-CTA MMA, N <= 256; TMEM holds at least
+# two accumulators of up to 256 columns): up to 256 since 2026-11-21 (C1152 / C1280:
+# 144-176 requests per DP group = 144-176 shard rows per GPU at q 4).
+MAX_ROWS = 256
+
+
 def supports(rows, hidden, inter):
     t_mma = -(-rows // 16) * 16
     return (
-        1 <= rows <= 128
+        1 <= rows <= MAX_ROWS
         and inter % 64 == 0
         and hidden % 128 == 0
         and inter // 64 <= MAX_HB

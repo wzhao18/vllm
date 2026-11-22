@@ -1051,8 +1051,13 @@ class PreparedWideSK:
             if self.share is None:
                 flags = torch.zeros(2 * npairs + 2 + 4 * npairs * STAMPS + 8 * gemm.tpd,
                                     dtype=torch.int32, device=dev)  # fmt: skip
-            args = (self.w0, self.w1, x.data_ptr(), x.data_ptr(),
-                    self._y(y[:, : self.out_n]), from_dlpack(ws, assumed_align=16),
+            # The weight / activation addresses are launch values (``run`` passes
+            # them every call): DSL Int64 values make them runtime arguments of the
+            # compiled kernel, so its code (and CuTe cache key) does not depend on
+            # where this process's buffers happen to live.
+            args = (Int64(self.w0), Int64(self.w1), Int64(x.data_ptr()),
+                    Int64(x.data_ptr()), self._y(y[:, : self.out_n]),
+                    from_dlpack(ws, assumed_align=16),
                     from_dlpack(flags, assumed_align=16), self.table_c)  # fmt: skip
             key = (rows, self.n, self.k, self.pairs, self.ldo, self.opts)
             if key not in _COMPILED:
