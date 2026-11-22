@@ -988,16 +988,24 @@ class MooncakeStoreScheduler:
             tracker.has_pending_offload = True
             prune_resume_tokens = self._take_prune_resume_tokens(req_id, accepted)
             prune_targets: tuple[tuple[int, float], ...] = ()
+            prune_origin_lookups: tuple[tuple[int, float], ...] = ()
             if prune_resume_tokens and self.prune_policy == "lag1":
-                prune_targets = self._lag1_prune_targets(
+                prune_targets, prune_origin_lookups = self._lag1_prune_targets(
                     prune_resume_tokens, req_tuple[0].block_hashes
                 )
                 prune_resume_tokens = 0
             self._record_state_origins(req_id, req_tuple[0].block_hashes, accepted)
+            state_origin_tokens = (
+                self._req_origin_tokens.get(req_id, 0)
+                if self.prune_policy == "lag1"
+                else 0
+            )
             if (req_meta := save_metas.get(req_id)) is not None:
                 req_meta.boundary_puts = accepted
                 req_meta.prune_resume_tokens = prune_resume_tokens
                 req_meta.prune_targets = prune_targets
+                req_meta.prune_origin_lookups = prune_origin_lookups
+                req_meta.state_origin_tokens = state_origin_tokens
                 continue
             meta.add_request(
                 ReqMeta(
@@ -1012,6 +1020,8 @@ class MooncakeStoreScheduler:
                     completed_token_len=tracker.token_len,
                     prune_resume_tokens=prune_resume_tokens,
                     prune_targets=prune_targets,
+                    prune_origin_lookups=prune_origin_lookups,
+                    state_origin_tokens=state_origin_tokens,
                 )
             )
 
@@ -1033,20 +1043,29 @@ class MooncakeStoreScheduler:
 
     def _lag1_prune_targets(
         self, resume_tokens: int, block_hashes: Sequence[bytes]
-    ) -> tuple[tuple[int, float], ...]:
+    ) -> tuple[tuple[tuple[int, float], ...], tuple[tuple[int, float], ...]]:
         """lag1: prune the state this resume point's producer resumed from now,
-        and the resume point itself only after ``prune_lag_ttl_s``."""
+        and the resume point itself only after ``prune_lag_ttl_s``.
+
+        Returns ``(targets, origin_lookups)``. The producer's resume point comes
+        from this scheduler's map when this rank produced the state; otherwise
+        the worker reads it from the state's origin object (``origin_lookups``),
+        so the prune does not depend on where the follow-up request lands.
+        """
         targets: list[tuple[int, float]] = []
+        lookups: tuple[tuple[int, float], ...] = ()
         idx = resume_tokens // self._hash_block_size - 1
         if 0 <= idx < len(block_hashes):
             origin = self._state_origin.get(bytes(block_hashes[idx]))
-            if origin and origin < resume_tokens:
+            if origin is None:
+                lookups = ((resume_tokens, self._prune_delay_s),)
+            elif origin and origin < resume_tokens:
                 targets.append((origin, self._prune_delay_s))
         if self._prune_lag_ttl_s > 0:
             targets.append(
                 (resume_tokens, max(self._prune_lag_ttl_s, self._prune_delay_s))
             )
-        return tuple(targets)
+        return tuple(targets), lookups
 
     def _take_prune_resume_tokens(
         self, req_id: str, accepted: list[BoundaryPut]
