@@ -645,6 +645,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             }
         }
 
@@ -671,6 +673,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             },
             "MockConnector": {"mock_field": [1, 2, 3]},
         }
@@ -703,6 +707,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             },
         }
 
@@ -725,6 +731,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             }
         )
         mock_stats = MockConnectorStats(data={"mock_field": [1, 2, 3]})
@@ -757,6 +765,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             }
         )
 
@@ -791,6 +801,8 @@ class TestMultiConnectorStats:
                 "num_failed_handshakes": [],
                 "num_kv_expired_reqs": [],
                 "num_notifications_after_expiry": [],
+                "num_kv_lease_lost": [],
+                "request_xfer_wall": [],
             },
             "ExampleConnector": {"some_field": [1, 2, 3]},
         }
@@ -848,6 +860,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
@@ -866,6 +880,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
@@ -900,6 +916,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
@@ -929,6 +947,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
@@ -958,6 +978,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
@@ -990,6 +1012,8 @@ class TestMultiConnectorStats:
                         "num_failed_handshakes": [],
                         "num_kv_expired_reqs": [],
                         "num_notifications_after_expiry": [],
+                        "num_kv_lease_lost": [],
+                        "request_xfer_wall": [],
                     }
                 )
             }
