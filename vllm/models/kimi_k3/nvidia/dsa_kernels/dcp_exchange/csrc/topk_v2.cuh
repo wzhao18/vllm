@@ -786,6 +786,37 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     __syncthreads();
     int nc = s_cnt;
+    if constexpr (kFast) {
+      // PIDX DIAGNOSTIC (never merge): why the hot path's sampled theta fails, per slot.
+      // stats[128 + ...]: 0 over (nc > kV2Cand), 1 under (nc < q); 2-9 / 10-17 log2 of
+      // nc / q (over) / q / nc (under); 18-25 / 26-33 eighths of the stored candidates in
+      // theta's coarse bin [th, th + 16) (over / under); 34-49 log2 q (failing rows);
+      // 50-57 log2 q - 6 (all rows; q < 128 in bucket 0)
+      if (p.stats) {
+        if (tid == 0) atomicAdd(&p.stats[128 + 50 + min(7, max(0, 31 - __clz(max(q, 1u)) - 6))], 1);
+        const bool over = nc > kV2Cand, under = (uint32_t)nc < q;
+        if (over || under) {
+          if (tid == 0) s_u[13] = 0;
+          __syncthreads();
+          const int cn2 = min(nc, kV2Cand);
+          uint32_t lowc = 0;
+          for (int c = tid; c < cn2; c += kV2T) lowc += (int)ckey[c] < th + 16;
+          for (int o = 16; o > 0; o >>= 1) lowc += __shfl_xor_sync(0xffffffffu, lowc, o);
+          if ((tid & 31) == 0 && lowc) atomicAdd(&s_u[13], lowc);
+          __syncthreads();
+          if (tid == 0) {
+            int* st = p.stats + 128;
+            atomicAdd(&st[over ? 0 : 1], 1);
+            const uint32_t r = over ? (uint32_t)nc / max(q, 1u) : q / (uint32_t)max(nc, 1);
+            atomicAdd(&st[(over ? 2 : 10) + min(7, 31 - __clz(max(r, 1u)))], 1);
+            const int e8 = cn2 > 0 ? min(7, (int)(s_u[13] * 8u / (uint32_t)cn2)) : 0;
+            atomicAdd(&st[(over ? 18 : 26) + e8], 1);
+            atomicAdd(&st[34 + min(15, 31 - __clz(max(q, 1u)))], 1);
+          }
+          __syncthreads();
+        }
+      }
+    }
     if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
       // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
       // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
