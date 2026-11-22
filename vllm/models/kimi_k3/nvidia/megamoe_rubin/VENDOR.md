@@ -172,6 +172,20 @@ scan; the backend's own modules stay covered.
   any computed value); sites: src software_sync 0, token_comm 40-42; src_gp software_sync 10,
   token_comm_dedup 20-22, token_comm 30-32, genphase_tail 50-51.
 
+- **S8** (vLLM-local, BUG-E2E-3, ``src_gp`` dedup comm path only): ``token_comm_dedup.py`` gets the GenPhase
+  previous-call protocol (``DedupCallTail`` = ``GenphaseTail`` with its own region names
+  ``nvlink.token_comm_dedup.call_epoch`` / ``call_done_signal``). The router (a PDL primary whose dependents start at
+  its entry, and which itself can start while a peer is still in the previous call's tail) used to add this call's
+  sizes / sizes_ready / metadata_ready into every peer's ``tail_reset`` counters with no previous-call guard, so a
+  peer's ``reset_tail_space`` could erase the add and that peer's router waited forever (EP group hang). Now
+  ``reset_tail`` ends with ``signal_done`` (CTA 0, thread 0, after the publish barrier = after every rank's reset)
+  and the router's thread 0 runs ``previous_done_observation`` + ``wait_previous_done`` before any remote write.
+  Ordering only: every computed value is unchanged (bitwise A/B).
+  The same guard covers the non-dedup comm paths: ``src`` ``token_comm.py`` (inference kernel) and ``src_gp``
+  ``token_comm.py`` (``TokenCommNonDeterministic``), via ``CallTail`` (``src/sources/helpers/call_tail.py``,
+  ``src_gp/common/call_tail.py``; regions ``nvlink.token_comm.call_epoch`` / ``call_done_signal``; guarded spin
+  site 60): ``signal_done`` after the tail barrier, ``wait_previous_done`` at the router kernel's entry.
+
 ## sha256 manifest of `src/sources`
 
 ```
@@ -180,9 +194,10 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 1a7715c127c74c61187ddfd0d63c171e9acc229e644f180641c74f5107dda589  sources/communication/nvlink_domain/symmetric_buffer.py
-004e65775592473ceb4bfa09516ebbb243c3d579c44880a305cfebfc5b42c9a1  sources/communication/nvlink_domain/token_comm.py
+2e00ed29426d04841ad44c0b290a911152c01c3672fe0582ba33fff4961ff3ef  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
+6113bea4ddf732fed754cece6b6c4d6ee4bbd4627e4a263f164dee25dd7bee91  sources/helpers/call_tail.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
 868871ef468436bcfbfb638c4b8778805f05d6772ee2dea0ba9a5c9b4901d6cc  sources/helpers/cute_py_helpers.py
 8e60cb15729e91245dcafb8a9a9c17466884e6b68983307a2b9c213b71ef047a  sources/helpers/device_workspace.py
