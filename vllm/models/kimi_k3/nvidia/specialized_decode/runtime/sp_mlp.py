@@ -171,6 +171,34 @@ def shared_mxfp8(mlp):
     return flags.pop() if len(flags) == 1 else None
 
 
+# --- EPLB DIAGNOSTIC (never merge): a bench routing fixture that reaches route_stage --------------------
+# The bench's --routing fixture hooks mlp.gate / mlp.experts, which route_stage bypasses (fused router|latent GEMM,
+# direct MegaMoE launch), so in the sdec graph only its e_score_correction_bias zeroing ever took effect. With
+# EPLB_ROUTE_FIX=1 every route_stage layer gets fixed int32 buffers fix/seen [max shard rows, top_k] and, after
+# route_stage stages the real routes, two captured ops: (1) torch.where overwrites the live rows' ids with fix when
+# the device flag is set (rows route_stage masked to -1 stay -1), (2) seen <- the ids MegaMoE will read. Both ops run
+# in every arm (flag 0 = real routing), so arms differ only in routing content. The bench
+# (vllm/benchmarks/forward/routing.py, EPLB modes) fills fix + flag per case and reads seen for the skew stats.
+EPLB_FIX = {"flag": None, "layers": {}, "uncovered": set(), "E": None}
+
+
+def _eplb_fix_register(sp, index, rows, covered):
+    import os
+
+    if os.environ.get("EPLB_ROUTE_FIX") != "1":
+        return None
+    dev = sp.mlp.gate.weight.device
+    if EPLB_FIX["flag"] is None:
+        EPLB_FIX["flag"] = torch.zeros((), dtype=torch.bool, device=dev)
+    k = sp.mlp.experts.top_k
+    EPLB_FIX["E"] = sp.mlp.gate.weight.shape[0]
+    cap = max(rows)
+    bufs = (torch.zeros(cap, k, dtype=torch.int32, device=dev), torch.full((cap, k), -1, dtype=torch.int32, device=dev))
+    EPLB_FIX["layers"][index] = bufs
+    EPLB_FIX["uncovered"] |= set(r for r in rows if r not in covered)
+    return bufs
+
+
 class SpMlp:
     """One MegaMoE layer's MLP on this rank's shard (module docstring):
     ``run(h [n, 7168])`` returns a new [n, 7168] BF16 tensor (stock
@@ -216,6 +244,11 @@ class SpMlp:
                 r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
             ):
                 self.prewait_router_latent = prewait_gemm.pack_weight(packed)
+        self._eplb_fix = (
+            _eplb_fix_register(self, index, self.rows, set(self.router_latent[1].plans))
+            if self.route_stage is not None
+            else None
+        )
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -370,6 +403,11 @@ class SpMlp:
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
             staged = route.stage(y)
+            if self._eplb_fix is not None:  # EPLB DIAGNOSTIC (bench routing fixture)
+                fix, seen = self._eplb_fix
+                idx = staged[1].topk_idx[: staged[2]]
+                torch.where(EPLB_FIX["flag"] & (idx >= 0), fix[: staged[2]], idx, out=idx)
+                seen[: staged[2]].copy_(idx)
 
             def experts(shared=None):
                 return route.launch(staged, fused_norm, shared)

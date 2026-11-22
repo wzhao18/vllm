@@ -215,7 +215,12 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         include_drafter=include_drafter,
     )
     routing, fixture = install_routing(
-        runner, args.routing, args.load_format == "dummy", batch.num_tokens, args.seed
+        runner,
+        args.routing,
+        args.load_format == "dummy",
+        batch.num_tokens,
+        args.seed,
+        case_name=case.name,  # EPLB DIAGNOSTIC: per-case sdec routing mode
     )
     try:
         result = bench.run()
