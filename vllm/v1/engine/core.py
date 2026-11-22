@@ -158,6 +158,19 @@ DP_MOVED_MEMORY = 65536
 # 16384 = one full 16K step at short context (~0.77 s on the DEP16 prefill, PSOL),
 # about twice the output hop.
 DP_CROSS_NODE_MIN_GAIN = 16384
+# Moving a request off the rank whose GPU prefix cache holds part of its prompt
+# costs a reload from the external store: about one lockstep step (the load
+# runs while the request waits) plus the transfer, priced at 1/24 short-context
+# token per reloaded token (~40 KB/token of KV at ~1 MB/ms). A move must gain
+# more than that (planner units).
+DP_RELOAD_STEP_PENALTY = 16384
+DP_RELOAD_TOKENS_PER_UNIT = 24
+
+
+def dp_reload_penalty(local_hit_tokens: int) -> int:
+    if local_hit_tokens <= 0:
+        return 0
+    return DP_RELOAD_STEP_PENALTY + local_hit_tokens // DP_RELOAD_TOKENS_PER_UNIT
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -2865,8 +2878,12 @@ class DPEngineCoreProc(EngineCoreProc):
         if slots:
             movable = self.scheduler.dp_movable_requests(slots)
             counts[pd_base + rank] = self.scheduler.dp_move_demand()
-            for i, (_, n_tok) in enumerate(movable):
-                counts[mv_base + rank * slots + i] = n_tok
+            hits = self.scheduler.dp_listed_local_hit
+            for i, (rid, n_tok) in enumerate(movable):
+                # Size in the low 32 bits, the reload penalty above them.
+                counts[mv_base + rank * slots + i] = n_tok | (
+                    dp_reload_penalty(hits.get(rid, 0)) << 32
+                )
             for dst, ids in self._dp_abort_forward.items():
                 counts[ab_base + rank * size + dst] = len(ids)
             for home, outs in self._dp_out_forward.items():
@@ -2926,10 +2943,12 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.v1.core.sched.dp_rebalance import plan_dp_moves
 
         demand = [int(x) for x in counts[pd_base : pd_base + size]]
-        per_rank = [
+        packed = [
             [int(x) for x in counts[mv_base + r * slots : mv_base + (r + 1) * slots] if x > 0]
             for r in range(size)
         ]
+        per_rank = [[x & 0xFFFFFFFF for x in row] for row in packed]
+        penalties = [[x >> 32 for x in row] for row in packed]
         local = self._dp_move_local_size
         self._dp_plan_demand = demand
         self._dp_moves = plan_dp_moves(
@@ -2938,6 +2957,7 @@ class DPEngineCoreProc(EngineCoreProc):
             self.scheduler.max_num_scheduled_tokens,
             node_of=[r // local for r in range(size)],
             cross_min_gain=DP_CROSS_NODE_MIN_GAIN,
+            penalties=penalties,
         )
         self._dp_movable_ids = [rid for rid, _ in movable]
         self._dp_abort_counts = [
@@ -3148,6 +3168,10 @@ class DPEngineCoreProc(EngineCoreProc):
             demand[mv.src] if mv.src < len(demand) else -1,
             demand[mv.dst] if mv.dst < len(demand) else -1,
             outgoing,
+            # The source's GPU prefix hit (a reload at the destination).
+            self.scheduler.dp_listed_local_hit.get(req.request_id, -1)
+            if outgoing
+            else -1,
         )
 
     def _dp_remember_moved(self, request_id: str, dst: int) -> None:
