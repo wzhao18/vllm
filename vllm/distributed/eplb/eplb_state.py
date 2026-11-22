@@ -1197,6 +1197,8 @@ class EplbState:
                 ),
                 nixl_available=is_nixl_available(),
                 use_async=eplb_config.use_async,
+                # Rubin (VR): NIXL/UCX EPLB reads segfault (BUG-EPLB-NIXL-UCX).
+                nixl_eplb_broken=current_platform.is_device_capability(107),
             )
             logger.info_once(
                 "EPLB communicator (auto): %s", eplb_config.communicator

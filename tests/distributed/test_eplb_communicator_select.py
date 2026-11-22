@@ -50,6 +50,30 @@ def test_no_working_communicator_raises():
         )
 
 
+@pytest.mark.parametrize("nixl_available", [True, False])
+@pytest.mark.parametrize("use_async", [True, False])
+def test_vr_multi_domain_raises_instead_of_nixl(nixl_available, use_async):
+    with pytest.raises(ValueError, match="NIXL EPLB transfers crash"):
+        select_eplb_communicator(
+            in_nvlink_domain=False,
+            nixl_available=nixl_available,
+            use_async=use_async,
+            nixl_eplb_broken=True,
+        )
+
+
+def test_vr_single_domain_uses_symm_mem():
+    assert (
+        select_eplb_communicator(
+            in_nvlink_domain=True,
+            nixl_available=True,
+            use_async=True,
+            nixl_eplb_broken=True,
+        )
+        == "symm_mem"
+    )
+
+
 def _config(monkeypatch, *, cuda, xpu=False, elastic=False, nixl=True, comm=None):
     import vllm.config.parallel as parallel_mod
     import vllm.distributed.nixl_utils as nixl_utils
