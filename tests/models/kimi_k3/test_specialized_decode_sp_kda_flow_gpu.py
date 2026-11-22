@@ -44,7 +44,7 @@ def core_of(kind, attention, rows, records, caches, mx_out=False):
 
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176])
+@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176, 177, 192, 208, 212])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
     monkeypatch.setattr(flow, "max_stages", lambda *args, **kwargs: stages)
     sp.executable.cache_clear()
@@ -199,9 +199,34 @@ def test_flow_mxfp8_output_is_the_quantized_bf16_output(n, graph):
 def test_flow_item_build_per_shape():
     """KdaFlow's item-capacity build per shape at 24 heads on Rubin's 212 SMs: the
     16-item build up to 141 requests (unchanged), the 20-item build from 142 to
-    176, none above (the SP KDA core raises Unsupported)."""
+    176 (unchanged), the 24-item build from 177 to 212, none above (the SP KDA core
+    raises Unsupported)."""
     for n in (1, 21, 96, 128, 141):
         assert flow.item_build(24 * n, n, 212)[2] == 16, n
     for n in (142, 144, 160, 176):
         assert flow.item_build(24 * n, n, 212)[2] == 20, n
-    assert flow.item_build(24 * 177, 177, 212)[2] is None
+    for n in (177, 192, 208, 212):
+        assert flow.item_build(24 * n, n, 212)[2] == 24, n
+    assert flow.item_build(24 * 213, 213, 212)[2] is None
+
+
+def test_flow_raises_above_largest_build():
+    """Above the largest item build (213 requests at 24 heads on 212 SMs) the SP KDA
+    core forced to KdaFlow raises ``Unsupported`` at build: a clean error, never a
+    silent fallback to another core."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
+
+    n = 213
+    sp.executable.cache_clear()
+    layer = kda.layer()
+    layer.deferred_recoverssm = True
+    saved = dict(sp.RECORD_KINDS)
+    sp.RECORD_KINDS[HEADS] = "1-:flow"
+    try:
+        with pytest.raises(Unsupported, match="exceed the largest build"):
+            core = sp.SpKdaCore(layer, (Q * n,), records="deferred", ctx=kda.context())
+            core.prepare_caches(list(kda.caches(2 * n + 2)))
+    finally:
+        sp.RECORD_KINDS.clear()
+        sp.RECORD_KINDS.update(saved)
+        sp.executable.cache_clear()

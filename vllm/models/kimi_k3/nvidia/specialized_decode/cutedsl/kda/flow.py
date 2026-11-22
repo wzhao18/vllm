@@ -112,9 +112,10 @@ SLOTS = 3  # the CTA's state page ring
 MAX_ITEMS = 16  # items per CTA (tables, raw gates) of the default build
 # Item-capacity builds (a KdaFlow specialization parameter): 16 serves up to 141
 # requests per DP group at 24 heads on Rubin's 212 SMs (24 n / 212 <= 16); 20 serves
-# only the captured sizes above that, up to 176 (C1152 / C1280). The 16 build is
-# unchanged; ``sp.make_core`` picks the smallest build that fits per captured shape.
-ITEM_BUILDS = (16, 20)
+# only the captured sizes above that, up to 176 (C1152 / C1280); 24 serves 177 to 212
+# (decode 192 / 208 per rank). The 16 and 20 builds are unchanged; ``sp.make_core``
+# picks the smallest build that fits per captured shape.
+ITEM_BUILDS = (16, 20, 24)
 # Rubin's oversized shared memory mode (327 KiB per CTA; budget 320 KiB). Elsewhere
 # the opt-in limit.
 OVERSIZED_BUDGET = 320 * 1024
