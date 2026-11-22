@@ -54,6 +54,11 @@ def test_prefix_caching_from_cli():
     vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
     assert vllm_config.cache_config.prefix_cache_retention_interval == 64
 
+    for value, expected in (("auto", "auto"), ("0", 0), ("None", None)):
+        args = parser.parse_args(["--prefix-cache-retention-interval", value])
+        vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+        assert vllm_config.cache_config.prefix_cache_retention_interval == expected
+
 
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
 def test_prefix_caching_xxhash_from_cli():
