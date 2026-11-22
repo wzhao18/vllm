@@ -103,7 +103,10 @@ def test_every_load_spin_is_guarded(rel):
         if not re.match(r"\s*while\b", line):
             continue
         indent = len(line) - len(line.lstrip())
-        body, j = [], i + 1
+        j = i
+        while not lines[j].rstrip().endswith(":"):  # a header that spans lines ends with its own ':'
+            j += 1
+        body, j = [], j + 1
         while j < len(lines) and (not lines[j].strip() or len(lines[j]) - len(lines[j].lstrip()) > indent):
             body.append(lines[j])
             j += 1
