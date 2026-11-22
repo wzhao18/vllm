@@ -1454,10 +1454,11 @@ class _DedupMetadataPushRouter(KernelComponent):
         """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
         CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
         so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
-        ring, with a %globaltimer stamp. TokenCommDedup.log_ep_balance calls it at the end of the dispatch warps' work.
+        ring, with a %globaltimer stamp. token_in calls it right after sizes_ready, before the pulls: issuing ~60 16-byte stores
+        costs ~0.1 us, and their completion (~100 us under kernel load, measured) overlaps the rest of the call.
 
-        No system fence (the fenced record cost ~105 us per logging call in the kernel vs 2.4 us for the same stores +
-        fence on an idle GPU). Instead word 7 carries ``epbal_checksum(call, counts)``, a position-weighted sum bound
+        No system fence: a sys fence waits for these host stores to complete, ~100 us under kernel load vs 2.4 us
+        idle (measured). Instead word 7 carries ``epbal_checksum(call, counts)``, a position-weighted sum bound
         to the call id, and the host takes a slot only when the call id and the checksum agree (a slot read while its
         stores are still landing, or mixing two calls' counts, is retried on the next drain). Stores only: 16-byte
         relaxed system stores, no launch, no sync; the other calls, warps and CTAs read nothing and skip."""
@@ -2147,6 +2148,9 @@ class TokenCommDedup(KernelComponent):
         iket.range_push("token_in.wait_sizes_ready")
         self._router.wait_for_sizes_ready(self._device_workspace)
         iket.range_pop()
+        # Served EP-balance record (int64.3 item 3), issued as EARLY as possible: its pinned-host stores take ~100 us
+        # to complete under MegaMoE load (task G), so they get the whole call to land before CTA 0 exits.
+        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         iket.range_push("token_in.stage_sizes")
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
         owner_expert_begin = self._local_rank * Int32(self.experts_per_rank)
@@ -2699,15 +2703,6 @@ class TokenCommDedup(KernelComponent):
                 claimed_token = cute.arch.atomic_add(schedule_counter, Int32(1), sem="relaxed", scope="gpu")
             return Int32(cute.arch.shuffle_sync(claimed_token, Int32(0)))
         return current_token + global_worker_count
-
-    @cute.jit
-    def log_ep_balance(self) -> None:
-        """Served EP-balance record (int64.3 item 3), called by the dispatch warps at the very end of their work
-        (after token_in and, when they run it, their token_back share; before the finalize barrier that precedes the
-        tail reset of ``sizes``). Only transfer warp 0 of CTA 0 writes, on one call in EPBAL_PERIOD, so nothing in
-        this call or the next waits on its loads and stores except CTA 0's own exit (task E: after the pulls it
-        still cost +3.9 us per logging call at 8192 tokens, mostly in the next call)."""
-        self._router.log_ep_balance(self._device_workspace, self._lane_idx, self._transfer_warp_idx)
 
     @cute.jit
     def reset_tail(self) -> None:
