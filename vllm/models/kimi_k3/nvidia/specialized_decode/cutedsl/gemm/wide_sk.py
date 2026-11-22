@@ -41,11 +41,11 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common import dies, tensormap
 from ..common.primitives import asm, div_rn
 from .wide import (
-    _now,
-    _st_u64,
     _atom_add,
     _bar,
     _bulk_load,
@@ -54,11 +54,13 @@ from .wide import (
     _ld_acquire,
     _lds_v4,
     _nanosleep,
+    _now,
     _red_release_add,
     _round_bf16,
     _st_bf16,
     _st_f32,
     _st_relaxed,
+    _st_u64,
     _st_v4,
     mma_columns,
 )
@@ -726,8 +728,10 @@ class WideSK:
                         if ew == 0:
                             if lane == 0:
                                 flag = flags + Int64((g + 1) * 2 + v) * 4
+                                sgn, sgt = spin_start()
                                 while _ld_acquire(flag) == 0:
                                     _nanosleep()
+                                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                                 cute.arch.mbarrier_arrive_and_expect_tx(xfer, rows * 512)
                             cute.arch.sync_warp()
                             _fence_proxy_global()
@@ -784,8 +788,10 @@ class WideSK:
                         if ew == 0:
                             if lane == 0:
                                 flag = flags + Int64((g + 1) * 2 + v) * 4
+                                sgn, sgt = spin_start()
                                 while _ld_acquire(flag) == 0:
                                     _nanosleep()
+                                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                                 cute.arch.mbarrier_arrive_and_expect_tx(xfer, rows * 512)
                             cute.arch.sync_warp()
                             _fence_proxy_global()
@@ -883,8 +889,10 @@ class WideSK:
             me = j - jf
             cnt = cnt0 + Int64(t * 2 + v) * 4
             if lead:
+                sgn, sgt = spin_start()
                 while _ld_acquire(cnt) < c:
                     _nanosleep()
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             _bar(2, 256)
             if cutlass.const_expr(self.debug & 8):
                 if lead:

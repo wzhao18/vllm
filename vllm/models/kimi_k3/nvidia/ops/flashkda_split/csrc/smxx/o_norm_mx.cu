@@ -18,6 +18,8 @@
 #include <cudaTypedefs.h>
 
 #include "norm_mx.cuh"
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
+K31SG_DEFINE_SET_RANK(o_norm_mx)  // rank of the timeout line (binding: set_spin_rank)
 
 namespace {
 
@@ -299,12 +301,8 @@ __device__ __forceinline__ void mbar_expect_tx(uint32_t b, uint32_t bytes) {
 __device__ __forceinline__ void mbar_arrive(uint32_t b) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(b) : "memory");
 }
-__device__ __forceinline__ void mbar_wait(uint32_t b, uint32_t parity) {
-  asm volatile(
-      "{\n.reg .pred p;\nWAIT_%=:\n"
-      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-      "@!p bra WAIT_%=;\n}" ::"r"(b), "r"(parity) : "memory");
-}
+// bounded (k31_spin_guard.cuh): site = the wait's line
+#define mbar_wait(b, parity) k31sg::mbar_wait((b), (parity), "flashkda_o_norm_mx", __LINE__)
 __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* tm, int c0, int c1,
                                       uint32_t bar) {
   asm volatile(
@@ -332,6 +330,7 @@ constexpr int kNS = 12;  // 16 KiB stages: 192 KiB of loads in flight per SM
 __global__ void __launch_bounds__(32 * (kConsumerWarps + 1), 1) o_norm_tma_kernel(
     const __grid_constant__ CUtensorMap tm_x, const __grid_constant__ CUtensorMap tm_g,
     int nblk, int heads, NormMxArgs const a) {
+  k31sg::begin_call((long long)(nblk));  // timeout lines: call index and size
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));

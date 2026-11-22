@@ -36,6 +36,9 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
+K31SG_DEFINE_SET_RANK(attn_res_mxfp8)  // rank of the timeout line (binding: set_spin_rank)
+
 using bf16_t = __nv_bfloat16;
 
 namespace k31pf {
@@ -185,21 +188,10 @@ __device__ __forceinline__ void mbarrier_expect_tx(uint64_t& barrier,
                "r"(bytes));
 }
 
-__device__ __forceinline__ void mbarrier_wait(uint64_t& barrier, int phase) {
-  uint32_t const barrier_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(&barrier));
-  asm volatile(
-      "{\n"
-      ".reg .pred p;\n"
-      "WAIT:\n"
-      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-      "@p bra DONE;\n"
-      "bra WAIT;\n"
-      "DONE:\n"
-      "}\n" ::"r"(barrier_addr),
-      "r"(phase)
-      : "memory");
-}
+// bounded (k31_spin_guard.cuh): site = the wait's line
+#define mbarrier_wait(barrier, phase)                                                      \
+  k31sg::mbar_wait(static_cast<uint32_t>(__cvta_generic_to_shared(&(barrier))),          \
+                   (uint32_t)(phase), "attn_res_mxfp8", __LINE__)
 
 __device__ __forceinline__ void mbarrier_arrive(uint64_t& barrier) {
   uint32_t const barrier_addr =
@@ -347,6 +339,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     const bf16_t* __restrict__ output_norm_weight, float output_norm_eps,
     int block_write_idx, uint8_t* __restrict__ q_out,
     uint8_t* __restrict__ sf_out, int sf_padded_cols) {
+  k31sg::begin_call((long long)(T));  // timeout lines: call index and size
   static_assert(!QUANT || HAS_OUTPUT_NORM);
   static_assert(QUANT || WRITE_BF16);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100
@@ -1162,4 +1155,5 @@ void attn_res_mxfp8(torch::Tensor prefix, std::optional<torch::Tensor> delta,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_res_mxfp8", &attn_res_mxfp8);
+  m.def("set_spin_rank", [](int64_t r, int64_t diag) { k31sg_set_rank_attn_res_mxfp8(static_cast<int>(r), diag); });
 }

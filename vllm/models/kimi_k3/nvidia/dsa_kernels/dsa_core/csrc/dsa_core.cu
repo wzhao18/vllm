@@ -121,9 +121,17 @@ __device__ __forceinline__ long long now_ns() {
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
 }
+static __device__ unsigned int g_fail_printed;  // one timeout line per process and GPU
 __device__ __noinline__ void fail(int* err, int code) {
   atomicCAS(err, 0, code);
   __threadfence_system();
+  // the trap ends the context before the host can read err: name it first
+  if (atomicCAS(&g_fail_printed, 0u, 1u) == 0u) {
+    unsigned sm;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+    printf("K31_SPIN_TIMEOUT kernel=k31_dsa_core site=%d smid=%u block=%d,%d thread=%d\n", code, sm,
+           (int)blockIdx.x, (int)blockIdx.y, (int)threadIdx.x);
+  }
   __trap();
 }
 __device__ __forceinline__ uint4 ld_sys_v4(const void* p) {

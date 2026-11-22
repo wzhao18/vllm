@@ -11,6 +11,7 @@ from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
 from ....common.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
+from ....common.spin_guard import globaltimer_ns, spin_guard_value
 
 
 class GridStrideWorkIdState:
@@ -659,6 +660,7 @@ def _claim_fixed_group_fallback_work_id(
 
         if work_id_state.in_group_idx == Int32(0):
             all_members_consumed = Boolean(False)
+            spin_start_ns = globaltimer_ns()
             while not all_members_consumed:
                 observed_token = work_id_state.previous_token
                 if lane_idx < Int32(work_id_state.split_factor):
@@ -670,6 +672,7 @@ def _claim_fixed_group_fallback_work_id(
                 all_members_consumed = ready_mask == Int32(-1)
                 if not all_members_consumed:
                     nanosleep(500)
+                    spin_guard_value(spin_start_ns, 80, ready_mask, Int32(-1))
 
             claimed_work_id = Int32(0)
             if lane_idx == Int32(0):
@@ -685,6 +688,7 @@ def _claim_fixed_group_fallback_work_id(
             work_id_state.next_generation = work_id_state.next_generation + Int32(1)
         else:
             token = work_id_state.previous_token
+            spin_start_ns = globaltimer_ns()
             while token == work_id_state.previous_token:
                 token_high = Int32(0)
                 token_low = Int32(0)
@@ -697,6 +701,7 @@ def _claim_fixed_group_fallback_work_id(
                 token = (Int64(token_high) << Int64(32)) | (Int64(token_low) & Int64(0xFFFFFFFF))
                 if token == work_id_state.previous_token:
                     nanosleep(500)
+                    spin_guard_value(spin_start_ns, 81, Int32(token & Int64(0xFFFFFFFF)), Int32(-1))
             claimed_payload = Int32(token & Int64(0xFFFFFFFF))
             if lane_idx == Int32(0):
                 cute.arch.store(group_token_pointer + work_id_state.in_group_idx, token, sem="relaxed", scope="gpu")

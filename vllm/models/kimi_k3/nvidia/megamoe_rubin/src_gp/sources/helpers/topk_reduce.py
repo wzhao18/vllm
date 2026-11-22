@@ -35,6 +35,7 @@ from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invar
 from ...common.megamoe_constants import Nvfp4E2M1RcpLimit
 from ...common.dsl_helpers import mark_alignment
 from ...common.ptx_helpers import cvt_e2m1_to_fp32_cvt_ptx, cvt_e2m1_to_fp32_optimal_ptx, nanosleep
+from ...common.spin_guard import globaltimer_ns, spin_guard, spin_guard_value
 
 
 
@@ -904,11 +905,13 @@ class TopkReduce:
             stale = Int64(0)
             for k in cutlass.range_constexpr(num_topk):
                 stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            spin_start_ns = globaltimer_ns()
             while stale != Int64(0):
                 # Launched while the producer's last tiles still stream: one short sleep
                 # per round, then every stale slot is reloaded at once (never one sleep
                 # per slot, which would serialize the latency over the top-k).
                 nanosleep(128)
+                spin_guard_value(spin_start_ns, 72, Int32(stale & Int64(0xFFFFFFFF)), Int32(0))
                 for k in cutlass.range_constexpr(num_topk):
                     if (_zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])) != Int64(0):
                         low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
@@ -981,8 +984,10 @@ class TopkReduce:
             cute.arch.griddepcontrol_wait()
         else:
             counter = producer_done.iterator
+            spin_start_ns = globaltimer_ns()
             while cute.arch.load(counter, Int32, sem="acquire", scope="gpu") < Int32(self.producer_arrivals):
                 nanosleep(32)
+                spin_guard(spin_start_ns, 74, counter, Int32(self.producer_arrivals))
             cute.arch.store(counter, Int32(0), sem="relaxed", scope="gpu")
             cute.arch.fence_acq_rel_gpu()
 
@@ -1097,8 +1102,10 @@ class TopkReduce:
             stale = Int64(0)
             for k in cutlass.range_constexpr(num_topk):
                 stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            spin_start_ns = globaltimer_ns()
             while stale != Int64(0):
                 nanosleep(128)
+                spin_guard_value(spin_start_ns, 73, Int32(stale & Int64(0xFFFFFFFF)), Int32(0))
                 for k in cutlass.range_constexpr(num_topk):
                     if (_zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])) != Int64(0):
                         low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())

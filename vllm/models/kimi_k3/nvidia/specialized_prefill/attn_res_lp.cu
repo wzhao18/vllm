@@ -39,6 +39,9 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
+K31SG_DEFINE_SET_RANK(attn_res_lp)  // rank of the timeout line (binding: set_spin_rank)
+
 namespace k31lp {
 // Internal linkage: probe / variant builds load side by side in one process.
 namespace {
@@ -130,19 +133,8 @@ __device__ __forceinline__ void mbar_expect_tx(uint64_t* b, uint32_t bytes) {
                "r"(bytes)
                : "memory");
 }
-__device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t parity) {
-  asm volatile(
-      "{\n"
-      ".reg .pred p;\n"
-      "LAB_WAIT:\n"
-      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-      "@p bra LAB_DONE;\n"
-      "bra LAB_WAIT;\n"
-      "LAB_DONE:\n"
-      "}\n" ::"r"(smem_u32(b)),
-      "r"(parity)
-      : "memory");
-}
+// bounded (k31_spin_guard.cuh): site = the wait's line
+#define mbar_wait(b, parity) k31sg::mbar_wait(smem_u32(b), (parity), "attn_res_lp", __LINE__)
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t bytes,
                                          uint64_t* bar) {
   asm volatile(
@@ -283,6 +275,7 @@ __device__ __forceinline__ void group_sync(int g) {
 
 template <int D, bool HAS_DELTA, bool NORM, bool WRITE_BF16, bool QUANT>
 __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args a) {
+  k31sg::begin_call((long long)(a.T));  // timeout lines: call index and size
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   extern __shared__ __align__(128) unsigned char smem_raw[];
   auto& sm = *reinterpret_cast<Smem<D>*>(smem_raw);
@@ -810,4 +803,5 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_res_lp", &attn_res_lp);
+  m.def("set_spin_rank", [](int64_t r, int64_t diag) { k31sg_set_rank_attn_res_lp(static_cast<int>(r), diag); });
 }

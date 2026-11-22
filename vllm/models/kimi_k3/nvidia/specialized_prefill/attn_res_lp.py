@@ -33,9 +33,15 @@ import threading
 import torch
 
 from vllm.logger import init_logger
-from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.models.kimi_k3.nvidia.ops.stable_build import (
+    SPIN_GUARD,
+    spin_guard_bytes,
+    spin_rank,
+    spin_record_ptr,
+    stable_copy,
+)
 
 from . import attn_res_dielocal, attn_res_mxfp8
 
@@ -86,6 +92,7 @@ def _module(
             h = hashlib.sha256()
             with open(_SRC, "rb") as fh:
                 h.update(fh.read())
+            h.update(spin_guard_bytes())
             h.update(f"{torch.__version__} {torch.version.cuda}".encode())
             h.update(f"{probe} {vec} {groups} {claim_ahead} {pdl}".encode())
             tag = h.hexdigest()[:16]
@@ -94,7 +101,7 @@ def _module(
             )
             os.makedirs(build, exist_ok=True)
             name = os.path.basename(_SRC)
-            src = stable_copy(build, os.path.dirname(_SRC), [name])
+            src = stable_copy(build, os.path.dirname(_SRC), [name], extra=[SPIN_GUARD])
             _mod[key] = (
                 load(
                     name=f"k31pf_attn_res_lp_{tag}",
@@ -120,6 +127,8 @@ def _module(
                     verbose=False,
                 )
             )
+            # k31_spin_guard.cuh
+            _mod[key].set_spin_rank(spin_rank(), spin_record_ptr())
     return _mod[key]
 
 
