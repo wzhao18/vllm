@@ -14,6 +14,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -145,6 +147,7 @@ class MoeTail:
         # ``common.twoshot.poll_slots``). Reloading a published source relies on the
         # re-arm ordering stated at ``WaveMoeTail.settle``.
         if cutlass.const_expr(self.reload):
+            sgn, sgt = spin_start()
             while pending != 0:
                 if cutlass.const_expr(self.poll_ns):
                     sleep_ns(Uint32(self.poll_ns))
@@ -152,7 +155,9 @@ class MoeTail:
                 for source in cutlass.range_constexpr(16):
                     if self.tp == 16 or source < 8 or dual:
                         pending |= self.poll_source(values, source, sources)
+                sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=self.tp)
         else:
+            sgn, sgt = spin_start()
             while pending != 0:
                 if cutlass.const_expr(self.poll_ns):
                     sleep_ns(Uint32(self.poll_ns))
@@ -161,6 +166,7 @@ class MoeTail:
                     if (pending & (Uint32(1) << source)) != 0:
                         next_pending |= self.poll_source(values, source, sources)
                 pending = next_pending
+                sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=self.tp)
         return values
 
     @cute.jit
@@ -191,8 +197,10 @@ class MoeTail:
     @cute.jit
     def wait_fragment(self, ptr):
         word = load_volatile(ptr, count=4)
+        sgn, sgt = spin_start()
         while reduce(or_, (v == 0x80000000 for v in word)):
             word = load_volatile(ptr, count=4)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
 
     @cute.jit
     def sum_sources(self, values, start: cutlass.Constexpr[int]):
@@ -222,6 +230,7 @@ class MoeTail:
                 w = cute.make_rmem_tensor(8, Uint32)
                 rows = cute.make_rmem_tensor(16, Uint32)
                 dirty = Int32(1)
+                sgn, sgt = spin_start()
                 while dirty != 0:
                     for h in cutlass.range_constexpr(2):
                         for k, v in enumerate(load_volatile(wp + 8 * h, count=4)):
@@ -236,6 +245,10 @@ class MoeTail:
                             sleep_ns(Uint32(self.front_poll_ns))
                     else:
                         dirty = 0
+                    sgn, sgt = spin_tick(
+                        sgn, sgt, observed=dirty,
+                        target=0, rank=rank, size=self.tp
+                    )
                 a0, a1 = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(16):
                     weight = bf16(w[j // 2], j % 2)
@@ -255,10 +268,15 @@ class MoeTail:
                 src = s.iterator + par * ss + token * 7168 + 64 * line + 8 * lane
                 word = load_volatile(src, count=4)
                 if cutlass.const_expr(self.mode == "front_poll"):
+                    sgn, sgt = spin_start()
                     while reduce(or_, map(front_dirty, word)):
                         if cutlass.const_expr(self.front_poll_ns):
                             sleep_ns(Uint32(self.front_poll_ns))
                         word = load_volatile(src, count=4)
+                        sgn, sgt = spin_tick(
+                            sgn, sgt, observed=0,
+                            target=0, rank=rank, size=self.tp
+                        )
                 packed = tuple(no_neg_zero(v) for v in word)
                 row = (par * self.tp + rank) * capacity + token
                 offset = row * self.shard + 64 * own_line + 8 * lane
@@ -836,11 +854,13 @@ class WaveMoeTail(MoeTail):
         if active:
             for source in cutlass.range_constexpr(self.tp):
                 pending |= self.poll_source(values, source, sources)
+        sgn, sgt = spin_start()
         while not cute.arch.vote_all_sync(pending == 0):
             if pending != 0:
                 pending = Uint32(0)
                 for source in cutlass.range_constexpr(self.tp):
                     pending |= self.poll_source(values, source, sources)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0, size=self.tp)
         return values
 
     @cute.jit
@@ -865,13 +885,16 @@ class WaveMoeTail(MoeTail):
         # front GEMM (which needs every rank's output of this tail). ``moe.front``
         # refuses an entry release (``SharedFront.release_early``).
         if cutlass.const_expr(self.reload):
+            sgn, sgt = spin_start()
             while pending != 0:
                 sleep_ns(Uint32(self.poll_ns))
                 again = Uint32(0)
                 for source in cutlass.range_constexpr(self.tp):
                     again |= self.poll_row(values, source, ptr + source * stride)
                 pending = again
+                sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=self.tp)
         else:
+            sgn, sgt = spin_start()
             while pending != 0:
                 sleep_ns(Uint32(self.poll_ns))
                 again = Uint32(0)
@@ -879,6 +902,7 @@ class WaveMoeTail(MoeTail):
                     if (pending & (Uint32(1) << source)) != 0:
                         again |= self.poll_row(values, source, ptr + source * stride)
                 pending = again
+                sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=self.tp)
 
     @cute.jit
     def column_sums(self, values):
@@ -1029,6 +1053,7 @@ class WaveMoeTail(MoeTail):
         for r in cutlass.range_constexpr(self.groups):
             if r < count:
                 pending |= self.poll_row(values, r, base + r * stride)
+        sgn, sgt = spin_start()
         while pending != 0:
             sleep_ns(Uint32(self.poll_ns))
             again = Uint32(0)
@@ -1036,6 +1061,7 @@ class WaveMoeTail(MoeTail):
                 if (pending & (Uint32(1) << r)) != 0:
                     again |= self.poll_row(values, r, base + r * stride)
             pending = again
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
         return values
 
     @cute.jit

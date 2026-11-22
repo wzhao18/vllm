@@ -15,6 +15,7 @@
 #include "fwd_kernel1.cuh"
 #include "fwd_kernel2.cuh"
 #include "k2_tc.cuh"
+K31SG_DEFINE_SET_RANK(fwd_launch)  // rank of the timeout line (binding: set_spin_rank)
 
 // ==================== launch_fwd ====================
 template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32,

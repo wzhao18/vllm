@@ -67,6 +67,12 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from ...shapes import Shape, full_capture, refuse
 from ..common.embedding import compile_ring_gather
 from ..common.host import (
@@ -123,8 +129,10 @@ def globaltimer():
 def wait_published(pointer):
     """Spin until the 16-byte fragment at ``pointer`` holds no sentinel word."""
     words = load_words(pointer, count=4, volatile=True)
+    sgn, sgt = spin_start()
     while not published(words):
         words = load_words(pointer, count=4, volatile=True)
+        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
 
 
 class ArNorm:
@@ -300,6 +308,7 @@ class ArNorm:
         16 B chunk was armed; lane 0's report decides each round for the warp."""
         nbytes: cutlass.Constexpr = COLUMNS * 2
         phase, armed = Int32(0), Int32(1)
+        sgn, sgt = spin_start()
         while armed != 0:
             if tid == 0:
                 expect_valid(vbar, self.sources * nbytes)
@@ -310,6 +319,7 @@ class ArNorm:
                     )
             armed = cute.arch.shuffle_sync(wait_valid(vbar, phase), 0)
             phase = phase ^ 1
+            sgn, sgt = spin_tick(sgn, sgt, observed=armed, target=0)
 
     @cute.jit
     def staged(self, stage, tid):
@@ -1049,3 +1059,7 @@ class PreparedDraftAr:
         out = empty()
         self.site(polled, residual, residual, model.final_norm, out, site % 2)
         return out
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "wait_published")

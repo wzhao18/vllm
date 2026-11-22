@@ -24,6 +24,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.policy import batch_table
 from ..common.primitives import published
 from .dcp import Q_SENT, _without_reducer, long_split, poll_b32x8, split_workspace_ts
@@ -105,6 +107,7 @@ def polled_q_core(batch, valid=0, persistent=False, push=None, long=None, wlist=
                 cute.arch.mbarrier_init_fence()
                 phase = Int32(0)
                 armed = Int32(1)
+                sgn, sgt = spin_start()
                 while armed != 0:
                     expect_valid(barrier, nbytes)
                     copy_valid(q_latent, base, head, barrier)
@@ -112,6 +115,7 @@ def polled_q_core(batch, valid=0, persistent=False, push=None, long=None, wlist=
                         copy_valid(q_rope, base + Int64(head), nbytes - head, barrier)
                     armed = wait_valid(barrier, phase)
                     phase = phase ^ 1
+                    sgn, sgt = spin_tick(sgn, sgt, observed=armed, target=0)
                 self.ts_invalidate(barrier)
 
         @cute.jit
@@ -152,8 +156,10 @@ def polled_q_core(batch, valid=0, persistent=False, push=None, long=None, wlist=
                             loads = [poll_b32x8(p) for p in ptrs]
                             for i in cutlass.range_constexpr(n):
                                 words = loads[i]
+                                sgn, sgt = spin_start()
                                 while not published(words, sentinel=Q_SENT):
                                     words = poll_b32x8(ptrs[i])
+                                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                     self.ts_q_bar.arrive()
 
         @cute.jit

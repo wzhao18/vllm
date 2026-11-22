@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import Boolean, Int16, Int32
+from ...common.spin_guard import globaltimer_ns, spin_guard_value
 
 
 @cute.jit
@@ -102,9 +103,11 @@ def spin_wait(
 
     if wait_required:
         value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+        spin_start_ns = globaltimer_ns()
         while not condition(value):
             nanosleep(sleep_cycles)
             value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+            spin_guard_value(spin_start_ns, 70, Int32(value), Int32(-1))
 
 
 class ReadyFlag:

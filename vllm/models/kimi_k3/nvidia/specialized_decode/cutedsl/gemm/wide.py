@@ -32,6 +32,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import asm, div_rn
 
 CHUNK = 16  # token columns per exchange chunk (one tcgen05.ld 32x32b.x16)
@@ -661,8 +663,10 @@ class WideGemm:
             _bar(3, 128)
             if tid == 0:
                 _red_release_add(flag, 1)
+                sgn, sgt = spin_start()
                 while _ld_acquire(flag) < split:
                     _nanosleep()
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 _st_u64(stamp + 24, _now())
                 cute.arch.mbarrier_arrive_and_expect_tx(xfer, (split - 1) * mine_n * 512)
             _bar(3, 128)
@@ -785,8 +789,10 @@ class WideGemm:
             total = Float32(0)
             for s in cutlass.range_constexpr(split):
                 b = bits[q * split + s]
+                sgn, sgt = spin_start()
                 while b == SENTINEL:
                     b = _ld_relaxed_b32(slots[q * split + s])
+                    sgn, sgt = spin_tick(sgn, sgt, observed=b, target=0)
                 _st_relaxed(slots[q * split + s], Int32(SENTINEL))
                 total = _as_f32(b) if s == 0 else total + _as_f32(b)
             col = Int64(lo + q) * self.n + tile * 128 + r
@@ -801,8 +807,10 @@ class WideGemm:
                 total = Float32(0)
                 for s in cutlass.range_constexpr(split):
                     b = tbits[s]
+                    sgn, sgt = spin_start()
                     while b == SENTINEL:
                         b = _ld_relaxed_b32(tail[s])
+                        sgn, sgt = spin_tick(sgn, sgt, observed=b, target=0)
                     _st_relaxed(tail[s], Int32(SENTINEL))
                     total = _as_f32(b) if s == 0 else total + _as_f32(b)
                 col = Int64(lo + full_q) * self.n + tile * 128 + r

@@ -25,6 +25,12 @@ import torch
 from cutlass import Constexpr, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from ..common.host import fake, tensor_maps
 from ..common.primitives import (
     acquire_tensormap,
@@ -107,8 +113,10 @@ def fetch_count(address):
 @cute.jit
 def wait_count(address, target):
     seen = Int32(acquire_count(address))
+    sgn, sgt = spin_start()
     while seen < target:
         seen = Int32(acquire_count(address))
+        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
 
 
 def weight_maps(gate_up, down, front=None):
@@ -682,3 +690,7 @@ def compile_down(tp, batch, device, sms):
 def scratch(device):
     """Model-owned fused shared-expert counters (zeroed; re-armed by each launch)."""
     return torch.zeros(COUNTERS, dtype=torch.int32, device=device)
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "wait_count")

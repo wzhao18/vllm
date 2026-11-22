@@ -188,6 +188,7 @@ LONG_SPLIT.update({(r, 96): (1, 2, 64, 128) for r in range(516, 769, 4)})
 LONG_SPLIT.update(
     {(r, 64): (1, 4, 64, 128) for r in range(195, 577, 3) if (r, 64) not in LONG_SPLIT}
 )
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 
 class OpenRules(dict):
@@ -1508,6 +1509,7 @@ class DcpValue:
         for i in cutlass.range_constexpr(2 * S):
             if sraw[i] == Uint32(SPLIT_SENT):
                 pending |= 1 << (S + i)
+        sgn, sgt = spin_start()
         while pending != 0:
             for s in cutlass.range_constexpr(P):
                 if (pending & (1 << s)) != 0:
@@ -1525,6 +1527,7 @@ class DcpValue:
                 if (pending & (1 << (S + i))) != 0:  # noqa: SIM102
                     if sraw[i] != Uint32(SPLIT_SENT):
                         pending &= ~(1 << (S + i))
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
         xs = [tuple(bits_float(raw[s, e]) for e in range(8)) for s in range(P)]
         values = [bits_float(sraw[i]) for i in range(2 * S)]
         return xs, values[:S], values[S:]
@@ -1577,8 +1580,10 @@ class DcpValue:
             if lane < D:
                 source = at(lbox, lane, t0 + warp, head)
                 word = load_volatile(source)[0]
+                sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0, size=D)
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
             top = lse
@@ -1607,8 +1612,10 @@ class DcpValue:
                     loads = [load_volatile(source, count=4) for source in sources]
                     for i in cutlass.range_constexpr(len(sources)):
                         words = loads[i]
+                        sgn, sgt = spin_start()
                         while not published(words):
                             words = load_volatile(sources[i], count=4)
+                            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0, size=D)
                         store_words(sources[i], (Uint32(PAIR_SENT),) * 4)
                         w = scales[r, s0 + i]
                         for e in cutlass.range_constexpr(4):
@@ -1687,8 +1694,10 @@ class DcpValue:
             if lane < D:  # the row's sources share one line
                 source = lbox.iterator + ((t0 + warp) * self.heads + head) * D + lane
                 word = load_volatile(source)[0]
+                sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0, size=D)
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
             top = lse
@@ -1781,6 +1790,7 @@ class DcpValue:
         for i in cutlass.range_constexpr(n):
             if not published(raw[i, j] for j in range(4)):
                 pending |= 1 << i
+        sgn, sgt = spin_start()
         while pending != 0:
             for i in cutlass.range_constexpr(n):
                 if (pending & (1 << i)) != 0:
@@ -1791,6 +1801,7 @@ class DcpValue:
                 if (pending & (1 << i)) != 0:  # noqa: SIM102
                     if published(raw[i, j] for j in range(4)):
                         pending &= ~(1 << i)
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
         return raw
 
     @cute.jit
@@ -1821,18 +1832,22 @@ class DcpValue:
                     word = load_volatile(source)[0]
                 if cutlass.const_expr(POLL_LSE):
                     ready = cute.arch.vote_all_sync(word != Uint32(LSE_SENT))
+                    sgn, sgt = spin_start()
                     while not ready:
                         if word == Uint32(LSE_SENT):  # (lanes < D only)
                             word = load_volatile(source)[0]
                         ready = cute.arch.vote_all_sync(word != Uint32(LSE_SENT))
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0, size=D)
                 if lane < D:
                     store_words(source, (Uint32(LSE_SENT),))
                     lse = bits_float(word)
             elif lane < D:
                 source = lbox.iterator + (t * self.heads + head) * D + lane
                 word = load_volatile(source)[0]
+                sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0, size=D)
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
             top = lse
