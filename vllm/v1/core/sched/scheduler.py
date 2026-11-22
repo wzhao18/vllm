@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import contextlib
 import itertools
 import os
 import time
@@ -97,9 +96,6 @@ logger = init_logger(__name__)
 KV_CONNECTOR_LOOKUP_TIMEOUT_S = float(
     os.getenv("VLLM_KV_CONNECTOR_LOOKUP_TIMEOUT_S", "10")
 )
-# Load-ahead (waiting loop): at most this many fresh waiting requests hold an
-# async KV load started while the step's token budget was used up.
-LOAD_AHEAD_MAX_REQS = 8
 # WAITING_FOR_REMOTE_KVS for this long logs a warning (the load cannot be
 # abandoned: a late transfer may still write the request's blocks).
 KV_CONNECTOR_LOAD_WARN_S = 60.0
@@ -464,13 +460,6 @@ class Scheduler(SchedulerInterface):
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
-        # Load-ahead keeps one full step chunk of token blocks free beyond the
-        # in-flight reservations (Mamba managers reserve their state blocks).
-        self._load_ahead_reserve_blocks = sum(
-            cdiv(self.max_num_scheduled_tokens, manager.block_size)
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if not isinstance(manager.kv_cache_spec, MambaSpec)
-        )
         # DSA-DP prefix-hit owner choice (dsa_dp.PREFIX_OWNER, per-card
         # regions): queued DSA prompt cost per owner card, kept incrementally.
         self._dsa_load: list[int] | None = None
@@ -651,9 +640,6 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-        # Load-ahead: fresh waiting requests whose async KV load was started
-        # while the step's token budget was used up (see the waiting loop).
-        self._load_ahead: set[Request] = set()
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
@@ -1391,40 +1377,14 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             owner_decodes = self._dsa_owner_decodes()
-            load_ahead = False
-            load_ahead_left = LOAD_AHEAD_MAX_REQS - len(self._load_ahead)
-            while True:
-                if token_budget <= 0 or input_budget <= draft_slots:
-                    # Load-ahead: the step's compute budget is used up, but an
-                    # async KV load takes none of it. Start the loads of the
-                    # next fresh waiting requests (scheduler order) now so the
-                    # KV is resident when compute frees up; a request with
-                    # nothing to load waits for budget as before.
-                    if (
-                        self.connector is None
-                        or self._pause_state != PauseState.UNPAUSED
-                        or load_ahead_left <= 0
-                        or not self.waiting
-                    ):
-                        break
-                    head = self.waiting.peek_request()
-                    if head.status != RequestStatus.WAITING or head.num_computed_tokens:
-                        break
-                    load_ahead = True
-                    load_ahead_left -= 1
+            while token_budget > 0:
+                # Requests holding KV blocks are always drained first, and are
+                # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
+                request_queue = self.kv_holding_waiting
+                if not request_queue and self._pause_state == PauseState.UNPAUSED:
                     request_queue = self.waiting
-                else:
-                    # Requests holding KV blocks are always drained first, and
-                    # are the only ones admitted under PAUSED_NEW (e.g. async
-                    # KV loads).
-                    request_queue = self.kv_holding_waiting
-                    if (
-                        not request_queue
-                        and self._pause_state == PauseState.UNPAUSED
-                    ):
-                        request_queue = self.waiting
-                    if not request_queue:
-                        break
+                if not request_queue or input_budget <= draft_slots:
+                    break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -1663,11 +1623,6 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
-                if load_ahead and not load_kv_async:
-                    # Nothing to load ahead: it waits for compute budget.
-                    skip_request(request_queue)
-                    continue
-
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 duplicate_encoder_inputs = []
@@ -1860,42 +1815,28 @@ class Scheduler(SchedulerInterface):
                         self._inflight_prefill_reserved_blocks(exclude=request)
                         + self._spec_decode_step_blocks
                     )
-                    if load_ahead:
-                        # Keep one full chunk of blocks free beyond every
-                        # in-flight reservation: loads started ahead never
-                        # take the blocks a step's compute needs.
-                        reserved_blocks += self._load_ahead_reserve_blocks
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                # An async load's blocks must be unused by the step still in
-                # flight, else the connector's early load (issued from
-                # schedule(), outside the GPU stream order) must wait for that
-                # step: take them from settled free blocks (BlockFreeClock).
-                with (
-                    BLOCK_FREE_CLOCK.settled()
-                    if load_kv_async
-                    else contextlib.nullcontext()
-                ):
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_tokens_past_hit,
-                        num_new_computed_tokens=num_new_local_computed_tokens,
-                        new_computed_blocks=new_computed_blocks,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        num_external_computed_tokens=num_external_computed_tokens,
-                        delay_cache_blocks=load_kv_async,
-                        skip_zeroing_group_ids=(
-                            self.connector.get_loaded_kv_cache_group_ids(request)
-                            if load_kv_async and self.connector is not None
-                            else ()
-                        ),
-                        num_encoder_tokens=num_encoder_tokens,
-                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                        reserved_blocks=reserved_blocks,
-                        has_scheduled_reqs=bool(self.running),
-                    )
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_tokens_past_hit,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
+                    new_computed_blocks=new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                    delay_cache_blocks=load_kv_async,
+                    skip_zeroing_group_ids=(
+                        self.connector.get_loaded_kv_cache_group_ids(request)
+                        if load_kv_async and self.connector is not None
+                        else ()
+                    ),
+                    num_encoder_tokens=num_encoder_tokens,
+                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    reserved_blocks=reserved_blocks,
+                    has_scheduled_reqs=bool(self.running),
+                )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1992,15 +1933,12 @@ class Scheduler(SchedulerInterface):
                             request, num_computed_tokens
                         )
                     self._inflight_prefills.add(request)
-                    if load_ahead:
-                        self._load_ahead.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
                     skip_request(request_queue)
                     continue
 
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
-                self._load_ahead.discard(request)
                 self.running.append(request)
                 if owner_decodes is not None and _decodes_here(request):
                     owner_decodes[getattr(request, "dsa_owner", 0)] += 1
@@ -2334,7 +2272,6 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
-        self._load_ahead.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if self._dsa_load is not None:
@@ -4077,7 +4014,6 @@ class Scheduler(SchedulerInterface):
         if self._dsa_load is not None:
             self._dsa_load_update(request)
         self._inflight_prefills.discard(request)
-        self._load_ahead.discard(request)
         self.kv_cache_manager.finish_conversation_turn(request)
         self._connector_lookup_pending_since.pop(request.request_id, None)
         self._connector_lookup_timed_out.discard(request.request_id)

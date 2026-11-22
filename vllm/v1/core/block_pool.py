@@ -70,7 +70,6 @@ class BlockFreeClock:
         # Epoch of the first free after the last non-empty schedule() returned.
         self._boundary = 0
         self._fenced = 0
-        self._settled = 0
 
     def tick(self) -> None:
         self.epoch += 1
@@ -81,20 +80,6 @@ class BlockFreeClock:
 
     def stamp(self) -> int:
         return self.FENCED if self._fenced else self.epoch
-
-    @contextmanager
-    def settled(self):
-        """Allocations inside prefer blocks not ``freed_recently`` (for a
-        load the connector writes outside the GPU stream order)."""
-        self._settled += 1
-        try:
-            yield
-        finally:
-            self._settled -= 1
-
-    @property
-    def wants_settled(self) -> bool:
-        return self._settled > 0
 
     @contextmanager
     def fenced(self):
@@ -791,29 +776,6 @@ class BlockPool:
             self._low_priority_on_free.discard(src_block.block_id)
             self._low_priority_on_free.add(dst_block.block_id)
 
-    def _pop_settled(self, num_blocks: int) -> list[KVCacheBlock]:
-        """Pop ``num_blocks`` free blocks in queue order, passing over blocks
-        ``BLOCK_FREE_CLOCK.freed_recently`` (they sit at the front: uncached
-        frees are reused LIFO). Takes recent blocks only when too few others
-        are free; the caller then just loses the early load."""
-        queue = self.free_block_queue
-        tail = queue.fake_free_list_tail
-        ret: list[KVCacheBlock] = []
-        recent: list[KVCacheBlock] = []
-        block = queue.fake_free_list_head.next_free_block
-        while len(ret) < num_blocks and block is not None and block is not tail:
-            nxt = block.next_free_block
-            if BLOCK_FREE_CLOCK.freed_recently(block):
-                recent.append(block)
-            else:
-                queue.remove(block)
-                ret.append(block)
-            block = nxt
-        for block in recent[: num_blocks - len(ret)]:
-            queue.remove(block)
-            ret.append(block)
-        return ret
-
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -829,11 +791,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = (
-            self._pop_settled(num_blocks)
-            if BLOCK_FREE_CLOCK.wants_settled
-            else self.free_block_queue.popleft_n(num_blocks)
-        )
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._slot_rows:
             for block in ret:
@@ -1477,36 +1435,15 @@ class SlotBlockPool(BlockPool):
             max(0, num_new_blocks - num_free), self.slots_per_block
         )
 
-    def _has_settled_free_slot(self) -> bool:
-        queue = self.free_block_queue
-        slot = queue.fake_free_list_head.next_free_block
-        while slot is not None and slot is not queue.fake_free_list_tail:
-            if not BLOCK_FREE_CLOCK.freed_recently(slot):
-                return True
-            slot = slot.next_free_block
-        return False
-
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         ret: list[KVCacheBlock] = []
         queue = self.free_block_queue
         for _ in range(num_blocks):
             head = queue.fake_free_list_head.next_free_block
-            if (
-                head is queue.fake_free_list_tail
-                or (
-                    head is not None
-                    and head.block_hash is not None
-                    and self.parent.is_cheap_to_reuse(
-                        self._lru_since.get(head.block_id)
-                    )
-                )
-                or (
-                    # An early load needs a slot no in-flight step uses: open
-                    # a settled row when every free slot is in a recent one.
-                    BLOCK_FREE_CLOCK.wants_settled
-                    and self.parent.get_num_free_blocks() > 0
-                    and not self._has_settled_free_slot()
-                )
+            if head is queue.fake_free_list_tail or (
+                head is not None
+                and head.block_hash is not None
+                and self.parent.is_cheap_to_reuse(self._lru_since.get(head.block_id))
             ):
                 self._take_row()
             (block,) = super().get_new_blocks(1)
