@@ -603,10 +603,75 @@ def _compile_target(compile_fn: Any, fn: Any, kwargs: dict) -> str:
     return f"arch {arch}\noptions {' '.join(flags)}"
 
 
+_RUNTIME = "__k3_cute_runtime_argument__"
+
+
+def _runtime_marker(annotation: Any, value: Any) -> tuple[str, str, str]:
+    """Key stand-in for the value of a ``@cute.jit`` parameter annotated with a DSL
+    numeric type (``Int32``, ``Int64``, ``Float32``, ...): the DSL passes it as a
+    runtime argument of the compiled function, so the trace never reads the value
+    (e.g. WideSK's weight / activation addresses as ``Int64``). Only the annotation
+    and the Python type of the passed value are trace inputs."""
+    return (_RUNTIME, _qual(annotation), _qual(type(value)))
+
+
+def _numeric_annotation(annotation: Any) -> bool:
+    try:
+        from cutlass.cutlass_dsl import Numeric
+    except ImportError:
+        return False
+    return isinstance(annotation, type) and issubclass(annotation, Numeric)
+
+
+def _runtime_values(fn: Any, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """``args`` / ``kwargs`` with the values bound to DSL-numeric parameters of the
+    compiled ``@cute.jit`` function replaced by ``_runtime_marker`` (anything the binding
+    cannot place keeps its value: a conservative key, never a wrong hit)."""
+    import inspect
+    import typing
+
+    target = _jit_function(fn)
+    try:
+        sig = inspect.signature(target)
+        hints = typing.get_type_hints(target)
+    except Exception:
+        return args, kwargs
+    params = list(sig.parameters.values())
+    if params and params[0].name == "self" and not isinstance(fn, types.FunctionType):
+        params = params[1:]  # a bound method or a callable kernel object
+    try:
+        bound = inspect.Signature(params).bind_partial(*args, **kwargs)
+    except TypeError:
+        return args, kwargs
+    runtime = {
+        name: _runtime_marker(hints[name], value)
+        for name, value in bound.arguments.items()
+        if _numeric_annotation(hints.get(name))
+        and isinstance(value, (bool, int, float, *_dsl_numeric_types()))
+    }
+    if not runtime:
+        return args, kwargs
+    names = [p.name for p in params]
+    new_args = tuple(
+        runtime.get(names[i], a) if i < len(names) else a for i, a in enumerate(args)
+    )
+    new_kwargs = {k: runtime.get(k, v) for k, v in kwargs.items()}
+    return new_args, new_kwargs
+
+
+def _dsl_numeric_types() -> tuple[type, ...]:
+    try:
+        from cutlass.cutlass_dsl import Numeric
+    except ImportError:
+        return ()
+    return (Numeric,)
+
+
 def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp = _Fingerprint()
     fp.add(getattr(compile_fn, "_compile_options", None))
     fp.add(fn)
+    args, kwargs = _runtime_values(fn, args, kwargs)
     fp.add(args)
     fp.add(kwargs)
     target = _compile_target(compile_fn, fn, kwargs)
