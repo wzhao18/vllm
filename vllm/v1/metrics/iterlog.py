@@ -268,7 +268,15 @@ class WorkerIterLog:
 
         self._torch = torch
         self._level = level
-        self._w = _Writer("worker-r0", WORKER_FIELDS, {"gpu_level": level})
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        self._rank = rank
+        self._w = _Writer(f"worker-r{rank}", WORKER_FIELDS, {"gpu_level": level})
+        # DSTEP diag: torch-profiler (CUPTI) window on request, see _maybe_profile.
+        self._prof = None
+        self._prof_left = 0
+        self._prof_done: set[str] = set()
         self._put = self._w.put
         n_ev = 6 if level >= 2 else (2 if level == 1 else 0)
         self._ring = [
@@ -288,12 +296,59 @@ class WorkerIterLog:
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-            return None
+            # DSTEP diag: also the first TP rank of every DP rank (DP lockstep:
+            # each DP rank's GPU timeline).
+            from vllm.distributed import parallel_state as ps
+
+            try:
+                if ps.get_tp_group().rank_in_group != 0:
+                    return None
+            except AssertionError:
+                return None
         return cls(int(os.environ.get("VLLM_ITERLOG_GPU", "2")))
+
+    def _maybe_profile(self) -> None:
+        """DSTEP diag: ``<ITERLOG_DIR>/PROFILE.<tag>`` holding a step count
+        starts one torch-profiler window (CUDA + CPU activity) of that many
+        steps; the trace goes to ``trace-<tag>-r<rank>.json.gz``."""
+        torch = self._torch
+        if self._prof is not None:
+            self._prof_left -= 1
+            if self._prof_left <= 0:
+                prof, self._prof = self._prof, None
+                prof.stop()
+                tag = self._prof_tag
+                prof.export_chrome_trace(
+                    os.path.join(ITERLOG_DIR, f"trace-{tag}-r{self._rank}.json.gz")
+                )
+            return
+        if self._seq % 64:
+            return
+        import glob
+
+        for path in glob.glob(os.path.join(ITERLOG_DIR, "PROFILE.*")):
+            tag = path.rsplit(".", 1)[1]
+            if tag in self._prof_done:
+                continue
+            self._prof_done.add(tag)
+            try:
+                steps = int(open(path).read().strip() or "200")
+            except (OSError, ValueError):
+                steps = 200
+            from torch.profiler import ProfilerActivity, profile
+
+            self._prof_tag = tag
+            self._prof_left = steps
+            self._prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            )
+            self._prof.start()
+            break
 
     def begin(self, h_entry: float, meta: tuple) -> None:
         """execute_model, once the batch is known (``meta``: n_reqs, n_tokens,
         n_tokens_padded, cg_mode, has_prefill)."""
+        self._maybe_profile()
         if self._inflight:
             self._resolve()
         ev = None
