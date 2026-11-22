@@ -271,7 +271,9 @@ def test_given_up_joined_load_recomputes_after_its_transfer_ends():
     engine_outputs = scheduler.update_from_output(
         output, create_model_runner_output([request], failed_recving={"r"})
     )
-    assert not [o for outs in engine_outputs.values() for o in outs.outputs]
+    delivered = [o for outs in engine_outputs.values() for o in outs.outputs]
+    assert all(o.new_token_ids == [] and o.finish_reason is None for o in delivered)
+    assert request.num_output_tokens == 0
     assert request.status == RequestStatus.PREEMPTED
     assert _num_free(scheduler) == free_before - held
 
@@ -442,7 +444,7 @@ def _join_scheduler():
     scheduler = _make_bare_scheduler()
     scheduler._early_loads = _Channel()
     scheduler._group_block_sizes = [16]
-    scheduler._joined = set()
+    scheduler._joined = {}
     scheduler._early_tokens = {}
     scheduler._load_model = LoadTimeModel()
     scheduler.join_stats = {"joined": 0, "no_headroom": 0, "cold": 0, "recent": 0}
