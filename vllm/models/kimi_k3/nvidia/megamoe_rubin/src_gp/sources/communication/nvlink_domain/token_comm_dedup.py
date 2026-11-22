@@ -45,6 +45,34 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
 from ....common.spin_guard import globaltimer_ns, spin_guard
+from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
+
+
+class DedupCallTail(GenphaseTail):
+    """vLLM-local (BUG-E2E-3): the GenPhase previous-call protocol for the dedup comm path.
+
+    The next call's router adds this call's sizes / sizes_ready / metadata_ready into every peer's
+    ``tail_reset`` counters right after entry. Without a guard, a router that starts while a peer is
+    still in the previous call's tail (before ``reset_tail_space``) has its adds erased by that reset,
+    and the peer's router then waits forever for ``sizes_ready == world_size`` (the EP group hangs).
+    Each call's tail now ends with ``signal_done`` (epoch + one done signal into every rank, after
+    the reset); the next call's router waits for every rank's done signal of the previous call
+    (``wait_previous_done``) before its first remote write. Ordering only: no computed value changes.
+    Own region names, so it never aliases the GenPhase kernel's tail state.
+    """
+
+    epoch_region = "nvlink.token_comm_dedup.call_epoch"
+    signal_region = "nvlink.token_comm_dedup.call_done_signal"
+
+    def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
+        workspace.register(
+            self.epoch_region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16,
+            reset="zero_on_first_allocate",
+        )
+        workspace.register(
+            self.signal_region, cutlass.Int32, (2,), buffer_space="shared", byte_alignment=16,
+            reset="zero_on_first_allocate",
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -542,6 +570,12 @@ class _DedupMetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
         self._router_smem_base = smem_base
+
+        # BUG-E2E-3: no remote write before every rank has finished (reset) the previous call.
+        if thread_idx == Int32(0):
+            previous_done = self._call_tail.previous_done_observation(device_workspace)
+            self._call_tail.wait_previous_done(device_workspace, previous_done)
+        cute.arch.sync_threads()
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -1470,6 +1504,8 @@ class TokenCommDedup(KernelComponent):
         self._validate_configuration()
         self._router = _DedupMetadataPushRouter(problem_desc, impl_desc)
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
+        self._call_tail = DedupCallTail(world_size=self.world_size)
+        self._router._call_tail = self._call_tail
         self._device_workspace = None
         self._token_comm_args = None
         self._local_rank = None
@@ -1701,6 +1737,7 @@ class TokenCommDedup(KernelComponent):
         self._router.register_device_workspace(workspace)
         self._register_main_workspace(workspace)
         self._nvlink_barrier.register_device_workspace(workspace)
+        self._call_tail.register_device_workspace(workspace)
 
     @cute.jit
     def launch_router(
@@ -2565,6 +2602,13 @@ class TokenCommDedup(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
+        # BUG-E2E-3: every rank has reset its tail span (barrier above): release the next call's routers.
+        if self._linear_cta_idx == Int32(0):
+            if transfer_thread_idx == Int32(0):
+                epoch = self._call_tail.read_epoch(self._device_workspace)
+                self._call_tail.signal_done(
+                    self._device_workspace, self._token_comm_args.peer_rank_ptr_mapper, epoch
+                )
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(

@@ -569,7 +569,7 @@ def main():
     if any(t > c for t, c in zip(tokens, caps)):
         raise SystemExit("a point's live tokens exceed its capacity.")
     points = sorted(
-        {(args.variant, c, t) for t, c in zip(tokens, caps)}, key=lambda p: p[1]
+        {(args.variant, c, t) for t, c in zip(tokens, caps)}, key=lambda p: (p[1], p[2])
     )
     # one bucket per capacity: the smallest live point of that capacity picks the knobs
     by_cap = {}
@@ -717,6 +717,16 @@ def main():
         )
         torch.cuda.synchronize()
         moe.check_route_errors()
+        # Bitwise fingerprint of this rank's first eager output (A/B of ordering-only kernel changes).
+        import hashlib
+
+        out_hash = hashlib.sha256(
+            out[:n].contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()[:16]
+        out_hashes = [out_hash]
+        if group is not None:
+            out_hashes = [None] * dist.get_world_size(group)
+            dist.all_gather_object(out_hashes, out_hash, group=group)
 
         # staging A/B vs the torch stager (live rows)
         rx, rsf, ridx, rw = R.stage_inputs_torch(
@@ -731,7 +741,7 @@ def main():
             + (session.topk_weights[:n] != rw[:n]).sum()
         )
 
-        result = {}
+        result = {"out_sha256_per_rank": out_hashes}
         amax = torch.tensor(
             [float(hidden.float().abs().max()) if n else 0.0], device=device
         )
