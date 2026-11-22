@@ -193,6 +193,33 @@ class RubinBucket:
 
 
 @dataclasses.dataclass(frozen=True)
+def _diag_knob_override(bucket, *, k, world_size):
+    """DIAG ONLY (wzhao/k31ws-mmknob-diag, never merge): $VLLM_K3_MEGAMOE_KNOB_DIAG_FILE
+    (a _FILE name: not in the CuTe cache key) holds [{"variant": v, "max_tokens": n,
+    "set": {knob: value}}, ...]; a bucket whose (variant, max_tokens) matches gets
+    those knob fields replaced. Logged per bucket."""
+    import dataclasses as _dc
+    import json as _json
+    import os as _os
+
+    path = _os.environ.get("VLLM_K3_MEGAMOE_KNOB_DIAG_FILE")
+    if not path:
+        return k
+    for rule in _json.load(open(path)):
+        if rule.get("variant", bucket.variant) == bucket.variant and rule.get(
+            "max_tokens", bucket.max_tokens
+        ) == bucket.max_tokens:
+            new = {f: tuple(v) if isinstance(v, list) else v for f, v in rule["set"].items()}
+            k = _dc.replace(k, **new)
+            from vllm.logger import init_logger as _il
+
+            _il(__name__).warning(
+                "MegaMoE DIAG knob override: variant %s max_tokens %d world %d -> %s",
+                bucket.variant, bucket.max_tokens, world_size, new,
+            )  # fmt: skip
+    return k
+
+
 class RubinMoeConfig:
     num_total_experts: int
     max_tokens_per_rank: int
@@ -235,7 +262,7 @@ class RubinMoeConfig:
         rank: int,
         world_size: int,
     ) -> RubinMoeConfig:
-        k = bucket.knobs
+        k = _diag_knob_override(bucket, k=bucket.knobs, world_size=world_size)  # DIAG
         return cls(
             num_total_experts=problem.num_experts,
             max_tokens_per_rank=bucket.max_tokens,

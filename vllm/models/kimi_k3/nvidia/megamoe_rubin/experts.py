@@ -311,6 +311,23 @@ def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
     )
 
 
+def _diag_sum(prefix, y):
+    """DIAG ONLY (wzhao/k31ws-mmknob-diag): eager (not capturing) MegaMoE outputs'
+    SHA-256 per layer and token count appended to $VLLM_K3_MOE_SUM_FILE (bitwise A/B
+    of knob arms)."""
+    import os
+
+    path = os.environ.get("VLLM_K3_MOE_SUM_FILE")
+    if not path or torch.cuda.is_current_stream_capturing():
+        return
+    import hashlib
+
+    t = y[0] if isinstance(y, tuple) else y
+    data = t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    with open(f"{path}.{os.getpid()}", "a") as f:
+        f.write(f"{prefix} {t.shape[0]} {hashlib.sha256(data).hexdigest()}\n")
+
+
 def _genphase_decode(bucket: RubinBucket) -> RubinBucket:
     """A wide-EP bucket of at most :data:`RUBIN_WIDE_EP_DECODE_TOKENS` tokens per rank
     on the refreshed GenPhase kernel (src_gp, decode scheduler; die-aware
@@ -1196,6 +1213,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             y += shared_experts(hidden_states)
         if expert_dwdp is not None:
             expert_dwdp.after_experts(self)
+        _diag_sum(self.prefix, y)  # DIAG
         return y
 
 
