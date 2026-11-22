@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Load-ahead: with the step's token budget used up, the scheduler still starts
-the async KV loads of the next fresh waiting requests (an async load takes no
-compute budget), bounded by LOAD_AHEAD_MAX_REQS and a free-block reserve."""
+"""Load-only scan: once a step admits no more compute (token budget used up,
+prefill compute deferred, or no request slot), the scheduler still starts the
+async KV loads of every fresh waiting request with an external hit (a load
+takes no compute and no slot until it runs), bounded only by free KV blocks
+(with one step chunk kept free for compute)."""
 
 import pytest
 
-from vllm.v1.core.sched import scheduler as sched_mod
 from vllm.v1.request import RequestStatus
 
 from ..kv_connector.unit.utils import (
@@ -76,16 +77,6 @@ def test_loads_start_while_the_budget_is_used_up():
     )
 
 
-def test_without_load_ahead_budget_blocks_the_lookup(monkeypatch):
-    monkeypatch.setattr(sched_mod, "LOAD_AHEAD_MAX_REQS", 0)
-    scheduler = _scheduler()
-    _fill_budget(scheduler)
-    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
-    scheduler.schedule()
-    assert a.status == RequestStatus.WAITING
-    assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
-
-
 def test_request_without_a_hit_waits_for_budget_in_order():
     scheduler = _scheduler()
     _fill_budget(scheduler)
@@ -98,19 +89,74 @@ def test_request_without_a_hit_waits_for_budget_in_order():
     assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_at_most_load_ahead_max_reqs_are_loaded_ahead(monkeypatch):
-    monkeypatch.setattr(sched_mod, "LOAD_AHEAD_MAX_REQS", 2)
+def test_no_request_count_cap_only_free_blocks_bound_the_loads():
+    # 12 loads of 6 blocks each (72) fit next to the long prompt's reservation
+    # (36) and the 4-block chunk reserve in 199 usable blocks: all start.
     scheduler = _scheduler()
     _fill_budget(scheduler)
-    reqs = [_add(scheduler, 6 * BS, hit_tokens=5 * BS) for _ in range(4)]
+    reqs = [_add(scheduler, 6 * BS, hit_tokens=5 * BS) for _ in range(12)]
     scheduler.schedule()
-    assert [r.status for r in reqs] == [
-        RequestStatus.WAITING_FOR_REMOTE_KVS,
-        RequestStatus.WAITING_FOR_REMOTE_KVS,
-        RequestStatus.WAITING,
-        RequestStatus.WAITING,
+    assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in reqs)
+    assert len(scheduler._load_ahead) == 12
+
+
+def test_free_blocks_bound_the_loads():
+    # 62 usable blocks - 4 for the long prompt's first chunk = 58 free; a load
+    # must leave the long prompt's remaining 36 plus the 4-block chunk reserve:
+    # 58 - 3 * 6 = 40 admits three 6-block loads, a fourth (34) waits (no
+    # preemption, order kept).
+    scheduler = _scheduler(num_blocks=63)
+    _fill_budget(scheduler)
+    reqs = [_add(scheduler, 6 * BS, hit_tokens=5 * BS) for _ in range(4)]
+    out = scheduler.schedule()
+    assert not out.preempted_req_ids
+    assert [r.status for r in reqs] == [RequestStatus.WAITING_FOR_REMOTE_KVS] * 3 + [
+        RequestStatus.WAITING
     ]
-    assert len(scheduler._load_ahead) == 2
+    assert scheduler.waiting.peek_request() is reqs[3]
+
+
+def test_scan_continues_past_a_request_that_needs_compute():
+    scheduler = _scheduler()
+    _fill_budget(scheduler)
+    misses = [_add(scheduler, 6 * BS) for _ in range(3)]
+    hit = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.schedule()
+    assert hit.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert all(m.status == RequestStatus.WAITING for m in misses)
+    # The misses keep their order at the queue head.
+    assert scheduler.waiting.peek_request() is misses[0]
+
+
+def test_loads_start_when_prefill_compute_is_deferred():
+    # A throttled DP step (throttle_prefills, not capacity bound) defers all
+    # prefill compute while a decode runs; loads still start.
+    scheduler = _scheduler()
+    dec = create_request(num_tokens=2 * BS, max_tokens=8, block_size=BS)
+    scheduler.add_request(dec)
+    out = scheduler.schedule()
+    scheduler.update_from_output(out, _outputs(scheduler, out))
+    miss = _add(scheduler, 6 * BS)
+    hit = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.prefill_capacity_bound = False
+    out = scheduler.schedule(throttle_prefills=True)
+    assert out.num_scheduled_tokens == {dec.request_id: 1}
+    assert miss.status == RequestStatus.WAITING
+    assert hit.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert hit in scheduler._load_ahead
+
+
+def test_loads_start_with_every_request_slot_taken():
+    scheduler = _scheduler()
+    scheduler.max_num_active_reqs = 1
+    long = _fill_budget(scheduler)
+    out = scheduler.schedule()
+    assert long.request_id in out.num_scheduled_tokens
+    scheduler.update_from_output(out, _outputs(scheduler, out))
+    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    out = scheduler.schedule()
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert a.request_id not in out.num_scheduled_tokens
 
 
 @pytest.mark.parametrize("num_blocks,loads_ahead", [(49, False), (53, True)])
