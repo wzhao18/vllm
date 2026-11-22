@@ -55,6 +55,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Before any READ: earlier steps' pair exchanges may still be writing
         # blocks that an abort freed and this step's pulls reuse.
         self._drain_pair_events(metadata)
+        if (diag := self._step_diag) is not None:
+            diag.n_reads += len(metadata.reqs_to_recv)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 self._dsa_dp_local_block_ids(meta.local_block_ids),
