@@ -5,7 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 
 from vllm.config import VllmConfig
@@ -214,6 +214,51 @@ def _non_mamba_boundary_puts(
     )
 
 
+class LoadTimeModel:
+    """Conservative load time of an early load from its token count.
+
+    Least-squares line through recent (tokens, seconds) of clean early loads
+    (fixed per-load cost plus per-token cost), raised by a high quantile of
+    the loads' excess over the line, so a prediction errs late.
+    """
+
+    def __init__(
+        self, window: int = 256, min_samples: int = 16, quantile: float = 0.9
+    ) -> None:
+        self._samples: deque[tuple[int, float]] = deque(maxlen=window)
+        self._min_samples = min_samples
+        self._quantile = quantile
+        self._fit: tuple[float, float, float] | None = None
+
+    def add(self, tokens: int, seconds: float) -> None:
+        self._samples.append((tokens, seconds))
+        self._fit = None
+
+    def _refit(self) -> tuple[float, float, float]:
+        n = len(self._samples)
+        mean_t = sum(t for t, _ in self._samples) / n
+        mean_s = sum(s for _, s in self._samples) / n
+        var_t = sum((t - mean_t) ** 2 for t, _ in self._samples)
+        slope = (
+            sum((t - mean_t) * (s - mean_s) for t, s in self._samples) / var_t
+            if var_t > 0
+            else 0.0
+        )
+        slope = max(slope, 0.0)
+        intercept = max(mean_s - slope * mean_t, 0.0)
+        excess = sorted(s - (intercept + slope * t) for t, s in self._samples)
+        margin = max(excess[min(n - 1, int(self._quantile * n))], 0.0)
+        return intercept, slope, margin
+
+    def predict(self, tokens: int) -> float | None:
+        if len(self._samples) < self._min_samples:
+            return None
+        if self._fit is None:
+            self._fit = self._refit()
+        intercept, slope, margin = self._fit
+        return intercept + slope * tokens + margin
+
+
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
@@ -334,6 +379,13 @@ class MooncakeStoreScheduler:
         ):
             self._early_loads = EarlyLoadClient(vllm_config)
             logger.info("Mooncake early loads on (issued at schedule time)")
+        # Early loads that join their request's first step (join_load_in_step),
+        # until that step's metadata lists them for the worker to wait on.
+        self._joined: set[str] = set()
+        # req_id -> tokens of an early load, until its time is reported.
+        self._early_tokens: dict[str, int] = {}
+        self._load_model = LoadTimeModel()
+        self.join_stats = {"joined": 0, "no_headroom": 0, "cold": 0, "recent": 0}
         # Tokens per block of each KV cache group (indexes the request's blocks).
         self._group_block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
@@ -567,22 +619,77 @@ class MooncakeStoreScheduler:
             num_prompt_tokens=unfinished_req.num_prompt_tokens,
         )
 
+    def _writes_recent_block(self, load_spec: LoadSpec, blocks: KVCacheBlocks) -> bool:
+        """Whether the load writes a block a step in flight may still use."""
+        for group_id in self._store_group_ids:
+            first = load_spec.vllm_cached_tokens // self._group_block_sizes[group_id]
+            for block in blocks.blocks[group_id][first:]:
+                if not block.is_null and BLOCK_FREE_CLOCK.freed_recently(block):
+                    return True
+        return False
+
+    def join_load_in_step(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_external_tokens: int,
+        headroom_s: float,
+    ) -> bool:
+        """Join the load to this step when it is predicted to finish before
+        the steps in flight do, so this step's forward does not wait for it.
+
+        Only an early load can (it starts now; a metadata load starts after
+        the step in flight). The prediction is the load-time model's
+        conservative estimate for this many tokens; until it has samples,
+        nothing joins.
+        """
+        request_id = request.request_id
+        load_spec = self.load_specs.get(request_id)
+        if (
+            self._early_loads is None
+            or load_spec is None
+            or num_external_tokens <= 0
+        ):
+            return False
+        if self._writes_recent_block(load_spec, blocks):
+            self._count_join("recent")
+            return False
+        predicted = self._load_model.predict(num_external_tokens)
+        if predicted is None:
+            self._count_join("cold")
+            return False
+        if predicted > headroom_s:
+            self._count_join("no_headroom")
+            return False
+        self._count_join("joined")
+        self._joined.add(request_id)
+        return True
+
+    def _count_join(self, outcome: str) -> None:
+        self.join_stats[outcome] += 1
+        if sum(self.join_stats.values()) % 2000 == 0:
+            logger.info("Mooncake same-step load joins: %s", dict(self.join_stats))
+
     def _issue_load_early(self, request_id: str, blocks: KVCacheBlocks) -> None:
         """Hand the load to the worker now if no step in flight uses its
         blocks; otherwise it goes with this step's metadata."""
         assert self._early_loads is not None
         load_spec = self.load_specs[request_id]
-        for group_id in self._store_group_ids:
-            first = load_spec.vllm_cached_tokens // self._group_block_sizes[group_id]
-            for block in blocks.blocks[group_id][first:]:
-                if not block.is_null and BLOCK_FREE_CLOCK.freed_recently(block):
-                    return
+        if self._writes_recent_block(load_spec, blocks):
+            return
         req_meta = self._load_only_req_meta(request_id)
         if req_meta is None:
             return
+        joined = getattr(self, "_joined", None)
+        req_meta.join = joined is not None and request_id in joined
         if not self._early_loads.send(req_meta):
             # Worker channel not connected yet: the step's metadata carries it.
             self.load_specs[request_id] = load_spec
+            return
+        if hasattr(self, "_early_tokens"):
+            self._early_tokens[request_id] = (
+                load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens
+            )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -591,7 +698,11 @@ class MooncakeStoreScheduler:
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
 
+        joined: set[str] = getattr(self, "_joined", set())
+        early_tokens: dict[str, int] = getattr(self, "_early_tokens", {})
         for finished_req_id in scheduler_output.finished_req_ids:
+            joined.discard(finished_req_id)
+            early_tokens.pop(finished_req_id, None)
             self.client.discard(finished_req_id)
             self._resume_tokens.pop(finished_req_id, None)
             self._req_origin_tokens.pop(finished_req_id, None)
@@ -666,6 +777,13 @@ class MooncakeStoreScheduler:
                 num_prompt_tokens=request_real.num_prompt_tokens,
                 save_partial_tail=self.enable_partial_hash_hits,
             )
+            if request.req_id in joined:
+                # Its first step: the worker waits for its load before the
+                # forward. (Issued early, or, if the channel was down, here.)
+                joined.discard(request.req_id)
+                meta.join_wait.append(request.req_id)
+                if req_meta is not None and load_spec is not None:
+                    req_meta.join = True
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -1088,6 +1206,10 @@ class MooncakeStoreScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
+        for req_id, seconds in meta.load_seconds.items():
+            tokens = getattr(self, "_early_tokens", {}).pop(req_id, None)
+            if tokens is not None:
+                self._load_model.add(tokens, seconds)
         pool = self._gpu_block_pool
         assert pool is not None
         for store_job_id, count in meta.completed_saves.items():

@@ -256,6 +256,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def join_load_in_step(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_external_tokens: int,
+        headroom_s: float,
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.join_load_in_step(
+            request, blocks, num_external_tokens, headroom_s
+        )
+
     def update_state_after_alloc(
         self,
         request: Request,
@@ -412,6 +424,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return
         self.connector_worker.start_load_kv(connector_metadata)
         self._loads_issued_for = connector_metadata
+        # Joined loads (join_load_in_step) must be in their blocks before
+        # this step's forward is launched.
+        self.connector_worker.wait_joined_loads(connector_metadata)
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()

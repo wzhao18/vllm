@@ -856,6 +856,9 @@ class ReqMeta:
     # stream at bind) completes, and load_issue_time is when it was issued.
     load_ready_event: torch.cuda.Event | None = None
     load_issue_time: float | None = None
+    # The load joins its request's first step (join_load_in_step): that
+    # step's bind waits for it, and a failure is reported per request.
+    join: bool = False
 
     token_ids: list[int] | None = None
     # Absolute request offset represented by token_ids[0].
@@ -980,6 +983,9 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    # req_id -> seconds from issue to completion of a clean early load (the
+    # scheduler's load-time model for join_load_in_step). Slowest rank wins.
+    load_seconds: dict[str, float] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -989,6 +995,8 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
             )
+        for req_id, seconds in other.load_seconds.items():
+            self.load_seconds[req_id] = max(self.load_seconds.get(req_id, 0.0), seconds)
         return self
 
 
@@ -1003,6 +1011,9 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # Joined loads (join_load_in_step) of this step's new requests: the
+        # worker waits for each before this step's forward.
+        self.join_wait: list[str] = []
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

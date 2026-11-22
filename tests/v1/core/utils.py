@@ -162,6 +162,7 @@ def create_scheduler(
                 "num_defers_before_matching": (
                     use_kv_connector.num_defers_before_matching
                 ),
+                "join_in_step": use_kv_connector.join_in_step,
             },
         )
     elif isinstance(use_kv_connector, str):

@@ -23,7 +23,7 @@ import threading
 import struct
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
@@ -1345,6 +1345,67 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
 
 
+class JoinedLoads:
+    """Completion of the loads that join their request's first step
+    (join_load_in_step), for that step's bind to wait on.
+
+    A joined load is registered before it is queued, completed by the recv
+    thread once it is reported (errors first), and waited on by request id,
+    so a bind waits for exactly its own step's joined loads.
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._pending: set[str] = set()
+        self._done: set[str] = set()
+        self._failed: set[str] = set()
+
+    def register(self, req_id: str) -> None:
+        with self._cv:
+            self._pending.add(req_id)
+            self._done.discard(req_id)
+            self._failed.discard(req_id)
+            self._cv.notify_all()
+
+    def is_joined(self, req_id: str) -> bool:
+        with self._cv:
+            return req_id in self._pending
+
+    def mark_failed(self, req_id: str) -> None:
+        with self._cv:
+            if req_id in self._pending:
+                self._failed.add(req_id)
+
+    def complete(self, req_id: str) -> None:
+        with self._cv:
+            if req_id in self._pending:
+                self._pending.discard(req_id)
+                self._done.add(req_id)
+                self._cv.notify_all()
+
+    def wait(self, req_id: str, timeout_s: float) -> bool:
+        """Block until ``req_id``'s joined load is reported; True if it
+        failed. The load may not be registered yet (the early-load channel
+        and the step's metadata travel separately)."""
+        with self._cv:
+            if not self._cv.wait_for(lambda: req_id in self._done, timeout_s):
+                raise RuntimeError(
+                    f"Mooncake joined load of {req_id} not reported within "
+                    f"{timeout_s:.0f} s"
+                )
+            self._done.discard(req_id)
+            failed = req_id in self._failed
+            self._failed.discard(req_id)
+            return failed
+
+    def forget(self, req_ids: Iterable[str]) -> None:
+        with self._cv:
+            for req_id in req_ids:
+                self._pending.discard(req_id)
+                self._done.discard(req_id)
+                self._failed.discard(req_id)
+
+
 class KVCacheStoreRecvingThread(KVTransferThread):
     """Background thread for loading KV cache blocks from the store."""
 
@@ -1388,6 +1449,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # Guarded by done_task_lock. These may be reported early by
         # take_clean_finished_requests() instead of in-band.
         self._clean_finished: set[str] = set()
+        # Joined loads (set by the worker): reported per request, and
+        # completed for the bind that waits on them.
+        self.joined: JoinedLoads | None = None
+        # Called with (req_id, seconds) for each clean load issued early.
+        self.on_clean_early_load: Callable[[str, float], None] | None = None
+        self._load_error_reqs: set[str] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -1397,6 +1464,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+
+    def _error_reqs(self) -> set[str]:
+        # Requests of the load in progress that reported an error (created
+        # on first use as well: tests build threads without __init__).
+        if getattr(self, "_load_error_reqs", None) is None:
+            self._load_error_reqs = set()
+        return self._load_error_reqs
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1416,6 +1490,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             else:
                 self._clean_finished.discard(req_id)
             self.finished_requests.add(req_id)
+        joined = getattr(self, "joined", None)
+        if joined is not None:
+            joined.complete(req_id)
 
     def get_and_clear_finished_requests(self, include_clean: bool = True) -> set[str]:
         """Drain finished loads for the in-band report.
@@ -1446,7 +1523,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return failed
 
     def _report_load_error(self, req_id: str, block_ids: list[int]) -> None:
-        if self._is_hma_required:
+        self._error_reqs().add(req_id)
+        joined = getattr(self, "joined", None)
+        if joined is not None and joined.is_joined(req_id):
+            # A joined request is already admitted: it fails as a whole
+            # (the scheduler recomputes it), never by blocks.
+            joined.mark_failed(req_id)
+            self.set_failed_request(req_id)
+        elif self._is_hma_required:
             self.set_failed_request(req_id)
         else:
             self._add_load_error_block_ids(block_ids)
@@ -1462,6 +1546,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # would leave its request in WAITING_FOR_REMOTE_KVS forever.
         try:
             self._handle_load(req_meta)
+            failed = req_meta.req_id in self._error_reqs()
+            self._error_reqs().discard(req_meta.req_id)
+            on_clean = getattr(self, "on_clean_early_load", None)
+            if (
+                not failed
+                and on_clean is not None
+                and req_meta.load_ready_event is None
+                and req_meta.load_issue_time is not None
+            ):
+                on_clean(
+                    req_meta.req_id, time.perf_counter() - req_meta.load_issue_time
+                )
         except Exception:
             logger.exception(
                 "Mooncake load for request %s failed; recomputing", req_meta.req_id
@@ -1469,6 +1565,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._report_load_error(
                 req_meta.req_id, [b for group in req_meta.block_ids for b in group]
             )
+            self._error_reqs().discard(req_meta.req_id)
             self.set_finished_request(req_meta.req_id)
             self.request_queue.task_done()
 
@@ -1927,6 +2024,21 @@ class MooncakeStoreWorker:
         # Started with the receive threads (early_load_supported).
         self._early_loads_on = early_load_supported(vllm_config)
         self.early_load_server: EarlyLoadServer | None = None
+        # Loads joined to their request's first step (join_load_in_step).
+        self.joined_loads = JoinedLoads()
+        # A joined request whose load failed computes on KV that never
+        # arrived until the scheduler preempts it: never store that KV.
+        self._join_poisoned: set[str] = set()
+        self._join_wait_timeout_s = float(
+            (
+                vllm_config.kv_transfer_config.kv_connector_extra_config
+                if vllm_config.kv_transfer_config is not None
+                else {}
+            ).get("lookup_timeout_s", 10.0)
+        ) * 12
+        # req_id -> seconds of clean early loads, for the scheduler's model.
+        self._load_seconds_lock = threading.Lock()
+        self._load_seconds: dict[str, float] = {}
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
         if vllm_config.parallel_config.rank == 0:
@@ -2466,6 +2578,9 @@ class MooncakeStoreWorker:
                 is_hma_required=self._is_hma_required,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
+            recv_thread.joined = self._joined_registry()
+            if getattr(self, "_load_seconds_lock", None) is not None:
+                recv_thread.on_clean_early_load = self._record_load_seconds
             recv_thread.store_guard = self._make_store_guard(
                 recv_thread.name, recv_thread
             )
@@ -2502,7 +2617,43 @@ class MooncakeStoreWorker:
         req_meta.load_ready_event = None
         req_meta.load_issue_time = time.perf_counter()
         self._increment_kv_connector_counter("load_issued_early", 1)
+        if req_meta.join:
+            self._joined_registry().register(req_meta.req_id)
         self.recv_request_queue.put(req_meta)
+
+    def _joined_registry(self) -> JoinedLoads:
+        # Created on first use as well: tests build workers without __init__.
+        if getattr(self, "joined_loads", None) is None:
+            self.joined_loads = JoinedLoads()
+            self._join_poisoned = set()
+        return self.joined_loads
+
+    def _record_load_seconds(self, req_id: str, seconds: float) -> None:
+        with self._load_seconds_lock:
+            self._load_seconds[req_id] = seconds
+
+    def wait_joined_loads(self, metadata: MooncakeStoreConnectorMetadata) -> None:
+        """Before this step's forward: wait for the joined loads of its new
+        requests (each on its own completion, not on the connector).
+
+        A failed one is reported per request (failed_recving) with this step's
+        output, which the scheduler handles before the output; the forward
+        still runs, so the rank takes part in every collective of the step,
+        and the request's KV is never stored.
+        """
+        if not getattr(metadata, "join_wait", None):
+            return
+        start = time.perf_counter()
+        registry = self._joined_registry()
+        for req_id in metadata.join_wait:
+            if registry.wait(req_id, getattr(self, "_join_wait_timeout_s", 120.0)):
+                self._join_poisoned.add(req_id)
+                self._increment_kv_connector_counter("join_load_failed", 1)
+        waited = time.perf_counter() - start
+        self._record_kv_connector_operation("join_wait", waited, len(metadata.join_wait))
+        self._increment_kv_connector_counter("join_loads", len(metadata.join_wait))
+        if waited > 1e-3:
+            self._increment_kv_connector_counter("join_wait_stalled", 1)
 
     def unregister_kv_caches(self) -> None:
         """Unregister device KV buffers after the engine has drained transfers."""
@@ -2581,6 +2732,10 @@ class MooncakeStoreWorker:
             load_spec.token_len = load_spec.kvpool_cached_tokens
             request.load_ready_event = ready_event
             request.load_issue_time = issue_time
+            if request.join:
+                # Not issued early (channel not up): this bind waits for
+                # the whole load.
+                self._joined_registry().register(request.req_id)
             self.recv_request_queue.put(request)
 
     def poll_finished_recving(self) -> set[str]:
@@ -2622,8 +2777,13 @@ class MooncakeStoreWorker:
         for request in metadata.requests:
             if not request.can_save:
                 continue
-            request.current_event = current_event
             assert self.kv_send_thread is not None
+            if request.req_id in getattr(self, "_join_poisoned", ()):
+                # Its KV is built on a failed joined load: drop the job
+                # (reported done, so its blocks are released).
+                self.kv_send_thread.finish_store_job(request)
+                continue
+            request.current_event = current_event
             self.kv_send_thread.add_request(request)
 
     def get_finished(
@@ -2638,6 +2798,13 @@ class MooncakeStoreWorker:
 
         if self.can_put:
             self._close_ended_store_requests(finished_req_ids, meta)
+        if getattr(self, "joined_loads", None) is not None and (
+            finished_req_ids or meta.preempted_req_ids
+        ):
+            # The preemption restarts a poisoned request from scratch.
+            ended = set(finished_req_ids) | set(meta.preempted_req_ids)
+            self._join_poisoned -= ended
+            self.joined_loads.forget(finished_req_ids)
 
         # Blocks read by a store job are released by the scheduler when the job
         # reports back (see build_connector_worker_meta), so no request ever waits
@@ -2750,9 +2917,15 @@ class MooncakeStoreWorker:
         if self.kv_send_thread is None:
             return None
         completed_saves = self.kv_send_thread.take_completed_saves()
-        if not completed_saves:
+        load_seconds: dict[str, float] = {}
+        if getattr(self, "_load_seconds_lock", None) is not None:
+            with self._load_seconds_lock:
+                load_seconds, self._load_seconds = self._load_seconds, {}
+        if not completed_saves and not load_seconds:
             return None
-        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+        return MooncakeStoreWorkerMetadata(
+            completed_saves=completed_saves, load_seconds=load_seconds
+        )
 
     def lookup(
         self,

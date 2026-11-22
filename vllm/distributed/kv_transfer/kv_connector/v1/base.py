@@ -627,6 +627,34 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def join_load_in_step(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+        headroom_s: float,
+    ) -> bool:
+        """Whether the async load just allocated for ``request`` joins this step.
+
+        Called after the blocks of an async load (get_num_new_matched_tokens
+        returned ``load_async=True``) are allocated and before
+        update_state_after_alloc, only when the request could compute in this
+        step. True means the connector guarantees the load's KV is in the
+        blocks before this step's forward reads them (its worker waits on that
+        load), so the scheduler admits the request in this step instead of
+        parking it in WAITING_FOR_REMOTE_KVS until the load is reported.
+        ``headroom_s`` is the scheduler's prediction of how long the steps
+        already in flight still run (0 when none is): a load that finishes
+        within it costs this step's forward no wait.
+
+        The load is still reported in finished_recving, or failed_recving on
+        failure, by the output of the request's first step at the latest; the
+        scheduler caches the request's blocks only once it reports clean, and
+        on failure skips the request's output and recomputes or fails it per
+        kv_load_failure_policy.
+        """
+        return False
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

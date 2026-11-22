@@ -403,6 +403,8 @@ class MockKVConfig:
     is_async: bool = False
     num_defers_before_matching: int = 0
     supports_divergent_local_hybrid_hits: bool = False
+    # join_load_in_step answer (same-step admission of async loads).
+    join_in_step: bool = False
 
 
 class MockKVConnectorMetadata(KVConnectorMetadata):
@@ -431,7 +433,10 @@ class MockKVConnector(KVConnectorBase_V1):
             supports_divergent_local_hybrid_hits=extra_config.get(
                 "supports_divergent_local_hybrid_hits", False
             ),
+            join_in_step=extra_config.get("join_in_step", False),
         )
+        # (request_id, num_external_tokens, headroom_s) of each join query.
+        self.join_queries: list[tuple[str, int, float]] = []
         self._defers_left: defaultdict[str, int] = defaultdict(
             lambda: self.config.num_defers_before_matching
         )
@@ -449,6 +454,16 @@ class MockKVConnector(KVConnectorBase_V1):
             self._defers_left[request.request_id] -= 1
             return (None, False)
         return (self.config.matched_tokens, self.config.is_async)
+
+    def join_load_in_step(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_external_tokens: int,
+        headroom_s: float,
+    ) -> bool:
+        self.join_queries.append((request.request_id, num_external_tokens, headroom_s))
+        return self.config.join_in_step
 
     def update_state_after_alloc(
         self,

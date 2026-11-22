@@ -492,6 +492,20 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_external_tokens
         )
 
+    def join_load_in_step(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+        headroom_s: float,
+    ) -> bool:
+        chosen_connector = self._requests_to_connector.get(request.request_id)
+        if chosen_connector is None:
+            return False
+        return self._connectors[chosen_connector].join_load_in_step(
+            request, blocks, num_external_tokens, headroom_s
+        )
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
