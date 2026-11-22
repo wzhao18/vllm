@@ -180,3 +180,24 @@ def test_abort_while_loading_ahead_drops_it_from_the_set():
     )
     assert a.request_id not in scheduler.requests
 
+
+
+def test_no_load_ahead_while_a_dp_rank_is_idle():
+    """Late binding: while the last DP exchange saw an idle rank, queued
+    requests stay uncommitted (WAITING, movable) instead of being loaded ahead;
+    loads ahead resume once no rank is idle."""
+    scheduler = _scheduler()
+    long = _fill_budget(scheduler)
+    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.connector.dp_move_tokens.side_effect = lambda r: r.num_prompt_tokens
+    scheduler.dp_group_has_idle_rank = True
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert a.status == RequestStatus.WAITING
+    assert scheduler._load_ahead == set()
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [a.request_id]
+    scheduler.update_from_output(out, _outputs(scheduler, out))
+    scheduler.dp_group_has_idle_rank = False
+    scheduler.schedule()
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._load_ahead == {a}

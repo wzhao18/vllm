@@ -1447,6 +1447,9 @@ class Scheduler(SchedulerInterface):
                         or self._pause_state != PauseState.UNPAUSED
                         or load_ahead_left <= 0
                         or not self.waiting
+                        # Some DP rank of the group has no work: leave the
+                        # queued requests uncommitted so they can move there.
+                        or self.dp_group_has_idle_rank
                     ):
                         break
                     head = self.waiting.peek_request()
