@@ -46,7 +46,8 @@ def decode(code: int) -> str:
 
 class _Crumbs:
     def __init__(self) -> None:
-        self.word = torch.zeros(4, dtype=torch.int32, pin_memory=True)  # [0] GPU-side code
+        # Explicit device: the first crumb can come from model construction, under a CUDA default device.
+        self.word = torch.zeros(4, dtype=torch.int32, device="cpu", pin_memory=True)  # [0] GPU-side code
         self.addr = self.word.data_ptr()
         self.host_code = 0
         self.host_t = time.monotonic()

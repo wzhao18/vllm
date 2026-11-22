@@ -35,6 +35,17 @@ def test_crumb_reaches_the_gpu_word_in_stream_order():
 
 
 @cuda
+def test_first_use_under_a_cuda_default_device():
+    # Model construction runs under torch.device("cuda"); a crumb registered there must still get a pinned host word.
+    from vllm.models.kimi_k3.nvidia import breadcrumb as B
+
+    with torch.device("cuda"):
+        c = B._Crumbs()
+    assert c.word.device.type == "cpu" and c.word.is_pinned()
+    c.ok = False  # stop the extra watcher from reporting
+
+
+@cuda
 def test_no_crumb_is_recorded_into_a_cuda_graph():
     from vllm.models.kimi_k3.nvidia import breadcrumb as B
 
