@@ -31,6 +31,7 @@ class _Sched:
         self.exchange = None
         self.dp_group_has_idle_rank = False
         self.finished = []
+        self.dp_listed_local_hit = {}
 
     def set_dp_prefill_exchange(self, exchange):
         self.exchange = exchange
