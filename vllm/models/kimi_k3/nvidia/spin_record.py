@@ -21,9 +21,10 @@ word    meaning
 5       observed value
 6       target value
 7       SM id
-8       aux (MegaMoE: arrival mask over ranks)
+8       aux (MegaMoE: arrival mask over ranks; PIDX: the launch's size)
 9       number of entries
 10+4i   entry i: rank, issued, entered, verdict (``VERDICTS``), at most 13 entries
+48..63  PIDX (no entries): kernel name, NUL-terminated (k31_spin_guard.cuh)
 ======  ===========================================================================
 
 Record 0 is reserved for the MegaMoE missing-rank report; record 1 takes the first other guard.
@@ -47,6 +48,7 @@ DONE = 0x5350494E  # 'SPIN'
 SOURCE_MEGAMOE = 1
 SOURCE_PIDX = 2
 MAX_ENTRIES = (RECORD_WORDS - 10) // 4
+NAME_WORD = 48  # PIDX records: kernel name in words NAME_WORD..RECORD_WORDS-1
 VERDICTS = {1: "H1_host_never_issued", 2: "H2_gpu_stuck_before_call", 3: "IN_call_not_published"}
 _SOURCES = {SOURCE_MEGAMOE: "megamoe_rubin", SOURCE_PIDX: "pidx"}
 
@@ -54,7 +56,18 @@ _lock = threading.Lock()
 _instance: SpinRecords | None = None
 
 
+def _name(words: list[int]) -> str:
+    raw = b"".join((w & 0xFFFFFFFF).to_bytes(4, "little") for w in words[NAME_WORD:])
+    return raw.split(b"\0", 1)[0].decode(errors="replace")
+
+
 def format_record(words: list[int]) -> str:
+    if words[1] == SOURCE_PIDX:
+        return (
+            f"K31_SPIN_RECORD source=pidx kernel={_name(words)} site={words[2]} "
+            f"rank={words[3]} call={words[4]} size={words[8]} observed={words[5]} "
+            f"target={words[6]} smid={words[7]}"
+        )
     n = max(0, min(words[9], MAX_ENTRIES))
     entries = "; ".join(
         f"rank {words[10 + 4 * i]} issued {words[11 + 4 * i]} entered {words[12 + 4 * i]} "

@@ -192,3 +192,19 @@ def test_guards_delay_the_trap():
     body = src[src.index("def _trap() -> None:") :]
     assert body.index("TRAP_DELAY_NS") < body.index("_trap_now()")
     assert src.count("_trap_now()") == 1  # only the delayed _trap() traps
+
+
+def test_spin_record_format_pidx_record():
+    """PIDX raw CUDA guards (k31_spin_guard.cuh) write record 1 with SOURCE_PIDX and the kernel name in words 48..63."""
+    from vllm.models.kimi_k3.nvidia import spin_record as SR
+
+    words = [0] * SR.RECORD_WORDS
+    words[:10] = [SR.DONE, SR.SOURCE_PIDX, 438, 5, 1, 0, 1, 77, 1500, 0]
+    name = b"attn_res_lp\0"
+    name += b"\0" * (-len(name) % 4)
+    for i in range(len(name) // 4):
+        words[SR.NAME_WORD + i] = int.from_bytes(name[4 * i : 4 * i + 4], "little")
+    assert SR.format_record(words) == (
+        "K31_SPIN_RECORD source=pidx kernel=attn_res_lp site=438 rank=5 call=1 size=1500 "
+        "observed=0 target=1 smid=77"
+    )
