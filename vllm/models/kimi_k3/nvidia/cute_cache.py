@@ -603,6 +603,32 @@ def _compile_target(compile_fn: Any, fn: Any, kwargs: dict) -> str:
     return f"arch {arch}\noptions {' '.join(flags)}"
 
 
+_KEYDUMP = None  # DIAG (wzhao/k31ws-cutekey-diag, never merge)
+
+
+def _keydump(name: str, key: str, head: str, fp: "_Fingerprint") -> None:
+    """DIAG: one gzip-jsonl record per compile call with the full key material, to
+    $VLLM_KIMI_K3_CUTE_KEYDUMP_DIR/<host>-<pid>.jsonl.gz (a _DIR name: not in the key)."""
+    global _KEYDUMP
+    d = os.environ.get("VLLM_KIMI_K3_CUTE_KEYDUMP_DIR")
+    if not d:
+        return
+    import gzip
+
+    with _lock:
+        if _KEYDUMP is None:
+            os.makedirs(d, exist_ok=True)
+            _KEYDUMP = gzip.open(
+                os.path.join(d, f"{socket.gethostname()}-{os.getpid()}.jsonl.gz"), "at"
+            )
+        _KEYDUMP.write(json.dumps({
+            "name": name, "key": key, "head": head,
+            "foreign": sorted(_foreign_module(m) for m in fp.modules),
+            "parts": fp.parts,
+        }) + "\n")
+        _KEYDUMP.flush()
+
+
 def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp = _Fingerprint()
     fp.add(getattr(compile_fn, "_compile_options", None))
@@ -611,7 +637,12 @@ def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp.add(kwargs)
     target = _compile_target(compile_fn, fn, kwargs)
     head = f"{_versions()}\n{_environment()}\n{target}\n"
-    return hashlib.sha256((head + fp.digest()).encode()).hexdigest(), fp.modules
+    key = hashlib.sha256((head + fp.digest()).encode()).hexdigest()
+    try:
+        _keydump(_kernel_name(fn), key, head, fp)
+    except Exception as e:  # DIAG must never break a start
+        logger.warning("CuTe key dump failed: %s", e)
+    return key, fp.modules
 
 
 def key_of(compile_fn: Any, fn: Any, args: tuple, kwargs: dict) -> str:
