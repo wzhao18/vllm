@@ -2778,7 +2778,10 @@ class DPEngineCoreProc(EngineCoreProc):
             executed = self._process_engine_step_dp()
             self._maybe_publish_request_counts()
 
-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            local_unfinished_reqs = (
+                self.scheduler.has_unfinished_requests()
+                or self._dp_has_pending_handover()
+            )
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
@@ -3150,6 +3153,20 @@ class DPEngineCoreProc(EngineCoreProc):
                     self._dp_moved_to.pop(item.request_id, None)
         for client_index, eco in by_client.items():
             self.output_queue.put_nowait((client_index, eco))
+
+    def _dp_has_pending_handover(self) -> bool:
+        """Late-binding work this rank still owes its peers: planned moves,
+        abort forwards, or outputs of foreign requests not yet sent home. The
+        DP group must keep stepping until they are handed over - an output
+        parked here while every engine went idle would never reach its client
+        (the request would hang at the client)."""
+        return bool(
+            getattr(self, "_dp_moves", None)
+            or getattr(self, "_dp_abort_forward", None)
+            or getattr(self, "_dp_out_forward", None)
+            or any(any(row) for row in getattr(self, "_dp_abort_counts", ()) or ())
+            or any(any(row) for row in getattr(self, "_dp_out_counts", ()) or ())
+        )
 
     def _dp_count_move(self, i: int, num_tokens: int) -> None:
         st = self._dp_move_stats
