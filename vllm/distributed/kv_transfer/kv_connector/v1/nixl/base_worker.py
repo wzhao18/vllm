@@ -297,6 +297,45 @@ class _PairExchangeTimes:
             self._writer.put(("X", *record, start.elapsed_time(end)))
 
 
+class _StepDiag:
+    """DSTEP diag (VLLM_ITERLOG_DIR): one ``D`` record per get_transfer_results
+    of this worker: host microseconds of the step's pair exchange enqueue, of
+    the pre-READ drain waits, and of get_transfer_results itself."""
+
+    FIELDS = {
+        "D": "t n_units h_fin_us h_drain_us n_drain_sync h_res_us n_done_recv "
+        "n_recving n_reads_started"
+    }
+
+    def __init__(self, rank: int):
+        self._writer = iterlog._Writer(f"nixl-step-r{rank}", self.FIELDS, {})
+        self.reset()
+
+    def reset(self) -> None:
+        self.n_units = 0
+        self.h_fin = 0.0
+        self.h_drain = 0.0
+        self.n_sync = 0
+        self.n_reads = 0
+
+    def emit(self, h_res: float, n_done: int, n_recving: int) -> None:
+        self._writer.put(
+            (
+                "D",
+                time.perf_counter(),
+                self.n_units,
+                round(self.h_fin * 1e6, 1),
+                round(self.h_drain * 1e6, 1),
+                self.n_sync,
+                round(h_res * 1e6, 1),
+                n_done,
+                n_recving,
+                self.n_reads,
+            )
+        )
+        self.reset()
+
+
 class NixlBaseConnectorWorker:
     """Base implementation of Worker side methods shared by pull and push."""
 
@@ -346,6 +385,7 @@ class NixlBaseConnectorWorker:
     ] = ()
     # Pair mode with VLLM_ITERLOG_DIR: each step's exchange GPU time.
     _pair_times: _PairExchangeTimes | None = None
+    _step_diag: _StepDiag | None = None
 
     # Total KV heads of a non-MLA draft under an MLA target (see
     # _resolve_head_sharded_draft_kv_heads), its regions and transfer groups
@@ -2760,6 +2800,9 @@ class NixlBaseConnectorWorker:
         self._pair_exchanger = exchanger
         self._pair_group = group
         if iterlog.ITERLOG_DIR is not None and device.type == "cuda":
+            import torch.distributed as dist
+
+            self._step_diag = _StepDiag(dist.get_rank() if dist.is_initialized() else 0)
             self._pair_times = _PairExchangeTimes(
                 self.dcp_rank,
                 {
@@ -4853,6 +4896,7 @@ class NixlBaseConnectorWorker:
         """
         self._raise_peer_config_mismatch()
         assert self.transfer_topo is not None
+        t_res0 = time.perf_counter()
         done_sending = self._get_new_notifs()
         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
         if newly_failed:
@@ -5047,6 +5091,12 @@ class NixlBaseConnectorWorker:
             self._pair_times.poll()
 
         self._cleanup_remote_engines()
+        if (diag := self._step_diag) is not None:
+            diag.emit(
+                time.perf_counter() - t_res0,
+                len(done_recving),
+                len(self._recving_transfers),
+            )
         return KVConnectorTransferResults(
             finished_sending=done_sending,
             finished_recving=done_recving,
@@ -5072,8 +5122,14 @@ class NixlBaseConnectorWorker:
                 stream.wait_event(event)
             self._pair_side_events = ()
         if metadata.reqs_to_pair_exchange:
+            t0 = time.perf_counter()
             self.run_pair_exchanges(metadata)
             self._pair_consumed = metadata
+            if (diag := self._step_diag) is not None:
+                diag.h_fin += time.perf_counter() - t0
+                diag.n_units += sum(
+                    len(p) for p in metadata.reqs_to_pair_exchange.values()
+                )
         if metadata.fingerprint_pulls and self._fingerprint_log is not None:
             # Debug runs: the sums read the exchanged blocks on this stream.
             for event in self._pair_side_events:
@@ -5272,8 +5328,12 @@ class NixlBaseConnectorWorker:
             if targets.isdisjoint(blocks):
                 pending.append((meta, event, blocks))
                 continue
+            t0 = time.perf_counter()
             with gpu_sync_allowed():
                 event.synchronize()
+            if (diag := self._step_diag) is not None:
+                diag.h_drain += time.perf_counter() - t0
+                diag.n_sync += 1
         self._pair_events = tuple(pending)
 
     def _pair_read_targets(self, metadata: NixlConnectorMetadata) -> set[int]:
