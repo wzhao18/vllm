@@ -77,3 +77,11 @@ def test_one_huge_prompt_alone_stays():
 def test_small_gain_stays_home():
     # Moving 1K to save little is not worth a migration.
     assert plan_dp_moves([5000, 4800], [[1000], []], step_budget=16384) == []
+
+
+def test_reload_penalty_keeps_gpu_hit_requests_home():
+    # Same gain (12000) as test_queued_prompt_moves_to_idle_rank, but the home
+    # rank's GPU holds the request's prefix: the move must beat the reload.
+    assert plan_dp_moves([16000, 0], [[12000], []], 16384, penalties=[[20000], []]) == []
+    moves = plan_dp_moves([16000, 0], [[12000], []], 16384, penalties=[[8000], []])
+    assert [(m.src, m.dst) for m in moves] == [(0, 1)]

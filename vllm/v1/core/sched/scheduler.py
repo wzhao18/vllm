@@ -323,6 +323,9 @@ class Scheduler(SchedulerInterface):
         self._dp_scheduled_now: dict[str, int] = {}
         # Requests offered as movable in the current DP exchange.
         self._dp_listed: set[str] = set()
+        # Local GPU prefix hit (tokens) of each request offered as movable in
+        # the current DP exchange (see dp_local_prefix_hit).
+        self.dp_listed_local_hit: dict[str, int] = {}
         try:
             from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
 
@@ -3592,7 +3595,25 @@ class Scheduler(SchedulerInterface):
                 )
                 out.append((request.request_id, max(cost, 1)))
         self._dp_listed = {rid for rid, _ in out}
+        self.dp_listed_local_hit = {
+            rid: self.dp_local_prefix_hit(self.requests[rid]) for rid, _ in out
+        }
         return out
+
+    def dp_local_prefix_hit(self, request: Request) -> int:
+        """Prompt tokens of ``request`` this rank's GPU prefix cache holds now
+        (read-only lookup; 0 without prefix caching). A move elsewhere would
+        load them from the external store instead."""
+        if not self.cache_config.enable_prefix_caching or not request.block_hashes:
+            return 0
+        try:
+            return int(
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_prompt_tokens - 1
+                )[1]
+            )
+        except Exception:  # noqa: BLE001 - a planning hint only
+            return 0
 
     def _dp_plan_cost(self, num_tokens: int, ctx: int) -> int:
         """Planning size of ``num_tokens`` prompt tokens still to compute from

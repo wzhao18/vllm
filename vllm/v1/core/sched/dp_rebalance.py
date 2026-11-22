@@ -32,6 +32,7 @@ def plan_dp_moves(
     step_budget: int,
     max_moves_per_rank: int = 2,
     min_gain: int = 2048,
+    penalties: list[list[int]] | None = None,
 ) -> list[DPMove]:
     """Plan cross-rank moves of uncommitted requests.
 
@@ -63,6 +64,14 @@ def plan_dp_moves(
         ((size, r, i) for r in range(n) for i, size in enumerate(movable[r])),
         key=lambda t: (-t[0], t[1], t[2]),
     )
+
+    def penalty(r: int, i: int) -> int:
+        # Extra gain a move must clear (e.g. reloading a prefix the home
+        # rank's GPU cache already holds).
+        if penalties is None or i >= len(penalties[r]):
+            return 0
+        return penalties[r][i]
+
     left = [0] * n
     entered = [0] * n
     moves: list[DPMove] = []
@@ -76,7 +85,7 @@ def plan_dp_moves(
             # min_gain tokens (one CUDA-graph step's worth by default).
             and max(load[home] + size, load[best])
             - max(load[home], load[best] + size)
-            >= min_gain
+            >= max(min_gain, penalty(home, index))
         )
         if move_ok:
             load[best] += size

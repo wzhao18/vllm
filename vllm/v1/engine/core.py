@@ -151,6 +151,19 @@ def dp_step_token_cap(
 DP_MOVE_SLOTS = 4
 # Moved request ids a source rank remembers to forward client aborts.
 DP_MOVED_MEMORY = 65536
+# Moving a request off the rank whose GPU prefix cache holds part of its prompt
+# costs a reload from the external store: about one lockstep step (the load
+# runs while the request waits) plus the transfer, priced at 1/24 short-context
+# token per reloaded token (~40 KB/token of KV at ~1 MB/ms). A move must gain
+# more than that (planner units).
+DP_RELOAD_STEP_PENALTY = 16384
+DP_RELOAD_TOKENS_PER_UNIT = 24
+
+
+def dp_reload_penalty(local_hit_tokens: int) -> int:
+    if local_hit_tokens <= 0:
+        return 0
+    return DP_RELOAD_STEP_PENALTY + local_hit_tokens // DP_RELOAD_TOKENS_PER_UNIT
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -2835,8 +2848,12 @@ class DPEngineCoreProc(EngineCoreProc):
         if slots:
             movable = self.scheduler.dp_movable_requests(slots)
             counts[pd_base + rank] = self.scheduler.dp_move_demand()
-            for i, (_, n_tok) in enumerate(movable):
-                counts[mv_base + rank * slots + i] = n_tok
+            hits = self.scheduler.dp_listed_local_hit
+            for i, (rid, n_tok) in enumerate(movable):
+                # Size in the low 32 bits, the reload penalty above them.
+                counts[mv_base + rank * slots + i] = n_tok | (
+                    dp_reload_penalty(hits.get(rid, 0)) << 32
+                )
             for dst, ids in self._dp_abort_forward.items():
                 counts[ab_base + rank * size + dst] = len(ids)
         # Every rank adds 1: a collective paired with a different one on some
@@ -2890,10 +2907,12 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.v1.core.sched.dp_rebalance import plan_dp_moves
 
         demand = [int(x) for x in counts[pd_base : pd_base + size]]
-        per_rank = [
+        packed = [
             [int(x) for x in counts[mv_base + r * slots : mv_base + (r + 1) * slots] if x > 0]
             for r in range(size)
         ]
+        per_rank = [[x & 0xFFFFFFFF for x in row] for row in packed]
+        penalties = [[x >> 32 for x in row] for row in packed]
         local = self._dp_move_local_size
         moves = []
         for g in range(-(-size // local)):
@@ -2902,6 +2921,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 demand[lo:hi],
                 per_rank[lo:hi],
                 self.scheduler.max_num_scheduled_tokens,
+                penalties=penalties[lo:hi],
             ):
                 moves.append(type(mv)(mv.src + lo, mv.index, mv.dst + lo, mv.num_tokens))
         self._dp_moves = moves
