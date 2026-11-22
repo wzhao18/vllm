@@ -342,6 +342,21 @@ class NixlBaseConnectorScheduler:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
 
+    def on_request_arrival(self, request: "Request") -> None:
+        """P side: apply the prefill truncation as the request arrives, before
+        any later connector (e.g. the Mooncake store in a MultiConnector) keys
+        its arrival lookup on the prompt. Truncating only at ``on_new_request``
+        made every arrival lookup stale by one token, so the store lookup was
+        redone at the first schedule (one extra lockstep step per request).
+
+        Runs on the engine core input thread before the scheduler has the
+        request; it only mutates the request itself. ``on_new_request`` keeps
+        the same call, a no-op once ``_p_side_truncated`` is set.
+        """
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode"):
+            self._truncate_request_for_prefill(request)
+
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
         params = request.kv_transfer_params
