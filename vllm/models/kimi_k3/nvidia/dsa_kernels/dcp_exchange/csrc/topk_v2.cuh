@@ -655,6 +655,25 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             run += warp_sums[t];
             if (run >= want) { s_th = max(s_th, (cb << 4) + t); break; }
           }
+          if constexpr (kFast) {
+            // PIDX TIE DIAGNOSTIC (never merge): stats[192 + ...] per slot, rows that refine:
+            // 0 refined, 1 refined theta predicts no overflow (8 x sample >= theta <= kV2Cand),
+            // 2-9 eighths of the bin's sample on its single largest key, 10-17 log2 of the
+            // predicted candidates at the refined theta / q, 18-25 eighths of the sample in the
+            // bin on the refined theta's own key
+            if (p.stats) {
+              int* st = p.stats + 192;
+              uint32_t mx = 0, bin = 0;
+              for (int t = 0; t < 16; ++t) { mx = max(mx, warp_sums[t]); bin += warp_sums[t]; }
+              const uint32_t pred = run * (uint32_t)kV2SampleStride;
+              atomicAdd(&st[0], 1);
+              if (pred <= (uint32_t)kV2Cand) atomicAdd(&st[1], 1);
+              atomicAdd(&st[2 + (bin ? min(7u, mx * 8u / bin) : 0u)], 1);
+              atomicAdd(&st[10 + min(7, 31 - __clz(max(pred / max(q, 1u), 1u)))], 1);
+              const uint32_t own = warp_sums[(s_th & 15)];
+              atomicAdd(&st[18 + (bin ? min(7u, own * 8u / bin) : 0u)], 1);
+            }
+          }
         }
         __syncthreads();
       }
