@@ -184,6 +184,7 @@ class EngineIterLog:
         src_demand: int,
         dst_demand: int,
         outgoing: bool,
+        local_hit: int = -1,
     ) -> None:
         """DP late binding: ``request`` left this rank for ``dst`` (outgoing) or
         arrived here from ``src``. ``plan_size`` / demands are in the planner's
@@ -203,6 +204,7 @@ class EngineIterLog:
                 plan_size,
                 src_demand,
                 dst_demand,
+                local_hit,
             )
         )
 

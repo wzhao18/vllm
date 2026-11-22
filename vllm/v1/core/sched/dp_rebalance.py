@@ -36,6 +36,7 @@ def plan_dp_moves(
     cross_min_gain: int | None = None,
     bind_horizon: int | None = None,
     bound_home: list[tuple[int, int]] | None = None,
+    penalties: list[list[int]] | None = None,
 ) -> list[DPMove]:
     """Plan cross-rank moves of uncommitted requests.
 
@@ -76,6 +77,14 @@ def plan_dp_moves(
         ((size, r, i) for r in range(n) for i, size in enumerate(movable[r])),
         key=lambda t: (-t[0], t[1], t[2]),
     )
+
+    def penalty(r: int, i: int) -> int:
+        # Extra gain a move must clear (e.g. reloading a prefix the home
+        # rank's GPU cache already holds).
+        if penalties is None or i >= len(penalties[r]):
+            return 0
+        return penalties[r][i]
+
     left = [0] * n
     entered = [0] * n
     moves: list[DPMove] = []
@@ -102,7 +111,7 @@ def plan_dp_moves(
                     continue
                 cross = node[dst] != node[home]
                 g = gain(home, dst, size)
-                if g < (cross_gain if cross else min_gain):
+                if g < max(cross_gain if cross else min_gain, penalty(home, index)):
                     continue
                 sc = g - (cross_gain - min_gain if cross else 0)
                 if score is None or sc > score:

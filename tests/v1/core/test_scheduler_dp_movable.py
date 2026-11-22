@@ -68,3 +68,23 @@ def test_scheduled_request_is_not_exported():
     scheduler.schedule()
     assert scheduler.dp_export_request(req.request_id) is None
     assert req.request_id in scheduler.requests
+
+
+def test_listed_requests_report_their_local_gpu_prefix_hit():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, enable_prefix_caching=True
+    )
+    first, second = create_requests(num_requests=2, num_tokens=160, same_prompt=True)
+    scheduler.add_request(first)
+    scheduler.schedule()  # computes and caches the shared prompt's blocks
+    scheduler.add_request(second)
+    listed = scheduler.dp_movable_requests(4)
+    assert [rid for rid, _ in listed] == [second.request_id]
+    assert scheduler.dp_listed_local_hit[second.request_id] > 0
+
+
+def test_local_gpu_prefix_hit_is_zero_without_prefix_caching():
+    scheduler = create_scheduler(enable_prefix_caching=False)
+    (req,) = create_requests(num_requests=1, num_tokens=160)
+    scheduler.add_request(req)
+    assert scheduler.dp_local_prefix_hit(req) == 0
