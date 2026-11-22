@@ -307,8 +307,9 @@ def _bind_worker(rank, world_size, port, out):
 
 
 def test_plan_binds_requests_where_they_will_run():
-    """Bind at load-issue time: the planner moves "a" to the idle rank (bound
-    there on arrival) and binds "b" at home (it starts within the horizon)."""
+    """Bind at load-issue time: the planner moves "a" and then "b" to the rank
+    that would otherwise idle (bound there on arrival); nothing is left to bind
+    at home."""
     ctx = mp.get_context("spawn")
     port = get_open_port()
     out = ctx.Queue()
@@ -321,5 +322,5 @@ def test_plan_binds_requests_where_they_will_run():
         assert p.exitcode == 0
     bound0, _, held0 = got[0]
     _, bound1_after_move, held1 = got[1]
-    assert bound0 == ["b"] and held0 == ["b"]
-    assert "a" in bound1_after_move and held1 == ["a"]
+    assert bound0 == [] and held0 == []
+    assert {"a", "b"} <= set(bound1_after_move) and held1 == ["a", "b"]
