@@ -136,3 +136,24 @@ def test_dense_rows_above_the_cap_raise_at_build():
     wd = torch.zeros(1024, 4096, device=dev, dtype=torch.bfloat16)
     with pytest.raises(Unsupported, match="shard rows"):
         SpDenseMlp(_mlp(wgu, wd), (128, 272), dev, 0)
+
+
+def test_sp_block_dense_layers_run_dense_flow_or_raise():
+    """Every captured shard size of the SP decode's dense layer runs DenseFlow (up
+    to sp_dense.MAX_ROWS, 129-256 included) or the build raises: no stock dense
+    module on a captured shape."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_attention import (
+        dense_mlps,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
+
+    dev = torch.device("cuda")
+    wgu = torch.randn(2 * 4096, 1024, device=dev, dtype=torch.bfloat16) * 0.03
+    wd = torch.randn(1024, 4096, device=dev, dtype=torch.bfloat16) * 0.02
+    dense = types.SimpleNamespace(is_moe_layer=False, mlp=_mlp(wgu, wd), layer_idx=0)
+    moe = types.SimpleNamespace(is_moe_layer=True, mlp=None, layer_idx=1)
+    built = dense_mlps([dense, moe], (16, 128, 144, 176, 256), dev)
+    assert set(built) == {0}
+    assert all(built[0].serves(n) for n in (16, 128, 144, 176, 256))
+    with pytest.raises(Unsupported, match="shard rows"):
+        dense_mlps([dense], (128, 272), dev)
