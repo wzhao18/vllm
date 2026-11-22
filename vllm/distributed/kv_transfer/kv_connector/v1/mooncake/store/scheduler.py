@@ -599,6 +599,16 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        tracker = getattr(self, "tracker", None)
+        if tracker is not None:
+            # Every async load (joined or not), for the joined-load bookkeeping.
+            load_spec = self.load_specs[request.request_id]
+            tracker.on_async_load(
+                request,
+                load_spec.vllm_cached_tokens,
+                load_spec.kvpool_cached_tokens,
+                request.request_id in getattr(self, "_joined", {}),
+            )
         if getattr(self, "_early_loads", None) is not None:
             self._issue_load_early(request.request_id, blocks)
 
@@ -645,7 +655,7 @@ class MooncakeStoreScheduler:
         request: Request,
         blocks: KVCacheBlocks,
         num_external_tokens: int,
-        headroom_s: float,
+        headroom_s: float | None = None,
     ) -> bool:
         """Join the load to this step when it is predicted to finish before
         the steps in flight do, so this step's forward does not wait for it.
@@ -670,6 +680,10 @@ class MooncakeStoreScheduler:
         if predicted is None:
             self._count_join("cold")
             return False
+        if headroom_s is None:
+            # How long the steps in flight still run (JoinedLoadTracker).
+            tracker = getattr(self, "tracker", None)
+            headroom_s = tracker.headroom() if tracker is not None else 0.0
         if predicted > headroom_s:
             self._count_join("no_headroom")
             return False

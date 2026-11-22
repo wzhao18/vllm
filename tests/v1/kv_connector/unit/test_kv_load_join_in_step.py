@@ -52,7 +52,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     LoadTimeModel,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.distributed.kv_transfer.kv_connector.v1.joined_loads import InflightStepClock
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.joined_loads import (
+    InflightStepClock,
+)
 from vllm.v1.request import RequestStatus
 
 from .test_mooncake_store_early_load import _blocks, _Channel
@@ -132,7 +134,7 @@ def test_declined_join_parks_the_load_as_before():
 
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert output.num_scheduled_tokens == {}
-    assert not scheduler._joined._loading
+    assert scheduler._joined is None  # a connector that never joins
 
 
 def test_no_join_for_a_load_ahead():

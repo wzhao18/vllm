@@ -435,8 +435,11 @@ class MockKVConnector(KVConnectorBase_V1):
             ),
             join_in_step=extra_config.get("join_in_step", False),
         )
-        # (request_id, num_external_tokens, headroom_s) of each join query.
-        self.join_queries: list[tuple[str, int, float]] = []
+        # (request_id, num_external_tokens) of each join query.
+        self.join_queries: list[tuple[str, int]] = []
+        self._local_tokens: dict[str, int] = {}
+        self._joined: set[str] = set()
+        self.tracker = None
         self._defers_left: defaultdict[str, int] = defaultdict(
             lambda: self.config.num_defers_before_matching
         )
@@ -453,17 +456,26 @@ class MockKVConnector(KVConnectorBase_V1):
         if self._defers_left[request.request_id] > 0:
             self._defers_left[request.request_id] -= 1
             return (None, False)
+        self._local_tokens[request.request_id] = num_computed_tokens
         return (self.config.matched_tokens, self.config.is_async)
 
     def join_load_in_step(
-        self,
-        request: Request,
-        blocks: KVCacheBlocks,
-        num_external_tokens: int,
-        headroom_s: float,
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ) -> bool:
-        self.join_queries.append((request.request_id, num_external_tokens, headroom_s))
+        self.join_queries.append((request.request_id, num_external_tokens))
+        if self.config.join_in_step:
+            self._joined.add(request.request_id)
         return self.config.join_in_step
+
+    def joined_load_tracker(self, scheduler):
+        if not self.config.join_in_step:
+            return None
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.joined_loads import (  # noqa: E501
+            JoinedLoadTracker,
+        )
+
+        self.tracker = JoinedLoadTracker(scheduler)
+        return self.tracker
 
     def update_state_after_alloc(
         self,
@@ -471,7 +483,16 @@ class MockKVConnector(KVConnectorBase_V1):
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ):
-        pass
+        # As the Mooncake store connector: report each async load.
+        if self.tracker is not None and num_external_tokens > 0:
+            start = self._local_tokens.get(request.request_id, 0)
+            self.tracker.on_async_load(
+                request,
+                start,
+                start + num_external_tokens,
+                request.request_id in self._joined,
+            )
+            self._joined.discard(request.request_id)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

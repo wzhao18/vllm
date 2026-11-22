@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bookkeeping for async KV loads admitted in the step that issues them.
 
-A connector may join an async load to the step that allocated its blocks
-(KVConnectorBase_V1.join_load_in_step) when it can have the KV in the blocks
-before that step's forward reads them. The scheduler keeps only the hook
-points; this module holds the rest:
+The Mooncake store connector joins an early load to the step that allocated
+its blocks (KVConnectorBase_V1.join_load_in_step) when it can have the KV in
+the blocks before that step's forward reads them. It hands the scheduler this
+tracker (KVConnectorBase_V1.joined_load_tracker); the scheduler keeps only the
+hook points that call it:
 
 - InflightStepClock: how long the steps in flight still run (the headroom the
   connector compares its load-time prediction against);
@@ -95,6 +96,21 @@ class JoinedLoadTracker:
         self._hash_refs: Counter[BlockHash] = Counter()
         self.stats = {"joined": 0, "dup_reads": 0, "dup_read_blocks": 0}
 
+    def active(self) -> bool:
+        """Some joined load has not reported done."""
+        return bool(self._loading)
+
+    def _free_parked(self, blocks: list[KVCacheBlock]) -> None:
+        """Free a reported joined load's parked blocks after the steps in
+        flight, which may still use them."""
+        sched = self._scheduler
+        if not blocks:
+            return
+        if sched.defer_block_free:
+            sched.deferred_frees.append((sched.sched_step_seq, blocks))
+        else:
+            sched.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
     def headroom(self) -> float:
         return self.clock.headroom(time.monotonic())
 
@@ -154,8 +170,8 @@ class JoinedLoadTracker:
         blocks freed (after the steps in flight) and may be admitted again.
         Returns the filtered output and the ids whose output this step skips.
         """
-        reported_failed = kv_connector_output.failed_recving or set()
-        reported_done = kv_connector_output.finished_recving or set()
+        reported_failed = set(kv_connector_output.failed_recving or ())
+        reported_done = set(kv_connector_output.finished_recving or ())
         failed = reported_failed & self._loading
         done = reported_done & self._loading
         if not failed and not done:
@@ -191,7 +207,7 @@ class JoinedLoadTracker:
             request = sched.requests.get(req_id)
             if parked is not None:
                 for blocks in parked:
-                    sched._free_parked_blocks(blocks)
+                    self._free_parked(blocks)
                 if request is not None and request.is_finished():
                     # Its free waited for this report.
                     del sched.requests[req_id]
