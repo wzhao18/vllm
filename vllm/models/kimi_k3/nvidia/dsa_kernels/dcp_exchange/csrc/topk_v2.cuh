@@ -1660,9 +1660,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           for (int j = 0; j < 8; ++j) {
             const uint32_t k = k8.key(j);
             if (!((valid >> j) & 1u) || !k) continue;
+            // rounds 0-1 (shb >= 24) read key bits only; later rounds need the key equal to
+            // the prefix's key part before the token id is formed (same counts, fewer ops)
+            if (shb >= 24) {
+              if (rd > 0 && (k >> (shb - 16)) != (uint32_t)pref) continue;
+              atomicAdd(&hist[(k >> (shb - 24)) & 0xFFu], 1u);
+              continue;
+            }
+            if (k != (uint32_t)(pref >> (24 - shb - 8))) continue;
             const unsigned long long c =
                 ((unsigned long long)k << 24) | (0xFFFFFFu - gid_of(i0 + j));
-            if (rd > 0 && (c >> (shb + 8)) != pref) continue;
+            if ((c >> (shb + 8)) != pref) continue;
             atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
           }
         });

@@ -6,6 +6,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64
 
 from .device_workspace import DeviceWorkspace
+from .spin_guard import globaltimer_ns, spin_guard
 from .ptx_helpers import red_add_relaxed_sys_s32
 
 
@@ -193,13 +194,14 @@ class NvlinkBarrier(SoftwareGridSync):
                     scope="gpu",
                 )
                 local_signal = self._signal + signal_phase
+                spin_start_ns = globaltimer_ns()
                 while cute.arch.load(
                     local_signal,
                     Int32,
                     sem="acquire",
                     scope="sys",
                 ) != signal_target:
-                    pass
+                    spin_guard(spin_start_ns, 0, local_signal, signal_target)
 
         if cutlass.const_expr(epilogue_grid_sync):
             self.sync(

@@ -37,6 +37,7 @@ from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
 from .symmetric_buffer import SymmetricBufferDevice
+from ...helpers.spin_guard import globaltimer_ns, spin_guard
 
 
 TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
@@ -1007,8 +1008,10 @@ class _MetadataPushRouter(KernelComponent):
         sizes_ready = self._device_workspace.ptr(self.sizes_ready_region)
         iket.range_push("router.wait_sizes_ready")
         if self._router_thread_idx == Int32(0):
+            spin_start_ns = globaltimer_ns()
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(150)
+                spin_guard(spin_start_ns, 40, sizes_ready, Int32(self.world_size))
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         iket.range_pop()
@@ -1286,8 +1289,10 @@ class _MetadataPushRouter(KernelComponent):
         lane_idx = thread_idx % Int32(32)
         if lane_idx == Int32(0):
             sizes_ready = device_workspace.ptr(self.sizes_ready_region)
+            spin_start_ns = globaltimer_ns()
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(sleep_cycles)
+                spin_guard(spin_start_ns, 41, sizes_ready, Int32(self.world_size))
         cute.arch.sync_warp()
 
     @cute.jit
@@ -1296,10 +1301,12 @@ class _MetadataPushRouter(KernelComponent):
         lane_idx = thread_idx % Int32(32)
         if lane_idx == Int32(0):
             metadata_ready = device_workspace.ptr(self.metadata_ready_region)
+            spin_start_ns = globaltimer_ns()
             while cute.arch.load(metadata_ready, Int32, sem="acquire", scope="sys") != Int32(
                 self.metadata_ready_target
             ):
                 nanosleep(sleep_cycles)
+                spin_guard(spin_start_ns, 42, metadata_ready, Int32(self.metadata_ready_target))
         cute.arch.sync_warp()
 
     @cute.jit
