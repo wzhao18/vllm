@@ -54,6 +54,7 @@ class _Crumbs:
         self.size_idx = 0  # 1 + capture-size index while capturing sizes, else 0
         self.layer = 0
         self.ok = True
+        self.streams: dict[int, tuple[str, object]] = {}  # handle -> (name, stream): queried in the stall report
         self._main = threading.main_thread().ident
         self._thread = threading.Thread(target=self._watch, name="k31-breadcrumbs", daemon=True)
         self._thread.start()
@@ -65,8 +66,11 @@ class _Crumbs:
         try:
             from cuda.bindings import driver
 
+            cur = torch.cuda.current_stream()
+            if cur.cuda_stream not in self.streams:
+                self.streams[cur.cuda_stream] = (f"crumb_stream_{len(self.streams)}", cur)
             (err,) = driver.cuStreamWriteValue32(
-                driver.CUstream(torch.cuda.current_stream().cuda_stream),
+                driver.CUstream(cur.cuda_stream),
                 driver.CUdeviceptr(self.addr), code, 0,
             )
             if err != driver.CUresult.CUDA_SUCCESS:
@@ -89,7 +93,10 @@ class _Crumbs:
                 key = ("gpu", gpu, self.host_code)
                 if key != reported:
                     reported = key
-                    self._log(f"K31_BREADCRUMB gpu_stuck {now - gpu_t:.0f}s gpu_at={decode(gpu)} host_at={decode(self.host_code)}")
+                    self._log(
+                        f"K31_BREADCRUMB gpu_stuck {now - gpu_t:.0f}s gpu_at={decode(gpu)} host_at={decode(self.host_code)} "
+                        f"gpu_state=[{self._gpu_state()}] streams=[{self._stream_state()}]"
+                    )
             elif self.in_forward and gpu == self.host_code and now - self.host_t >= STALL_S:
                 key = ("host", self.host_code)
                 if key != reported:
@@ -100,6 +107,34 @@ class _Crumbs:
                         f"K31_BREADCRUMB host_stuck {now - self.host_t:.0f}s at={decode(self.host_code)} "
                         f"(or a long host-side compile: see the stack)\n{stack}"
                     )
+
+    def _gpu_state(self) -> str:
+        """DCRIT r47: busy (~100% util, high power) = a looping kernel; idle = a stream / event wait."""
+        try:
+            import subprocess
+
+            uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+            uuid = uuid if uuid.startswith("GPU-") else "GPU-" + uuid
+            out = subprocess.run(
+                ["nvidia-smi", "-i", uuid, "--query-gpu=utilization.gpu,power.draw,clocks.sm",
+                 "--format=csv,noheader"], capture_output=True, text=True, timeout=30,
+            )
+            return (out.stdout or out.stderr).strip().replace("\n", " ")
+        except Exception as e:  # noqa: BLE001
+            return f"n/a ({e})"
+
+    def _stream_state(self) -> str:
+        """cuStreamQuery per known stream: pending = work enqueued and not finished, done = idle."""
+        try:
+            from cuda.bindings import driver
+        except Exception:  # noqa: BLE001
+            return "n/a"
+        parts = []
+        for handle, (name, _) in list(self.streams.items()):
+            (err,) = driver.cuStreamQuery(driver.CUstream(handle))
+            state = {driver.CUresult.CUDA_SUCCESS: "done", driver.CUresult.CUDA_ERROR_NOT_READY: "pending"}.get(err, str(err))
+            parts.append(f"{name}:{state}")
+        return " ".join(parts)
 
     @staticmethod
     def _log(line: str) -> None:
@@ -129,6 +164,12 @@ def crumb(op: int, layer: int | None = None) -> None:
     c.write(op)
     if op == OP_FWD_END:
         c.in_forward = False
+
+
+def register_stream(name: str, stream) -> None:
+    """A side stream to query in the stall report (prefill shared experts, aux, attention aux, ...)."""
+    if stream is not None:
+        _get().streams[stream.cuda_stream] = (name, stream)
 
 
 def capture_size(index: int | None) -> None:

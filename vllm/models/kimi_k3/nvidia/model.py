@@ -975,9 +975,11 @@ class KimiMoE(nn.Module):
             # down projection on decode-sized batches (gated by
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
+            breadcrumb.register_stream("aux_down_proj", self._down_proj_stream)
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
             # Shared experts beside the routing front of prefill chunks.
             self._prefill_shared_side_stream = torch.cuda.Stream()
+            breadcrumb.register_stream("prefill_shared_side", self._prefill_shared_side_stream)
             self._prefill_shared_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
@@ -1077,6 +1079,7 @@ class KimiMoE(nn.Module):
         if self._shared_overlap:
             self.experts.reserve_sms_for_shared_expert()
             self._shared_stream = aux_stream()
+            breadcrumb.register_stream("aux_shared", self._shared_stream)
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
         if self._prefill_moe is not None and self._prefill_moe.subcalls:
             from .specialized_prefill.moe import PrefillSubcallExperts
@@ -2233,6 +2236,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # attention front-end; created at the model level and threaded into
         # each attention layer.
         aux_stream = torch.cuda.Stream()
+        breadcrumb.register_stream("attn_aux", aux_stream)
 
         # Single model-level top-k buffer shared by all DSA layers.
         # [max_num_batched_tokens + dcp_kg_slack, index_topk] int32.
