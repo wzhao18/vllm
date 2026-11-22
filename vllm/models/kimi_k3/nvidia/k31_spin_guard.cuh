@@ -26,9 +26,11 @@
 #include <cstdio>
 
 #ifndef K31_SPIN_GUARD_NS
-// 15 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
-// far below a forever-hang. Shorter only on never-merge stall-test overlays.
-#define K31_SPIN_GUARD_NS 900000000000ull
+// 10 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
+// far below a forever-hang, and below MegaMoE's 15 min guard so a stuck non-MegaMoE wait
+// reports on its own rank before healthy peers trap in MegaMoE (tests/models/kimi_k3/
+// test_k31_spin_guard_order.py). Shorter only on never-merge stall-test overlays.
+#define K31_SPIN_GUARD_NS 600000000000ull
 #endif
 
 namespace k31sg {

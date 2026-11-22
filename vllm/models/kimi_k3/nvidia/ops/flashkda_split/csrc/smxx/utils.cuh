@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cassert>
 
+#include "k31_spin_guard.cuh"  // bounded tile-flag wait (k3_acquire_tile)
+
 #include <cute/tensor.hpp>
 #include <cute/algorithm/cooperative_copy.hpp>
 #include <cute/algorithm/cooperative_gemm.hpp>
@@ -46,18 +48,17 @@ __device__ __forceinline__ void k3_publish_tile(unsigned* flag) {
   asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(flag), "r"(1u)
                : "memory");
 }
+// Bounded (k31_spin_guard.cuh, %globaltimer): was a 2^27-poll trap, whose wall time
+// depended on the poll rate and could exceed MegaMoE's guard (test_k31_spin_guard_order.py).
 __device__ __forceinline__ void k3_acquire_tile(unsigned const* flag) {
   unsigned v;
-  long long spins = 0;
-  do {
+  k31sg::Spin s;
+  for (;;) {
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(flag)
                  : "memory");
-    if (++spins == (1ll << 27)) {
-      printf("k3_flashkda_split: tile flag %p never published (block %d %d)\n",
-             flag, int(blockIdx.x), int(blockIdx.y));
-      __trap();
-    }
-  } while (v == 0);
+    if (v != 0) break;
+    s.check("k3_flashkda_acquire_tile", int(blockIdx.x) * 65536 + int(blockIdx.y), v, 1u);
+  }
   asm volatile("fence.proxy.async.global;" ::: "memory");
 }
 

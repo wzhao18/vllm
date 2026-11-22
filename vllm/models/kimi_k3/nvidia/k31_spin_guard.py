@@ -59,9 +59,11 @@ from cutlass import Int32, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-# 15 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
-# far below a forever-hang. Shorter only on never-merge stall-test overlays.
-SPIN_GUARD_NS = 900 * 1000 * 1000 * 1000
+# 10 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
+# far below a forever-hang, and below MegaMoE's 15 min guard so a stuck non-MegaMoE wait
+# reports on its own rank before healthy peers trap in MegaMoE (tests/models/kimi_k3/
+# test_k31_spin_guard_order.py). Shorter only on never-merge stall-test overlays.
+SPIN_GUARD_NS = 600 * 1000 * 1000 * 1000
 SPIN_POLLS = 1024  # failed polls before the first clock read
 SPIN_FLUSH_NS = 1000 * 1000 * 1000  # print -> trap delay (lets every line land)
 
