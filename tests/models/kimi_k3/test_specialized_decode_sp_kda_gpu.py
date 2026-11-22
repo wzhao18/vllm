@@ -52,7 +52,7 @@ from vllm.third_party.flash_linear_attention.ops.kda import (  # noqa: E402
 DEVICE = torch.device("cuda", 0)
 HEADS, DIM, Q = 24, 3072, 4  # C512: 96 KDA heads over TP4, DSpark q4
 PITCH = 4 * DIM + 128 + HEADS + 8  # Q | K | V | gate | F_A | beta | pad (16)
-MAX_REQS = 128
+MAX_REQS = 176  # requests per DP group up to C1280 (176 / rank); C512 used 128
 LOWER_BOUND = -5.0
 # One request count per record core (sp.RECORD_KINDS at 24 heads).
 REQUESTS = [
