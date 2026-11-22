@@ -1411,6 +1411,10 @@ class GenphaseTokenComm(KernelComponent):
             )
 
         self._run_refine(device_workspace, smem_base, thread_idx)
+        if linear_cta_idx == Int32(self.helper_cta_index):
+            # Served EP-balance log, after every helper duty the main kernel waits on (sizes_ready, prefix_ready,
+            # refine blocks; DCRIT r69): only this CTA's tail arrival can wait on it, on one call in EPBAL_PERIOD.
+            self._log_ep_balance(device_workspace, local_rank, thread_idx)
         self._leave(device_workspace, thread_idx)
 
         device_workspace.remove_device_members()
@@ -2299,8 +2303,8 @@ class GenphaseTokenComm(KernelComponent):
     @cute.jit
     def _log_ep_balance(self, device_workspace: DeviceWorkspace, local_rank: Int32, thread_idx: Int32) -> None:
         """Served EP-balance log (int64.3 item 3), decode: genphase only folds THIS rank's per-expert counts, so on one
-        call in EPBAL_PERIOD the helper CTA copies its local ``expert_sizes`` (after releasing sizes_ready: off the
-        main kernel's path) into a slot of the session's host-mapped ring, marked local (word 6 = local_rank + 1);
+        call in EPBAL_PERIOD the helper CTA copies its local ``expert_sizes`` (after its refine share, the
+        last work the main kernel waits on) into a slot of the session's host-mapped ring, marked local (word 6 = local_rank + 1);
         the host merges the ranks' records by call id. Stores only, no launch, no sync beyond the helper CTA."""
         if cutlass.const_expr(self.experts_per_rank <= EPBAL_MAX_EXPERTS):
             ring = cute.arch.load(device_workspace.ptr(self._tail.epbal_region), Int64, sem="relaxed", scope="gpu")
@@ -2392,7 +2396,6 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(device_workspace.ptr(self.sizes_ready_region), Int32(1))
-        self._log_ep_balance(device_workspace, local_rank, thread_idx)
         iket.range_pop()
 
         iket.range_push("helper.prefix")
