@@ -646,6 +646,22 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def on_request_moved_away(self, request: "Request") -> None:
+        """The scheduler handed ``request`` (never scheduled here: no blocks,
+        no load issued) to another DP rank of the same engine. Drop any
+        per-request state started for it (e.g. an arrival lookup) without the
+        finish semantics of ``request_finished``: the request is not finished
+        and the other rank sees it arrive anew. Default: nothing to drop."""
+        return
+
+    def dp_move_tokens(self, request: "Request") -> int | None:
+        """Prompt tokens ``request`` would compute on any DP rank of this
+        engine (its prompt minus the prefix this connector can load there), for
+        cross-rank balancing of a request that never ran here; None while that
+        is not known yet (e.g. its prefix lookup is in flight), so it is not
+        moved. Default: the whole prompt (the connector loads nothing)."""
+        return request.num_prompt_tokens
+
     def on_request_arrival(self, request: "Request") -> None:
         """Called when a new request arrives at the engine core, before the
         scheduler has it (``EngineCore.preprocess_add_request``).

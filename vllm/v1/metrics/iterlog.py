@@ -178,6 +178,44 @@ class EngineIterLog:
             if r is not None:
                 self._put(("RX", r[0], t))
 
+    def move(
+        self,
+        request,
+        src: int,
+        dst: int,
+        plan_size: int,
+        fresh_tokens: int,
+        src_demand: int,
+        dst_demand: int,
+        outgoing: bool,
+        local_hit: int = -1,
+        plan_gain: int = -1,
+        plan_penalty: int = -1,
+    ) -> None:
+        """DP late binding: ``request`` left this rank for ``dst`` (outgoing) or
+        arrived here from ``src``. ``plan_size`` / demands are in the planner's
+        units at plan time (predicted cost with a prompt cost model);
+        ``fresh_tokens`` = prompt minus the external prefix hit."""
+        r = self._reqs.pop(request.request_id, None) if outgoing else None
+        self._put(
+            (
+                "RM",
+                r[0] if r is not None else -1,
+                request.request_id,
+                time.perf_counter(),
+                src,
+                dst,
+                request.num_prompt_tokens,
+                fresh_tokens,
+                plan_size,
+                src_demand,
+                dst_demand,
+                local_hit,
+                plan_gain,
+                plan_penalty,
+            )
+        )
+
     def idle(self, t0: float, t1: float) -> None:
         self._put(("I", t0, t1))
 

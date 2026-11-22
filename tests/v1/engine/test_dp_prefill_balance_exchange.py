@@ -46,6 +46,8 @@ def _fake_core(pg, sched, engines_running=True, pull_up=True):
         dp_prefill_pull_up=pull_up,
         _dp_prefill_exchanged=False,
         _dp_step_token_floor=2048,
+        _dp_moves=[],
+        _dp_abort_counts=[],
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(cpu_distributed_timeout=None)
         ),

@@ -39,6 +39,7 @@ def _scheduler(num_blocks=200, mnbt=64):
     scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     scheduler.connector.request_finished.return_value = (False, None)
     scheduler.connector.take_events.return_value = ()
+    scheduler.connector.take_deferred_recving.return_value = set()
     return scheduler
 
 
@@ -180,3 +181,48 @@ def test_abort_while_loading_ahead_drops_it_from_the_set():
     )
     assert a.request_id not in scheduler.requests
 
+
+
+def test_load_ahead_only_for_requests_the_dp_plan_bound_here():
+    """Bind at load-issue time: with a DP plan, load-ahead loads only requests
+    the plan bound to this rank; others stay uncommitted (WAITING, movable)."""
+    scheduler = _scheduler()
+    long = _fill_budget(scheduler)
+    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.connector.dp_move_tokens.side_effect = lambda r: r.num_prompt_tokens
+    scheduler.dp_bound_here = set()
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert a.status == RequestStatus.WAITING
+    assert scheduler._load_ahead == set()
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [a.request_id]
+    # The next plan binds it here: loaded ahead while the budget is still full.
+    scheduler.dp_bound_here = {a.request_id}
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._load_ahead == {a}
+
+
+def test_moved_in_request_is_not_herded_onto_or_moved_again():
+    """B'/C regression (move thrash): a request moved to this rank restarts its
+    prefix lookup here. While that lookup is in flight it must still count in
+    this rank's planning demand (else the rank looks idle and the planner
+    herds more work onto it), and once its lookup is done it must not be
+    offered for another move (ping-pong)."""
+    scheduler = _scheduler()
+    moved = _add(scheduler, 20 * BS)
+    other = _add(scheduler, 6 * BS)
+    in_flight = {moved.request_id}
+    scheduler.connector.dp_move_tokens.side_effect = (
+        lambda r: None if r.request_id in in_flight else r.num_prompt_tokens
+    )
+    moved.dp_pinned_size = 20 * BS  # set by the engine when it took it in
+    listed = scheduler.dp_movable_requests(4)
+    assert listed == [(other.request_id, 6 * BS)]
+    # Herding: the in-flight moved-in request counts at its planned size.
+    assert scheduler.dp_move_demand() == 20 * BS
+    # Ping-pong: lookup done, still not offered again.
+    in_flight.clear()
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [other.request_id]
+    assert scheduler.dp_move_demand() == 20 * BS

@@ -3274,6 +3274,22 @@ class LookupKeyClient:
             if self.futures.get(req_id) is future:
                 self._drop_locked(req_id)
 
+    def peek_hit(
+        self, req_id: str, num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> int | None:
+        """The hit length of ``req_id``'s completed lookup for these inputs,
+        without starting, waiting for or consuming one; None if there is no
+        such completed, successful lookup."""
+        with self._lock:
+            future = self.futures.get(req_id)
+            if future is None or self._inputs.get(req_id) != self._lookup_inputs(
+                num_tokens, block_hashes
+            ):
+                return None
+        if not future.done() or future.cancelled() or future.exception() is not None:
+            return None
+        return future.result().hit_length
+
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
         with self._lock:

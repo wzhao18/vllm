@@ -68,6 +68,16 @@ class ConversationStateTracker:
         if state.current_request_id is None:
             state.current_request_id = request.request_id
 
+    def forget(self, request: Request) -> None:
+        """``request`` left this engine before it ran (moved to another DP
+        rank): it is no longer its conversation's current request."""
+        conversation_id = self.conversation_id(request)
+        if conversation_id is None:
+            return
+        state = self._conversations.get(conversation_id)
+        if state is not None and state.current_request_id == request.request_id:
+            state.current_request_id = None
+
     def finish(
         self, request: Request, state_hashes: set[Hashable], completed: bool
     ) -> set[Hashable]:

@@ -313,6 +313,34 @@ class Scheduler(SchedulerInterface):
         # by the DP engine core from the DP group's outstanding prefill work at
         # each exchange (see set_dp_step_token_cap). None = no cap.
         self._dp_step_token_cap: int | None = None
+        # Prompt chunk cost model of a DEP prefill rank (Kimi K3 DSA): a step's
+        # prompt chunks are sized by predicted cost, not tokens alone, so a
+        # long-context chunk does not set every rank's lockstep step. None =
+        # tokens only (see _prompt_chunk_cost).
+        self._prompt_cost = None
+        # This step's scheduled tokens while its DP exchange runs (see
+        # dp_move_demand); empty outside schedule().
+        self._dp_scheduled_now: dict[str, int] = {}
+        # Requests offered as movable in the current DP exchange.
+        self._dp_listed: set[str] = set()
+        # Local GPU prefix hit (tokens) of each request offered as movable in
+        # the current DP exchange (see dp_local_prefix_hit).
+        self.dp_listed_local_hit: dict[str, int] = {}
+        try:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
+
+            if step_cost.applies(vllm_config):
+                self._prompt_cost = step_cost
+                logger.info_once(
+                    "DEP prefill: prompt chunks sized by predicted step cost "
+                    "(Kimi K3 step_cost table)."
+                )
+        except ImportError:
+            pass
+        # DP late binding: the waiting requests the last DP plan bound to this
+        # rank (placed here by cost within the binding horizon, or moved in).
+        # Load-ahead loads only these; None = no DP plan (no gating).
+        self.dp_bound_here: set[str] | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -963,6 +991,9 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        # The step's prompt cost budget (short-context tokens): the token budget,
+        # charged by predicted cost for prompt chunks (see _prompt_chunk_cost).
+        cost_left = float(token_budget)
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -1108,6 +1139,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._cut_prompt_chunk_to_cost(
+                request, request.num_computed_tokens, num_new_tokens, cost_left
+            )
             if (
                 owner_left is not None
                 and request.num_computed_tokens < request.num_prompt_tokens
@@ -1213,6 +1247,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                cost_left -= self._prompt_chunk_cost(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
                 if owner_left is not None:
                     self._dsa_owner_charge(
                         owner_left, request, request.num_computed_tokens, num_new_tokens
@@ -1269,6 +1306,11 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
+                            cost_left += self._prompt_chunk_cost(
+                                preempted_req,
+                                preempted_req.num_computed_tokens,
+                                restored,
+                            )
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -1327,6 +1369,9 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            cost_left -= self._prompt_chunk_cost(
+                request, request.num_computed_tokens, num_new_tokens
+            )
             if owner_left is not None:
                 self._dsa_owner_charge(
                     owner_left, request, request.num_computed_tokens, num_new_tokens
@@ -1405,7 +1450,21 @@ class Scheduler(SchedulerInterface):
                         or self._pause_state != PauseState.UNPAUSED
                         or load_ahead_left <= 0
                         or not self.waiting
+                        # Some DP rank of the group has no work: leave the
+                        # queued requests uncommitted so they can move there.
+                        or (
+                            self.dp_bound_here is not None
+                            and self.waiting.peek_request().request_id
+                            not in self.dp_bound_here
+                            # Moved here by a plan: bound here for good.
+                            and getattr(
+                                self.waiting.peek_request(), "dp_pinned_size", None
+                            )
+                            is None
+                        )
                     ):
+                        # Not bound here by the DP plan (it may run on another
+                        # rank or later): load nothing for it yet.
                         break
                     head = self.waiting.peek_request()
                     if head.status != RequestStatus.WAITING or head.num_computed_tokens:
@@ -1761,6 +1820,12 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._cut_prompt_chunk_to_cost(
+                        request, num_computed_tokens, num_new_tokens, cost_left
+                    )
+                    if num_new_tokens == 0:
+                        # The step's prompt cost budget is used up.
+                        break
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -2025,6 +2090,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                cost_left -= self._prompt_chunk_cost(
+                    request, num_computed_tokens, num_new_tokens
+                )
                 if owner_left is not None:
                     self._dsa_owner_charge(
                         owner_left, request, num_computed_tokens, num_new_tokens
@@ -2089,6 +2157,7 @@ class Scheduler(SchedulerInterface):
                 input_budget,
                 draft_slots,
                 owner_left=owner_left,
+                cost_left=cost_left,
             )
             drafts_needed = drafts_needed or pulled_drafts_needed
 
@@ -3484,6 +3553,163 @@ class Scheduler(SchedulerInterface):
         """
         self._dp_step_token_cap = cap
 
+    def _dp_movable(self, request: Request) -> bool:
+        """Whether nothing of ``request`` lives on this rank yet, so any DP rank
+        of the engine could compute it from the same prompt: WAITING with no
+        computed tokens, no KV blocks, no connector load or remote prefill,
+        never preempted, a plain token prompt (no multimodal inputs, embeds or
+        structured output), not streaming, and no DSA-DP owner."""
+        kv_params = request.kv_transfer_params or {}
+        return (
+            request.status == RequestStatus.WAITING
+            and request.num_computed_tokens == 0
+            and request.num_preemptions == 0
+            and not request.resumable
+            and not request.mm_features
+            and request.prompt_embeds is None
+            and not request.use_structured_output
+            and request.pooling_params is None
+            and not kv_params.get("do_remote_prefill")
+            and getattr(request, "dsa_owner", -1) in (-1, None)
+            and request.request_id not in self.finished_recving_kv_req_ids
+            and not self._has_allocated_blocks(request.request_id)
+        )
+
+    def dp_movable_requests(self, limit: int) -> list[tuple[str, int]]:
+        """Up to ``limit`` waiting requests not yet committed to this rank (see
+        ``_dp_movable``), in queue order, as (request id, prompt tokens to
+        compute: the prompt minus the external prefix hit, see
+        ``KVConnectorBase_V1.dp_move_tokens``; requests whose hit is not known
+        yet are skipped). The external prefix cache is shared by all DP ranks,
+        so cross-rank balancing may hand such a request to another rank."""
+        out: list[tuple[str, int]] = []
+        if limit <= 0:
+            return out
+        for request in self.waiting:
+            if len(out) >= limit:
+                break
+            if not self._dp_movable(request) or (
+                getattr(request, "dp_pinned_size", None) is not None
+            ):
+                # A request moved here once stays (no ping-pong between ranks).
+                continue
+            num_tokens = (
+                request.num_prompt_tokens
+                if self.connector is None
+                else self.connector.dp_move_tokens(request)
+            )
+            if num_tokens:
+                cost = self._dp_plan_cost(
+                    num_tokens, request.num_prompt_tokens - num_tokens
+                )
+                out.append((request.request_id, max(cost, 1)))
+        self._dp_listed = {rid for rid, _ in out}
+        self.dp_listed_local_hit = {
+            rid: self.dp_local_prefix_hit(self.requests[rid]) for rid, _ in out
+        }
+        return out
+
+    def dp_local_prefix_hit(self, request: Request) -> int:
+        """Prompt tokens of ``request`` this rank's GPU prefix cache holds now
+        (read-only lookup; 0 without prefix caching). A move elsewhere would
+        load them from the external store instead."""
+        if not self.cache_config.enable_prefix_caching or not request.block_hashes:
+            return 0
+        try:
+            return int(
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_prompt_tokens - 1
+                )[1]
+            )
+        except Exception:  # noqa: BLE001 - a planning hint only
+            return 0
+
+    def _dp_plan_cost(self, num_tokens: int, ctx: int) -> int:
+        """Planning size of ``num_tokens`` prompt tokens still to compute from
+        context ``ctx``: their predicted cost with a prompt cost model (see
+        ``step_cost.prompt_cost``), else the tokens."""
+        if self._prompt_cost is None:
+            return num_tokens
+        return int(self._prompt_cost.prompt_cost(num_tokens, ctx) + 0.5)
+
+    def dp_move_demand(self) -> int:
+        """This rank's prompt work after the step being scheduled, in the units
+        of ``dp_movable_requests`` (predicted cost with a prompt cost model),
+        for cross-rank planning: committed work (``dp_prefill_demand``) plus
+        every waiting request not committed yet and not offered as movable in
+        this exchange whose size is known (moved-in requests, which stay here,
+        and requests past the movable slots). Leaving those out makes a rank
+        that just took work in look idle, so the next plans pile more onto it."""
+        scheduled = self._dp_scheduled_now
+        listed = self._dp_listed
+        demand = 0
+        for request in self.running:
+            ctx = request.num_computed_tokens + scheduled.get(request.request_id, 0)
+            left = request.num_prompt_tokens - ctx
+            if left > 0:
+                demand += self._dp_plan_cost(left, ctx)
+        for queue in (self.kv_holding_waiting, self.waiting):
+            for request in queue:
+                if request.num_computed_tokens > 0:
+                    # Committed, in-flight loads included (their compute is
+                    # committed here).
+                    ctx = request.num_computed_tokens + scheduled.get(
+                        request.request_id, 0
+                    )
+                    left = request.num_prompt_tokens - ctx
+                    if left > 0:
+                        demand += self._dp_plan_cost(left, ctx)
+                    continue
+                if request.request_id in listed or request.request_id in scheduled:
+                    continue
+                pinned = getattr(request, "dp_pinned_size", None)
+                if pinned is not None:
+                    demand += pinned
+                    continue
+                num_tokens = (
+                    request.num_prompt_tokens
+                    if self.connector is None
+                    else self.connector.dp_move_tokens(request)
+                )
+                if num_tokens:
+                    demand += self._dp_plan_cost(
+                        num_tokens, request.num_prompt_tokens - num_tokens
+                    )
+        return demand
+
+    def dp_export_request(self, request_id: str) -> Request | None:
+        """Remove a still-movable request so another DP rank can take it in.
+
+        Returns None (and keeps the request) if it is gone or no longer
+        movable. The request is not finished: no output is produced for it here
+        and the connector only drops per-request state started for it (its
+        arrival lookup); the receiving rank sees it arrive anew."""
+        request = self.requests.get(request_id)
+        if request is None or not self._dp_movable(request):
+            return None
+        self.waiting.remove_request(request)
+        del self.requests[request_id]
+        self.kv_cache_manager.forget_conversation_turn(request)
+        # Tokens left to compute (prompt minus the external hit), recorded by
+        # the engine's iteration log before the connector drops the lookup.
+        request.dp_move_fresh_tokens = (
+            request.num_prompt_tokens
+            if self.connector is None
+            else (self.connector.dp_move_tokens(request) or request.num_prompt_tokens)
+        )
+        if self.connector is not None:
+            self.connector.on_request_moved_away(request)
+        return request
+
+    def _has_allocated_blocks(self, request_id: str) -> bool:
+        """Whether any KV cache group holds blocks for ``request_id`` (read only:
+        does not create the per-request entry)."""
+        coordinator = getattr(self.kv_cache_manager, "coordinator", None)
+        for manager in getattr(coordinator, "single_type_managers", ()):
+            if manager.req_to_blocks.get(request_id):
+                return True
+        return False
+
     def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
         """Prompt tokens this rank can compute after this step's schedule:
         running prefills plus waiting requests whose prefix hit is known and
@@ -3570,6 +3796,20 @@ class Scheduler(SchedulerInterface):
             )
         return num_new_tokens
 
+    def _dp_exchange_with(
+        self,
+        exchange: Callable[[int, int], int],
+        num_scheduled_tokens: dict[str, int],
+        quantity: int,
+    ) -> int:
+        """Run the step's DP exchange; while it runs, ``dp_move_demand`` sees
+        this step's scheduled tokens."""
+        self._dp_scheduled_now = num_scheduled_tokens
+        try:
+            return exchange(quantity, self.dp_prefill_demand(num_scheduled_tokens))
+        finally:
+            self._dp_scheduled_now = {}
+
     def _dp_prefill_pull_up(
         self,
         exchange: Callable[[int], int],
@@ -3581,6 +3821,7 @@ class Scheduler(SchedulerInterface):
         input_budget: int,
         draft_slots: int,
         owner_left: list[float] | None = None,
+        cost_left: float | None = None,
     ) -> tuple[int, int, bool]:
         """Exchange this step's token count with the DP peers, then allocate the
         deferred running prefill chunks, pulled up toward the busiest rank's
@@ -3592,18 +3833,31 @@ class Scheduler(SchedulerInterface):
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
         drafts_needed = False
+        room_cost: float | None = None
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
-            busiest = exchange(int(max(used)), self.dp_prefill_demand(num_scheduled_tokens))
+            busiest = self._dp_exchange_with(
+                exchange, num_scheduled_tokens, int(max(used))
+            )
             room_o = [max(busiest - u, 0.0) for u in used]
             extra = 1 << 62
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
+        elif self._prompt_cost is not None and cost_left is not None:
+            # Prompt cost model: the exchanged quantity is the step's predicted
+            # cost (short-context tokens), and the deferred chunks are pulled up
+            # toward the costliest rank's step by cost.
+            used = self._step_cost(num_scheduled_tokens)
+            busiest = self._dp_exchange_with(
+                exchange, num_scheduled_tokens, int(used + 0.5)
+            )
+            room_cost = max(float(busiest) - used, 0.0)
+            extra = 1 << 62
         else:
             num_tokens = sum(num_scheduled_tokens.values())
             extra = max(
-                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
+                self._dp_exchange_with(exchange, num_scheduled_tokens, num_tokens)
                 - num_tokens,
                 0,
             )
@@ -3625,6 +3879,14 @@ class Scheduler(SchedulerInterface):
                             dsa_dp.chunk_cost(num_stock, ctx) + room_o[o], ctx
                         ),
                     )
+                elif room_cost is not None:
+                    want = min(
+                        want,
+                        num_stock
+                        + self._prompt_cost.max_tokens_for_cost(
+                            room_cost, request.num_computed_tokens + num_stock
+                        ),
+                    )
                 # The stock clamps decide the pulled chunk too; both it and the
                 # stock chunk are chunks the stock rules can produce.
                 pulled = self._dp_pull_chunk(
@@ -3637,6 +3899,11 @@ class Scheduler(SchedulerInterface):
                     room_o[o] -= dsa_dp.chunk_cost(
                         num_new_tokens, ctx
                     ) - dsa_dp.chunk_cost(num_stock, ctx)
+                if room_cost is not None and num_new_tokens > num_stock:
+                    room_cost -= self._prompt_cost.chunk_cost(
+                        num_new_tokens - num_stock,
+                        request.num_computed_tokens + num_stock,
+                    )
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -3781,6 +4048,43 @@ class Scheduler(SchedulerInterface):
                 )
                 self._dsa_prepaid.add(r.request_id)
         return left
+
+    def _prompt_chunk_cost(self, request: Request, ctx: int, num_tokens: int) -> float:
+        """Predicted cost (short-context tokens) of scheduling ``num_tokens`` of
+        ``request`` from position ``ctx``: prompt tokens by the prompt cost
+        model (see ``step_cost``), other tokens (decode, drafts) 1 each."""
+        if self._prompt_cost is None or num_tokens <= 0:
+            return float(max(num_tokens, 0))
+        prompt = max(min(num_tokens, request.num_prompt_tokens - ctx), 0)
+        return self._prompt_cost.chunk_cost(prompt, ctx) + (num_tokens - prompt)
+
+    def _cut_prompt_chunk_to_cost(
+        self, request: Request, ctx: int, num_tokens: int, cost_left: float
+    ) -> int:
+        """``num_tokens`` cut so that the chunk's predicted cost fits the step's
+        prompt cost budget ``cost_left`` (unchanged without a cost model and for
+        chunks with no prompt tokens). Prompt tokens are the chunk's first
+        tokens, so the cut keeps a prefix of them."""
+        if self._prompt_cost is None or num_tokens <= 0:
+            return num_tokens
+        if ctx >= request.num_prompt_tokens:
+            return num_tokens
+        if self._prompt_chunk_cost(request, ctx, num_tokens) <= cost_left:
+            return num_tokens
+        return min(num_tokens, self._prompt_cost.max_tokens_for_cost(cost_left, ctx))
+
+    def _step_cost(self, num_scheduled_tokens: dict[str, int]) -> float:
+        """Predicted cost of this step's scheduled work (short-context tokens)."""
+        total = 0.0
+        for request_id, n in num_scheduled_tokens.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                total += n
+            else:
+                total += self._prompt_chunk_cost(
+                    request, request.num_computed_tokens, n
+                )
+        return total
 
     def _dsa_owner_take(
         self,
