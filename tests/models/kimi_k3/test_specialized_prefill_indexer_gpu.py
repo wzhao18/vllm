@@ -152,12 +152,13 @@ def test_selective_topk_reproducible(reqs, zero_keys):
         t0 += rows
 
 
-def _tie_inputs(reqs, seed=0):
+def _tie_inputs(reqs, seed=0, counts=(1500, 1000, 4500)):
     """Keys c * e_0 (MXFP4 c in {0, 3, 4, 6}) and one positive head: every row's
     logit is a function of c only. Per request: 1500 keys c = 6, 1000 keys c = 4 (the
     top-k boundary value: 548 of its 1000 ties are taken), 4500 keys c = 3 (so the
     sampled PUBLISH threshold lands at c = 3), the rest c = 0, at random positions
-    over the whole row (ties in older, boundary and newer position bins)."""
+    over the whole row (ties in older, boundary and newer position bins).
+    ``counts`` overrides the (above, boundary, below) key counts."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     t = sum(r for r, _ in reqs)
     index_q = torch.randn(t, 32, 128, device="cuda", dtype=torch.bfloat16, generator=g)
@@ -173,24 +174,32 @@ def _tie_inputs(reqs, seed=0):
     bases = [sum(pads[:i]) for i in range(len(reqs))]
     for (_, kv), base in zip(reqs, bases):
         perm = torch.randperm(kv, device="cuda", generator=g)
-        for code, (lo, hi) in ((7, (0, 1500)), (6, (1500, 2500)), (5, (2500, 7000))):
+        a, b, c = counts[0], counts[0] + counts[1], sum(counts)
+        for code, (lo, hi) in ((7, (0, a)), (6, (a, b)), (5, (b, c))):
             # FP4 e2m1 code in both nibbles of byte 0 (elements 0 and 1)
             k8[base + perm[lo:hi], 0] = code | (code << 4)
     return q, q_scale, w16, k8, ks.view(torch.int32).view(nk), bases
 
 
 @pytest.mark.parametrize(
-    "reqs",
+    "reqs,counts",
     [
         # rows longer than CS2_BINS 128-key tiles (262,144 keys): 256-key position bins
-        [(48, 300000)],
-        [(16, 262144), (16, 262145), (16, 319488)],
+        ([(48, 300000)], (1500, 1000, 4500)),
+        ([(16, 262144), (16, 262145), (16, 319488)], (1500, 1000, 4500)),
         # past the 256-key bitmap: still flagged, recomputed by the full path
-        [(16, 330000)],
+        # (PrefillFinish: 1000 boundary ties > TIE_BUF -> radix tie select)
+        ([(16, 330000)], (1500, 1000, 4500)),
+        # 600K rows: 3000 boundary ties, 1048 taken (radix tie select)
+        ([(8, 600000)], (1000, 3000, 1000)),
+        # bound bin > CAND: PrefillExact (chunk-parallel threshold + key-order ties)
+        ([(8, 600000)], (1500, 6000, 1500)),
+        # boundary ties <= TIE_BUF: shared-memory tie rank
+        ([(8, 600000)], (1900, 300, 1500)),
     ],
 )
-def test_selective_topk_long_row_ties(reqs):
-    q, q_scale, w16, k8, k_sf, bases = _tie_inputs(reqs)
+def test_selective_topk_long_row_ties(reqs, counts):
+    q, q_scale, w16, k8, k_sf, bases = _tie_inputs(reqs, counts=counts)
     sp = pidx.SelectivePlan(
         [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
     )
@@ -216,3 +225,25 @@ def test_selective_topk_long_row_ties(reqs):
         )
         assert flagged[t0 : t0 + rows][~settled].all()
         t0 += rows
+
+
+@pytest.mark.parametrize("recover_all", [False, True])
+def test_selective_topk_long_rows_random(recover_all):
+    """600K-key rows of random keys: the flagged rows' bound bin overflows CAND
+    (PrefillExact); every row matches stock, run to run identical."""
+    reqs = [(16, 600000)]
+    q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, seed=1)
+    sp = pidx.SelectivePlan(
+        [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
+    )
+    outs = []
+    for _ in range(2):
+        out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
+        pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out, recover_all=recover_all)
+        outs.append(out)
+    assert (outs[1] == outs[0]).all()
+    ref = _stock_topk(q, q_scale, w16, k8, k_sf, 0, 16, 600000, bases[0])
+    got = outs[0].to(torch.int64)
+    got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
+    ok = (got == ref).all(1)
+    assert ok.all(), f"{int((~ok).sum())} rows differ"

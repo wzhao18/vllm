@@ -37,6 +37,7 @@ from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
 from .symmetric_buffer import SymmetricBufferDevice
+from ...helpers.call_tail import CallTail
 from ...helpers.spin_guard import globaltimer_ns, spin_guard
 
 
@@ -513,6 +514,11 @@ class _MetadataPushRouter(KernelComponent):
         self._router_grid_thread_idx = grid_thread_idx
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
+
+        # BUG-E2E-3 (VENDOR.md S8): no remote write before every rank has finished (reset) the previous call.
+        if thread_idx == Int32(0):
+            self._call_tail.wait_previous_done(device_workspace)
+        cute.arch.sync_threads()
 
         if cutlass.const_expr(self.decode_landing):
             self._router_landing_single_cta(topk_indices, topk_scores, smem_base)
@@ -1430,6 +1436,12 @@ class TokenCommNonDeterministic(KernelComponent):
         # Landing (T * topk <= 16384) takes the landing token_in loop with dynamic claim up to 4096 routes and the
         # static warp stride above (16K pulls over every resident warp: no single-counter contention).
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
+        self._call_tail = CallTail(
+            world_size=self.world_size,
+            epoch_region="nvlink.token_comm.call_epoch",
+            signal_region="nvlink.token_comm.call_done_signal",
+        )
+        self._router._call_tail = self._call_tail
         self.tail_reset_single_cta = False
         self._device_workspace = None
         self._token_comm_args = None
@@ -1585,6 +1597,7 @@ class TokenCommNonDeterministic(KernelComponent):
         self._router.register_device_workspace(workspace)
         self._register_main_workspace(workspace)
         self._nvlink_barrier.register_device_workspace(workspace)
+        self._call_tail.register_device_workspace(workspace)
 
     @cute.jit
     def launch_router(
@@ -3193,6 +3206,13 @@ class TokenCommNonDeterministic(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
+        # BUG-E2E-3: this rank's tail state is reset and every rank passed the barrier: release the next routers.
+        if self._linear_cta_idx == Int32(0):
+            if transfer_thread_idx == Int32(0):
+                epoch = self._call_tail.read_epoch(self._device_workspace)
+                self._call_tail.signal_done(
+                    self._device_workspace, self._token_comm_args.peer_rank_ptr_mapper, epoch
+                )
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(

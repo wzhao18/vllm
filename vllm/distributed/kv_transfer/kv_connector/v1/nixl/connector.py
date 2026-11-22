@@ -198,6 +198,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    def on_request_arrival(self, request: "Request") -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.on_request_arrival(request)
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
@@ -205,6 +209,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
+
+    def take_deferred_recving(self) -> set[str]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_deferred_recving()
 
     def request_finished(
         self,

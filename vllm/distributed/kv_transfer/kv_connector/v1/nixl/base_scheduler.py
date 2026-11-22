@@ -231,6 +231,22 @@ class NixlBaseConnectorScheduler:
         # the pull, then emitted with the next step's connector metadata.
         self._pair_plans: dict[ReqId, list[PairUnit]] = {}
         self._pair_ready: dict[ReqId, list[PairUnit]] = {}
+        # Deferred admission (DSTEP): a pulled request whose blocks need an
+        # exchange is withheld from the scheduler's finished pulls (hidden)
+        # until the step metadata carrying its exchange has been built, then
+        # released at the start of the next schedule(). The exchange thus runs
+        # in a step that does not read the request's blocks, off the forward's
+        # critical path on the D workers (which order the next forward after
+        # it on the device), instead of in front of the lockstep forward of
+        # the step that admits the request. Only when one host holds the whole
+        # DCP group (the workers' peer-copy exchange): otherwise the exchange
+        # stays inline and deferring would only add a step.
+        self._pair_defer = self._pair_mode and (
+            vllm_config.parallel_config.decode_context_parallel_size
+            <= current_platform.device_count()
+        )
+        self._pair_hidden: set[ReqId] = set()
+        self._pair_release: set[ReqId] = set()
         if self._pair_mode:
             logger.info(
                 "NIXL DCP pair mode: partner ranks exchange the blocks of "
@@ -325,6 +341,21 @@ class NixlBaseConnectorScheduler:
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+
+    def on_request_arrival(self, request: "Request") -> None:
+        """P side: apply the prefill truncation as the request arrives, before
+        any later connector (e.g. the Mooncake store in a MultiConnector) keys
+        its arrival lookup on the prompt. Truncating only at ``on_new_request``
+        made every arrival lookup stale by one token, so the store lookup was
+        redone at the first schedule (one extra lockstep step per request).
+
+        Runs on the engine core input thread before the scheduler has the
+        request; it only mutates the request itself. ``on_new_request`` keeps
+        the same call, a no-op once ``_p_side_truncated`` is set.
+        """
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode"):
+            self._truncate_request_for_prefill(request)
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
@@ -807,6 +838,12 @@ class NixlBaseConnectorScheduler:
             # This step is the first that can promote these requests, so every
             # rank exchanges their blocks before any forward reads them.
             meta.reqs_to_pair_exchange, self._pair_ready = self._pair_ready, {}
+            if self._pair_defer:
+                # Their exchange is queued with this step; the next schedule()
+                # may admit them (see take_deferred_recving).
+                self._pair_release.update(
+                    r for r in meta.reqs_to_pair_exchange if r in self._pair_hidden
+                )
         if self._fingerprint:
             # Sends go with their reqs_to_send, pulls with their plans.
             meta.fingerprint_sends = self._fingerprint_sends
@@ -844,6 +881,7 @@ class NixlBaseConnectorScheduler:
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Stop heartbeating for requests whose KV transfer completed."""
+        withheld = []
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
             # A pull completes once, on every rank (a retry after a remote
@@ -855,6 +893,8 @@ class NixlBaseConnectorScheduler:
                 and req_id not in connector_output.failed_recving
             ):
                 self._pair_ready[req_id] = units
+                if self._pair_defer:
+                    withheld.append(req_id)
             # A pull that failed, or whose request finished, is logged by P
             # only. One that ended without a plan to emit is logged without
             # rows, so the comparator does not take it for either.
@@ -868,6 +908,11 @@ class NixlBaseConnectorScheduler:
                     if req_id in self._pair_ready
                     else replace(pulled, exchanged=False)
                 )
+        if withheld:
+            # The scheduler sees these pulls finish once their exchange is
+            # queued (take_deferred_recving), not now.
+            connector_output.finished_recving.difference_update(withheld)
+            self._pair_hidden.update(withheld)
         # Called before the scheduler frees finished_sending blocks.
         lock = getattr(self, "_held_send_leases_lock", None)
         if connector_output.finished_sending and lock is not None:
@@ -875,6 +920,16 @@ class NixlBaseConnectorScheduler:
                 self._held_send_leases.difference_update(
                     connector_output.finished_sending
                 )
+
+    def take_deferred_recving(self) -> set[ReqId]:
+        """Pulls to report finished now: withheld ones whose exchange went out
+        with the last built step metadata, or whose request finished first
+        (the scheduler frees their blocks on this report)."""
+        if not self._pair_release:
+            return set()
+        ready, self._pair_release = self._pair_release, set()
+        self._pair_hidden -= ready
+        return ready
 
     def has_pending_push_work(self) -> bool:
         return False

@@ -1331,20 +1331,27 @@ class DcpPairExchanger:
             arrays,
         )
 
-    def exchange(self, units: Sequence[PairUnit]) -> None:
+    def exchange(
+        self,
+        units: Sequence[PairUnit],
+        side: "torch.cuda.Stream | None" = None,
+    ) -> None:
         """Swap the units' rows with the partner and rewrite their blocks in
-        interleave-1 order, queued on the current stream without a host sync.
+        interleave-1 order, queued without a host sync.
 
         Args:
             units: The step's units of this rank's group, distinct blocks in
                 metadata order. Every rank of the DCP group passes the same
-                units: each chunk of ``chunk_units`` is one NCCL round with the
+                units: each chunk of ``chunk_units`` is one round with the
                 partner.
+            side: None: pack, swap and unpack on the current stream. Else the
+                packs run on the current stream and each chunk's swap and
+                unpack on ``side`` (see ``_run``).
 
         """
         if units:
             rows = async_tensor_h2d(_unit_rows(units), self.device, torch.int64)
-            self._run(units, rows, self._plan)
+            self._run(units, rows, self._plan, side)
 
     def record_event(self) -> torch.cuda.Event:
         """An event on the current stream, after every exchange queued so
@@ -1435,20 +1442,87 @@ class DcpPairExchanger:
                 "memory is free after warm-up, under 1 GiB"
             )
 
+    def check_round_trip(self) -> None:
+        """Pack, swap and unpack a scratch block filled with this rank's byte
+        through the current communicator and check the partner's rows came
+        back (as in ``warm_up``, without the stamp swap and the NCCL timing).
+        On every rank of the DCP group at once."""
+        offset = self.table.base_addr % 16
+        scratch = torch.full(
+            (offset + self.table.block_stride,),
+            _fill_byte(self.layout.dcp_rank),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        delta = scratch.data_ptr() + offset - self.table.base_addr
+        unit = [PairUnit(0, 0, True)]
+        rows = async_tensor_h2d(_unit_rows(unit), self.device, torch.int64)
+        self._run(unit, rows, self._plan.rebased(delta))
+        self._check_scratch(scratch[offset:].cpu().numpy())
+
+    def use_send_buffer(self, send: torch.Tensor, communicator: Any) -> None:
+        """Swap through ``communicator`` from ``send`` (same shape as the
+        built buffer), e.g. a buffer the partner maps for peer copies."""
+        if send.shape != self.send.shape or send.dtype != self.send.dtype:
+            raise NixlPairModeError(
+                f"DCP pair exchange: send buffer {tuple(send.shape)} "
+                f"{send.dtype}, expected {tuple(self.send.shape)} {self.send.dtype}"
+            )
+        self.send = send
+        self._words["send"] = send.view(torch.int32)
+        self._communicator = communicator
+        self._swaps = [
+            (
+                _p2p_op(torch.distributed.isend, send[:n], self.layout.partner),
+                _p2p_op(torch.distributed.irecv, self.recv[:n], self.layout.partner),
+            )
+            for n in range(self.chunk_units + 1)
+        ]
+
     def _run(
         self,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
         plan: _LaunchPlan,
+        side: "torch.cuda.Stream | None" = None,
     ) -> None:
         """Pack, swap and unpack the units chunk by chunk, ``rows`` being
-        their ``_unit_rows`` on the device."""
+        their ``_unit_rows`` on the device.
+
+        With ``side``, every pack kernel stays on the current stream and only
+        the swap (stream memory operations and copy-engine copies) and the
+        unpack run on ``side``. The partner's swap waits for this rank's
+        "packed" counter, so the pack must never sit behind work that can wait
+        for the partner: on the current stream it precedes this step's
+        forward, whose collectives and MegaMoE spin on the peers, so it always
+        runs, even when every SM is held by a spinning kernel or the device
+        serializes kernels (CUPTI tracing). A pack on ``side`` could be
+        starved by such a kernel while the partner's host blocks on its side
+        stream, which closes a cycle. The unpack only rewrites this rank's
+        own blocks; no peer waits for it.
+
+        Each pack first waits for ``side``: the previous chunk's swap must
+        have consumed ``send`` and its unpack read ``keep`` and ``recv``.
+        """
+        if side is None:
+            for start in range(0, len(units), self.chunk_units):
+                chunk = units[start : start + self.chunk_units]
+                chunk_rows = rows[start : start + len(chunk)]
+                self._pack(chunk, chunk_rows, plan)
+                self._communicate(len(chunk))
+                self._unpack(chunk, chunk_rows, plan)
+            return
+        compute = current_stream()
+        rows.record_stream(side)
         for start in range(0, len(units), self.chunk_units):
             chunk = units[start : start + self.chunk_units]
             chunk_rows = rows[start : start + len(chunk)]
+            compute.wait_stream(side)
             self._pack(chunk, chunk_rows, plan)
-            self._communicate(len(chunk))
-            self._unpack(chunk, chunk_rows, plan)
+            side.wait_stream(compute)
+            with torch.cuda.stream(side):
+                self._communicate(len(chunk))
+                self._unpack(chunk, chunk_rows, plan)
 
     def _pack(
         self,
@@ -1640,9 +1714,17 @@ class DcpStagedExchanger:
         for stride in sorted(self.stages, reverse=True):
             self.stages[stride].warm_up()
 
-    def exchange(self, units: Sequence[PairUnit]) -> None:
+    def exchange(
+        self,
+        units: Sequence[PairUnit],
+        side: "torch.cuda.Stream | None" = None,
+    ) -> None:
         """Run the stages of every P DCP size among ``units``, in the order
-        the sizes first appear (the same on every rank)."""
+        the sizes first appear (the same on every rank). ``side`` as in
+        ``DcpPairExchanger.exchange``: a later stage's packs wait for the
+        earlier stage's unpacks on ``side``."""
+        # Without a side stream, stages are called as before (``exchange(units)``).
+        kwargs = {} if side is None else {"side": side}
         by_remote: dict[int, list[PairUnit]] = {}
         for u in units:
             remote = u.remote_dcp_size or self.dcp_size // 2
@@ -1651,15 +1733,25 @@ class DcpStagedExchanger:
             strides = exchange_strides(self.dcp_size, remote)
             if len(strides) == 1:
                 # Ratio 2: the one-stage exchange of the units as planned.
-                self.stages[strides[0]].exchange(group_units)
+                self.stages[strides[0]].exchange(group_units, **kwargs)
                 continue
             for stride in strides:
                 self.stages[stride].exchange(
-                    stage_units(group_units, self.dcp_rank, stride, remote)
+                    stage_units(group_units, self.dcp_rank, stride, remote),
+                    **kwargs,
                 )
 
     def record_event(self) -> torch.cuda.Event:
         return self.first.record_event()
+
+    def use_send_buffer(self, send: torch.Tensor, communicator: Any) -> None:
+        """Every stage swaps through ``communicator`` from ``send``; each
+        stage's round trip is checked (largest stride first, as warm_up), on
+        every rank of the DCP group at once."""
+        for stride in sorted(self.stages, reverse=True):
+            stage = self.stages[stride]
+            stage.use_send_buffer(send, communicator)
+            stage.check_round_trip()
 
 
 def build_dcp_staged_exchanger(
@@ -1699,3 +1791,192 @@ def build_dcp_staged_exchanger(
     for stride in strides[1:]:
         stages[stride] = first.for_layout(layout(stride))
     return DcpStagedExchanger(stages, dcp_size)
+
+
+# ----------------------------------------------------------------------------
+# Peer-copy swap (one host): copy engines + stream memory operations
+# ----------------------------------------------------------------------------
+
+
+class _CudaDriver:
+    """The few driver calls the peer-copy swap needs, through ctypes."""
+
+    def __init__(self):
+        import ctypes
+
+        lib = ctypes.CDLL("libcuda.so.1")
+
+        def fn(*names: str):
+            for name in names:
+                f = getattr(lib, name, None)
+                if f is not None:
+                    f.restype = ctypes.c_int
+                    return f
+            raise OSError(f"libcuda has none of {names}")
+
+        u64, ptr = ctypes.c_uint64, ctypes.c_void_p
+        self._wait = fn("cuStreamWaitValue64_v2", "cuStreamWaitValue64")
+        self._wait.argtypes = [ptr, u64, u64, ctypes.c_uint]
+        self._write = fn("cuStreamWriteValue64_v2", "cuStreamWriteValue64")
+        self._write.argtypes = [ptr, u64, u64, ctypes.c_uint]
+        self._copy = fn("cuMemcpyAsync")
+        self._copy.argtypes = [u64, u64, ctypes.c_size_t, ptr]
+
+    @staticmethod
+    def _check(name: str, rc: int) -> None:
+        if rc != 0:
+            raise RuntimeError(f"DCP peer-copy swap: {name} returned CUresult {rc}")
+
+    def wait_geq(self, stream: int, addr: int, value: int) -> None:
+        # CU_STREAM_WAIT_VALUE_GEQ
+        self._check("cuStreamWaitValue64", self._wait(stream, addr, value, 0))
+
+    def write(self, stream: int, addr: int, value: int) -> None:
+        # Default flags: a memory barrier orders the stream's earlier writes.
+        self._check("cuStreamWriteValue64", self._write(stream, addr, value, 0))
+
+    def copy(self, stream: int, dst: int, src: int, nbytes: int) -> None:
+        self._check("cuMemcpyAsync", self._copy(dst, src, nbytes, stream))
+
+
+class _DeviceBuffer:
+    """A uint8 view of raw device memory, for ``torch.as_tensor``."""
+
+    def __init__(self, ptr: int, shape: tuple[int, ...]):
+        self.__cuda_array_interface__ = {
+            "shape": shape,
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "strides": None,
+            "version": 3,
+        }
+
+
+class PeerCopySwap:
+    """``batch_isend_irecv`` for the pair exchanger when one host holds the
+    whole DCP group: each rank copies the partner's ``send`` rows into its
+    ``recv`` with a copy engine (the partner's buffer is mapped over CUDA
+    IPC), ordered by stream memory operations on per-pair counters.
+
+    Nothing waits on an SM: a rank's stream waits for the partner's "packed"
+    and "consumed" counters in front-end stream waits, so the exchange can run
+    on a side stream beside a forward whose kernels spin on peers (MegaMoE,
+    the DCP collectives) without being able to starve them. Per chunk ``s`` of
+    the pair (both ranks issue the same chunks in the same order)::
+
+        write partner.packed[me] = s          (after this rank's pack kernel)
+        wait  mine.packed[partner] >= s
+        copy  partner.send[:n] -> recv[:n]    (copy engine)
+        write partner.consumed[me] = s
+        wait  mine.consumed[partner] >= s     (before the next pack overwrites send)
+
+    Args:
+        dcp_rank: This rank in the DCP group.
+        dcp_size: The group size.
+        send_ptrs: Every rank's mapped ``send`` buffer.
+        flag_ptrs: Every rank's mapped counters: ``2 * dcp_size`` int64, zeroed.
+    """
+
+    def __init__(
+        self,
+        dcp_rank: int,
+        dcp_size: int,
+        send_ptrs: Sequence[int],
+        flag_ptrs: Sequence[int],
+        driver: _CudaDriver | None = None,
+    ):
+        self.dcp_rank, self.dcp_size = dcp_rank, dcp_size
+        self.send_ptrs, self.flag_ptrs = list(send_ptrs), list(flag_ptrs)
+        self._cu = driver or _CudaDriver()
+        self._seq = [0] * dcp_size
+
+    def _packed(self, owner: int, peer: int) -> int:
+        return self.flag_ptrs[owner] + 8 * peer
+
+    def _consumed(self, owner: int, peer: int) -> int:
+        return self.flag_ptrs[owner] + 8 * (self.dcp_size + peer)
+
+    def batch_isend_irecv(self, ops: Sequence[Any]) -> None:
+        send, recv = ops[0].tensor, ops[1].tensor
+        partner, me = ops[0].group_peer, self.dcp_rank
+        if send.data_ptr() != self.send_ptrs[me] or ops[1].group_peer != partner:
+            raise NixlPairModeError(
+                "DCP peer-copy swap: the round must send from this rank's mapped "
+                "buffer and receive from the same partner"
+            )
+        self._seq[partner] += 1
+        s = self._seq[partner]
+        stream = current_stream().cuda_stream
+        cu = self._cu
+        cu.write(stream, self._packed(partner, me), s)
+        cu.wait_geq(stream, self._packed(me, partner), s)
+        cu.copy(stream, recv.data_ptr(), self.send_ptrs[partner], send.numel())
+        cu.write(stream, self._consumed(partner, me), s)
+        cu.wait_geq(stream, self._consumed(me, partner), s)
+
+
+def build_peer_copy_swap(
+    exchanger: "DcpStagedExchanger", cpu_group: Any
+) -> "PeerCopySwap | None":
+    """Switch ``exchanger`` to peer-copy swaps when every rank of the DCP group
+    (``cpu_group``) is on this host and can map the others' buffers; else
+    leave it on NCCL and return None. Collective over the group."""
+    import socket
+
+    import torch.distributed as dist
+
+    first = exchanger.first
+    ok = True
+    reason = ""
+    try:
+        from vllm import _custom_ops as ops
+
+        driver = _CudaDriver()
+        ok = hasattr(ops, "allocate_shared_buffer_and_handle")
+        # Probe the stream memory operations and the copy on this device.
+        probe = torch.zeros(4, dtype=torch.int64, device=first.device)
+        stream = current_stream().cuda_stream
+        driver.write(stream, probe.data_ptr(), 7)
+        driver.wait_geq(stream, probe.data_ptr(), 7)
+        driver.copy(stream, probe.data_ptr() + 8, probe.data_ptr(), 8)
+        ok = ok and probe.tolist() == [7, 7, 0, 0]
+        if not ok:
+            reason = "stream memory operation probe failed"
+    except Exception as e:  # noqa: BLE001 - capability probe
+        ok, reason, driver = False, repr(e), None
+    views: list[Any] = [None] * dist.get_world_size(cpu_group)
+    dist.all_gather_object(views, (socket.gethostname(), ok), group=cpu_group)
+    if len({h for h, _ in views}) != 1 or not all(o for _, o in views):
+        logger.info(
+            "NIXL DCP pair exchange: peer-copy swap off (DCP group on hosts %s, "
+            "capable %s%s); NCCL swaps inline.",
+            sorted({h for h, _ in views}),
+            [o for _, o in views],
+            f", {reason}" if reason else "",
+        )
+        return None
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    rank = dist.get_rank(cpu_group)
+    size = dist.get_world_size(cpu_group)
+    shape = tuple(first.send.shape)
+    send_ptrs = CustomAllreduce.create_shared_buffer(first.send.numel(), cpu_group)
+    flag_ptrs = CustomAllreduce.create_shared_buffer(16 * size, cpu_group)
+    device = first.device
+    send = torch.as_tensor(_DeviceBuffer(send_ptrs[rank], shape), device=device)
+    flags = torch.as_tensor(_DeviceBuffer(flag_ptrs[rank], (16 * size,)), device=device)
+    flags.zero_()
+    torch.accelerator.synchronize()
+    dist.barrier(group=cpu_group)
+    swap = PeerCopySwap(rank, size, send_ptrs, flag_ptrs, driver)
+    exchanger.use_send_buffer(send, swap)
+    torch.accelerator.synchronize()
+    logger.info(
+        "NIXL DCP pair exchange: peer-copy swaps (copy engines, stream memory "
+        "operations) between the %d DCP ranks of this host; exchanges run on a "
+        "side stream off the forward's critical path.",
+        size,
+    )
+    return swap

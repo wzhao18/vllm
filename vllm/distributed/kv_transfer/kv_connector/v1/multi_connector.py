@@ -505,6 +505,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 c.update_state_after_alloc(request, blocks, 0)
 
     def on_request_arrival(self, request: "Request") -> None:
+        # In connector order: a connector that rewrites the request at arrival
+        # (NIXL P-side prefill truncation) must run before one that keys work
+        # on it (Mooncake store arrival lookup), as in the production config.
         for c in self._connectors:
             c.on_request_arrival(request)
 
@@ -528,6 +531,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             metadata.extra_async_saves = self._extra_async_saves
             self._extra_async_saves = {}
         return metadata
+
+    def take_deferred_recving(self) -> set[str]:
+        ready: set[str] = set()
+        for c in self._connectors:
+            ready |= c.take_deferred_recving()
+        return ready
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
