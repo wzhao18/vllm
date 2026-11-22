@@ -159,6 +159,38 @@ class _RouteDump:
 
 
 _ROUTE = {}
+_MEMSTATS = {}
+
+
+def _start_memstats(device):
+    """DDSA DIAGNOSTIC (never merge): with DDSA_MEMSTATS_DIR set, one host thread per decode worker
+    appends torch.cuda.memory_stats (caching-allocator counters, no CUDA work) every 10 s to
+    <dir>/mem-<host>-<pid>-<dev>.jsonl, after DDSA_MEMSTATS_DELAY_S (default 600, past capture)."""
+    import json, os, socket, threading, time
+
+    d = os.environ.get("DDSA_MEMSTATS_DIR")
+    if not d or device.index in _MEMSTATS:
+        return
+    _MEMSTATS[device.index] = True
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"mem-{socket.gethostname()}-{os.getpid()}-{device.index}.jsonl")
+    keys = ("num_alloc_retries", "num_ooms", "num_device_alloc", "num_device_free",
+            "reserved_bytes.all.current", "allocated_bytes.all.current", "active_bytes.all.current",
+            "inactive_split_bytes.all.current", "reserved_bytes.all.peak", "allocated_bytes.all.peak",
+            "num_sync_all_streams")
+
+    def run():
+        time.sleep(float(os.environ.get("DDSA_MEMSTATS_DELAY_S", "600")))
+        while True:
+            try:
+                st = torch.cuda.memory_stats(device)
+                with open(path, "a") as f:
+                    f.write(json.dumps({"t": time.time(), **{k: st.get(k) for k in keys}}) + "\n")
+            except Exception as e:  # diagnostic only
+                print(f"DDSA memstats failed: {e}", flush=True)
+            time.sleep(10)
+
+    threading.Thread(target=run, daemon=True, name="ddsa-memstats").start()
 
 
 def _route_dump(device, cap, top_k):
@@ -265,6 +297,7 @@ class SpMlp:
             raise Unsupported("moe", None, f"layer {index}: {cause}")
         self.mlp, self.rows = mlp, tuple(sorted(set(rows)))
         self._ddsa_index = index
+        _start_memstats(next(mlp.parameters()).device)
         self._ddsa_route = _route_dump(next(mlp.parameters()).device, max(self.rows),
                                        int(getattr(mlp.experts, "top_k", 16)))
         shared, transform = mlp.shared_experts, mlp.routed_output_transform
