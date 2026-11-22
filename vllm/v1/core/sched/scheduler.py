@@ -4071,7 +4071,15 @@ class Scheduler(SchedulerInterface):
             return num_tokens
         if self._prompt_chunk_cost(request, ctx, num_tokens) <= cost_left:
             return num_tokens
-        return min(num_tokens, self._prompt_cost.max_tokens_for_cost(cost_left, ctx))
+        cut = self._prompt_cost.max_tokens_for_cost(cost_left, ctx)
+        if self.need_mamba_block_aligned_split:
+            # A non-final prompt chunk must end on a Mamba block boundary, so a
+            # cut below one block would align to 0 tokens: the request would
+            # never progress (every step, while it holds its running slot).
+            # Take at least one whole block (the step then costs slightly more
+            # than the budget rather than stalling).
+            cut = max(cut, self.mamba_block_size)
+        return min(num_tokens, cut)
 
     def _step_cost(self, num_scheduled_tokens: dict[str, int]) -> float:
         """Predicted cost of this step's scheduled work (short-context tokens)."""
