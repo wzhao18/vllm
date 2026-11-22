@@ -211,6 +211,36 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+def _megamoefix_repro_cycles(runner) -> None:
+    """NEVER MERGE (MEGAMOEFIX startup-stall repro, DCRIT r44): repeat the warmup + CUDA graph capture
+    profiling pass K31_REPRO_CAPTURE_CYCLES times before the real one, each a full setup / capture /
+    teardown like the startup pass where the MegaMoE stall was seen. K31_REPRO_JITTER_MS adds a random
+    0..J ms host sleep before each cycle, and K31_REPRO_STAGGER_MS sleeps rank * S ms (timing skew)."""
+    import os
+    import random
+    import time
+
+    n = int(os.environ.get("K31_REPRO_CAPTURE_CYCLES", "0"))
+    jit = float(os.environ.get("K31_REPRO_JITTER_MS", "0")) / 1000.0
+    stag = float(os.environ.get("K31_REPRO_STAGGER_MS", "0")) / 1000.0
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) or 0)
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+    except Exception:  # noqa: BLE001
+        pass
+    rng = random.Random(1000 + rank)
+    for c in range(n):
+        if jit or stag:
+            time.sleep(rng.uniform(0, jit) + rank * stag)
+        t0 = time.perf_counter()
+        _profile_cudagraph_memory(runner)
+        torch.cuda.synchronize()
+        logger.info("MEGAMOEFIX_REPRO cycle %d/%d done in %.1f s (rank %d)", c + 1, n, time.perf_counter() - t0, rank)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1206,6 +1236,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Estimate the GPU memory required to capture CUDA graphs."""
         # Runs before the KV cache exists, outside compile_or_warm_up_model.
         with self.eplb.suppress():
+            _megamoefix_repro_cycles(self)
             return _profile_cudagraph_memory(self)
 
     def needs_cudagraph_capture(self) -> bool:

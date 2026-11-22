@@ -61,7 +61,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 # 15 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
 # far below a forever-hang. Shorter only on never-merge stall-test overlays.
-SPIN_GUARD_NS = 900 * 1000 * 1000 * 1000
+SPIN_GUARD_NS = 120 * 1000 * 1000 * 1000  # REPRO ONLY, never merge
 SPIN_POLLS = 1024  # failed polls before the first clock read
 SPIN_FLUSH_NS = 1000 * 1000 * 1000  # print -> trap delay (lets every line land)
 

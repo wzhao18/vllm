@@ -28,7 +28,7 @@
 #ifndef K31_SPIN_GUARD_NS
 // 15 min: far above any legitimate wait (peers compiling, loading or capturing graphs),
 // far below a forever-hang. Shorter only on never-merge stall-test overlays.
-#define K31_SPIN_GUARD_NS 900000000000ull
+#define K31_SPIN_GUARD_NS 120000000000ull  // REPRO ONLY, never merge
 #endif
 
 namespace k31sg {
