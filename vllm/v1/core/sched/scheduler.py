@@ -309,6 +309,12 @@ class Scheduler(SchedulerInterface):
         # by the DP engine core from the DP group's outstanding prefill work at
         # each exchange (see set_dp_step_token_cap). None = no cap.
         self._dp_step_token_cap: int | None = None
+        # Whether, at the last DP exchange, some DP rank of this engine's group
+        # had nothing to schedule (no scheduled tokens and no computable prompt
+        # tokens) while the group had prompt work. Work this rank holds but has
+        # not committed yet (no blocks, no load issued) is better left movable
+        # then; load-ahead stays off while it is set.
+        self.dp_group_has_idle_rank: bool = False
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -3420,6 +3426,44 @@ class Scheduler(SchedulerInterface):
         budget once the group is saturated).
         """
         self._dp_step_token_cap = cap
+
+    def dp_movable_requests(self, limit: int) -> list[tuple[str, int]]:
+        """Up to ``limit`` waiting requests not yet committed to this rank, in
+        queue order, as (request id, prompt tokens).
+
+        Not committed means nothing of the request lives on this rank yet: it
+        is WAITING with no computed tokens, holds no KV blocks and no connector
+        load is in flight for it. Such a request could be computed by any DP
+        rank of the group from the same prompt (the external prefix cache is
+        shared), so cross-rank balancing may consider it. Requests waiting for
+        a remote prefill, streaming, or with a preemption history are never
+        listed.
+        """
+        out: list[tuple[str, int]] = []
+        if limit <= 0:
+            return out
+        for request in self.waiting:
+            if len(out) >= limit:
+                break
+            if (
+                request.status == RequestStatus.WAITING
+                and request.num_computed_tokens == 0
+                and request.num_preemptions == 0
+                and not request.resumable
+                and request.request_id not in self.finished_recving_kv_req_ids
+                and not self._has_allocated_blocks(request.request_id)
+            ):
+                out.append((request.request_id, request.num_prompt_tokens))
+        return out
+
+    def _has_allocated_blocks(self, request_id: str) -> bool:
+        """Whether any KV cache group holds blocks for ``request_id`` (read only:
+        does not create the per-request entry)."""
+        coordinator = getattr(self.kv_cache_manager, "coordinator", None)
+        for manager in getattr(coordinator, "single_type_managers", ()):
+            if manager.req_to_blocks.get(request_id):
+                return True
+        return False
 
     def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
         """Prompt tokens this rank can compute after this step's schedule:

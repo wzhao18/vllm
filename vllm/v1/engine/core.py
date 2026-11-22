@@ -2810,6 +2810,15 @@ class DPEngineCoreProc(EngineCoreProc):
                 "DP prefill pull-up exchange is out of step across DP ranks "
                 f"({int(counts[2 * size])} of {size} ranks)."
             )
+        sched_counts = counts[:size]
+        demands = counts[size : 2 * size]
+        # Some rank has neither scheduled tokens nor computable prompt tokens
+        # while the group still has prompt work: uncommitted work elsewhere is
+        # better left movable (see Scheduler.dp_group_has_idle_rank).
+        self.scheduler.dp_group_has_idle_rank = bool(
+            int(demands.sum()) > 0
+            and bool(((sched_counts == 0) & (demands == 0)).any())
+        )
         self.scheduler.set_dp_step_token_cap(
             dp_step_token_cap(
                 # A rank runs at most the budget per step, so a long cold

@@ -168,3 +168,41 @@ def test_exchange_sets_the_same_cap_on_every_rank():
         # demand 0 + 4096 + 8192 + 12288 = 24576 -> 6144 per rank
         for rank in range(world_size):
             assert out[rank] == (300, [6144, 4096])
+
+
+def _idle_flag_worker(rank, world_size, port, sched_tokens, demand, out):
+    pg = stateless_init_torch_distributed_process_group(
+        "127.0.0.1", port, rank, world_size, backend="gloo"
+    )
+    sched = _Sched([sched_tokens[rank]])
+    core = _fake_core(pg, sched)
+    DPEngineCoreProc._exchange_dp_prefill_tokens(core, sched_tokens[rank], demand[rank])
+    out.put((rank, sched.dp_group_has_idle_rank))
+
+
+@pytest.mark.parametrize(
+    "sched_tokens,demand,expected",
+    [
+        ([4096, 0], [8000, 0], True),  # rank 1 has nothing, rank 0 has work
+        ([4096, 2048], [8000, 0], False),  # rank 1 schedules something
+        ([0, 0], [0, 0], False),  # no prompt work anywhere
+    ],
+)
+def test_exchange_sets_idle_rank_flag(sched_tokens, demand, expected):
+    ctx = mp.get_context("spawn")
+    port = get_open_port()
+    out = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_idle_flag_worker,
+            args=(r, 2, port, sched_tokens, demand, out),
+        )
+        for r in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    got = dict(out.get(timeout=5) for _ in range(2))
+    assert got == {0: expected, 1: expected}
