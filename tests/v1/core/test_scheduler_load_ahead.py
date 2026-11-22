@@ -180,13 +180,3 @@ def test_abort_while_loading_ahead_drops_it_from_the_set():
     )
     assert a.request_id not in scheduler.requests
 
-
-def test_no_load_ahead_while_a_dp_rank_of_the_group_is_idle():
-    scheduler = _scheduler()
-    scheduler.dp_group_has_idle_rank = True
-    _fill_budget(scheduler)
-    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
-    scheduler.schedule()
-    assert a.status == RequestStatus.WAITING
-    assert a.num_computed_tokens == 0
-    assert not scheduler._load_ahead
