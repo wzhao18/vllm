@@ -680,9 +680,42 @@ class RubinMegaMoeSession:
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
+        self._stamp_issued()
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
+    # Host "issued" stamp (MEGAMOEFIX 2026-11-22, VENDOR.md S9): this rank's count of launches of this session,
+    # written into its [issued, entered] progress word in the symmetric arena by a 4-byte H2D copy on a side
+    # stream (copy engine: needs no SM and no sync, so it lands even when this GPU is stuck in an earlier
+    # kernel). A peer's spin guard reads it over NVLink on timeout to tell a host that never issued the call (H1)
+    # from a GPU that never started it (H2). Eager launches only: during CUDA graph capture the host does not
+    # issue per launch, so graph replays leave it behind (the trap line reports raw ids).
+    _PROGRESS_REGION = "nvlink.token_comm_dedup.call_progress"
+
+    def _stamp_issued(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        view = getattr(self, "_issued_view", None)
+        if view is None:
+            ws = self.kernel._device_workspace
+            names = {r.name for r in ws.regions("shared")}
+            if self._PROGRESS_REGION not in names:
+                self._issued_view = False  # this kernel variant has no progress word
+                return
+            off = ws.offset(self._PROGRESS_REGION)
+            view = self.shared_workspace[off : off + 4].view(torch.int32)
+            self._issued_view = view
+            self._issued = 0
+            self._issued_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            self._issued_stream = torch.cuda.Stream(device=self.device)
+        elif view is False:
+            return
+        self._issued += 1
+        self._issued_host[0] = self._issued
+        with torch.cuda.stream(self._issued_stream):
+            view.copy_(self._issued_host, non_blocking=True)
+
     def release(self) -> None:
+        self._issued_view = None  # the progress word lives in the arena being released
         self._bound.clear()
         self._out_bound.clear()
         self._norm_bound.clear()

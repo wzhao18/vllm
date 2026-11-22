@@ -186,6 +186,21 @@ scan; the backend's own modules stay covered.
   ``src_gp/common/call_tail.py``; regions ``nvlink.token_comm.call_epoch`` / ``call_done_signal``; guarded spin
   site 60): ``signal_done`` after the tail barrier, ``wait_previous_done`` at the router kernel's entry.
 
+- **S9** (vLLM-local, BUG-E2E-3 follow-up MEGAMOEFIX 2026-11-22): hang diagnostics, ordering/guards only (bitwise A/B).
+  (a) Every remaining load-spin on the ``src_gp`` dedup path is bounded by ``spin_guard`` / ``spin_guard_value``: router
+  internal waits (sites 23-26), token-back fc2_done wait (27), generic ``dsl_helpers.spin_wait`` (70), polled top-k
+  reduce cell polls (72-73) and its producer_done wait (74), work-id claim group waits (80-81).
+  (b) Missing-rank report: ``DedupCallTail`` registers per-rank progress words ``call_progress`` = [issued, entered]
+  (arena, zero_on_first_allocate) and per-call arrival masks ``sizes_arrived_mask`` / ``metadata_arrived_mask``
+  (tail_reset). The router stamps ``entered`` (call id) at entry before any wait, and ORs its rank bit into each
+  peer's mask before counting the arrival. ``session.launch`` stamps ``issued`` (host launch count) by a 4-byte H2D
+  copy on a side stream (copy engine, no sync; eager launches only). On a site-20 timeout ``spin_guard_ranks``
+  prints one ``MEGAMOE_SPIN_MISSING`` line per missing rank with its issued/entered ids (read over NVLink)
+  against the expected call id: H1 = host never issued, H2 = issued but its GPU never started the call,
+  IN = entered but not published. ``spin_guard.py`` stays identical in ``src`` and ``src_gp``.
+  (c) The dedup reduce (``TopkReduceDedup``) is a plain launch with no poll, so the next call's router always reads
+  the epoch after its own previous main kernel completed: no stale-epoch window (F3 needs no change on this path).
+
 ## sha256 manifest of `src/sources`
 
 ```
@@ -207,7 +222,7 @@ c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3  sources/helper
 215675b7f0def6526bb3c75b385cf12ccf0a5a35e8816c68bffbda03eaeabd9c  sources/helpers/ptx_helpers.py
 91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c  sources/helpers/smem_workspace.py
 fc131f9575b733b1f0a79a2f63d5221f810d64b4f05c2c34b47bf33842559a4f  sources/helpers/software_sync.py
-d24f445030ac0fcabed2476a5ca1f505e5ac36a2578ed6633975b28f1db1f4bf  sources/helpers/spin_guard.py
+aa8cc617627b60b988d41bde8712a56a2f5c891c13b69fe307e3122149e64332  sources/helpers/spin_guard.py
 39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22  sources/helpers/utils.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/__init__.py
 81689f9850af024d9ec22416d4c2a1535d73946d455b7e22042d321534918642  sources/kernel_src/function_mapping.py
