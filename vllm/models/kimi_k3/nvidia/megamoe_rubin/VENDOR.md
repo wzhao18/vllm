@@ -172,6 +172,16 @@ scan; the backend's own modules stay covered.
   any computed value); sites: src software_sync 0, token_comm 40-42; src_gp software_sync 10,
   token_comm_dedup 20-22, token_comm 30-32, genphase_tail 50-51.
 
+- **S8** (vLLM-local, BUG-E2E-3, ``src_gp`` dedup comm path only): ``token_comm_dedup.py`` gets the GenPhase
+  previous-call protocol (``DedupCallTail`` = ``GenphaseTail`` with its own region names
+  ``nvlink.token_comm_dedup.call_epoch`` / ``call_done_signal``). The router (a PDL primary whose dependents start at
+  its entry, and which itself can start while a peer is still in the previous call's tail) used to add this call's
+  sizes / sizes_ready / metadata_ready into every peer's ``tail_reset`` counters with no previous-call guard, so a
+  peer's ``reset_tail_space`` could erase the add and that peer's router waited forever (EP group hang). Now
+  ``reset_tail`` ends with ``signal_done`` (CTA 0, thread 0, after the publish barrier = after every rank's reset)
+  and the router's thread 0 runs ``previous_done_observation`` + ``wait_previous_done`` before any remote write.
+  Ordering only: every computed value is unchanged (bitwise A/B).
+
 ## sha256 manifest of `src/sources`
 
 ```
