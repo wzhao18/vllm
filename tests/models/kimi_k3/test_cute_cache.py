@@ -66,6 +66,15 @@ def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     c = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
     monkeypatch.setenv("VLLM_ITERLOG_DIR", "/tmp/b")
     assert c == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+    # the launcher's per-start identity (container name with its timestamp, node list,
+    # time budget) is not a trace input either
+    for name, a1, a2 in (("K31_CNAME", "k31e2e-105921-1121222010", "k31e2e-105921-1121232827"),
+                         ("K31_NODES", "rhea0073,rhea0074", "rhea0055,rhea0056"),
+                         ("K31_MIN_LEFT_S", "2700", "900")):
+        monkeypatch.setenv(name, a1)
+        d = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+        monkeypatch.setenv(name, a2)
+        assert d == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3"), name
     # sources are not in the key (each entry records its own files)
     assert not hasattr(cute_cache, "_source_digest")
 
@@ -633,6 +642,98 @@ def test_warm_start_loads_every_kernel_bitwise(tmp_path):
     assert (s["compiled"], s["loaded"]) == (1, 2), s
     for name, ref in cold_out["reference"].items():
         assert _bitwise(broken_out["cached"][name], ref), f"rebuilt {name}"
+
+
+def _scale_runtime_kernel_class():
+    """A kernel object whose ``factor`` is a runtime ``Float32`` argument and whose
+    ``rows`` is a ``Constexpr`` (traced)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    class ScaleRt:
+        @cute.jit
+        def __call__(self, x: cute.Tensor, y: cute.Tensor, factor: cutlass.Float32,
+                     base: cutlass.Int64, rows: cutlass.Constexpr = 128):  # fmt: skip
+            self.kernel(x, y, factor).launch(
+                grid=[x.shape[0] // rows, 1, 1], block=[rows, 1, 1]
+            )
+
+        @cute.kernel
+        def kernel(self, x: cute.Tensor, y: cute.Tensor, factor: cutlass.Float32):
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, _, _ = cute.arch.block_idx()
+            i = bidx * 128 + tidx
+            y[i] = x[i] * factor
+
+    return ScaleRt
+
+
+def test_runtime_numeric_argument_values_are_not_in_the_key():
+    """DSL numeric values (cutlass.Float32(v), Int64(a)) bound to DSL-numeric
+    parameters are runtime arguments: not in the key. Plain Python numbers there are
+    folded into the trace as constants, so their values stay in the key, as do every
+    Constexpr value and the kernel object's state."""
+    import cutlass
+    from cutlass.cute.runtime import make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    f32, i64 = cutlass.Float32, cutlass.Int64
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    a = _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    assert a == _key(k, fx, fx, f32(3.5), i64((1 << 40) + 4096))  # launch values
+    assert a != _key(k, fx, fx, 2.0, i64(1 << 40))  # a Python float: a constant
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 3.0, 7)
+    assert _key(k, fx, fx, 2.0, 7) != _key(k, fx, fx, 2.0, 8)
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40), 256)  # a Constexpr value
+    k.tag = "x"  # kernel object state
+    assert a != _key(k, fx, fx, f32(2.0), i64(1 << 40))
+    # keyword binding follows the same rule
+    assert _key(k, fx, fx, factor=f32(1.0), base=i64(3)) == _key(
+        k, fx, fx, factor=f32(9.0), base=i64(5)
+    )
+
+    def f(n: cutlass.Int32, m: cutlass.Int32, c: cutlass.Constexpr):
+        pass
+
+    assert cute_cache._runtime_values(f, (cutlass.Int32(5), 6, 7), {})[0] == (
+        cute_cache._runtime_marker(cutlass.Int32, cutlass.Int32(5)), 6, 7
+    )
+
+
+@_needs_blackwell
+def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
+    """Two compiles that differ only in the values of DSL numeric runtime arguments:
+    one compile, one hit; VERIFY re-traces the hit to the stored DSL module hash
+    (exact), and the hit runs with the launch values it is given."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    f32, i64 = cutlass.Float32, cutlass.Int64
+    monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    before = dict(vars(cute_cache.stats))
+    cute_cache._compile(inner, k, (fx, fx, f32(2.0), i64(1 << 40)), {})
+    hit = cute_cache._compile(inner, k, (fx, fx, f32(3.0), i64((1 << 40) + 64)), {})
+    s = vars(cute_cache.stats)
+    assert s["compiled"] - before["compiled"] == 1
+    assert s["loaded"] - before["loaded"] == 1
+    assert s["verified"] - before["verified"] == 1
+    assert s["mismatched"] == before["mismatched"]
+    x = torch.arange(4096, device=device, dtype=torch.float32)
+    y = torch.empty_like(x)
+    hit(from_dlpack(x, assumed_align=16), from_dlpack(y, assumed_align=16), 5.0, 0)
+    torch.cuda.synchronize()
+    assert torch.equal(y, x * 5.0)
 
 
 def _scale_kwargs_kernel_class():
