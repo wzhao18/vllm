@@ -166,6 +166,8 @@ def persistent_prefill(
     has_initial_state: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     step_memo: dict | None = None,
+    checkpoint_offsets: list[int] | None = None,
+    checkpoint_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
@@ -177,9 +179,23 @@ def persistent_prefill(
     With ``state_cache`` [slots, H, D, D] the kernel loads each sequence's
     initial state from ``state_cache[state_indices[i]]`` (zero where
     ``has_initial_state[i]`` is false) and stores its final state back to that
-    row in place; the returned final state is then None."""
+    row in place; the returned final state is then None.
+
+    ``checkpoint_offsets`` (host, one per sequence, 0 = none) requests prefill
+    checkpoints: ``checkpoint_out[s]`` (an FP32 [N >= nseq, H, D, D] buffer)
+    receives the state after exactly ``checkpoint_offsets[s]`` tokens of
+    sequence ``s``. The checkpoint is a sequence boundary of the persistent
+    schedule (kda_persistent.forward.make_cut_plan): the prefix computes as a
+    run of [0, offset) alone and the rest as a run seeded with its state. Needs
+    the in-place ``state_cache``."""
     from .kda_persistent import forward as kp
 
+    if checkpoint_offsets is not None and any(checkpoint_offsets):
+        return _persistent_prefill_cut(
+            q, k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens_cpu,
+            state_cache, state_indices, has_initial_state, out, step_memo,
+            checkpoint_offsets, checkpoint_out,
+        )
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
     # Every KDA layer of a step passes the same host offsets and state rows:
     # the host plan and the state-row table are built by the step's first layer
@@ -256,6 +272,112 @@ def persistent_prefill(
         srow=srow,
     )
     return out, (None if srow is not None else final_state)
+
+
+def _persistent_prefill_cut(
+    q, k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens_cpu,
+    state_cache, state_indices, has_initial_state, out, step_memo,
+    checkpoint_offsets, checkpoint_out,
+):
+    """persistent_prefill with checkpoint cuts (see its docstring)."""
+    from .kda_persistent import forward as kp
+
+    T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    dev = q.device
+    if state_cache is None or state_indices is None or has_initial_state is None:
+        raise ValueError("persistent KDA checkpoints need the in-place state cache")
+    offsets = tuple(cu_seqlens_cpu.tolist())
+    nseq = len(offsets) - 1
+    cuts = tuple(int(x) for x in checkpoint_offsets)
+    if len(cuts) != nseq:
+        raise ValueError(f"{len(cuts)} checkpoint offsets for {nseq} sequences")
+    if (
+        checkpoint_out is None
+        or checkpoint_out.dtype != torch.float32
+        or not checkpoint_out.is_contiguous()
+        or checkpoint_out.shape[1:] != (H, D, D)
+        or checkpoint_out.shape[0] < nseq
+    ):
+        raise ValueError(
+            f"checkpoint_out must be a contiguous FP32 [>= {nseq}, {H}, {D}, {D}] "
+            f"tensor, got {None if checkpoint_out is None else tuple(checkpoint_out.shape)}"
+        )
+    memo = step_memo
+    mkey = ("cplan", H, dev.index, cuts)
+    entry = memo.get(mkey) if memo is not None else None
+    if entry is None:
+        key = (offsets, cuts, H, dev.index)
+        entry = _persistent_plans.get(key)
+        if entry is None:
+            if len(_persistent_plans) >= 64:
+                _persistent_plans.clear()
+            entry = kp.make_cut_plan(list(offsets), list(cuts), H, dev)
+            _persistent_plans[key] = entry
+        if memo is not None:
+            memo[mkey] = entry
+    plan, meta = entry
+    # Pseudo-sequence state rows: a prefix loads its sequence's initial state
+    # (its final state goes to the checkpoint buffer, not the cache); a suffix
+    # seeds from that buffer and stores the sequence's final state.
+    skey = (
+        "csrow", H, state_cache.stride(0), state_cache.device.index,
+        state_indices.data_ptr(), has_initial_state.data_ptr(), cuts,
+    )
+    srow = memo.get(skey) if memo is not None else None
+    rows = kp.state_cache_view(state_cache, H)
+    if srow is None:
+        _, base = kp.state_cache_rows(
+            state_cache, state_indices[:nseq], has_initial_state, H
+        )
+        load, store = base[: nseq * H], base[nseq * H :]
+        src_chain, is_suffix = [], []
+        for s, (pre, suf) in enumerate(meta["pseudo_of"]):
+            for p in (pre, suf):
+                if p < 0:
+                    continue
+                for h in range(H):
+                    src_chain.append(s * H + h)
+                    is_suffix.append(p == suf)
+        idx = torch.tensor(src_chain, dtype=torch.int64, device=dev)
+        suffix = torch.tensor(is_suffix, dtype=torch.bool, device=dev)
+        srow = torch.cat(
+            (torch.where(suffix, -1, load.index_select(0, idx)), store.index_select(0, idx))
+        )
+        if memo is not None:
+            memo[skey] = srow
+    flat = checkpoint_out.view(-1, D, D)
+    nbuf = meta["nbuf"]
+    mid = flat[:nbuf] if flat.shape[0] >= nbuf else torch.empty(
+        nbuf, D, D, dtype=torch.float32, device=dev
+    )
+    if out is None:
+        out = torch.empty(1, T, H, D, dtype=q.dtype, device=dev)
+    elif not (out.shape == (1, T, H, D) and out.dtype == q.dtype and out.is_contiguous()):
+        raise ValueError(
+            f"persistent KDA prefill out must be a contiguous (1, {T}, {H}, {D}) "
+            f"{q.dtype} tensor, got {tuple(out.shape)} {out.dtype} stride {out.stride()}"
+        )
+    plan = plan[:8] + (mid,) + plan[9:]
+    kp.fwd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.reshape(1, T, H).contiguous(),
+        D**-0.5,
+        out,
+        A_log,
+        dt_bias.view(H, D),
+        lower_bound,
+        initial_state=rows,
+        final_state=rows,
+        cu_seqlens=plan[0],
+        plan=plan,
+        srow=srow,
+    )
+    if mid.data_ptr() != flat.data_ptr():
+        flat[: nseq * H].copy_(mid[: nseq * H])
+    return out, None
 
 
 _fp32_weights: dict = {}
