@@ -4,8 +4,9 @@
 
 Set ``VLLM_ITERLOG_DIR=<dir>`` to turn it on. Each process writes one file:
 ``engine-<host>-<pid>.jsonl`` (EngineCore: one record per scheduled batch, request
-lifecycle, idle gaps) and ``worker-r0-<host>-<pid>.jsonl`` (global rank 0: host
-phase times and CUDA-event GPU times per executed batch).
+lifecycle, idle gaps) and ``worker-r<rank>-<host>-<pid>.jsonl`` (global rank 0, or
+every global rank with ``VLLM_ITERLOG_ALL_RANKS=1``: host phase times and CUDA-event
+GPU times per executed batch; all ranks are needed to see per-rank skew in DP/EP).
 
 ``VLLM_ITERLOG_GPU`` (worker): 2 (default) times six points per step with CUDA
 events, 1 only step begin / end, 0 none (host times only).
@@ -258,8 +259,16 @@ class EngineIterLog:
         put(tuple(rec))
 
 
+def _global_rank() -> int:
+    """Global rank of this worker (0 when torch.distributed is not initialized)."""
+    import torch.distributed as dist
+
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+
 class WorkerIterLog:
-    """Worker side (global rank 0): host phase times and GPU times per batch."""
+    """Worker side (global rank 0, or every rank with ``VLLM_ITERLOG_ALL_RANKS=1``): host
+    phase times and GPU times per batch."""
 
     RING = 64
 
@@ -268,7 +277,8 @@ class WorkerIterLog:
 
         self._torch = torch
         self._level = level
-        self._w = _Writer("worker-r0", WORKER_FIELDS, {"gpu_level": level})
+        self._w = _Writer(f"worker-r{_global_rank()}", WORKER_FIELDS,
+                          {"gpu_level": level, "rank": _global_rank()})
         self._put = self._w.put
         n_ev = 6 if level >= 2 else (2 if level == 1 else 0)
         self._ring = [
@@ -287,7 +297,8 @@ class WorkerIterLog:
             return None
         import torch.distributed as dist
 
-        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        if (dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
+                and os.environ.get("VLLM_ITERLOG_ALL_RANKS") != "1"):
             return None
         return cls(int(os.environ.get("VLLM_ITERLOG_GPU", "2")))
 
