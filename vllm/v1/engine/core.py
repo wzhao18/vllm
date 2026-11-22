@@ -68,6 +68,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_cache_hit_alignment_tokens,
     resolve_kv_cache_block_sizes,
+    resolve_prefix_cache_retention_interval,
     update_kv_cache_capacity,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -412,9 +413,17 @@ class EngineCore:
         # The scheduler's config is a deep copy taken before these are resolved,
         # so set them there too: the KV connector's scheduler side reads the same
         # fields as its workers.
+        retention_interval = resolve_prefix_cache_retention_interval(
+            vllm_config.cache_config.prefix_cache_retention_interval,
+            scheduler_kv_cache_config.kv_cache_groups,
+            scheduler_block_size,
+            bool(vllm_config.cache_config.enable_prefix_caching),
+        )
+        vllm_config.cache_config.prefix_cache_retention_interval = retention_interval
         for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
             kv_cache_config.hash_block_size = hash_block_size
             kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+            kv_cache_config.prefix_cache_retention_interval = retention_interval
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         kv_transfer_config = vllm_config.kv_transfer_config

@@ -839,6 +839,30 @@ def eagle_proof_margin(
     return block_size
 
 
+def resolve_prefix_cache_retention_interval(
+    retention_interval: int | str | None,
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+    scheduler_block_size: int,
+    enable_prefix_caching: bool,
+) -> int | None:
+    """Resolve ``CacheConfig.prefix_cache_retention_interval``.
+
+    ``"auto"`` retains a checkpoint at every scheduler block boundary when
+    prefix caching is on and a Mamba group runs in "align" mode, and only the
+    semantic checkpoints (``0``) otherwise. Explicit values pass through.
+    """
+    if retention_interval != "auto":
+        assert retention_interval is None or isinstance(retention_interval, int)
+        return retention_interval
+    if enable_prefix_caching and any(
+        isinstance(g.kv_cache_spec, MambaSpec)
+        and g.kv_cache_spec.mamba_cache_mode == "align"
+        for g in kv_cache_groups
+    ):
+        return scheduler_block_size
+    return 0
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,

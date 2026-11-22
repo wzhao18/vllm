@@ -2337,3 +2337,45 @@ def test_null_head_len():
         assert null_head_len(table) == expected
     blocks = KVCacheBlocks(([null] * 4 + real, [null] + real[:1] + [null]))
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
+
+
+def _retention_groups(mamba_cache_mode: str) -> list[KVCacheGroupSpec]:
+    return [
+        KVCacheGroupSpec(["attn"], new_kv_cache_spec(block_size=64)),
+        KVCacheGroupSpec(
+            ["mamba"],
+            new_mamba_spec(block_size=64, mamba_cache_mode=mamba_cache_mode),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "mode", "prefix_caching", "expected"),
+    [
+        # auto: every block-boundary state of an align-mode Mamba group.
+        ("auto", "align", True, 64),
+        # auto without align-mode Mamba or without prefix caching: semantic only.
+        ("auto", "none", True, 0),
+        ("auto", "align", False, 0),
+        # explicit values pass through unchanged.
+        (0, "align", True, 0),
+        (None, "align", True, None),
+        (128, "align", True, 128),
+    ],
+)
+def test_resolve_prefix_cache_retention_interval(value, mode, prefix_caching, expected):
+    resolved = kv_cache_utils.resolve_prefix_cache_retention_interval(
+        value, _retention_groups(mode), 64, prefix_caching
+    )
+    assert resolved == expected
+
+
+def test_resolve_prefix_cache_retention_interval_without_mamba():
+    groups = [
+        KVCacheGroupSpec(["attn"], new_kv_cache_spec(block_size=64)),
+        KVCacheGroupSpec(["swa"], new_sliding_window_spec(block_size=64)),
+    ]
+    assert (
+        kv_cache_utils.resolve_prefix_cache_retention_interval("auto", groups, 64, True)
+        == 0
+    )
