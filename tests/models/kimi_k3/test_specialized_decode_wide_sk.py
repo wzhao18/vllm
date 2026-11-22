@@ -181,5 +181,6 @@ def test_wide_sk_addresses_are_runtime_arguments(tmp_path, monkeypatch):
     s = vars(cute_cache.stats)
     assert s["compiled"] - before["compiled"] == 1, (s, before)
     assert s["loaded"] - before["loaded"] == 1
-    assert s["verified"] - before["verified"] == 1 and s["mismatched"] == 0
+    assert s["verified"] - before["verified"] == 1
+    assert s["mismatched"] == before["mismatched"]
     assert not torch.equal(outs[0], outs[1])  # each from its own weights

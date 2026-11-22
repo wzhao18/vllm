@@ -718,7 +718,8 @@ def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
     s = vars(cute_cache.stats)
     assert s["compiled"] - before["compiled"] == 1
     assert s["loaded"] - before["loaded"] == 1
-    assert s["verified"] - before["verified"] == 1 and s["mismatched"] == 0
+    assert s["verified"] - before["verified"] == 1
+    assert s["mismatched"] == before["mismatched"]
     x = torch.arange(4096, device=device, dtype=torch.float32)
     y = torch.empty_like(x)
     hit(from_dlpack(x, assumed_align=16), from_dlpack(y, assumed_align=16), 5.0, 0)
