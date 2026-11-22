@@ -192,7 +192,6 @@ class RubinBucket:
 # --------------------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
 def _diag_knob_override(bucket, *, k, world_size):
     """DIAG ONLY (wzhao/k31ws-mmknob-diag, never merge): $VLLM_K3_MEGAMOE_KNOB_DIAG_FILE
     (a _FILE name: not in the CuTe cache key) holds [{"variant": v, "max_tokens": n,
@@ -220,6 +219,7 @@ def _diag_knob_override(bucket, *, k, world_size):
     return k
 
 
+@dataclasses.dataclass(frozen=True)
 class RubinMoeConfig:
     num_total_experts: int
     max_tokens_per_rank: int
