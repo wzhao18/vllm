@@ -2014,6 +2014,7 @@ class KimiDecoderLayer(nn.Module):
                 hidden_states,
                 (prefix_sum, not self.is_block_write_layer) if resid_attn else None,
             )
+        breadcrumb.crumb(breadcrumb.OP_ATTN_OUT)
         dsa_dp.rec(evs)
 
         # GEMM-RS returns the local sequence shard; standard O-proj preserves M.
