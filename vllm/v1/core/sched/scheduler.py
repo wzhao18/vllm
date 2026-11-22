@@ -1424,6 +1424,8 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = request_queue.peek_request()
+                if not hasattr(request, "padm_tv"):
+                    request.padm_tv = time.perf_counter()
                 request_id = request.request_id
 
                 if (
@@ -1505,6 +1507,8 @@ class Scheduler(SchedulerInterface):
 
                         if ext_tokens is None:
                             request.padm_lp = getattr(request, "padm_lp", 0) + 1
+                            if not hasattr(request, "padm_tl0"):
+                                request.padm_tl0 = time.perf_counter()
                             pending_since = (
                                 self._connector_lookup_pending_since.setdefault(
                                     request_id, time.monotonic()
@@ -1532,6 +1536,10 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
                         else:
                             self._connector_lookup_pending_since.pop(request_id, None)
+                            if hasattr(request, "padm_tl0") and not hasattr(
+                                request, "padm_tl1"
+                            ):
+                                request.padm_tl1 = time.perf_counter()
                             self._connector_lookup_timed_out.discard(request_id)
 
                         if self.prefix_replay_tokens and not (
