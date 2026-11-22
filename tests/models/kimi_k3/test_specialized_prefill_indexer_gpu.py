@@ -75,8 +75,10 @@ def _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base):
         ([(37, 1000), (300, 9000), (9, 2100), (40, 40000), (3, 140000)], (), False),
         # all-tied rows (zero head weights): flagged, recomputed by the full path
         ([(64, 20000)], tuple(range(10, 20)), False),
-        # every row through the full path
+        # every row through the full path (few items: key-split scoring)
         ([(37, 1000), (21, 9000), (40, 40000)], (), True),
+        # more items than SMs: whole items, row bounds in the score kernel
+        ([(1800, 3000)], (), True),
     ],
 )
 def test_selective_topk_matches_stock(reqs, zero_rows, recover_all):
