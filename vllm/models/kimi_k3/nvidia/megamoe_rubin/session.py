@@ -719,7 +719,7 @@ class RubinMegaMoeSession:
             return
         from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
 
-        self._ep_balance_ring = ep_balance.new_ring(f"{self.cfg.kernel_variant}-{self.cfg.max_tokens_per_rank}")
+        self._ep_balance_ring = ep_balance.new_ring(f"{self.cfg.kernel_variant}-{self.cfg.max_tokens_per_rank}", self.device)
         for region in regions:
             off = ws.offset(region)
             self.local_workspace[off : off + 8].view(torch.int64).fill_(self._ep_balance_ring.address)

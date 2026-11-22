@@ -4,9 +4,9 @@
 genphase token comm (this rank's local per-expert counts); host side megamoe_rubin/ep_balance.py uses the same values.
 
 Slot (int32 words): [0] call id (1-based, written last), [1..2] t_ready %globaltimer (lo, hi), [3] entries, [4] world
-size, [5] experts per rank, [6] 0 = global record, local_rank + 1 = this rank's local experts only, [7] global record:
-epbal_checksum(call, counts) (written without a system fence, so the host checks it); local record: 0 (fenced),
-[8 ..] per-expert token counts. One call in EPBAL_PERIOD writes slot (call >> EPBAL_SHIFT) % EPBAL_SLOTS."""
+size, [5] experts per rank, [6] 0 = global record, local_rank + 1 = this rank's local experts only,
+[7] epbal_checksum(call, counts) (every record: the ring is in device memory, written with gpu-scope stores and no
+fence, and the host copies slots out while kernels run, so it checks the checksum), [8 ..] per-expert token counts. One call in EPBAL_PERIOD writes slot (call >> EPBAL_SHIFT) % EPBAL_SLOTS."""
 
 EPBAL_SHIFT = 6
 EPBAL_PERIOD = 1 << EPBAL_SHIFT

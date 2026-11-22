@@ -8,6 +8,14 @@ import torch
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host memory needs CUDA")
 
 
+def _d(ring):
+    """One host drain cycle: drain() takes the copy issued by the previous drain and issues the next one, so a
+    drain, a device sync and a second drain see everything written before the first."""
+    out = _d(ring)
+    torch.cuda.synchronize()
+    return out + _d(ring)
+
+
 def _write(ring, call, sizes, world, epr, t=123456789):
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
 
@@ -30,16 +38,16 @@ def test_drain_returns_completed_calls_in_order_with_rank_loads():
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
 
     ring = E.EpBalanceRing("test")
-    assert ring.drain() == []
+    assert _d(ring) == []
     # 4 ranks x 2 experts: rank loads [3, 7, 0, 6] -> mean 4, max/mean 1.75
     _write(ring, 64, [1, 2, 3, 4, 0, 0, 5, 1], world=4, epr=2)
     _write(ring, 128, [2, 2, 2, 2, 2, 2, 2, 2], world=4, epr=2)
-    out = ring.drain()
+    out = _d(ring)
     assert [r["call"] for r in out] == [64, 128]
     assert out[0]["rank_loads"] == [3, 7, 0, 6] and out[0]["routes"] == 16
     assert out[0]["max_over_mean"] == pytest.approx(1.75) and out[0]["expert_max"] == 5
     assert out[1]["max_over_mean"] == pytest.approx(1.0)
-    assert ring.drain() == []  # nothing new
+    assert _d(ring) == []  # nothing new
 
 
 @cuda
@@ -48,29 +56,29 @@ def test_slot_being_rewritten_waits_for_the_next_drain():
 
     ring = E.EpBalanceRing("test")
     _write(ring, 64, [1, 1], world=2, epr=1)
-    assert [r["call"] for r in ring.drain()] == [64]
+    assert [r["call"] for r in _d(ring)] == [64]
     # call 128's slot: payload written, call word not yet (the kernel writes it last)
     i = (128 >> E.SHIFT) % E.SLOTS
     ring.buffer[i * E.SLOT_WORDS + E.HEADER_WORDS] = 9
-    assert ring.drain() == []
+    assert _d(ring) == []
     _write(ring, 128, [9, 1], world=2, epr=1)
-    out = ring.drain()
+    out = _d(ring)
     assert [r["call"] for r in out] == [128] and out[0]["rank_loads"] == [9, 1]
 
 
 @cuda
 def test_global_record_without_matching_checksum_waits():
-    """The dedup router writes global records without a system fence: a slot whose call id is visible but whose
-    counts (or checksum) are still landing fails the checksum and is taken on a later drain."""
+    """Records are written without a fence and copied out while kernels run: a slot whose call id is visible but
+    whose counts (or checksum) are still landing fails the checksum and is taken on a later drain."""
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
 
     ring = E.EpBalanceRing("test")
     _write(ring, 64, [4, 4], world=2, epr=1)
     i = (64 >> E.SHIFT) % E.SLOTS
     ring.buffer[i * E.SLOT_WORDS + E.HEADER_WORDS + 1] = 3  # one count not landed yet
-    assert ring.drain() == []
+    assert _d(ring) == []
     ring.buffer[i * E.SLOT_WORDS + E.HEADER_WORDS + 1] = 4
-    out = ring.drain()
+    out = _d(ring)
     assert [r["call"] for r in out] == [64] and out[0]["routes"] == 8
 
 
@@ -115,16 +123,16 @@ def test_torn_record_mixing_two_same_size_calls_is_rejected():
     new = [2, 6, 4, 4, 7, 1, 5, 3]
     assert sum(old) == sum(new)
     _write(ring, 64, old, world=4, epr=2)
-    assert [r["call"] for r in ring.drain()] == [64]
+    assert [r["call"] for r in _d(ring)] == [64]
     nxt = 64 + 64 * E.SLOTS
     _write(ring, nxt, new, world=4, epr=2)
     i = (nxt >> E.SHIFT) % E.SLOTS
     base = i * E.SLOT_WORDS + E.HEADER_WORDS
     ring.buffer[base : base + 4] = torch.tensor(old[:4], dtype=torch.int32)  # first half still the old call's
     ring._last = nxt - 64  # cursor just before the new call
-    assert ring.drain() == []  # torn: rejected, retried later
+    assert _d(ring) == []  # torn: rejected, retried later
     ring.buffer[base : base + 4] = torch.tensor(new[:4], dtype=torch.int32)
-    out = ring.drain()
+    out = _d(ring)
     assert [r["call"] for r in out] == [nxt] and out[0]["rank_loads"] == [8, 8, 8, 8]
 
 
@@ -136,11 +144,11 @@ def test_lapped_slot_counts_lost_calls_and_layer_index():
     E.configure(4)
     ring = E.EpBalanceRing("test")
     _write(ring, 64, [1, 1], world=2, epr=1)
-    assert [(r["call"], r["layer"]) for r in ring.drain()] == [(64, (64 - 1) % 4)]
+    assert [(r["call"], r["layer"]) for r in _d(ring)] == [(64, (64 - 1) % 4)]
     # the next slot (call 128's) was lapped by call 128 + SLOTS * PERIOD before this drain
     lapped = 128 + E.SLOTS * E.PERIOD
     _write(ring, lapped, [2, 2], world=2, epr=1)
-    out = ring.drain()
+    out = _d(ring)
     assert [r["call"] for r in out] == [lapped]
     assert out[0]["lost"] == E.SLOTS  # calls 128 .. lapped - PERIOD were overwritten
     E.configure(0)
@@ -154,10 +162,41 @@ def test_call_id_reset_resyncs_after_rescan():
     _write(ring, 64 * 10, [1, 1], world=2, epr=1, t=100)
     ring._last = 64 * 10  # as if drained
     _write(ring, 64, [3, 1], world=2, epr=1, t=200)  # later: the session restarted its call ids
-    for _ in range(E.RESCAN_EVERY - 1):
-        assert ring.drain() == []
-    out = ring.drain()  # the rescan resyncs the cursor; the restarted sequence drains from the next call
+    cycles, out = 0, []
+    while not out and cycles < 3 * E.RESCAN_EVERY:
+        out = _d(ring)  # the rescan resyncs the cursor; the restarted sequence drains from the next call
+        cycles += 1
+    assert cycles >= E.RESCAN_EVERY // 2  # only the rescan finds it
     assert [r["call"] for r in out] == [64] and out[0]["rank_loads"] == [3, 1]
+
+
+@cuda
+def test_local_record_needs_its_checksum_too():
+    """Genphase local records are fence-free as well: a local slot is taken only with a matching checksum."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    ring = E.EpBalanceRing("test")
+    _write(ring, 64, [5, 2], world=8, epr=2)
+    i = (64 >> E.SHIFT) % E.SLOTS
+    ring.buffer[i * E.SLOT_WORDS + 6] = 3  # local record of rank 2
+    ring.buffer[i * E.SLOT_WORDS + 7] = 0  # checksum not landed
+    assert _d(ring) == []
+    ring.buffer[i * E.SLOT_WORDS + 7] = E.epbal_checksum(64, [5, 2])
+    out = _d(ring)
+    assert [(r["call"], r["local_rank"], r["rank_loads"]) for r in out] == [(64, 2, [7])]
+
+
+@cuda
+def test_ring_lives_in_device_memory_and_drain_never_blocks():
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    ring = E.EpBalanceRing("test")
+    assert ring.buffer.is_cuda and ring.address == ring.buffer.data_ptr()
+    # a long kernel on the compute stream: the drain issues its copy on its own stream and returns at once
+    x = torch.randn(4096, 4096, device="cuda")
+    for _ in range(20):
+        x = x @ x.T / 4096
+    assert ring.drain() == [] and ring._pending is not None
 
 
 def test_local_decode_records_merge_by_call():

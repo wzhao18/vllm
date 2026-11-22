@@ -44,7 +44,7 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
-from ....common.spin_guard import _st_sys_s32, _st_sys_v4_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
+from ....common.spin_guard import _st_gpu_s32, _st_gpu_v4_s32, _st_sys_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
 
 
@@ -1453,15 +1453,14 @@ class _DedupMetadataPushRouter(KernelComponent):
     def log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32, warp_idx: Int32) -> None:
         """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
         CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
-        so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
-        ring, with a %globaltimer stamp. token_in calls it right after sizes_ready, before the pulls: issuing ~60 16-byte stores
-        costs ~0.1 us, and their completion (~100 us under kernel load, measured) overlaps the rest of the call.
+        so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the session's
+        DEVICE-memory ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
 
-        No system fence: a sys fence waits for these host stores to complete, ~100 us under kernel load vs 2.4 us
-        idle (measured). Instead word 7 carries ``epbal_checksum(call, counts)``, a position-weighted sum bound
-        to the call id, and the host takes a slot only when the call id and the checksum agree (a slot read while its
-        stores are still landing, or mixing two calls' counts, is retried on the next drain). Stores only: 16-byte
-        relaxed system stores, no launch, no sync; the other calls, warps and CTAs read nothing and skip."""
+        Device memory, gpu-scope stores, no fence: pinned-host stores cost ~100 us under MegaMoE load to whatever
+        next orders at system scope (a sys fence, a sys acquire, the CTA exit; MEGAMOEFIX tasks C-Gp). The host
+        copies the slot out at drain time on its own stream; word 7 carries ``epbal_checksum(call, counts)``, a
+        position-weighted sum bound to the call id, and the host takes a slot only when the call id and the
+        checksum agree (a slot copied while its stores are still landing is retried on the next drain)."""
         linear_cta_idx, _, _ = cute.arch.block_idx()
         # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
         if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS and self.expert_count_padded % 4 == 0):
@@ -1479,7 +1478,7 @@ class _DedupMetadataPushRouter(KernelComponent):
                             c1 = sizes[expert + Int32(1)]
                             c2 = sizes[expert + Int32(2)]
                             c3 = sizes[expert + Int32(3)]
-                            _st_sys_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
+                            _st_gpu_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
                             # position-weighted (odd weight (i * POS_MUL + POS_ADD) | 1 per expert), wrapping int32
                             w0 = (expert * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
                             w1 = ((expert + Int32(1)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
@@ -1492,11 +1491,11 @@ class _DedupMetadataPushRouter(KernelComponent):
                         t_ready = globaltimer_ns()
                         checksum = (total ^ Int32(EPBAL_CHECKSUM_SALT)) + call * Int32(EPBAL_CHECKSUM_MUL)
                         # words 4..7: world, experts_per_rank, 0 = global record, checksum
-                        _st_sys_v4_s32(base + Int64(16), Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), checksum)
-                        _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
-                        _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
-                        _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
-                        _st_sys_s32(base, call)
+                        _st_gpu_v4_s32(base + Int64(16), Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), checksum)
+                        _st_gpu_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
+                        _st_gpu_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
+                        _st_gpu_s32(base + Int64(12), Int32(self.expert_count_padded))
+                        _st_gpu_s32(base, call)
                     cute.arch.sync_warp()
 
     @cute.jit
@@ -2148,9 +2147,6 @@ class TokenCommDedup(KernelComponent):
         iket.range_push("token_in.wait_sizes_ready")
         self._router.wait_for_sizes_ready(self._device_workspace)
         iket.range_pop()
-        # Served EP-balance record (int64.3 item 3), issued as EARLY as possible: its pinned-host stores take ~100 us
-        # to complete under MegaMoE load (task G), so they get the whole call to land before CTA 0 exits.
-        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         iket.range_push("token_in.stage_sizes")
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
         owner_expert_begin = self._local_rank * Int32(self.experts_per_rank)
@@ -2253,6 +2249,8 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
+        # EP-balance log after this CTA's pulls are published: off the dispatch critical path (int64.3 item 3).
+        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode == "standalone_warps"):
             # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
             cute.arch.cp_async_bulk_wait_group(0, read=True)

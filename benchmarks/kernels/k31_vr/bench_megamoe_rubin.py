@@ -1031,7 +1031,14 @@ def main():
                    "FAIL" if (not v or any(x == "FAIL" for x in v)) else "INCONCLUSIVE")
         print(f"EPBAL_PERCALL_ALL {overall} shapes={len(v)} passed={sum(x == 'PASS' for x in v)} "
               f"inconclusive={sum(x == 'INCONCLUSIVE' for x in v)}", flush=True)
-    recs = ep_balance.drain_all()
+    # the served drain is asynchronous (each drain takes the copy issued by the previous one, WINDOW slots at a
+    # time): drain until two consecutive drains after a device sync bring nothing
+    recs, empty = [], 0
+    while empty < 2:
+        torch.cuda.synchronize()
+        got = ep_balance.drain_all()
+        recs += got
+        empty = 0 if got else empty + 1
     expected = {n * world * problem.top_k for _, _, n in points}
     glob = [r for r in recs if r["local_rank"] < 0]
     ok = sum(1 for r in glob if r["routes"] in expected and sum(r["rank_loads"]) == r["routes"] and r["world"] == world)
