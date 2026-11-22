@@ -278,7 +278,7 @@ def _next_turn(engine: _Engine, new_tokens: int, request_id: str = "t1"):
         (11072, [2000], [(RESUME, CUT), (CUT, 131072)]),
         # The first chunk stops at the block end; the last chunk starts at the
         # boundary and ends in that block: was 3 passes (checkpoint 134912).
-        # Under sparse retention the first chunk crosses instead (below).
+        # (Crossing chunks come only from the DP pull-up, not this split.)
         (15000, [12000], [(RESUME, 131072), (131072, PREFIX + 15000)]),
         # A first chunk ending in its block: the first-chunk snapshot, as before.
         (5000, [], [(RESUME, PREFIX + 5000)]),
@@ -296,11 +296,6 @@ def test_last_chunk_ending_in_its_block_runs_in_one_pass(
     request = _next_turn(engine, new_tokens)
     _, hit, _ = engine.manager.get_computed_blocks(request)
     assert hit == RESUME and RESUME % BLOCK != 0
-    if retention_interval in (0, BLOCK) and spans[0] == (RESUME, 131072):
-        # Sparse / one-block-grid retention: the first chunk crosses 131072,
-        # exporting that boundary state from inside the step, and ends on the
-        # hash grid where its budget runs out (the junction); same 2 passes.
-        spans = [(RESUME, 131840), (131840, PREFIX + 15000)]
     assert engine.prefill(request, budgets) == spans
     prompt_len = PREFIX + new_tokens
     checkpoint = _checkpoint(prompt_len)

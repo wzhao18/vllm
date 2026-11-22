@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import itertools
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -157,12 +158,50 @@ def _stop_mamba_chunk_at_block_end(
     return num_new_tokens
 
 
+# Context weight of a prefill token (per token of context) in a rank's own,
+# pre-MoE work, where the DP lockstep's imbalance lives: the served K3.1 DEP16
+# per-rank fit (CUPTI, 652 rank-steps: 18.2 ms per 1K tokens + 49.2 ms per 1e9
+# token x context -> w = 2.7e-6). The whole-step fit is lower (1.5e-6, MoE
+# dilutes it), but the pull-up must not fill a lighter rank past the busiest
+# rank's own work, so it uses the per-rank weight.
+DP_PREFILL_CTX_WEIGHT = 2.7e-6
+
+
+def _prefill_chunk_cost(num_tokens: int, context: int) -> float:
+    """Cost of ``num_tokens`` new tokens after ``context`` computed ones: each
+    token weighted by 1 + w * (its context), summed exactly."""
+    w = DP_PREFILL_CTX_WEIGHT
+    return num_tokens * (1.0 + w * (context + (num_tokens - 1) / 2))
+
+
+def _max_tokens_for_prefill_cost(cost: float, context: int) -> int:
+    """Largest n with ``_prefill_chunk_cost(n, context) <= cost``."""
+    w = DP_PREFILL_CTX_WEIGHT
+    b = 1.0 + w * (context - 0.5)
+    n = (
+        int((-b + math.sqrt(b * b + 2.0 * w * max(cost, 0.0))) / w)
+        if w > 0
+        else int(max(cost, 0.0) / b)
+    )
+    while n > 0 and _prefill_chunk_cost(n, context) > cost:
+        n -= 1
+    while _prefill_chunk_cost(n + 1, context) <= cost:
+        n += 1
+    return n
+
+
 def _mamba_may_cross(sched, start: int, end: int, prefill_end: int) -> bool:
     """Whether the chunk ``[start, end)`` may cross its block boundary and export
     the boundary state internally (``Scheduler.mamba_crossing_chunks``: the
-    backend's prefill snapshot and sparse retention). ``sched`` is a Scheduler
-    or a unit test stand-in, hence getattr."""
-    if not getattr(sched, "mamba_crossing_chunks", False):
+    backend's prefill snapshot and sparse retention). Only the DP prefill
+    pull-up forms crossing chunks (``_mamba_crossing_pull`` set by
+    ``_dp_pull_chunk``): it fills ranks below the step's busiest up to the
+    busiest's cost, so a crossing never lengthens the lockstep step. ``sched``
+    is a Scheduler or a unit test stand-in, hence getattr."""
+    if not (
+        getattr(sched, "mamba_crossing_chunks", False)
+        and getattr(sched, "_mamba_crossing_pull", False)
+    ):
         return False
     return (
         get_mamba_crossing_checkpoint_position(
@@ -3555,6 +3594,15 @@ class Scheduler(SchedulerInterface):
         """
         self._dp_step_token_cap = cap
 
+    def dp_prefill_cost(self, num_scheduled_tokens: dict[str, int]) -> float:
+        """This step's context-weighted cost: each scheduled chunk's tokens,
+        weighted by the context they attend (``_prefill_chunk_cost``)."""
+        return sum(
+            _prefill_chunk_cost(n, self.requests[rid].num_computed_tokens)
+            for rid, n in num_scheduled_tokens.items()
+            if rid in self.requests
+        )
+
     def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
         """Prompt tokens this rank can compute after this step's schedule:
         running prefills plus waiting requests whose prefix hit is known and
@@ -3619,7 +3667,17 @@ class Scheduler(SchedulerInterface):
         self, request: Request, num_new_tokens: int, token_room: int
     ) -> int:
         """The running loop's clamps of a chunk, for a pull-up chunk (no
-        encoder inputs, no spec tokens: see the running loop)."""
+        encoder inputs, no spec tokens: see the running loop). A pull-up chunk
+        may cross one Mamba block boundary (get_mamba_crossing_checkpoint_position)."""
+        self._mamba_crossing_pull = True
+        try:
+            return self._dp_pull_chunk_clamped(request, num_new_tokens, token_room)
+        finally:
+            self._mamba_crossing_pull = False
+
+    def _dp_pull_chunk_clamped(
+        self, request: Request, num_new_tokens: int, token_room: int
+    ) -> int:
         num_new_tokens = min(num_new_tokens, token_room)
         num_new_tokens = min(
             num_new_tokens,
@@ -3660,6 +3718,7 @@ class Scheduler(SchedulerInterface):
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
         drafts_needed = False
+        room = 0.0
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
@@ -3669,12 +3728,19 @@ class Scheduler(SchedulerInterface):
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
         else:
-            num_tokens = sum(num_scheduled_tokens.values())
-            extra = max(
-                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
-                - num_tokens,
-                0,
+            # The lockstep step waits for the rank with the most work, and a
+            # prompt token costs more the longer its context: exchange the
+            # step's context-weighted cost (dp_prefill_cost), so a lighter rank
+            # is pulled up to the busiest rank's cost, not its token count.
+            own_cost = self.dp_prefill_cost(num_scheduled_tokens)
+            room = max(
+                exchange(
+                    round(own_cost), self.dp_prefill_demand(num_scheduled_tokens)
+                )
+                - own_cost,
+                0.0,
             )
+            extra = 1 << 62 if room > 0 else 0
         for request_id, (request, num_unclipped) in pull_reqs.items():
             if request_id not in num_scheduled_tokens:
                 # Preempted later in the step (priority policy); its booking was
@@ -3684,13 +3750,20 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = num_stock
             if extra > 0:
                 want = num_stock + min(extra, num_unclipped - num_stock)
+                ctx = request.num_computed_tokens
                 if owner_left is not None:
                     o = getattr(request, "dsa_owner", 0)
-                    ctx = request.num_computed_tokens
                     want = min(
                         want,
                         dsa_dp.max_tokens_for_cost(
                             dsa_dp.chunk_cost(num_stock, ctx) + room_o[o], ctx
+                        ),
+                    )
+                else:
+                    want = min(
+                        want,
+                        _max_tokens_for_prefill_cost(
+                            _prefill_chunk_cost(num_stock, ctx) + room, ctx
                         ),
                     )
                 # The stock clamps decide the pulled chunk too; both it and the
@@ -3705,6 +3778,10 @@ class Scheduler(SchedulerInterface):
                     room_o[o] -= dsa_dp.chunk_cost(
                         num_new_tokens, ctx
                     ) - dsa_dp.chunk_cost(num_stock, ctx)
+                elif num_new_tokens > num_stock:
+                    room -= _prefill_chunk_cost(
+                        num_new_tokens, ctx
+                    ) - _prefill_chunk_cost(num_stock, ctx)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,

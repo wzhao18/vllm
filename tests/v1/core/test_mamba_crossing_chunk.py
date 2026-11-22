@@ -98,6 +98,9 @@ def _stub(snapshot: bool, budget: int = 4096) -> SimpleNamespace:
         mamba_prefill_checkpoint_alignment=ALIGN,
         mamba_internal_snapshot=snapshot,
         mamba_crossing_chunks=snapshot,
+        # Crossing chunks are formed by the DP pull-up only (_dp_pull_chunk);
+        # these split-level tests exercise the rule as the pull-up applies it.
+        _mamba_crossing_pull=snapshot,
     )
 
 
@@ -302,7 +305,12 @@ def test_dp_pull_chunk_keeps_the_crossing() -> None:
     stub._reserve_prefill_lookahead = (
         lambda r, c, n: Scheduler._reserve_prefill_lookahead(stub, r, c, n)
     )
+    stub._dp_pull_chunk_clamped = (
+        lambda r, n, t: Scheduler._dp_pull_chunk_clamped(stub, r, n, t)
+    )
+    stub._mamba_crossing_pull = False  # set by _dp_pull_chunk itself
     n = Scheduler._dp_pull_chunk(stub, request, 2000, 2000)
+    assert stub._mamba_crossing_pull is False  # reset after the pull-up chunk
     assert 1600 < 800 + n <= 3200
     stub.mamba_crossing_chunks = False
     assert Scheduler._dp_pull_chunk(stub, request, 2000, 2000) == 800
@@ -336,3 +344,28 @@ def test_worker_and_scheduler_prefill_end_agree(num_output_tokens, trim) -> None
         trim_new_request_data(new, request)
     expected = max(request.num_prompt_tokens, request.num_tokens - 1)
     assert mamba_prefill_end(new) == expected
+
+
+def test_base_schedule_never_crosses() -> None:
+    """Outside the DP pull-up the split keeps block-aligned stops, so the step's
+    busiest rank is never lengthened by a crossing chunk."""
+    (request,) = create_requests(1, num_tokens=10 * BLK, block_size=HASH)
+    request.num_computed_tokens = 800
+    stub = _stub(snapshot=True)
+    stub._mamba_crossing_pull = False
+    assert 800 + Scheduler._mamba_block_aligned_split(stub, request, 2400) <= BLK
+
+
+@pytest.mark.parametrize("context", [0, 1000, 100_000, 600_000])
+@pytest.mark.parametrize("cost", [0.0, 1.0, 999.5, 16384.0, 40_000.0])
+def test_max_tokens_for_prefill_cost_is_exact(context, cost) -> None:
+    n = sched_mod._max_tokens_for_prefill_cost(cost, context)
+    assert sched_mod._prefill_chunk_cost(n, context) <= cost
+    assert sched_mod._prefill_chunk_cost(n + 1, context) > cost
+
+
+def test_prefill_chunk_cost_is_the_per_token_sum() -> None:
+    w = sched_mod.DP_PREFILL_CTX_WEIGHT
+    for n, c in ((1, 0), (7, 13), (300, 5000)):
+        exact = sum(1 + w * (c + i) for i in range(n))
+        assert sched_mod._prefill_chunk_cost(n, c) == pytest.approx(exact)

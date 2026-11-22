@@ -19,6 +19,16 @@ from .utils import create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.fixture(autouse=True)
+def _token_weighted_exchange(monkeypatch):
+    """These tests pin the pull-up's token arithmetic: weight context 0, so the
+    exchanged cost is the token count. The context weight is tested in
+    test_pull_up_is_capped_by_context_weighted_cost."""
+    from vllm.v1.core.sched import scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "DP_PREFILL_CTX_WEIGHT", 0.0)
+
+
 class _Exchange:
     """Stands in for the DP all-reduce: returns max(own, peer)."""
 
@@ -328,3 +338,30 @@ def test_demand_counts_a_connector_load_once_it_lands():
     left = request.num_prompt_tokens - request.num_computed_tokens
     assert left > 0
     assert scheduler.dp_prefill_demand({}) == left
+
+
+def test_pull_up_is_capped_by_context_weighted_cost():
+    """The exchange carries the step's context-weighted cost, and a pulled-up
+    chunk stops where its added cost fills the gap to the busiest rank: with
+    long context a token costs more, so fewer tokens are pulled than the
+    token gap would allow."""
+    from vllm.v1.core.sched import scheduler as sched_mod
+
+    scheduler = _scheduler()
+    requests = _running_chunked(scheduler)
+    ex = _Exchange(peer=900)
+    scheduler.set_dp_prefill_exchange(ex)
+    sched_mod_w = sched_mod.DP_PREFILL_CTX_WEIGHT
+    try:
+        sched_mod.DP_PREFILL_CTX_WEIGHT = 1e-3  # make 200 tokens of context visible
+        out = scheduler.schedule()
+    finally:
+        sched_mod.DP_PREFILL_CTX_WEIGHT = sched_mod_w
+    w, ctx = 1e-3, 200
+    own = 3 * 200 * (1 + w * (ctx + 199 / 2))
+    assert ex.calls == [round(own)]
+    first = out.num_scheduled_tokens[requests[0].request_id]
+    gap = 900 - own
+    cost = lambda n: n * (1 + w * (ctx + (n - 1) / 2))  # noqa: E731
+    assert cost(first) - cost(200) <= gap < cost(first + 1) - cost(200)
+    assert first < 500  # the token gap alone would have pulled to 500
