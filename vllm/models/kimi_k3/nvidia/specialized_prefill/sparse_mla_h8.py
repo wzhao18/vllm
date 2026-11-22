@@ -434,6 +434,8 @@ class SparseMlaPrefillH8:
         # way) (production: knob 0; 9 = always masked)
         # zf (timing only): every cp.async zero-fills (src-size 0: no L2 request), so the
         # gather warps keep their instruction stream without delivering any data
+        # ewslow (timing only, tests): the epw store warp sleeps ewslow ns before each
+        # block of epi_store, so the softmax producer runs ahead of it (production: 0)
         # pace (timing only): every gather lane sleeps pace ns after each of its first
         # 8 cp.async of a row, so a stage's 72 LDGSTS leave the SM in 8-instruction slices
         # nbs: S-free as named barrier NB_SFREE (the owning softmax warpgroup bar.arrives
@@ -453,12 +455,12 @@ class SparseMlaPrefillH8:
         # atom's rows), so the QK MMAs multiply zeros there. The kernel is power-bound at the
         # 2.3 kW cap (P-MLA run184-185: sustained -2.5%, bitwise equal): operand energy is
         # time. Production: knob 0; 9 = off (diagnostic).
-        knobs = tuple(knobs) + (0,) * (27 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (28 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
          self.epb, self.epw, self.msk, self.zf, self.pace, self.nbs, self.nex,
-         self.sw, self.cpb, self.qz) = knobs[:27]
+         self.sw, self.cpb, self.qz, self.ewslow) = knobs[:28]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
@@ -1925,6 +1927,8 @@ class SparseMlaPrefillH8:
         for qi in range(n_mine):
             row = cta + qi * self.grid
             for b in cutlass.range_constexpr(4):
+                if cutlass.const_expr(self.ewslow):
+                    nanosleep(self.ewslow)
                 mbar_wait(_bar(base, B_EPIFULL + b % 2), Uint32(b // 2))
                 if lane == 0:
                     if cutlass.const_expr(not self.no_store):
