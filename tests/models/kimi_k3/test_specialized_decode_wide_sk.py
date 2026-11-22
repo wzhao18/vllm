@@ -143,3 +143,44 @@ def test_wide_sk_silu(rows):
         fused.run(x, act)
         torch.cuda.synchronize()
         assert torch.equal(act, ref)
+
+
+def test_wide_sk_addresses_are_runtime_arguments(tmp_path, monkeypatch):
+    """The weight / activation addresses are DSL Int64 runtime arguments: a second
+    prepare on other buffers (as the next process start would have) is a CuTe cache
+    hit that VERIFY re-traces to the same DSL module, and it computes from the new
+    buffers (no address folded into the code)."""
+    from vllm.models.kimi_k3.nvidia import cute_cache
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
+
+    try:
+        _, pairs = wide_sk.die_pairs("cuda")
+    except ValueError:
+        pytest.skip("die-local GEMM needs a two-die device")
+    rows, n, k = 32, 40960, 1024
+    if not wide_sk.supports(rows, n, k, pairs):
+        pytest.skip(f"shape not supported at {pairs} pairs per die")
+    cute_cache.install()
+    monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    monkeypatch.setattr(wide_sk, "_COMPILED", {})  # the in-process memo per test
+    torch.manual_seed(1)
+    before = dict(vars(cute_cache.stats))
+    outs = []
+    for seed in (1, 2):
+        torch.manual_seed(seed)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+        x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+        wide_sk._COMPILED.clear()  # compile again through the cache, other buffers
+        gemm = wide_sk.PreparedWideSK(w, [rows]).prepare()
+        out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+        gemm.run(x, out)
+        torch.cuda.synchronize()
+        assert _ulps(out, (x.float() @ w.float().t()).bfloat16()) <= 1
+        outs.append(out)
+    s = vars(cute_cache.stats)
+    assert s["compiled"] - before["compiled"] == 1, (s, before)
+    assert s["loaded"] - before["loaded"] == 1
+    assert s["verified"] - before["verified"] == 1
+    assert s["mismatched"] == before["mismatched"]
+    assert not torch.equal(outs[0], outs[1])  # each from its own weights
