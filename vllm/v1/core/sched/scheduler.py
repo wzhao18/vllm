@@ -65,6 +65,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    get_mamba_crossing_checkpoint_position,
     get_mamba_extra_tail_checkpoint_position,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
@@ -134,16 +135,59 @@ def _log_bucket(n: int) -> int:
 
 
 def _stop_mamba_chunk_at_block_end(
-    request: Request, start: int, num_new_tokens: int, block_size: int
+    request: Request,
+    start: int,
+    num_new_tokens: int,
+    block_size: int,
+    may_cross: bool = False,
 ) -> int:
-    """Only a chunk that finishes the prefill exports its checkpoint into the
-    column of the mid-block state it resumes from. A chunk starting mid-block
-    that a stop or cap ends short of the prefill must stop at the block's end:
-    otherwise that column's full-block hash names the wrong state."""
+    """Only a chunk that finishes the prefill, or a crossing chunk that exports
+    the boundary state (``may_cross``, see
+    ``get_mamba_crossing_checkpoint_position``), writes the column of the
+    mid-block state it resumes from. Any other chunk starting mid-block that a
+    stop or cap ends short of the prefill must stop at the block's end:
+    otherwise that column's full-block hash names the wrong state. A crossing
+    chunk still never runs past the next boundary after that one."""
     prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
     if start % block_size and start + num_new_tokens < prefill_end:
-        num_new_tokens = min(num_new_tokens, block_size - start % block_size)
+        num_new_tokens = min(
+            num_new_tokens,
+            block_size - start % block_size + (block_size if may_cross else 0),
+        )
     return num_new_tokens
+
+
+def _mamba_may_cross(sched, start: int, end: int, prefill_end: int) -> bool:
+    """Whether the chunk ``[start, end)`` may cross its block boundary and export
+    the boundary state internally (``Scheduler.mamba_crossing_chunks``: the
+    backend's prefill snapshot and sparse retention). ``sched`` is a Scheduler
+    or a unit test stand-in, hence getattr."""
+    if not getattr(sched, "mamba_crossing_chunks", False):
+        return False
+    return (
+        get_mamba_crossing_checkpoint_position(
+            query_start=start,
+            query_end=end,
+            prefill_end=prefill_end,
+            mamba_block_size=sched.mamba_block_size,
+            hash_block_size=sched.hash_block_size,
+            checkpoint_alignment=sched.mamba_prefill_checkpoint_alignment,
+        )
+        > 0
+    )
+
+
+def _stop_at_block_end(sched, request: Request, start: int, num_new_tokens: int) -> int:
+    """``_stop_mamba_chunk_at_block_end`` with the scheduler's crossing rule: a
+    cap that leaves a crossing chunk past its boundary keeps it there."""
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    return _stop_mamba_chunk_at_block_end(
+        request,
+        start,
+        num_new_tokens,
+        sched.mamba_block_size,
+        may_cross=_mamba_may_cross(sched, start, start + num_new_tokens, prefill_end),
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -589,6 +633,16 @@ class Scheduler(SchedulerInterface):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        # Crossing chunks (get_mamba_crossing_checkpoint_position) export a
+        # crossed block boundary from inside an intermediate chunk. Under dense
+        # retention every chunk already publishes a checkpoint at its own end
+        # (one export per sequence per step), so they need sparse retention
+        # (prefix_cache_retention_interval == 0), where intermediate chunks
+        # publish only full blocks.
+        self.mamba_crossing_chunks = (
+            self.mamba_internal_snapshot
+            and kv_cache_config.prefix_cache_retention_interval == 0
+        )
         if (
             self.cache_config.mamba_internal_snapshot
             and not self.mamba_internal_snapshot
@@ -813,12 +867,26 @@ class Scheduler(SchedulerInterface):
             )
         if use_internal_checkpoint:
             last_cache_position = 0
+        # An intermediate chunk resuming mid-block may cross the next boundary
+        # B and export the state at B from inside the step
+        # (get_mamba_crossing_checkpoint_position), instead of stopping at B
+        # with the rest of its step budget unused. Its end stays on the hash
+        # grid so the next chunk can do the same.
+        crossing = False
+        boundary = (start // block_size + 1) * block_size
+        if not use_internal_checkpoint and start % block_size and end < prefill_end:
+            cand = min(end, boundary + block_size)
+            if cand % block_size:
+                cand = cand // self.hash_block_size * self.hash_block_size
+            if _mamba_may_cross(self, start, cand, prefill_end):
+                end, crossing = cand, True
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
-        # to the boundary. A block too wide for one chunk advances sub-block
-        # and re-aligns at the next boundary.
-        if end < prefill_end:
+        # to the boundary, and a crossing chunk, which exports the boundary
+        # state from inside the step. A block too wide for one chunk advances
+        # sub-block and re-aligns at the next boundary.
+        if end < prefill_end and not crossing:
             max_prefill_tokens = self.max_num_scheduled_tokens
             # getattr: the split is also called on bare scheduler stand-ins
             # (unit tests), like the other optional attributes it reads.
@@ -867,10 +935,11 @@ class Scheduler(SchedulerInterface):
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
+            if start % block_size != 0 and not use_internal_checkpoint and not crossing
             else 0,
-            # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
+            # Never run past the last cacheable block boundary mid-chunk (a
+            # crossing chunk exports its boundary B internally).
+            0 if crossing and last_cache_position == boundary else last_cache_position,
             # Stop at the prompt checkpoint unless the backend saves it internally.
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
@@ -881,9 +950,7 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return _stop_mamba_chunk_at_block_end(
-            request, start, max(end - start, 0), block_size
-        )
+        return _stop_at_block_end(self, request, start, max(end - start, 0))
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -1169,11 +1236,8 @@ class Scheduler(SchedulerInterface):
             )
             if self.need_mamba_block_aligned_split:
                 # The caps above can cut a final chunk short.
-                num_new_tokens = _stop_mamba_chunk_at_block_end(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    self.mamba_block_size,
+                num_new_tokens = _stop_at_block_end(self, 
+                    request, request.num_computed_tokens, num_new_tokens
                 )
 
             if num_new_tokens == 0:
@@ -1808,11 +1872,8 @@ class Scheduler(SchedulerInterface):
                     )
                     if self.need_mamba_block_aligned_split:
                         # The caps above can cut a final chunk short.
-                        num_new_tokens = _stop_mamba_chunk_at_block_end(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            self.mamba_block_size,
+                        num_new_tokens = _stop_at_block_end(self, 
+                            request, num_computed_tokens, num_new_tokens
                         )
 
                     if num_new_tokens == 0:
@@ -3562,11 +3623,8 @@ class Scheduler(SchedulerInterface):
             request, request.num_computed_tokens, num_new_tokens
         )
         if self.need_mamba_block_aligned_split:
-            num_new_tokens = _stop_mamba_chunk_at_block_end(
-                request,
-                request.num_computed_tokens,
-                num_new_tokens,
-                self.mamba_block_size,
+            num_new_tokens = _stop_at_block_end(self, 
+                request, request.num_computed_tokens, num_new_tokens
             )
         return num_new_tokens
 

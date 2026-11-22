@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    get_mamba_crossing_checkpoint_position,
     get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
@@ -2313,6 +2314,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.has_prefill_checkpoint_blocks
                     and total_computed_tokens % self.block_size != 0
                     and checkpoint_position == 0
+                    and not self._is_crossing_chunk(
+                        total_computed_tokens, num_tokens, prefill_end
+                    )
                     and num_tokens - total_computed_tokens
                     > self.block_pool.hash_block_size
                     and num_tokens > cdiv(total_computed_tokens, self.block_size)
@@ -2569,7 +2573,7 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int],
     ) -> None:
         if self.mamba_cache_mode == "align":
-            self._skip_stale_initial_state(request, num_tokens)
+            self._skip_stale_initial_state(request, num_tokens, retention_interval)
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         extra_checkpoint = getattr(request, "mamba_extra_checkpoint", None)
         if extra_checkpoint:
@@ -2674,7 +2678,30 @@ class MambaManager(SingleTypeKVCacheManager):
             keys, self._pending_handoff_block_ids()
         )
 
-    def _skip_stale_initial_state(self, request: Request, num_tokens: int) -> None:
+    def _is_crossing_chunk(
+        self, query_start: int, query_end: int, prefill_end: int
+    ) -> bool:
+        """The worker exports this intermediate chunk's crossed block boundary
+        into its initial-state column (same rule as the scheduler and
+        ``compute_mamba_prefill_checkpoints``)."""
+        if not self.prefill_snapshot:
+            return False
+        assert isinstance(self.kv_cache_spec, MambaSpec)
+        return (
+            get_mamba_crossing_checkpoint_position(
+                query_start=query_start,
+                query_end=query_end,
+                prefill_end=prefill_end,
+                mamba_block_size=self.block_size,
+                hash_block_size=self.block_pool.hash_block_size,
+                checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
+            )
+            > 0
+        )
+
+    def _skip_stale_initial_state(
+        self, request: Request, num_tokens: int, retention_interval: int | None = None
+    ) -> None:
         """Never publish the initial-state block of a prefill chunk that started
         mid-block and ran past that block's end.
 
@@ -2687,7 +2714,15 @@ class MambaManager(SingleTypeKVCacheManager):
         start = self._chunk_starts.pop(request.request_id, None)
         if start is None or start % self.block_size == 0:
             return
-        if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return
+        if retention_interval == 0 and self._is_crossing_chunk(
+            start, num_tokens, prefill_end
+        ):
+            # The chunk exported the state at the block end into this column
+            # (get_mamba_crossing_checkpoint_position), so its full-block hash
+            # names the right state: publish it like a block-ended chunk's.
             return
         initial_state_col = start // self.block_size
         if num_tokens <= (initial_state_col + 1) * self.block_size:

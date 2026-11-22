@@ -64,6 +64,7 @@ class _Engine:
         self, *, snapshot: bool, num_spec: int = 0, retention_interval=0
     ) -> None:
         self.snapshot = snapshot
+        self.retention_interval = retention_interval
         self.num_spec = num_spec
         self.manager = make_full_mamba_manager(
             dcp_world_size=1,
@@ -105,6 +106,8 @@ class _Engine:
             mamba_has_prefill_checkpoint_blocks=True,
             mamba_prefill_checkpoint_alignment=16,
             mamba_internal_snapshot=self.snapshot,
+            # Scheduler.mamba_crossing_chunks: snapshot support + sparse retention.
+            mamba_crossing_chunks=self.snapshot and self.retention_interval == 0,
             kv_cache_manager=self.manager,
         )
         return Scheduler._mamba_block_aligned_split(stub, request, num_new, local)
@@ -166,6 +169,13 @@ class _Engine:
             cache_hit_alignment_tokens=HASH,
             first_chunk=(
                 [self.snapshot_start.get(rid) == start] if self.snapshot else None
+            ),
+            # The V2 model state ships each row's prefill end with the snapshot
+            # support (crossing-chunk boundary export).
+            prefill_ends=(
+                [max(request.num_prompt_tokens, request.num_tokens - 1)]
+                if self.snapshot and self.retention_interval == 0
+                else None
             ),
         )
         if offsets[0] and table[cols[0]] != self.null_id:
@@ -264,6 +274,7 @@ def _next_turn(engine: _Engine, new_tokens: int, request_id: str = "t1"):
         (11072, [2000], [(RESUME, CUT), (CUT, 131072)]),
         # The first chunk stops at the block end; the last chunk starts at the
         # boundary and ends in that block: was 3 passes (checkpoint 134912).
+        # Under sparse retention the first chunk crosses instead (below).
         (15000, [12000], [(RESUME, 131072), (131072, PREFIX + 15000)]),
         # A first chunk ending in its block: the first-chunk snapshot, as before.
         (5000, [], [(RESUME, PREFIX + 5000)]),
@@ -281,6 +292,11 @@ def test_last_chunk_ending_in_its_block_runs_in_one_pass(
     request = _next_turn(engine, new_tokens)
     _, hit, _ = engine.manager.get_computed_blocks(request)
     assert hit == RESUME and RESUME % BLOCK != 0
+    if retention_interval == 0 and spans[0] == (RESUME, 131072):
+        # Sparse retention: the first chunk crosses the block end 131072,
+        # exporting that boundary state from inside the step, and ends on the
+        # hash grid where its budget runs out (the junction); same 2 passes.
+        spans = [(RESUME, 131840), (131840, PREFIX + 15000)]
     assert engine.prefill(request, budgets) == spans
     prompt_len = PREFIX + new_tokens
     checkpoint = _checkpoint(prompt_len)
