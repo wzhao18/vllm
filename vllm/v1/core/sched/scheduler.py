@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import itertools
 import os
 import time
@@ -1812,24 +1813,33 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_tokens_past_hit,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    skip_zeroing_group_ids=(
-                        self.connector.get_loaded_kv_cache_group_ids(request)
-                        if load_kv_async and self.connector is not None
-                        else ()
-                    ),
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                # An async load's blocks must be unused by the step still in
+                # flight, else the connector's early load (issued from
+                # schedule(), outside the GPU stream order) must wait for that
+                # step: take them from settled free blocks (BlockFreeClock).
+                with (
+                    BLOCK_FREE_CLOCK.settled()
+                    if load_kv_async
+                    else contextlib.nullcontext()
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_tokens_past_hit,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        skip_zeroing_group_ids=(
+                            self.connector.get_loaded_kv_cache_group_ids(request)
+                            if load_kv_async and self.connector is not None
+                            else ()
+                        ),
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
