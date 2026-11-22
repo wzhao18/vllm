@@ -3717,7 +3717,7 @@ class Scheduler(SchedulerInterface):
             extra = 1 << 62
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
-        elif self._prompt_cost is not None and cost_left is not None:
+        elif False:  # A/B arm B: token pull-up
             # Prompt cost model: the exchanged quantity is the step's predicted
             # cost (short-context tokens), and the deferred chunks are pulled up
             # toward the costliest rank's step by cost.
@@ -3938,8 +3938,9 @@ class Scheduler(SchedulerInterface):
         prompt cost budget ``cost_left`` (unchanged without a cost model and for
         chunks with no prompt tokens). Prompt tokens are the chunk's first
         tokens, so the cut keeps a prefix of them."""
-        if self._prompt_cost is None or num_tokens <= 0:
-            return num_tokens
+        # A/B arm B (move path, cost-planned moves, NO cost cap): chunks stay
+        # token-sized.
+        return num_tokens
         if ctx >= request.num_prompt_tokens:
             return num_tokens
         if self._prompt_chunk_cost(request, ctx, num_tokens) <= cost_left:
