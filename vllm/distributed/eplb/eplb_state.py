@@ -847,7 +847,7 @@ class EplbState:
                 )
                 continue
             expert_load_window = eplb_model_state.expert_load_window
-            physical_to_logical = eplb_model_state.physical_to_logical_map.to(torch.int16)
+            physical_to_logical = eplb_model_state.physical_to_logical_map
             invalid_idx = eplb_model_state.model.num_logical_experts
             logical_expert_load_window = torch.zeros(
                 self.expert_load_window_size,
@@ -973,7 +973,7 @@ class EplbState:
                         return (loads_per_rank.max() / mean_load).item()
 
                     current_imbalance = rank_load_imbalance(
-                        eplb_model_state.physical_to_logical_map.to(torch.int16)
+                        eplb_model_state.physical_to_logical_map
                     )
                     proposed_imbalance = rank_load_imbalance(
                         new_physical_to_logical_map
@@ -1180,7 +1180,7 @@ class EplbState:
             expanded_physical_to_logical
         )
         eplb_model_state.expert_load_pass.zero_()
-        physical_to_logical_map = eplb_model_state.physical_to_logical_map.to(torch.int16)
+        physical_to_logical_map = eplb_model_state.physical_to_logical_map
 
         (logical_to_physical_map_cpu, logical_replica_count_cpu) = compute_logical_maps(
             physical_to_logical_map.cpu(),
