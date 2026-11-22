@@ -45,6 +45,64 @@ def _key(fn, *args, compile_fn=None, **kwargs):
     return cute_cache.key_of(compile_fn, fn, args, kwargs)
 
 
+class _DecodeKernel:
+    """Stand-in for a specialized decode kernel object: the codegen-relevant launch
+    configuration lives in its attributes (as on the real kernel classes)."""
+
+    def __init__(self, world=16, ep=16, dcp=8, tp=4, rows=128, knobs=None):
+        self.world, self.ep, self.dcp, self.tp, self.rows = world, ep, dcp, tp, rows
+        self.knobs = knobs if knobs is not None else {
+            "mma_tiler_mnk": (256, 128, 256), "cluster_shape_mn": (2, 1),
+            "epi_flag_batches": (1, 4), "schedule_policy": ("decode", None),
+        }
+
+
+def test_key_separates_every_codegen_relevant_setting(monkeypatch, tmp_path):
+    """Safety: a key that is too coarse would load a kernel compiled for another
+    shape (wrong output, no error). Starts that differ in any codegen-relevant
+    setting get different keys; starts that differ only in the launcher's
+    per-start identity get the same key."""
+    for name in ("K31_CNAME", "K31_NODES", "K31_MIN_LEFT_S"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_107a")
+    x = torch.empty(128, 3584, dtype=torch.bfloat16)
+    knob_file = tmp_path / "knobs.json"
+    knob_file.write_text(json.dumps({"epi_flag_batches": [1, 4]}))
+
+    def key(kernel=None, arg=x, **kw):
+        return _key(kernel or _DecodeKernel(**kw), arg, 3, options="--opt-level 3")
+
+    base = key()
+    variants = {
+        "world size": key(world=32),
+        "EP size": key(ep=32),
+        "DCP layout": key(dcp=16),
+        "TP layout": key(tp=8),
+        "row bucket": key(rows=176),
+        "knob record": key(knobs={**_DecodeKernel().knobs, "epi_flag_batches": (2, 4)}),
+        "knob file": key(knobs=json.loads(knob_file.read_text())),
+        "argument rows": key(arg=torch.empty(176, 3584, dtype=torch.bfloat16)),
+        "argument dtype": key(arg=torch.empty(128, 3584, dtype=torch.float16)),
+        "argument width": key(arg=torch.empty(128, 7168, dtype=torch.bfloat16)),
+    }
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    variants["arch"] = key()
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_107a")
+    assert key() == base
+    for what, k in variants.items():
+        assert k != base, f"{what} does not change the key"
+    assert len(set(variants.values())) == len(variants), "two settings share a key"
+    # the launcher's per-start identity is not a trace input
+    monkeypatch.setenv("K31_CNAME", "k31e2e-105921-1121222010")
+    monkeypatch.setenv("K31_NODES", "rhea0073,rhea0074")
+    monkeypatch.setenv("K31_MIN_LEFT_S", "2700")
+    first = key()
+    monkeypatch.setenv("K31_CNAME", "k31e2e-107336-1122001106")
+    monkeypatch.setenv("K31_NODES", "rhea0109,rhea0113")
+    monkeypatch.setenv("K31_MIN_LEFT_S", "1200")
+    assert key() == first == base
+
+
 def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     from vllm.models.kimi_k3.nvidia import cute_cache
 
@@ -734,6 +792,42 @@ def test_runtime_argument_hit_is_the_same_kernel(tmp_path, monkeypatch):
     hit(from_dlpack(x, assumed_align=16), from_dlpack(y, assumed_align=16), 5.0, 0)
     torch.cuda.synchronize()
     assert torch.equal(y, x * 5.0)
+
+
+@_needs_blackwell
+def test_verify_flags_a_too_coarse_key(tmp_path, monkeypatch):
+    """Negative control for the restart check: with a deliberately too-coarse key
+    (the 13ed4cd676 bug: Python numbers keyed as runtime arguments although the DSL
+    folds them into the trace as constants), a compile with another constant hits
+    the first entry, and VERIFY's re-trace flags the module-hash mismatch instead
+    of returning the wrong kernel."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    monkeypatch.setenv("VLLM_KIMI_K3_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    torch.cuda.set_device(0)
+
+    def too_coarse(fn, args, kwargs):  # every numeric-annotated value as a marker
+        marked = tuple(
+            cute_cache._runtime_marker(cutlass.Float32, cutlass.Float32(0.0))
+            if isinstance(a, float) else a for a in args
+        )
+        return marked, kwargs
+
+    monkeypatch.setattr(cute_cache, "_runtime_values", too_coarse)
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    k = _scale_runtime_kernel_class()()
+    before = dict(vars(cute_cache.stats))
+    cute_cache._compile(inner, k, (fx, fx, 2.0, cutlass.Int64(0)), {})
+    assert vars(cute_cache.stats)["compiled"] - before["compiled"] == 1
+    with pytest.raises(cute_cache.VerifyMismatch):
+        cute_cache._compile(inner, k, (fx, fx, 3.0, cutlass.Int64(0)), {})
+    assert vars(cute_cache.stats)["mismatched"] - before["mismatched"] == 1
 
 
 def _scale_kwargs_kernel_class():
