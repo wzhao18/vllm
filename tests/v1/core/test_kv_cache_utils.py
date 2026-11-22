@@ -2339,6 +2339,7 @@ def test_null_head_len():
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
 
 
+
 def _retention_groups(mamba_cache_mode: str) -> list[KVCacheGroupSpec]:
     return [
         KVCacheGroupSpec(["attn"], new_kv_cache_spec(block_size=64)),
@@ -2349,33 +2350,99 @@ def _retention_groups(mamba_cache_mode: str) -> list[KVCacheGroupSpec]:
     ]
 
 
+_MOONCAKE_MULTI = {
+    "kv_connector": "MultiConnector",
+    "kv_connector_extra_config": {
+        "connectors": [
+            {"kv_connector": "NixlConnector"},
+            {"kv_connector": "MooncakeStoreConnector"},
+        ]
+    },
+}
+
+
 @pytest.mark.parametrize(
-    ("value", "mode", "prefix_caching", "expected"),
+    ("kv_transfer_config", "expected"),
     [
-        # auto: every block-boundary state of an align-mode Mamba group.
-        ("auto", "align", True, 64),
-        # auto without align-mode Mamba or without prefix caching: semantic only.
-        ("auto", "none", True, 0),
-        ("auto", "align", False, 0),
-        # explicit values pass through unchanged.
-        (0, "align", True, 0),
-        (None, "align", True, None),
-        (128, "align", True, 128),
+        (None, False),
+        ({"kv_connector": "NixlConnector"}, False),
+        ({"kv_connector": "MooncakeStoreConnector"}, True),
+        ({"kv_connector": "OffloadingConnector"}, True),
+        (_MOONCAKE_MULTI, True),
+        (
+            SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_extra_config={
+                    "connectors": [{"kv_connector": "NixlConnector"}]
+                },
+            ),
+            False,
+        ),
     ],
 )
-def test_resolve_prefix_cache_retention_interval(value, mode, prefix_caching, expected):
+def test_has_prefix_store_connector(kv_transfer_config, expected):
+    assert kv_cache_utils.has_prefix_store_connector(kv_transfer_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "mode", "prefix_caching", "store", "expected"),
+    [
+        # auto: every block-boundary state of align-mode Mamba, with a prefix store.
+        ("auto", "align", True, True, 64),
+        # auto without a prefix store, align-mode Mamba or prefix caching: 0.
+        ("auto", "align", True, False, 0),
+        ("auto", "none", True, True, 0),
+        ("auto", "align", False, True, 0),
+        # explicit values pass through unchanged.
+        (0, "align", True, True, 0),
+        (None, "align", True, True, None),
+        (128, "align", True, True, 128),
+    ],
+)
+def test_resolve_prefix_cache_retention_interval(
+    value, mode, prefix_caching, store, expected
+):
     resolved = kv_cache_utils.resolve_prefix_cache_retention_interval(
-        value, _retention_groups(mode), 64, prefix_caching
+        value, _retention_groups(mode), 64, prefix_caching, store
     )
     assert resolved == expected
 
 
-def test_resolve_prefix_cache_retention_interval_without_mamba():
-    groups = [
-        KVCacheGroupSpec(["attn"], new_kv_cache_spec(block_size=64)),
-        KVCacheGroupSpec(["swa"], new_sliding_window_spec(block_size=64)),
-    ]
-    assert (
-        kv_cache_utils.resolve_prefix_cache_retention_interval("auto", groups, 64, True)
-        == 0
+@pytest.mark.parametrize(
+    ("kv_transfer_config", "expected"),
+    [(_MOONCAKE_MULTI, 64), ({"kv_connector": "NixlConnector"}, 0)],
+)
+def test_apply_prefix_cache_retention_interval_writes_every_config(
+    kv_transfer_config, expected
+):
+    """The scheduler, connector and worker KVCacheConfigs all hold the resolved
+    integer (never "auto"), and so does the CacheConfig."""
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            prefix_cache_retention_interval="auto", enable_prefix_caching=True
+        ),
+        kv_transfer_config=kv_transfer_config,
     )
+    groups = _retention_groups("align")
+    workers = [
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+            prefix_cache_retention_interval="auto",
+        )
+        for _ in range(2)
+    ]
+    scheduler = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval="auto",
+    )
+    resolved = kv_cache_utils.apply_prefix_cache_retention_interval(
+        vllm_config, workers, scheduler, 64
+    )
+    assert resolved == expected
+    assert vllm_config.cache_config.prefix_cache_retention_interval == expected
+    for cfg in (*workers, scheduler):
+        assert cfg.prefix_cache_retention_interval == expected

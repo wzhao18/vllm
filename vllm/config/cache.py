@@ -274,7 +274,7 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
-    prefix_cache_retention_interval: int | Literal["auto"] | None = "auto"
+    prefix_cache_retention_interval: int | Literal["auto"] | None = 0
     """Token interval between retained sliding-window and Mamba prefix-cache
     checkpoints. ``0`` retains only semantic checkpoints, including the latest
     replay boundary and shared-prefix junctions. Positive values additionally
@@ -282,14 +282,16 @@ class CacheConfig:
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups.
 
-    ``"auto"`` (default) resolves, once the KV cache groups are known, to the
-    scheduler block size when prefix caching is on and a Mamba group runs in
-    "align" mode: every block-boundary state a prefill computes is retained
-    (and offered to a KV connector), so a later request sharing only part of
+    ``"auto"`` resolves, once the KV cache groups are known, to the
+    scheduler block size when prefix caching is on, a Mamba group runs in
+    "align" mode and a prefix-store KV connector (Mooncake store, offloading,
+    UMBP) persists boundary states: every block-boundary state a prefill
+    computes is retained and offloaded, so a later request sharing only part of
     the prompt -- a forked subagent, a sibling, a reset conversation -- resumes
-    at the last block boundary of the shared prefix instead of recomputing it.
-    Those states exist anyway (align-mode chunks end on block boundaries), so
-    retaining them costs no compute. Otherwise it resolves to ``0``."""
+    at the last block boundary of the shared prefix on any engine instead of
+    recomputing it. Those states exist anyway (align-mode chunks end on block
+    boundaries), so this costs no compute. Otherwise it resolves to ``0``.
+    Model wiring may select it (Kimi K3 does, with a prefix-store connector)."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""

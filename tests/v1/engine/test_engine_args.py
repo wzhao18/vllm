@@ -20,8 +20,7 @@ def test_prefix_caching_from_cli():
     assert vllm_config.cache_config.enable_prefix_caching, (
         "V1 turns on prefix caching by default."
     )
-    # Resolved by the engine core once the KV cache groups are known.
-    assert vllm_config.cache_config.prefix_cache_retention_interval == "auto"
+    assert vllm_config.cache_config.prefix_cache_retention_interval == 0
 
     # Turn it off possible with flag.
     args = parser.parse_args(["--no-enable-prefix-caching"])

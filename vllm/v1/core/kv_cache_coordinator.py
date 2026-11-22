@@ -245,6 +245,9 @@ class KVCacheCoordinator(ABC):
             kv_cache_config.kv_cache_groups,
             self.scheduler_block_size,
             enable_caching,
+            # Built outside the engine core (tests, tools): no connector is known,
+            # so "auto" keeps the semantic checkpoints only.
+            has_prefix_store=False,
         )
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
