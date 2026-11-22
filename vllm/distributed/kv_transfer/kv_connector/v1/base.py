@@ -775,6 +775,23 @@ class KVConnectorBase_V1(ABC):
         return None
 
     @classmethod
+    def get_reserved_device_memory(
+        cls, vllm_config: "VllmConfig", kv_cache_spec: dict[str, Any]
+    ) -> int:
+        """Device bytes each worker of this connector allocates after the KV
+        cache (transfer buffers), taken from the KV cache budget at memory
+        profiling so the later allocation cannot run out of memory.
+
+        Args:
+            vllm_config: The vllm config.
+            kv_cache_spec: The worker's KV cache spec per layer.
+
+        Returns:
+            The bytes to reserve; 0 by default.
+        """
+        return 0
+
+    @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """Check if this connector requires PIECEWISE CUDA graph mode.
 

@@ -340,6 +340,9 @@ class NixlBaseConnectorWorker:
     _pair_side: "torch.cuda.Stream | None" = None
     _pair_side_events: tuple[torch.cuda.Event, ...] = ()
     _pair_consumed: NixlConnectorMetadata | None = None
+    # The step metadata whose forward is bound (about to be or being queued):
+    # its exchanges must already be queued (see run_pair_exchanges).
+    _pair_forward_bound: NixlConnectorMetadata | None = None
     # (metadata, event, blocks the exchange rewrites) per exchanging step.
     _pair_events: tuple[
         tuple[NixlConnectorMetadata, torch.cuda.Event, frozenset[int]], ...
@@ -2714,8 +2717,30 @@ class NixlBaseConnectorWorker:
             interleave=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             device=device,
             chunk_units=chunk_units,
+            ring_slots=dcp_pair_exchange.PAIR_RING_SLOTS,
         )
         table = exchanger.table
+        # The buffers were reserved out of the KV cache budget at profiling
+        # (NixlBaseConnector.get_reserved_device_memory) from a bound over the
+        # layer specs, which covers these layers: a unit half above it would
+        # allocate past the budget.
+        bound = dcp_pair_exchange.pair_half_bytes_bound(
+            {region.layer_name: region.spec for region in regions}
+        )
+        actual = dcp_pair_exchange.reserved_device_bytes(table.half_bytes, chunk_units)
+        reserved = dcp_pair_exchange.reserved_device_bytes(bound, chunk_units)
+        if actual > reserved:
+            raise dcp_pair_exchange.NixlPairModeError(
+                f"DCP pair exchange: buffers of {actual} B (unit half "
+                f"{table.half_bytes} B) exceed the {reserved} B reserved from the KV "
+                "cache budget at memory profiling"
+            )
+        logger.info(
+            "NIXL DCP pair exchange: buffers %.2f GiB of the %.2f GiB reserved at "
+            "memory profiling.",
+            actual / (1 << 30),
+            reserved / (1 << 30),
+        )
         arrays = Counter((array.kind.value, array.width) for array in table.arrays)
         draft = self._draft_layer_names()
         # What a deployment exchanges, to check against the model: the regions
@@ -5190,16 +5215,27 @@ class NixlBaseConnectorWorker:
     def check_pair_exchanges_ran(self, metadata: NixlConnectorMetadata) -> None:
         """Stop before the forward if this step's DCP pair exchanges did not
         run: its blocks would be read in P's row order."""
-        if metadata.reqs_to_pair_exchange and self._pair_consumed is not metadata:
+        if not metadata.reqs_to_pair_exchange:
+            return  # No exchange this step: no state (pair mode off is a no-op).
+        if self._pair_consumed is not metadata:
             raise RuntimeError(
                 "NIXL DCP pair exchange did not run before the forward: the model "
                 "runner (or a connector wrapping NIXL) did not call "
                 "finalize_loaded_kv for this step."
             )
+        self._pair_forward_bound = metadata
 
     def run_pair_exchanges(self, metadata: NixlConnectorMetadata) -> None:
         """Exchange the units of every request with the partner rank, in
         metadata order as on every rank, and record an event after them."""
+        if metadata is self._pair_forward_bound:
+            # The exchange's deadlock freedom needs its packs queued on the
+            # compute stream before any kernel of this step's forward
+            # (DcpPairExchanger._run): never queue them after the forward.
+            raise RuntimeError(
+                "NIXL DCP pair exchange queued after this step's forward was "
+                "bound: its packs must precede the forward on the compute stream."
+            )
         exchanger = self._pair_exchanger
         if exchanger is None:
             raise RuntimeError(
