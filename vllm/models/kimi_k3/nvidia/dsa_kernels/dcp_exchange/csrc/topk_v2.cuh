@@ -1664,6 +1664,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             if ((c >> (shb + 8)) != pref) continue;
             atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
           }
+          __syncthreads();  // as for_keys: the histogram is complete before it is sent
         } else
         for_keys(0, ng, [&](int i0, const uint4& r) {
           const uint32_t valid = 0xFFu;
