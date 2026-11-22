@@ -40,6 +40,7 @@ def _scheduler(num_blocks=200, mnbt=64):
     scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     scheduler.connector.request_finished.return_value = (False, None)
     scheduler.connector.take_events.return_value = ()
+    scheduler.connector.take_deferred_recving.return_value = set()
     return scheduler
 
 
@@ -226,3 +227,24 @@ def test_abort_while_loading_ahead_drops_it_from_the_set():
     )
     assert a.request_id not in scheduler.requests
 
+
+
+def test_load_ahead_only_for_requests_the_dp_plan_bound_here():
+    """Bind at load-issue time: with a DP plan, load-ahead loads only requests
+    the plan bound to this rank; others stay uncommitted (WAITING, movable)."""
+    scheduler = _scheduler()
+    long = _fill_budget(scheduler)
+    a = _add(scheduler, 6 * BS, hit_tokens=5 * BS)
+    scheduler.connector.dp_move_tokens.side_effect = lambda r: r.num_prompt_tokens
+    scheduler.dp_bound_here = set()
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert a.status == RequestStatus.WAITING
+    assert scheduler._load_ahead == set()
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [a.request_id]
+    # The next plan binds it here: loaded ahead while the budget is still full.
+    scheduler.dp_bound_here = {a.request_id}
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._load_ahead == {a}

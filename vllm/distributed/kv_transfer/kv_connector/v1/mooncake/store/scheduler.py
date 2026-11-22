@@ -420,6 +420,21 @@ class MooncakeStoreScheduler:
         an ordinary admission lookup."""
         self.client.adopt(request.request_id, request)
 
+    def dp_move_tokens(self, request: Request) -> int | None:
+        """The prompt minus its store hit once the request's lookup (started at
+        arrival) has completed; None while it is in flight or absent."""
+        hit = self.client.peek_hit(
+            request.request_id, request.num_tokens, request.block_hashes
+        )
+        if hit is None:
+            return None
+        return max(request.num_prompt_tokens - hit, 0)
+
+    def on_request_moved_away(self, request: Request) -> None:
+        """The request moved to another DP rank before its first schedule:
+        drop its arrival/admission lookup here (that rank looks it up again)."""
+        self.client.discard(request.request_id)
+
     def on_request_arrival_handled(self, request: Request) -> None:
         """Drop the arrival lookup of a request the scheduler did not take in."""
         self.client.release_unadopted(request.request_id, request)

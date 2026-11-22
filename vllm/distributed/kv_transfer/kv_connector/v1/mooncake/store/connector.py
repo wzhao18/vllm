@@ -242,6 +242,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def dp_move_tokens(self, request: Request) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.dp_move_tokens(request)
+
+    def on_request_moved_away(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_request_moved_away(request)
+
     def on_request_arrival_handled(self, request: Request) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_request_arrival_handled(request)
