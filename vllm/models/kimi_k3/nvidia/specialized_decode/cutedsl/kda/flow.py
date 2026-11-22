@@ -692,7 +692,7 @@ class KdaFlow(KdaWS):
             self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
                              buffers, ops, outs, sums_g, state_full,
                              stage_full + g, k0)  # fmt: skip
-        if cutlass.const_expr(self.mx):
+        if cutlass.const_expr(self.mx and "mx" not in self.skip):  # RHEADEC knob
             cute.arch.barrier()  # both groups' outputs stored
             self.quantize_outputs(args, tid, count, table)
 
