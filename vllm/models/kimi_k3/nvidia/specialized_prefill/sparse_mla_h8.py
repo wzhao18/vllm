@@ -98,6 +98,34 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
 )
 
 P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
+
+# NEVER MERGE (MEGAMOEFIX DCRIT r47 2b): every mbarrier wait of SparseMlaPrefillH8 bounded by the
+# k31 spin guard, one site per call line (caller_site at trace time), so the stuck CTA of the
+# layer-87 startup stall names its wait before the peers' MegaMoE guard fires.
+from vllm.models.kimi_k3.nvidia import k31_spin_guard as _sg  # noqa: E402
+
+
+@asm(Uint32, pure=False)
+def _mbar_try(bar, parity):
+    code = ("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2; "
+            "selp.u32 $0, 1, 0, p; }")
+    return code, "=r,r,r,~{memory}", (Uint32(bar), Uint32(parity))
+
+
+@cute.jit
+def _mbar_wait_guarded(bar, parity, site: cutlass.Constexpr[str]):
+    n, t0 = _sg.spin_start()
+    while _mbar_try(bar, parity) == Uint32(0):
+        n, t0 = _sg.spin_tick(n, t0, observed=Uint32(parity) ^ Uint32(1), target=Uint32(parity),
+                              kernel="SparseMlaPrefillH8", site=site)
+
+
+def mbar_wait(bar, parity):  # noqa: F811 - replaces the unbounded import for this file
+    _mbar_wait_guarded(bar, parity, _sg.caller_site())
+
+
+_sg.register_poll_helper(__file__, "mbar_wait", "_mbar_wait_guarded")
+
 NS = 6  # 64-key KV stages
 # cpa 2: a gather warp signals stage g full once its stage g - CPA_LAG + 1 copies are done
 # (one arrive per warp; per-thread cp.async.mbarrier arrives serialize at ~0.9 us per stage)
