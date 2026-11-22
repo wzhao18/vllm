@@ -11,9 +11,9 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host mem
 def _d(ring):
     """One host drain cycle: drain() takes the copy issued by the previous drain and issues the next one, so a
     drain, a device sync and a second drain see everything written before the first."""
-    out = _d(ring)
+    out = ring.drain()
     torch.cuda.synchronize()
-    return out + _d(ring)
+    return out + ring.drain()
 
 
 def _write(ring, call, sizes, world, epr, t=123456789):
