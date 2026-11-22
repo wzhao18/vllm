@@ -97,6 +97,9 @@ logger = init_logger(__name__)
 KV_CONNECTOR_LOOKUP_TIMEOUT_S = float(
     os.getenv("VLLM_KV_CONNECTOR_LOOKUP_TIMEOUT_S", "10")
 )
+# Load-ahead (waiting loop): at most this many fresh waiting requests hold an
+# async KV load started while the step's token budget was used up.
+LOAD_AHEAD_MAX_REQS = 8
 # WAITING_FOR_REMOTE_KVS for this long logs a warning (the load cannot be
 # abandoned: a late transfer may still write the request's blocks).
 KV_CONNECTOR_LOAD_WARN_S = 60.0
@@ -461,9 +464,8 @@ class Scheduler(SchedulerInterface):
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
-        # Loads started by the load-only scan keep one full step chunk of token
-        # blocks free beyond the in-flight reservations (Mamba managers reserve
-        # their state blocks), so they never take the blocks compute needs.
+        # Load-ahead keeps one full step chunk of token blocks free beyond the
+        # in-flight reservations (Mamba managers reserve their state blocks).
         self._load_ahead_reserve_blocks = sum(
             cdiv(self.max_num_scheduled_tokens, manager.block_size)
             for manager in self.kv_cache_manager.coordinator.single_type_managers
@@ -649,8 +651,8 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-        # Load-ahead: fresh waiting requests whose async KV load was started by
-        # the waiting loop's load-only scan (see schedule()).
+        # Load-ahead: fresh waiting requests whose async KV load was started
+        # while the step's token budget was used up (see the waiting loop).
         self._load_ahead: set[Request] = set()
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
@@ -1389,35 +1391,28 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             owner_decodes = self._dsa_owner_decodes()
-            # Load-only scan: once this step admits no more compute (token
-            # budget used up, prefill compute deferred to a cadence-aligned
-            # step, or every request slot taken), the loop keeps visiting the
-            # waiting queue and starts the async KV load of every fresh request
-            # whose lookup found an external hit. A load takes no compute and
-            # no request slot until it runs, so it is issued at the first
-            # schedule after the lookup completes, bounded only by free KV
-            # blocks (see the reservation below), and overlaps the request's
-            # queueing. Requests that need compute keep their place in order.
             load_ahead = False
+            load_ahead_left = LOAD_AHEAD_MAX_REQS - len(self._load_ahead)
             while True:
-                if not load_ahead and (
-                    token_budget <= 0 or input_budget <= draft_slots
-                ):
-                    load_ahead = True
-                if load_ahead:
+                if token_budget <= 0 or input_budget <= draft_slots:
+                    # Load-ahead: the step's compute budget is used up, but an
+                    # async KV load takes none of it. Start the loads of the
+                    # next fresh waiting requests (scheduler order) now so the
+                    # KV is resident when compute frees up; a request with
+                    # nothing to load waits for budget as before.
                     if (
                         self.connector is None
                         or self._pause_state != PauseState.UNPAUSED
+                        or load_ahead_left <= 0
                         or not self.waiting
                     ):
                         break
-                    request_queue = self.waiting
-                    head = request_queue.peek_request()
+                    head = self.waiting.peek_request()
                     if head.status != RequestStatus.WAITING or head.num_computed_tokens:
-                        # Not fresh (e.g. preempted, or a finished load): it
-                        # waits for compute; keep scanning for loads.
-                        skip_request(request_queue)
-                        continue
+                        break
+                    load_ahead = True
+                    load_ahead_left -= 1
+                    request_queue = self.waiting
                 else:
                     # Requests holding KV blocks are always drained first, and
                     # are the only ones admitted under PAUSED_NEW (e.g. async
@@ -1430,16 +1425,11 @@ class Scheduler(SchedulerInterface):
                         request_queue = self.waiting
                     if not request_queue:
                         break
-                    # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are
-                    # not in `running` but still hold a model-runner request
-                    # slot.
-                    num_running = (
-                        len(self.running) + self.num_waiting_for_streaming_input
-                    )
-                    if num_running >= self.max_num_active_reqs:
-                        # No request slot for compute: loads only.
-                        load_ahead = True
-                        continue
+                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                # in `running` but still hold a model-runner request slot.
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if num_running >= self.max_num_active_reqs:
+                    break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
@@ -1695,9 +1685,8 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = 0
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
-                    # compute to a cadence-aligned step; loads only.
-                    load_ahead = True
-                    continue
+                    # compute to a cadence-aligned step.
+                    break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     if owner_left is not None:
