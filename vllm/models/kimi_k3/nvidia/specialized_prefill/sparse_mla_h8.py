@@ -1684,6 +1684,14 @@ class SparseMlaPrefillH8:
             if owner:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+                elif cutlass.const_expr(not self.epw):
+                    # Last token (non-epw): no QLFREE(qi + 1) orders this epilogue after the
+                    # previous token's stores (the other WG may own it, and bulk_wait_read is
+                    # per issuing thread), so wait for its B_EPIDONE: completion qi - 1, parity
+                    # (qi - 1) & 1 (completion qi - 2 is behind the Q warp's wait; qi is ours).
+                    # epw orders every staging half through B_EPIFREE instead.
+                    if qi > 0:
+                        mbar_wait(_bar(base, B_EPIDONE), Uint32((qi - 1) & 1))
                 self.ss(base, cta, lane, u - 1, 23, 1)
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o, u - 1)
 
