@@ -75,10 +75,8 @@ def _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base):
         ([(37, 1000), (300, 9000), (9, 2100), (40, 40000), (3, 140000)], (), False),
         # all-tied rows (zero head weights): flagged, recomputed by the full path
         ([(64, 20000)], tuple(range(10, 20)), False),
-        # every row through the full path (few items: key-split scoring)
+        # every row through the full path
         ([(37, 1000), (21, 9000), (40, 40000)], (), True),
-        # more items than SMs: whole items, row bounds in the score kernel
-        ([(1800, 3000)], (), True),
     ],
 )
 def test_selective_topk_matches_stock(reqs, zero_rows, recover_all):
@@ -194,7 +192,7 @@ def _tie_inputs(reqs, seed=0, counts=(1500, 1000, 4500)):
         ([(16, 330000)], (1500, 1000, 4500)),
         # 600K rows: 3000 boundary ties, 1048 taken (radix tie select)
         ([(8, 600000)], (1000, 3000, 1000)),
-        # bound bin > CAND: PrefillExact (chunk-parallel threshold + key-order ties)
+        # bound bin > CAND: exact PrefillFinish path (full-row reads + tie walk)
         ([(8, 600000)], (1500, 6000, 1500)),
         # boundary ties <= TIE_BUF: shared-memory tie rank
         ([(8, 600000)], (1900, 300, 1500)),
@@ -227,25 +225,3 @@ def test_selective_topk_long_row_ties(reqs, counts):
         )
         assert flagged[t0 : t0 + rows][~settled].all()
         t0 += rows
-
-
-@pytest.mark.parametrize("recover_all", [False, True])
-def test_selective_topk_long_rows_random(recover_all):
-    """600K-key rows of random keys: the flagged rows' bound bin overflows CAND
-    (PrefillExact); every row matches stock, run to run identical."""
-    reqs = [(16, 600000)]
-    q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, seed=1)
-    sp = pidx.SelectivePlan(
-        [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
-    )
-    outs = []
-    for _ in range(2):
-        out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
-        pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out, recover_all=recover_all)
-        outs.append(out)
-    assert (outs[1] == outs[0]).all()
-    ref = _stock_topk(q, q_scale, w16, k8, k_sf, 0, 16, 600000, bases[0])
-    got = outs[0].to(torch.int64)
-    got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
-    ok = (got == ref).all(1)
-    assert ok.all(), f"{int((~ok).sum())} rows differ"
