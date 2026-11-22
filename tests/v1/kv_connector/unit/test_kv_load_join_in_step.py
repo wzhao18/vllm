@@ -262,6 +262,7 @@ def test_given_up_joined_load_recomputes_after_its_transfer_ends():
     # blocks stay parked and it is not admitted again (a new load under its
     # id would be confused with the old one) until the transfer reports.
     scheduler = _scheduler()
+    scheduler.recompute_kv_load_failures = True
     request = _request(max_tokens=4)
     free_before = _num_free(scheduler)
     scheduler.add_request(request)
@@ -271,8 +272,7 @@ def test_given_up_joined_load_recomputes_after_its_transfer_ends():
     engine_outputs = scheduler.update_from_output(
         output, create_model_runner_output([request], failed_recving={"r"})
     )
-    delivered = [o for outs in engine_outputs.values() for o in outs.outputs]
-    assert all(o.new_token_ids == [] and o.finish_reason is None for o in delivered)
+    assert not [o for outs in engine_outputs.values() for o in outs.outputs]
     assert request.num_output_tokens == 0
     assert request.status == RequestStatus.PREEMPTED
     assert _num_free(scheduler) == free_before - held
