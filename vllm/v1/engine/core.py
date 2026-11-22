@@ -2823,7 +2823,10 @@ class DPEngineCoreProc(EngineCoreProc):
         size = self.dp_group.size()
         rank = self.dp_group.rank()
         slots = getattr(self, "_dp_move_slots", 0)
-        mv_base = 2 * size + 1
+        # With moves: [plan demand n] (dp_move_demand, the planner's units),
+        # [movable n x slots], [abort forwards n x n] after the guard.
+        pd_base = 2 * size + 1
+        mv_base = pd_base + (size if slots else 0)
         ab_base = mv_base + size * slots
         counts = torch.zeros(ab_base + (size * size if slots else 0), dtype=torch.int64)
         counts[rank] = num_tokens
@@ -2831,6 +2834,7 @@ class DPEngineCoreProc(EngineCoreProc):
         movable: list[tuple[str, int]] = []
         if slots:
             movable = self.scheduler.dp_movable_requests(slots)
+            counts[pd_base + rank] = self.scheduler.dp_move_demand()
             for i, (_, n_tok) in enumerate(movable):
                 counts[mv_base + rank * slots + i] = n_tok
             for dst, ids in self._dp_abort_forward.items():
@@ -2849,7 +2853,9 @@ class DPEngineCoreProc(EngineCoreProc):
                 f"({int(counts[2 * size])} of {size} ranks)."
             )
         if slots:
-            self._dp_plan_moves(counts, size, slots, mv_base, ab_base, movable)
+            self._dp_plan_moves(
+                counts, size, slots, pd_base, mv_base, ab_base, movable
+            )
         sched_counts = counts[:size]
         demands = counts[size : 2 * size]
         # Some rank has neither scheduled tokens nor computable prompt tokens
@@ -2875,13 +2881,15 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         return int(counts[:size].max())
 
-    def _dp_plan_moves(self, counts, size, slots, mv_base, ab_base, movable) -> None:
+    def _dp_plan_moves(
+        self, counts, size, slots, pd_base, mv_base, ab_base, movable
+    ) -> None:
         """From the exchanged vector, plan this engine group's cross-rank moves
         of uncommitted prompts (identical on every rank) and the abort forwards
         for already-moved requests; both run before the next schedule()."""
         from vllm.v1.core.sched.dp_rebalance import plan_dp_moves
 
-        demand = [int(x) for x in counts[size : 2 * size]]
+        demand = [int(x) for x in counts[pd_base : pd_base + size]]
         per_rank = [
             [int(x) for x in counts[mv_base + r * slots : mv_base + (r + 1) * slots] if x > 0]
             for r in range(size)

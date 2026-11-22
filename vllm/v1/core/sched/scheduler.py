@@ -314,6 +314,9 @@ class Scheduler(SchedulerInterface):
         # long-context chunk does not set every rank's lockstep step. None =
         # tokens only (see _prompt_chunk_cost).
         self._prompt_cost = None
+        # This step's scheduled tokens while its DP exchange runs (see
+        # dp_move_demand); empty outside schedule().
+        self._dp_scheduled_now: dict[str, int] = {}
         try:
             from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
 
@@ -3513,8 +3516,46 @@ class Scheduler(SchedulerInterface):
                 else self.connector.dp_move_tokens(request)
             )
             if num_tokens:
-                out.append((request.request_id, num_tokens))
+                cost = self._dp_plan_cost(
+                    num_tokens, request.num_prompt_tokens - num_tokens
+                )
+                out.append((request.request_id, max(cost, 1)))
         return out
+
+    def _dp_plan_cost(self, num_tokens: int, ctx: int) -> int:
+        """Planning size of ``num_tokens`` prompt tokens still to compute from
+        context ``ctx``: their predicted cost with a prompt cost model (see
+        ``step_cost.prompt_cost``), else the tokens."""
+        if self._prompt_cost is None:
+            return num_tokens
+        return int(self._prompt_cost.prompt_cost(num_tokens, ctx) + 0.5)
+
+    def dp_move_demand(self) -> int:
+        """Committed prompt work of this rank after the step being scheduled
+        (``dp_prefill_demand``), in the units of ``dp_movable_requests``
+        (predicted cost with a prompt cost model), for cross-rank planning."""
+        scheduled = self._dp_scheduled_now
+        if self._prompt_cost is None:
+            return self.dp_prefill_demand(scheduled)
+        demand = 0
+        for request in self.running:
+            ctx = request.num_computed_tokens + scheduled.get(request.request_id, 0)
+            left = request.num_prompt_tokens - ctx
+            if left > 0:
+                demand += self._dp_plan_cost(left, ctx)
+        for queue in (self.kv_holding_waiting, self.waiting):
+            for request in queue:
+                if request.num_computed_tokens > 0 and (
+                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or request.request_id in self.finished_recving_kv_req_ids
+                ):
+                    ctx = request.num_computed_tokens + scheduled.get(
+                        request.request_id, 0
+                    )
+                    left = request.num_prompt_tokens - ctx
+                    if left > 0:
+                        demand += self._dp_plan_cost(left, ctx)
+        return demand
 
     def dp_export_request(self, request_id: str) -> Request | None:
         """Remove a still-movable request so another DP rank can take it in.
@@ -3628,6 +3669,20 @@ class Scheduler(SchedulerInterface):
             )
         return num_new_tokens
 
+    def _dp_exchange_with(
+        self,
+        exchange: Callable[[int, int], int],
+        num_scheduled_tokens: dict[str, int],
+        quantity: int,
+    ) -> int:
+        """Run the step's DP exchange; while it runs, ``dp_move_demand`` sees
+        this step's scheduled tokens."""
+        self._dp_scheduled_now = num_scheduled_tokens
+        try:
+            return exchange(quantity, self.dp_prefill_demand(num_scheduled_tokens))
+        finally:
+            self._dp_scheduled_now = {}
+
     def _dp_prefill_pull_up(
         self,
         exchange: Callable[[int], int],
@@ -3655,7 +3710,9 @@ class Scheduler(SchedulerInterface):
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
-            busiest = exchange(int(max(used)), self.dp_prefill_demand(num_scheduled_tokens))
+            busiest = self._dp_exchange_with(
+                exchange, num_scheduled_tokens, int(max(used))
+            )
             room_o = [max(busiest - u, 0.0) for u in used]
             extra = 1 << 62
             if dsa_dp.PROF:
@@ -3665,15 +3722,15 @@ class Scheduler(SchedulerInterface):
             # cost (short-context tokens), and the deferred chunks are pulled up
             # toward the costliest rank's step by cost.
             used = self._step_cost(num_scheduled_tokens)
-            busiest = exchange(
-                int(used + 0.5), self.dp_prefill_demand(num_scheduled_tokens)
+            busiest = self._dp_exchange_with(
+                exchange, num_scheduled_tokens, int(used + 0.5)
             )
             room_cost = max(float(busiest) - used, 0.0)
             extra = 1 << 62
         else:
             num_tokens = sum(num_scheduled_tokens.values())
             extra = max(
-                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
+                self._dp_exchange_with(exchange, num_scheduled_tokens, num_tokens)
                 - num_tokens,
                 0,
             )

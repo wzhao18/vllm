@@ -45,6 +45,13 @@ def chunk_cost(num_tokens: int, ctx: int) -> float:
     return num_tokens * weight(ctx) if num_tokens > 0 else 0.0
 
 
+def prompt_cost(num_tokens: int, ctx: int) -> float:
+    """Cost of computing ``num_tokens`` prompt tokens from context ``ctx`` over
+    however many chunks (each token priced at its own context: the midpoint
+    weight of the span), for planning where outstanding prompt work runs."""
+    return num_tokens * weight(ctx + num_tokens // 2) if num_tokens > 0 else 0.0
+
+
 def max_tokens_for_cost(cost: float, ctx: int) -> int:
     """Most prompt tokens from context ``ctx`` whose chunk costs <= ``cost``."""
     if cost <= 0:

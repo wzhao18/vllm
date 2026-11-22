@@ -41,6 +41,9 @@ class _Sched:
     def dp_prefill_demand(self, num_scheduled_tokens):
         return self.demand
 
+    def dp_move_demand(self):
+        return self.demand
+
     def dp_movable_requests(self, limit):
         return [(rid, r.num_prompt_tokens) for rid, r in self.requests.items()][:limit]
 

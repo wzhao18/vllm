@@ -21,6 +21,10 @@ class _Cost:
         return n * (1 + ctx / 64) if n > 0 else 0.0
 
     @staticmethod
+    def prompt_cost(n, ctx):
+        return n * (1 + (ctx + n // 2) / 64) if n > 0 else 0.0
+
+    @staticmethod
     def max_tokens_for_cost(cost, ctx):
         return int(cost / (1 + ctx / 64) + 1e-9) if cost > 0 else 0
 
@@ -83,3 +87,27 @@ def test_cut_and_cost_helpers():
     # Chunk ending past the prompt: prompt part by cost, the rest 1 each.
     assert scheduler._prompt_chunk_cost(req, 192, 10) == pytest.approx(8 * 4.0 + 2)
     assert scheduler._cut_prompt_chunk_to_cost(req, 0, 0, 0.0) == 0
+
+
+def test_planning_units_are_predicted_cost():
+    scheduler = create_scheduler(max_num_batched_tokens=64, long_prefill_token_threshold=0)
+    reqs = create_requests(num_requests=2, num_tokens=256)
+    # Token units without a cost model.
+    for r in reqs:
+        scheduler.add_request(r)
+    assert scheduler.dp_movable_requests(4) == [(r.request_id, 256) for r in reqs]
+    assert scheduler.dp_move_demand() == 0
+    scheduler._prompt_cost = _Cost
+    # A queued prompt: all 256 tokens from context 0, midpoint weight 1 + 128/64.
+    assert scheduler.dp_movable_requests(4) == [(r.request_id, 768) for r in reqs]
+    scheduler.schedule()  # reqs[0] runs its first 64 tokens
+    assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [reqs[1].request_id]
+    # Committed: reqs[0]'s 192 tokens left from context 64: 192 * (1 + 160/64).
+    assert scheduler.dp_move_demand() == 672
+    # During the step's exchange the step's own tokens are already counted.
+    scheduler._dp_scheduled_now = {reqs[0].request_id: 64}
+    assert scheduler.dp_move_demand() == int(128 * (1 + (128 + 64) / 64) + 0.5)
+    scheduler._dp_scheduled_now = {}
+    assert step_cost.prompt_cost(1000, 600_000) == pytest.approx(
+        1000 * step_cost.weight(600_500)
+    )
