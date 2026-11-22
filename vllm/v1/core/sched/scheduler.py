@@ -945,8 +945,23 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _ddsa_clip_totals(self, why: str) -> None:
+        """DDSA DIAGNOSTIC (never merged): cumulative align-clip totals per cause."""
+        logger.info(
+            "DDSA align-clip TOTALS (%s): admissions %s, running-step clips %d, "
+            "schedule calls %d", why, dict(self.__dict__.get("_ddsa_clip_counts", {})),
+            self.__dict__.get("_ddsa_run_clips", [0])[0],
+            self.__dict__.get("_ddsa_sched_calls", 0),
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # DDSA DIAGNOSTIC: periodic cumulative clip totals.
+        self.__dict__["_ddsa_sched_calls"] = self.__dict__.get("_ddsa_sched_calls", 0) + 1
+        _now = time.monotonic()
+        if _now - self.__dict__.setdefault("_ddsa_last_totals", _now) >= 60.0:
+            self.__dict__["_ddsa_last_totals"] = _now
+            self._ddsa_clip_totals("periodic, every 60 s")
         # Frees from here until this call returns are "recent" for connector
         # loads issued during the next call (BlockFreeClock).
         BLOCK_FREE_CLOCK.tick()
@@ -4432,6 +4447,7 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        self._ddsa_clip_totals("shutdown")
         logger.debug_once("[shutdown] Scheduler: start")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
