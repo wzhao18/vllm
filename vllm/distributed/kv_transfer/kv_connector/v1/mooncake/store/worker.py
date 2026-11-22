@@ -1401,6 +1401,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
     def _handle_load(self, req_meta: ReqMeta):
         self._wait_load_ready(req_meta)
+        _diag_ready = time.perf_counter()  # DIAG
+        _diag_bytes = 0  # DIAG
+        _diag_keys = 0  # DIAG
+        _diag_batches = 0  # DIAG
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -1552,6 +1556,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
+                _diag_bytes += batch_bytes  # DIAG
+                _diag_keys += len(batch_keys)  # DIAG
+                _diag_batches += 1  # DIAG
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
@@ -1615,8 +1622,60 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
 
         # Load errors are recorded above, before the request is reported.
+        _load_diag().record(  # DIAG
+            [req_id, req_meta.load_issue_time, _diag_ready, None,
+             time.perf_counter(), _diag_bytes, _diag_keys, _diag_batches,
+             not load_failed]
+        )
         self.set_finished_request(req_id, clean=not load_failed)
         self.request_queue.task_done()
+
+
+# ============================================================
+# DIAG ONLY (wzhao/k31ws-loaddiag, never merge): per-load timing records
+# ============================================================
+class _LoadDiag:
+    """Appends ["LD", req_id, t_issue, t_ready, t_get0, t_done, bytes, keys,
+    batches, clean] (time.perf_counter, CLOCK_MONOTONIC: shared by the node's
+    processes, same clock as the engine iterlog) to
+    $VLLM_ITERLOG_DIR/loads-<host>-<pid>.jsonl, with ["A", perf, wall] anchors."""
+
+    def __init__(self) -> None:
+        import socket
+
+        d = os.environ.get("VLLM_ITERLOG_DIR")
+        self._f = None
+        if d:
+            os.makedirs(d, exist_ok=True)
+            self._f = open(
+                os.path.join(d, f"loads-{socket.gethostname()}-{os.getpid()}.jsonl"),
+                "a",
+                buffering=1,
+            )
+            self._lock = threading.Lock()
+            self._last_anchor = 0.0
+
+    def record(self, rec: list) -> None:
+        if self._f is None:
+            return
+        import json
+
+        now = time.perf_counter()
+        with self._lock:
+            if now - self._last_anchor > 30.0:
+                self._f.write(json.dumps(["A", now, time.time()]) + "\n")
+                self._last_anchor = now
+            self._f.write(json.dumps(["LD", *rec]) + "\n")
+
+
+_LOAD_DIAG: "_LoadDiag | None" = None
+
+
+def _load_diag() -> _LoadDiag:
+    global _LOAD_DIAG
+    if _LOAD_DIAG is None:
+        _LOAD_DIAG = _LoadDiag()
+    return _LOAD_DIAG
 
 
 # ============================================================
