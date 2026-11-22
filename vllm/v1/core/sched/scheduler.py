@@ -1454,7 +1454,7 @@ class Scheduler(SchedulerInterface):
                         or not self.waiting
                         # Some DP rank of the group has no work: leave the
                         # queued requests uncommitted so they can move there.
-                        or self.dp_group_has_idle_rank
+                        or False  # A/B arm C62: load-ahead as int62
                     ):
                         break
                     head = self.waiting.peek_request()

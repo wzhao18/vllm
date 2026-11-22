@@ -2552,7 +2552,7 @@ class DPEngineCoreProc(EngineCoreProc):
             vllm_config.parallel_config.data_parallel_rank // max(local_size, 1)
         )
         self._dp_move_local_size = max(local_size, 1)
-        self._dp_move_slots = DP_MOVE_SLOTS if local_size > 1 else 0
+        self._dp_move_slots = 0  # A/B arm C62: cost cap only, no moves
         self._dp_movable_ids: list[str] = []
         self._dp_moves: list = []
         self._dp_abort_counts: list[list[int]] = []
