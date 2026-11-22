@@ -511,6 +511,19 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.on_request_arrival(request)
 
+    def dp_move_tokens(self, request: "Request") -> int | None:
+        out = request.num_prompt_tokens
+        for c in self._connectors:
+            n = c.dp_move_tokens(request)
+            if n is None:
+                return None
+            out = min(out, n)
+        return out
+
+    def on_request_moved_away(self, request: "Request") -> None:
+        for c in self._connectors:
+            c.on_request_moved_away(request)
+
     def on_request_arrival_handled(self, request: "Request") -> None:
         for c in self._connectors:
             c.on_request_arrival_handled(request)

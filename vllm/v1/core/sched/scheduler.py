@@ -3427,34 +3427,68 @@ class Scheduler(SchedulerInterface):
         """
         self._dp_step_token_cap = cap
 
-    def dp_movable_requests(self, limit: int) -> list[tuple[str, int]]:
-        """Up to ``limit`` waiting requests not yet committed to this rank, in
-        queue order, as (request id, prompt tokens).
+    def _dp_movable(self, request: Request) -> bool:
+        """Whether nothing of ``request`` lives on this rank yet, so any DP rank
+        of the engine could compute it from the same prompt: WAITING with no
+        computed tokens, no KV blocks, no connector load or remote prefill,
+        never preempted, a plain token prompt (no multimodal inputs, embeds or
+        structured output), not streaming, and no DSA-DP owner."""
+        kv_params = request.kv_transfer_params or {}
+        return (
+            request.status == RequestStatus.WAITING
+            and request.num_computed_tokens == 0
+            and request.num_preemptions == 0
+            and not request.resumable
+            and not request.mm_features
+            and request.prompt_embeds is None
+            and not request.use_structured_output
+            and request.pooling_params is None
+            and not kv_params.get("do_remote_prefill")
+            and getattr(request, "dsa_owner", -1) in (-1, None)
+            and request.request_id not in self.finished_recving_kv_req_ids
+            and not self._has_allocated_blocks(request.request_id)
+        )
 
-        Not committed means nothing of the request lives on this rank yet: it
-        is WAITING with no computed tokens, holds no KV blocks and no connector
-        load is in flight for it. Such a request could be computed by any DP
-        rank of the group from the same prompt (the external prefix cache is
-        shared), so cross-rank balancing may consider it. Requests waiting for
-        a remote prefill, streaming, or with a preemption history are never
-        listed.
-        """
+    def dp_movable_requests(self, limit: int) -> list[tuple[str, int]]:
+        """Up to ``limit`` waiting requests not yet committed to this rank (see
+        ``_dp_movable``), in queue order, as (request id, prompt tokens to
+        compute: the prompt minus the external prefix hit, see
+        ``KVConnectorBase_V1.dp_move_tokens``; requests whose hit is not known
+        yet are skipped). The external prefix cache is shared by all DP ranks,
+        so cross-rank balancing may hand such a request to another rank."""
         out: list[tuple[str, int]] = []
         if limit <= 0:
             return out
         for request in self.waiting:
             if len(out) >= limit:
                 break
-            if (
-                request.status == RequestStatus.WAITING
-                and request.num_computed_tokens == 0
-                and request.num_preemptions == 0
-                and not request.resumable
-                and request.request_id not in self.finished_recving_kv_req_ids
-                and not self._has_allocated_blocks(request.request_id)
-            ):
-                out.append((request.request_id, request.num_prompt_tokens))
+            if not self._dp_movable(request):
+                continue
+            num_tokens = (
+                request.num_prompt_tokens
+                if self.connector is None
+                else self.connector.dp_move_tokens(request)
+            )
+            if num_tokens:
+                out.append((request.request_id, num_tokens))
         return out
+
+    def dp_export_request(self, request_id: str) -> Request | None:
+        """Remove a still-movable request so another DP rank can take it in.
+
+        Returns None (and keeps the request) if it is gone or no longer
+        movable. The request is not finished: no output is produced for it here
+        and the connector only drops per-request state started for it (its
+        arrival lookup); the receiving rank sees it arrive anew."""
+        request = self.requests.get(request_id)
+        if request is None or not self._dp_movable(request):
+            return None
+        self.waiting.remove_request(request)
+        del self.requests[request_id]
+        self.kv_cache_manager.forget_conversation_turn(request)
+        if self.connector is not None:
+            self.connector.on_request_moved_away(request)
+        return request
 
     def _has_allocated_blocks(self, request_id: str) -> bool:
         """Whether any KV cache group holds blocks for ``request_id`` (read only:

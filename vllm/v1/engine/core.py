@@ -146,6 +146,12 @@ def dp_step_token_cap(
     return max(cap, floor)
 
 
+# Uncommitted waiting prompts each DP rank reports per step for cross-rank
+# moves (see dp_rebalance.plan_dp_moves); bounds the exchange vector.
+DP_MOVE_SLOTS = 4
+# Moved request ids a source rank remembers to forward client aborts.
+DP_MOVED_MEMORY = 65536
+
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -2524,6 +2530,21 @@ class DPEngineCoreProc(EngineCoreProc):
             and not vllm_config.parallel_config.enable_elastic_ep
         )
         self._dp_prefill_exchanged = False
+        # Cross-rank moves of uncommitted prompts (dp_rebalance.plan_dp_moves),
+        # among the DP ranks served by the same client (one front-end per node
+        # in hybrid/external DP load balancing: an engine's outputs go to its
+        # client, so a request may only move between engines of one client).
+        local_size = vllm_config.parallel_config.data_parallel_size_local or 1
+        self._dp_move_group = (
+            vllm_config.parallel_config.data_parallel_rank // max(local_size, 1)
+        )
+        self._dp_move_local_size = max(local_size, 1)
+        self._dp_move_slots = DP_MOVE_SLOTS if local_size > 1 else 0
+        self._dp_movable_ids: list[str] = []
+        self._dp_moves: list = []
+        self._dp_abort_counts: list[list[int]] = []
+        self._dp_moved_to: dict[str, int] = {}
+        self._dp_abort_forward: dict[int, list[str]] = {}
         # DP lockstep step cap floor: the largest captured CUDA-graph batch
         # (steps up to it replay a graph), never above the token budget.
         self._dp_step_token_floor = min(
@@ -2778,6 +2799,10 @@ class DPEngineCoreProc(EngineCoreProc):
         if not (self.dp_prefill_pull_up and self.engines_running):
             return self._process_engine_step()
         self._dp_prefill_exchanged = False
+        if self._dp_moves or any(any(row) for row in self._dp_abort_counts):
+            # Hand over the requests planned at the previous exchange before
+            # this step's schedule() (every rank runs the same plan).
+            self._dp_run_moves()
         self.scheduler.set_dp_prefill_exchange(self._exchange_dp_prefill_tokens)
         executed = self._process_engine_step()
         self.scheduler.set_dp_prefill_exchange(None)
@@ -2794,9 +2819,20 @@ class DPEngineCoreProc(EngineCoreProc):
         the next steps from the group's outstanding prefill work."""
         self._dp_prefill_exchanged = True
         size = self.dp_group.size()
-        counts = torch.zeros(2 * size + 1, dtype=torch.int64)
-        counts[self.dp_group.rank()] = num_tokens
-        counts[size + self.dp_group.rank()] = demand
+        rank = self.dp_group.rank()
+        slots = getattr(self, "_dp_move_slots", 0)
+        mv_base = 2 * size + 1
+        ab_base = mv_base + size * slots
+        counts = torch.zeros(ab_base + (size * size if slots else 0), dtype=torch.int64)
+        counts[rank] = num_tokens
+        counts[size + rank] = demand
+        movable: list[tuple[str, int]] = []
+        if slots:
+            movable = self.scheduler.dp_movable_requests(slots)
+            for i, (_, n_tok) in enumerate(movable):
+                counts[mv_base + rank * slots + i] = n_tok
+            for dst, ids in self._dp_abort_forward.items():
+                counts[ab_base + rank * size + dst] = len(ids)
         # Every rank adds 1: a collective paired with a different one on some
         # rank shows up here instead of returning a wrong count.
         counts[2 * size] = 1
@@ -2810,6 +2846,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 "DP prefill pull-up exchange is out of step across DP ranks "
                 f"({int(counts[2 * size])} of {size} ranks)."
             )
+        if slots:
+            self._dp_plan_moves(counts, size, slots, mv_base, ab_base, movable)
         sched_counts = counts[:size]
         demands = counts[size : 2 * size]
         # Some rank has neither scheduled tokens nor computable prompt tokens
@@ -2834,6 +2872,152 @@ class DPEngineCoreProc(EngineCoreProc):
             )
         )
         return int(counts[:size].max())
+
+    def _dp_plan_moves(self, counts, size, slots, mv_base, ab_base, movable) -> None:
+        """From the exchanged vector, plan this engine group's cross-rank moves
+        of uncommitted prompts (identical on every rank) and the abort forwards
+        for already-moved requests; both run before the next schedule()."""
+        from vllm.v1.core.sched.dp_rebalance import plan_dp_moves
+
+        demand = [int(x) for x in counts[size : 2 * size]]
+        per_rank = [
+            [int(x) for x in counts[mv_base + r * slots : mv_base + (r + 1) * slots] if x > 0]
+            for r in range(size)
+        ]
+        local = self._dp_move_local_size
+        moves = []
+        for g in range(-(-size // local)):
+            lo, hi = g * local, min(size, (g + 1) * local)
+            for mv in plan_dp_moves(
+                demand[lo:hi],
+                per_rank[lo:hi],
+                self.scheduler.max_num_scheduled_tokens,
+            ):
+                moves.append(type(mv)(mv.src + lo, mv.index, mv.dst + lo, mv.num_tokens))
+        self._dp_moves = moves
+        self._dp_movable_ids = [rid for rid, _ in movable]
+        self._dp_abort_counts = [
+            [int(counts[ab_base + s * size + d]) for d in range(size)]
+            for s in range(size)
+        ]
+
+    def _dp_send_bytes(self, data: bytes, dst: int) -> None:
+        n = torch.tensor([len(data)], dtype=torch.int64)
+        self.dp_group.send([n], dst, 0).wait()
+        if data:
+            buf = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+            self.dp_group.send([buf], dst, 1).wait()
+
+    def _dp_recv_bytes(self, src: int) -> bytes:
+        n = torch.zeros(1, dtype=torch.int64)
+        self.dp_group.recv([n], src, 0).wait()
+        if int(n[0]) == 0:
+            return b""
+        buf = torch.empty(int(n[0]), dtype=torch.uint8)
+        self.dp_group.recv([buf], src, 1).wait()
+        return buf.numpy().tobytes()
+
+    def _dp_run_moves(self) -> None:
+        """Run the planned moves, then the abort forwards, in plan order on
+        every rank (each transfer is a blocking point-to-point pair over the DP
+        group, so the common order cannot deadlock)."""
+        import pickle
+
+        rank = self.dp_group.rank()
+        moves, self._dp_moves = self._dp_moves, []
+        ids, self._dp_movable_ids = self._dp_movable_ids, []
+        aborts, self._dp_abort_counts = self._dp_abort_counts, []
+        for mv in moves:
+            if mv.src == rank:
+                payload = b""
+                if mv.index < len(ids):
+                    req = self.scheduler.dp_export_request(ids[mv.index])
+                    if req is not None:
+                        payload = self._dp_encode_moved(req, mv.dst)
+                        if payload:
+                            self._dp_remember_moved(req.request_id, mv.dst)
+                        else:
+                            # Cannot ship it: keep it here.
+                            self.scheduler.add_request(req)
+                self._dp_send_bytes(payload, mv.dst)
+            elif mv.dst == rank:
+                payload = self._dp_recv_bytes(mv.src)
+                if payload:
+                    self._dp_import_moved(payload)
+        for src, row in enumerate(aborts):
+            for dst, n in enumerate(row):
+                if not n:
+                    continue
+                if src == rank:
+                    fwd = self._dp_abort_forward.pop(dst, [])
+                    self._dp_send_bytes(pickle.dumps(fwd), dst)
+                elif dst == rank:
+                    data = self._dp_recv_bytes(src)
+                    fwd_ids = pickle.loads(data) if data else []
+                    if fwd_ids:
+                        self.abort_requests(fwd_ids)
+
+    def _dp_encode_moved(self, req, dst: int) -> bytes:
+        """The moved request as the EngineCoreRequest the receiving rank adds
+        (prompt as this rank holds it: a P-side truncation already applied is
+        marked in kv_transfer_params and not applied again)."""
+        sampling_params = req.sampling_params
+        if sampling_params is not None and sampling_params.max_tokens != req.max_tokens:
+            # A connector's arrival hook may cap the request (P-side
+            # truncation sets max_tokens = 1): ship the request as it is here.
+            sampling_params = sampling_params.clone()
+            sampling_params.max_tokens = req.max_tokens
+        ecr = EngineCoreRequest(
+            request_id=req.request_id,
+            prompt_token_ids=list(req.prompt_token_ids or []),
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            arrival_time=req.arrival_time,
+            lora_request=req.lora_request,
+            cache_salt=req.cache_salt,
+            data_parallel_rank=dst,
+            prompt_is_token_ids=req.prompt_is_token_ids,
+            client_index=req.client_index,
+            priority=req.priority,
+            trace_headers=req.trace_headers,
+            resumable=False,
+            reasoning_ended=getattr(req, "reasoning_ended", None),
+            reasoning_parser_kwargs=getattr(req, "reasoning_parser_kwargs", None),
+            abort_immediately=req.abort_immediately,
+            session_id=req.session_id,
+            kv_hints=req.kv_hints,
+        )
+        frames = MsgpackEncoder().encode(ecr)
+        if len(frames) != 1:
+            return b""
+        return bytes(frames[0])
+
+    def _dp_import_moved(self, payload: bytes) -> None:
+        """Take in a request another rank of this engine handed over, exactly
+        like a client ADD (arrival hooks, then add, then arrival handled)."""
+        ecr = MsgpackDecoder(EngineCoreRequest).decode([payload])
+        req, wave = self.preprocess_add_request(ecr)
+        try:
+            self.add_request(req, wave)
+        finally:
+            self._kv_connector_arrival_handled(req)
+
+    def _dp_remember_moved(self, request_id: str, dst: int) -> None:
+        self._dp_moved_to[request_id] = dst
+        while len(self._dp_moved_to) > DP_MOVED_MEMORY:
+            self._dp_moved_to.pop(next(iter(self._dp_moved_to)))
+
+    def abort_requests(self, request_ids: list[str]):
+        """Client aborts arrive at the rank the client sent the request to:
+        forward those for requests this rank moved away (at the next step)."""
+        moved = [rid for rid in request_ids if rid in self._dp_moved_to]
+        if moved:
+            for rid in moved:
+                self._dp_abort_forward.setdefault(self._dp_moved_to.pop(rid), []).append(rid)
+            request_ids = [rid for rid in request_ids if rid not in set(moved)]
+        if request_ids:
+            super().abort_requests(request_ids)
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.

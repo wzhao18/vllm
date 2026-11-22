@@ -724,6 +724,12 @@ class KVCacheManager:
         if self.conversation_tracker is not None:
             self.conversation_tracker.prepare(request)
 
+    def forget_conversation_turn(self, request: Request) -> None:
+        """Undo ``prepare_conversation_turn`` for a request that leaves this
+        engine before it ran (cross-rank move)."""
+        if self.conversation_tracker is not None:
+            self.conversation_tracker.forget(request)
+
     def finish_conversation_turn(self, request: Request) -> int:
         """Record a finished request's Mamba states as a turn of its
         conversation and drop the states of turns past the retained ones.
