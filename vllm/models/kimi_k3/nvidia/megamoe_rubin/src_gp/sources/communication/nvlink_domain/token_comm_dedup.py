@@ -1495,6 +1495,7 @@ class _DedupMetadataPushRouter(KernelComponent):
                         _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
                         _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
                         _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
+                        cute.arch.fence_acq_rel_gpu()  # EXPERIMENT ARM (not for merge): fence-scope A/B, PCRIT v94
                         _st_sys_s32(base, call)
                     cute.arch.sync_warp()
 
