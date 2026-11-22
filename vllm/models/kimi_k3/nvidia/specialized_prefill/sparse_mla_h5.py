@@ -21,21 +21,20 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 
-from vllm.models.kimi_k3.nvidia import k31_spin_guard as k31sg
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import tensormap
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import asm
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     D_NOPE,
+    ld_global_v4_s32,
+    H,
     LOG2E,
     ROW,
     SDESC_SW64,
     SDESC_SW128,
-    H,
     cvt_e4m3x2,
     ex2,
     fence_async_smem,
     gather4,
-    ld_global_v4_s32,
     ld_shared_f32,
     ld_shared_u32,
     ld_shared_v4f,
@@ -206,12 +205,11 @@ def fadd2(a0, a1, b0, b1):
     return code, "=f,=f,f,f,f,f", tuple(Float32(v) for v in (a0, a1, b0, b1))
 
 
+@asm()
 def mbar_wait_hint(bar, parity):
-    """Bounded parity wait with a 10 ms suspend-time hint (k31_spin_guard)."""
-    return k31sg.mbar_wait(bar, parity, hint=", 10000000")
-
-
-k31sg.register_poll_helper(__file__, "mbar_wait_hint")
+    code = ("{ .reg .pred p; WAITH_${:uid}: mbarrier.try_wait.parity.shared::cta.b64 "
+            "p, [$0], $1, 10000000; @!p bra WAITH_${:uid}; }")
+    return code, "r,r,~{memory}", (Uint32(bar), Uint32(parity))
 
 
 @cute.jit

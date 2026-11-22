@@ -124,12 +124,8 @@ def wait(barrier, phase) -> Uint32:
     """Wait for ``phase`` of ``barrier`` (the batch's source reads and completion);
     1 when the fabric reported an error for it, else 0."""
     state = _try_wait(barrier, phase)
-    n, t0 = spin_start()
     while state & Uint32(1) == Uint32(0):
         state = _try_wait(barrier, phase)
-        n, t0 = spin_tick(
-            n, t0, observed=Uint32(phase) ^ Uint32(1), target=Uint32(phase)
-        )
     return state >> Uint32(1)
 
 

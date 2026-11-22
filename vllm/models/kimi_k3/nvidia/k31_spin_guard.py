@@ -15,8 +15,7 @@ The clock is first read after ``SPIN_POLLS`` failed polls (a wait that resolves 
 them never touches it), then every ``SPIN_POLLS``. A wait still pending
 ``SPIN_GUARD_NS`` after the first read prints
 
-    K31_SPIN_TIMEOUT kernel=<name> site=<file:line> rank=<r> size=<s> observed=<v>
-        target=<v> smid=<sm> block=<x> thread=<t>
+    K31_SPIN_TIMEOUT kernel=<name> site=<file:line>
 
 and traps: the hang becomes a CUDA error naming the kernel, the wait and the rank.
 ``site`` is the source location of the poll loop, taken at trace time (the first
@@ -25,18 +24,30 @@ numbering.
 
 A trap from any thread ends the grid at once and drops device printf output still in
 flight in other threads (several threads time out in the same clock window). DSL
-kernels have no static device globals for a one-printer flag, so the lowest active
-lane of each timing-out warp prints, and every timing-out thread waits
-``SPIN_FLUSH_NS`` before it traps: every line in flight reaches the host. (Kernels
-with a workspace in scope, e.g. MegaMoE, elect one printer per rank and site and also
-fill the host-visible record of spin_record.py.) Nothing the kernels compute changes (same polls, same order).
+kernels have no static device globals for a one-printer flag, so every timing-out
+thread prints the (identical, constant) line and waits ``SPIN_FLUSH_NS`` before it
+traps: every line in flight reaches the host. (Kernels with a workspace in scope,
+e.g. MegaMoE, elect one printer per rank and site and also fill the host-visible
+record of spin_record.py.) Nothing the kernels compute changes (same polls, same
+order).
 
-Scope: only spins written in the Kimi K3.1 kernels themselves are bounded and named
-(custom flag / Lamport / counter polls, the kernels' own mbarrier waits incl. inline
-PTX loops). Waits inside CUTLASS / CuTe library code (PipelineTmaAsync / Umma
-consumer_wait, producer_acquire, producer_tail, cute.arch.mbarrier_wait,
-cute.arch.cluster_wait) stay unbounded: a hang there is not named by this guard
-(documented residual; such a hang usually follows a named spin on another warp/CTA)."""
+Scope: the spins written in the Kimi K3.1 kernels that wait on another thread's
+progress through memory are bounded and named: cross-rank and cross-CTA flag,
+Lamport-sentinel and counter polls (fabric counters, twoshot, sp_comm, DCP merges,
+draft / verify exchanges, MoE tail / routing / experts, o-proj, GEMM split flags,
+KDA fronts, latent-MoE tail, ...). Not guarded (documented residual):
+- the decode mailbox helpers (common/mailbox.py poll / poll_warp: Lamport rows from
+  peers): a guard there measured +0.26% decode step at B32 against a 0.2% budget.
+  A dead peer is still named by the other guarded cross-rank waits of the step.
+- intra-CTA / cluster mbarrier phase waits on TMA / MMA / warp completion, both the
+  kernels' own (primitives.wait, the sparse MLA mbar_wait helpers, splitk, the
+  fabric put-completion fabric.wait) and the
+  CUTLASS / CuTe library ones (pipeline consumer_wait, producer_acquire,
+  producer_tail, cute.arch.mbarrier_wait / cluster_wait). They complete unless the
+  producing warp is stuck, and a producer stuck on a guarded spin traps, which ends
+  the whole grid including these waiters. Guarding them costs: their loop sits on
+  the critical path of every pipeline stage (decode step +0.25..1.9% measured,
+  PIDX 2026-11-22), against a 0.2% budget."""
 
 import ast
 import os
@@ -44,7 +55,7 @@ import sys
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Uint32, Uint64
+from cutlass import Int32, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -153,13 +164,11 @@ def trap(*, loc=None, ip=None) -> None:
 @cute.jit
 def _timeout(kernel: cutlass.Constexpr[str], site: cutlass.Constexpr[str], observed,
              target, rank, size):
-    if warp_leader() != Int32(0):
-        cute.printf(
-            "K31_SPIN_TIMEOUT kernel=" + kernel + " site=" + site
-            + " rank={} size={} observed={} target={} smid={} block={} thread={}",
-            Int32(rank), Int64(size), Uint64(observed), Uint64(target), smid(),
-            Int32(cute.arch.block_idx()[0]), Int32(cute.arch.thread_idx()[0]),
-        )
+    # A constant line (no arguments): a printf with value arguments inlined at every
+    # guarded poll cost +0.25% decode step (mailbox polls, PIDX 2026-11-22); the
+    # process (rank) is named by the log line prefix. observed / target / rank / size
+    # document the wait at the call site.
+    cute.printf("K31_SPIN_TIMEOUT kernel=" + kernel + " site=" + site)
     t = globaltimer_ns()
     while globaltimer_ns() - t < Uint64(SPIN_FLUSH_NS):
         nanosleep_us()
@@ -196,54 +205,3 @@ def spin_tick(n, t0, observed=0, target=0, rank=-1, size=-1, kernel=None, site=N
     if kernel is None:
         kernel = site.rsplit(".py:", 1)[0]
     return _tick(n, t0, kernel, site, observed, target, rank, size, polls)
-
-
-def _bar_address(bar, loc, ip):
-    """32-bit shared address of an mbarrier given as a smem Pointer or an address."""
-    if hasattr(bar, "toint"):
-        return Int32(bar.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip)
-    return Uint32(bar).ir_value(loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mbar_try_n(bar, parity, sem: str = "", hint: str = "", *, loc=None, ip=None) -> Uint32:
-    """Up to ``SPIN_POLLS`` parity polls of a CTA mbarrier in one PTX loop (the
-    unguarded wait's loop, with an exit after SPIN_POLLS failures); nonzero once the
-    phase completed. ``sem``: e.g. ".acquire.cluster"; ``hint``: e.g. ", 10000000"
-    (suspend-time hint)."""
-    code = (
-        "{ .reg .pred p; .reg .u32 n; mov.u32 n, " + str(SPIN_POLLS) + "; "
-        "W_${:uid}: mbarrier.try_wait.parity" + sem + ".shared::cta.b64 p, [$1], $2"
-        + hint + "; @p bra D_${:uid}; sub.u32 n, n, 1; setp.ne.u32 p, n, 0; "
-        "@p bra W_${:uid}; D_${:uid}: mov.u32 $0, n; }"
-    )
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [_bar_address(bar, loc, ip), Uint32(parity).ir_value(loc=loc, ip=ip)],
-            code, "=r,r,r,~{memory}", has_side_effects=True, asm_dialect=0,
-            loc=loc, ip=ip,
-        )
-    )
-
-
-@cute.jit
-def _mbar_wait(bar, parity, sem: cutlass.Constexpr[str], hint: cutlass.Constexpr[str],
-               kernel: cutlass.Constexpr[str], site: cutlass.Constexpr[str]):
-    left = mbar_try_n(bar, parity, sem, hint)
-    n, t0 = spin_start()
-    while left == Uint32(0):
-        left = mbar_try_n(bar, parity, sem, hint)
-        n, t0 = _tick(n, t0, kernel, site, Uint32(parity) ^ Uint32(1), parity, -1, -1,
-                      SPIN_POLLS)
-
-
-def mbar_wait(bar, parity, sem="", hint="", kernel=None, site=None):
-    """Bounded parity wait on a CTA mbarrier (smem Pointer or 32-bit address): the
-    same try_wait polls as an unguarded loop; the clock is read once per SPIN_POLLS
-    failed polls."""
-    if site is None:
-        site = caller_site()
-    if kernel is None:
-        kernel = site.rsplit(".py:", 1)[0]
-    return _mbar_wait(bar, parity, sem, hint, kernel, site)

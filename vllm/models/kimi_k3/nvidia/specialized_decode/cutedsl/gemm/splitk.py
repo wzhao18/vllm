@@ -31,8 +31,6 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
     _store_shared_remote_v4,
 )
 
-from vllm.models.kimi_k3.nvidia import k31_spin_guard as k31sg
-
 CTA_K, ATOM_K = 128, 64  # K per tile; K per 128-byte swizzle atom (one A box)
 
 __all__ = ["SplitKTactic", "SplitKGemm"]
@@ -62,13 +60,13 @@ def _tma_load_evict_first(smem, mbar, tensor_map, k0, row0, *, loc=None, ip=None
     _asm(code, "r,l,r,r,r", operands, loc, ip)
 
 
-def _wait_cluster(mbar, phase):
-    """``cute.arch.mbarrier_wait`` at ``.acquire.cluster`` (remote ``st.async``),
-    bounded (k31_spin_guard)."""
-    return k31sg.mbar_wait(mbar, phase, sem=".acquire.cluster", hint=", 10000000")
-
-
-k31sg.register_poll_helper(__file__, "_wait_cluster")
+@dsl_user_op
+def _wait_cluster(mbar, phase, *, loc=None, ip=None):
+    """``cute.arch.mbarrier_wait`` at ``.acquire.cluster`` (remote ``st.async``)."""
+    code = "{ .reg .pred P1; LAB_WAIT: "
+    code += "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1, "
+    code += "10000000; @P1 bra.uni DONE; bra.uni LAB_WAIT; DONE: }"
+    _asm(code, "r,r", [mbar.toint().ir_value(), phase.ir_value()], loc, ip)
 
 
 @dsl_user_op

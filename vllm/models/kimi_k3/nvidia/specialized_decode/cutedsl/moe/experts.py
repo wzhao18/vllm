@@ -10,7 +10,6 @@ import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
-    register_poll_helper,
     spin_start,
     spin_tick,
 )
@@ -57,7 +56,6 @@ from ..common.primitives import (
 )
 from ..common.twoshot import push
 
-register_poll_helper(__file__, "sync")  # spin timeouts name the sync() caller
 shuffle = cute.arch.shuffle_sync
 
 
