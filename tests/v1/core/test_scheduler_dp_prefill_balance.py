@@ -24,9 +24,9 @@ def _token_weighted_exchange(monkeypatch):
     """These tests pin the pull-up's token arithmetic: weight context 0, so the
     exchanged cost is the token count. The context weight is tested in
     test_pull_up_is_capped_by_context_weighted_cost."""
-    from vllm.v1.core.sched import scheduler as sched_mod
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
 
-    monkeypatch.setattr(sched_mod, "DP_PREFILL_CTX_WEIGHT", 0.0)
+    monkeypatch.setattr(step_cost, "RANK_CTX_WEIGHT", 0.0)
 
 
 class _Exchange:
@@ -345,18 +345,18 @@ def test_pull_up_is_capped_by_context_weighted_cost():
     chunk stops where its added cost fills the gap to the busiest rank: with
     long context a token costs more, so fewer tokens are pulled than the
     token gap would allow."""
-    from vllm.v1.core.sched import scheduler as sched_mod
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
 
     scheduler = _scheduler()
     requests = _running_chunked(scheduler)
     ex = _Exchange(peer=900)
     scheduler.set_dp_prefill_exchange(ex)
-    sched_mod_w = sched_mod.DP_PREFILL_CTX_WEIGHT
+    saved = step_cost.RANK_CTX_WEIGHT
     try:
-        sched_mod.DP_PREFILL_CTX_WEIGHT = 1e-3  # make 200 tokens of context visible
+        step_cost.RANK_CTX_WEIGHT = 1e-3  # make 200 tokens of context visible
         out = scheduler.schedule()
     finally:
-        sched_mod.DP_PREFILL_CTX_WEIGHT = sched_mod_w
+        step_cost.RANK_CTX_WEIGHT = saved
     w, ctx = 1e-3, 200
     own = 3 * 200 * (1 + w * (ctx + 199 / 2))
     assert ex.calls == [round(own)]

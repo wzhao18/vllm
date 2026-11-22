@@ -158,25 +158,25 @@ def _stop_mamba_chunk_at_block_end(
     return num_new_tokens
 
 
-# Context weight of a prefill token (per token of context) in a rank's own,
-# pre-MoE work, where the DP lockstep's imbalance lives: the served K3.1 DEP16
-# per-rank fit (CUPTI, 652 rank-steps: 18.2 ms per 1K tokens + 49.2 ms per 1e9
-# token x context -> w = 2.7e-6). The whole-step fit is lower (1.5e-6, MoE
-# dilutes it), but the pull-up must not fill a lighter rank past the busiest
-# rank's own work, so it uses the per-rank weight.
-DP_PREFILL_CTX_WEIGHT = 2.7e-6
+def _dp_prefill_ctx_weight() -> float:
+    """Per-rank context weight of a prompt token (step_cost.RANK_CTX_WEIGHT):
+    the DP prefill pull-up fills a lighter rank up to the busiest rank's own,
+    pre-MoE work, where the lockstep's imbalance lives."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
+
+    return step_cost.RANK_CTX_WEIGHT
 
 
 def _prefill_chunk_cost(num_tokens: int, context: int) -> float:
     """Cost of ``num_tokens`` new tokens after ``context`` computed ones: each
     token weighted by 1 + w * (its context), summed exactly."""
-    w = DP_PREFILL_CTX_WEIGHT
+    w = _dp_prefill_ctx_weight()
     return num_tokens * (1.0 + w * (context + (num_tokens - 1) / 2))
 
 
 def _max_tokens_for_prefill_cost(cost: float, context: int) -> int:
     """Largest n with ``_prefill_chunk_cost(n, context) <= cost``."""
-    w = DP_PREFILL_CTX_WEIGHT
+    w = _dp_prefill_ctx_weight()
     b = 1.0 + w * (context - 0.5)
     n = (
         int((-b + math.sqrt(b * b + 2.0 * w * max(cost, 0.0))) / w)

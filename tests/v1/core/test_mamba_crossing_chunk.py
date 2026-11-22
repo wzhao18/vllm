@@ -365,7 +365,9 @@ def test_max_tokens_for_prefill_cost_is_exact(context, cost) -> None:
 
 
 def test_prefill_chunk_cost_is_the_per_token_sum() -> None:
-    w = sched_mod.DP_PREFILL_CTX_WEIGHT
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
+
+    w = step_cost.RANK_CTX_WEIGHT
     for n, c in ((1, 0), (7, 13), (300, 5000)):
         exact = sum(1 + w * (c + i) for i in range(n))
         assert sched_mod._prefill_chunk_cost(n, c) == pytest.approx(exact)
