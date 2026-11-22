@@ -4,7 +4,7 @@ import contextlib
 import itertools
 import os
 import time
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from importlib.metadata import entry_points
@@ -44,7 +44,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -80,6 +80,7 @@ from vllm.v1.metrics.stats import (
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.joined_loads import JoinedLoadTracker
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
@@ -144,52 +145,6 @@ def _stop_mamba_chunk_at_block_end(
     if start % block_size and start + num_new_tokens < prefill_end:
         num_new_tokens = min(num_new_tokens, block_size - start % block_size)
     return num_new_tokens
-
-
-class InflightStepClock:
-    """Predicts when the steps in flight end, for join_load_in_step.
-
-    A step is in flight from schedule() returning it until its output is
-    processed. Its GPU work starts at the later of its dispatch and the end of
-    the step before it; its duration is taken as a low quantile of recent
-    measured durations (start to output processed), so the prediction errs
-    early: a load predicted to beat it usually does.
-    """
-
-    # Steps never processed (e.g. dropped on a reset) leave after this long.
-    STALE_S = 30.0
-
-    def __init__(self, window: int = 64, quantile: float = 0.2, min_samples: int = 8):
-        self._inflight: dict[int, float] = {}  # id(scheduler_output) -> dispatch
-        self._last_done: float | None = None
-        self._durations: deque[float] = deque(maxlen=window)
-        self._quantile = quantile
-        self._min_samples = min_samples
-
-    def dispatched(self, step_key: int, now: float) -> None:
-        self._inflight[step_key] = now
-
-    def done(self, step_key: int, now: float) -> None:
-        dispatch = self._inflight.pop(step_key, None)
-        if dispatch is None:
-            return
-        start = dispatch if self._last_done is None else max(dispatch, self._last_done)
-        self._durations.append(now - start)
-        self._last_done = now
-
-    def headroom(self, now: float) -> float:
-        """Seconds until the steps in flight are predicted to end (0 when
-        none is in flight or too few steps were measured)."""
-        for key in [k for k, d in self._inflight.items() if now - d > self.STALE_S]:
-            del self._inflight[key]
-        if not self._inflight or len(self._durations) < self._min_samples:
-            return 0.0
-        ordered = sorted(self._durations)
-        step = ordered[min(len(ordered) - 1, int(self._quantile * len(ordered)))]
-        end = self._last_done if self._last_done is not None else now
-        for dispatch in self._inflight.values():
-            end = max(end, dispatch) + step
-        return max(end - now, 0.0)
 
 
 class Scheduler(SchedulerInterface):
@@ -376,22 +331,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
-        # Async loads admitted in the step that issued them
-        # (join_load_in_step) whose clean completion has not been reported
-        # yet: their requests' blocks are not cached until it is, so no other
-        # request can hit KV that may still fail to load.
-        self._joined_loads: set[str] = set()
-        # Joined loads whose request was preempted or finished before the load
-        # reported done: the request's blocks are parked here (the transfer
-        # may still write them) and the request is not admitted again (a new
-        # load under its id would be confused with the old one's report).
-        self._joined_parked: dict[str, list[list[KVCacheBlock]]] = {}
-        # Block hashes being loaded by joined loads (unhittable until clean),
-        # to count other requests that read the same prefix from the store.
-        self._joined_hashes: dict[str, list[BlockHash]] = {}
-        self._joined_hash_refs: Counter[BlockHash] = Counter()
-        self.joined_load_stats = {"joined": 0, "dup_reads": 0, "dup_read_blocks": 0}
-        self._step_clock = InflightStepClock()
+        # Async loads admitted in the step that issues them (join_load_in_step).
+        self._joined = JoinedLoadTracker(self)
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1291,7 +1232,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
-                        delay_cache_blocks=request.request_id in self._joined_loads,
+                        delay_cache_blocks=self._joined.loading(request.request_id),
                     )
 
                     if new_blocks is not None:
@@ -1496,10 +1437,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-
-                if request_id in self._joined_parked:
-                    # Its earlier joined load has not reported yet.
-                    skip_request(request_queue)
+                if self._joined.parked(request_id):
+                    skip_request(request_queue)  # its joined load not reported
                     continue
 
                 if (
@@ -1954,7 +1893,7 @@ class Scheduler(SchedulerInterface):
                         num_lookahead_tokens=effective_lookahead_tokens,
                         num_external_computed_tokens=num_external_computed_tokens,
                         delay_cache_blocks=load_kv_async
-                        or request_id in self._joined_loads,
+                        or self._joined.loading(request_id),
                         skip_zeroing_group_ids=(
                             self.connector.get_loaded_kv_cache_group_ids(request)
                             if load_kv_async and self.connector is not None
@@ -1990,20 +1929,15 @@ class Scheduler(SchedulerInterface):
                         and self.defer_async_loads
                         and self.sched_step_seq > self.processed_step_seq
                     )
-                    # Same-step admission of an async load (see
-                    # KVConnectorBase_V1.join_load_in_step): only a request
-                    # that would compute in this step now, and the connector
-                    # decides before it issues the load.
+                    # Same-step admission: only a request computing this step.
                     join_load = (
                         load_kv_async
-                        and not load_ahead
-                        and not defer_load
-                        and not defer_prefills
+                        and not (load_ahead or defer_load or defer_prefills)
                         and self.connector.join_load_in_step(
                             request,
                             self.kv_cache_manager.get_blocks(request_id),
                             num_external_computed_tokens,
-                            self._step_clock.headroom(time.monotonic()),
+                            self._joined.headroom(),
                         )
                         is True  # exactly a bool yes (a mock never joins)
                     )
@@ -2082,22 +2016,16 @@ class Scheduler(SchedulerInterface):
                     if load_ahead:
                         self._load_ahead.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
-                    self._count_joined_dup_read(
-                        request, num_new_local_computed_tokens, num_computed_tokens
+                    self._joined.on_async_load(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_computed_tokens,
+                        join_load,
                     )
                     if join_load:
-                        self._track_joined_hashes(
-                            request, num_new_local_computed_tokens, num_computed_tokens
-                        )
-                        # The connector has the load done before this step's
-                        # forward reads the blocks: take it as finished now and
-                        # admit it again in this pass, at the head of the
-                        # KV-holding queue (compute budget is left: no
-                        # load-ahead). Its blocks stay uncached until the load
-                        # reports clean (_settle_joined_loads).
+                        # Taken as loaded: admit it again in this pass.
                         request_queue.pop_request()
                         self.deferred_waiting.discard(request)
-                        self._joined_loads.add(request_id)
                         self.finished_recving_kv_req_ids.add(request_id)
                         self._set_kv_fetch_stage(request, KV_FETCH_COMPLETED_WAITING)
                         self.kv_holding_waiting.prepend_request(request)
@@ -2382,7 +2310,7 @@ class Scheduler(SchedulerInterface):
         if total_num_scheduled_tokens > 0:
             # This step may now be in flight: later frees are recent.
             BLOCK_FREE_CLOCK.step_built()
-            self._step_clock.dispatched(id(scheduler_output), time.monotonic())
+            self._joined.dispatched(id(scheduler_output))
         return scheduler_output
 
     def _trim_new_reqs_for_workers(
@@ -2891,7 +2819,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self._step_clock.done(id(scheduler_output), time.monotonic())
+        self._joined.done(id(scheduler_output))
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2920,11 +2848,10 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
-        if kv_connector_output and self._joined_loads:
-            kv_connector_output, failed_joined = self._settle_joined_loads(
+        if kv_connector_output:
+            kv_connector_output, failed_kv_load_req_ids = self._joined.settle(
                 kv_connector_output
             )
-            failed_kv_load_req_ids |= failed_joined
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -3755,7 +3682,7 @@ class Scheduler(SchedulerInterface):
                 request,
                 num_new_tokens,
                 num_lookahead_tokens=self.num_lookahead_tokens,
-                delay_cache_blocks=request_id in self._joined_loads,
+                delay_cache_blocks=self._joined.loading(request_id),
             )
             if new_blocks is None and num_new_tokens > num_stock:
                 num_new_tokens = num_stock
@@ -3763,7 +3690,7 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens,
-                    delay_cache_blocks=request_id in self._joined_loads,
+                    delay_cache_blocks=self._joined.loading(request_id),
                 )
             if new_blocks is None:
                 # Unreachable with _dp_pull_kv_headroom; like a stock allocation
@@ -4243,15 +4170,21 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         )
 
+    def _free_parked_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        """Free a reported joined load's parked blocks after the steps in flight."""
+        if self.defer_block_free:
+            self.deferred_frees.append((self.sched_step_seq, blocks))
+        elif blocks:
+            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
-        if request.request_id in self._joined_loads:
-            # A joined load still in flight writes these blocks outside the
-            # GPU stream: park them until it reports (_settle_joined_loads).
+        if self._joined.loading(request.request_id):
+            # A joined load still writes them outside the GPU stream: park.
             blocks = self.kv_cache_manager.pop_blocks_for_free(request)
-            self._joined_parked.setdefault(request.request_id, []).append(blocks)
+            self._joined.park(request.request_id, blocks)
             return
         if self._request_blocks_can_be_freed(request):
             if self.defer_block_free:
@@ -4706,10 +4639,9 @@ class Scheduler(SchedulerInterface):
                 self._inflight_prefills.discard(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
-        elif request.request_id not in self._joined_loads:
+        elif not self._joined.loading(request.request_id):
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
-            # (A joined load's blocks are cached when it reports clean.)
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
         # DSV41 SWA bounded replay recomputes the tail of a hit loaded without
@@ -4908,129 +4840,6 @@ class Scheduler(SchedulerInterface):
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
-
-    def _settle_joined_loads(
-        self, kv_connector_output: KVConnectorOutput
-    ) -> tuple[KVConnectorOutput, set[str]]:
-        """Take the reports of joined loads (join_load_in_step) out of
-        ``kv_connector_output`` before anything else reads it.
-
-        A failed load (reported by its first step's output at the latest; a
-        worker that gives up waiting reports it failed while the transfer may
-        still run) was admitted with KV that never arrived: its output is
-        skipped and, under the "recompute" policy, it is preempted (in-flight
-        output dropped) to recompute from scratch, else it fails as any failed
-        load does. Its blocks were never cached, so no other request read them,
-        and they stay parked until the load reports done.
-
-        A done report ends the load: a request still admitted gets its blocks
-        cached (held back so far); a preempted or finished one gets its parked
-        blocks freed (after the steps in flight) and may be admitted again.
-        Returns the filtered output and the ids whose output this step skips.
-        """
-        reported_failed = kv_connector_output.failed_recving or set()
-        reported_done = kv_connector_output.finished_recving or set()
-        failed = reported_failed & self._joined_loads
-        done = reported_done & self._joined_loads
-        if not failed and not done:
-            return kv_connector_output, set()
-        skip: set[str] = set()
-        timestamp = time.monotonic()
-        for req_id in failed:
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                continue
-            skip.add(req_id)
-            if req_id in self._joined_parked or not self.recompute_kv_load_failures:
-                # Already reset by an earlier report, or policy "fail":
-                # update_from_output finishes it with an error.
-                continue
-            if request.status == RequestStatus.RUNNING:
-                self.running.remove(request)
-                self._preempt_request(request, timestamp, drop_stale_output=True)
-            else:
-                # Admitted but not scheduled yet: back to a fresh start.
-                self._free_request_blocks(request)
-                self._inflight_prefills.discard(request)
-                request.num_computed_tokens = 0
-            self._joined_parked.setdefault(req_id, [])
-        for req_id in done:
-            self._joined_loads.discard(req_id)
-            for hash_ in self._joined_hashes.pop(req_id, ()):
-                self._joined_hash_refs[hash_] -= 1
-                if self._joined_hash_refs[hash_] <= 0:
-                    del self._joined_hash_refs[hash_]
-            parked = self._joined_parked.pop(req_id, None)
-            if parked is not None:
-                for blocks in parked:
-                    self._free_parked_blocks(blocks)
-                request = self.requests.get(req_id)
-                if request is not None and request.is_finished():
-                    # Its free waited for this report.
-                    del self.requests[req_id]
-                continue
-            request = self.requests.get(req_id)
-            if (
-                request is not None
-                and req_id not in failed
-                and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING)
-                and request.num_computed_tokens > 0
-            ):
-                self.kv_cache_manager.cache_blocks(
-                    request, min(request.num_computed_tokens, request.num_tokens)
-                )
-        settled = failed | done
-        return (
-            replace(
-                kv_connector_output,
-                finished_recving=(reported_done - settled) or None,
-                failed_recving=reported_failed - settled,
-            ),
-            skip,
-        )
-
-    def _free_parked_blocks(self, blocks: list[KVCacheBlock]) -> None:
-        """Free blocks parked for a joined load that has now reported: after
-        the steps in flight, which may still use them."""
-        if not blocks:
-            return
-        if self.defer_block_free:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
-        else:
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
-
-    def _joined_range_hashes(
-        self, request: Request, start_tokens: int, end_tokens: int
-    ) -> list[BlockHash]:
-        size = self.hash_block_size
-        return list(request.block_hashes[start_tokens // size : end_tokens // size])
-
-    def _track_joined_hashes(
-        self, request: Request, start_tokens: int, end_tokens: int
-    ) -> None:
-        hashes = self._joined_range_hashes(request, start_tokens, end_tokens)
-        self._joined_hashes[request.request_id] = hashes
-        self._joined_hash_refs.update(hashes)
-        self.joined_load_stats["joined"] += 1
-
-    def _count_joined_dup_read(
-        self, request: Request, start_tokens: int, end_tokens: int
-    ) -> None:
-        """Count a store read of blocks a joined load is loading right now
-        (unhittable until it reports clean, so this request reads them too)."""
-        if not self._joined_hash_refs:
-            return
-        dup = sum(
-            1
-            for hash_ in self._joined_range_hashes(request, start_tokens, end_tokens)
-            if hash_ in self._joined_hash_refs
-        )
-        if dup:
-            stats = self.joined_load_stats
-            stats["dup_reads"] += 1
-            stats["dup_read_blocks"] += dup
-            if stats["dup_reads"] % 100 == 1:
-                logger.info("Same-step joined loads: %s", dict(stats))
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""

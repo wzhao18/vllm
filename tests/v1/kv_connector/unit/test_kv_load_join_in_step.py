@@ -52,7 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     LoadTimeModel,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.sched.scheduler import InflightStepClock
+from vllm.distributed.kv_transfer.kv_connector.v1.joined_loads import InflightStepClock
 from vllm.v1.request import RequestStatus
 
 from .test_mooncake_store_early_load import _blocks, _Channel
@@ -120,7 +120,7 @@ def test_joined_load_computes_in_its_allocation_step():
     )
     assert request.is_finished()
     assert _cached_tokens(scheduler, _request("twin")) >= 3 * BS
-    assert not scheduler._joined_loads
+    assert not scheduler._joined._loading
 
 
 def test_declined_join_parks_the_load_as_before():
@@ -132,7 +132,7 @@ def test_declined_join_parks_the_load_as_before():
 
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert output.num_scheduled_tokens == {}
-    assert not scheduler._joined_loads
+    assert not scheduler._joined._loading
 
 
 def test_no_join_for_a_load_ahead():
@@ -167,7 +167,7 @@ def test_pending_blocks_are_not_hit_by_other_requests_in_the_step():
         ("b", 3 * BS),
     ]
     # Both read the same three blocks from the store: one duplicate read.
-    assert scheduler.joined_load_stats == {
+    assert scheduler._joined.stats == {
         "joined": 2,
         "dup_reads": 1,
         "dup_read_blocks": 3,
@@ -201,7 +201,7 @@ def test_failed_joined_load_drops_output(recompute):
     assert all(o.new_token_ids == [] for o in delivered)
     assert request.num_output_tokens == 0
     assert _cached_tokens(scheduler, _request("twin")) == 0
-    assert not scheduler._joined_loads
+    assert not scheduler._joined._loading
     if not recompute:
         assert request.status == RequestStatus.FINISHED_ERROR
         return
@@ -224,7 +224,7 @@ def test_report_after_the_request_ended_is_ignored():
         output, create_model_runner_output([], finished_recving={"r"})
     )
 
-    assert not scheduler._joined_loads
+    assert not scheduler._joined._loading
 
 
 def _num_free(scheduler) -> int:
@@ -246,13 +246,13 @@ def test_abort_during_joined_load_frees_blocks_only_after_its_report():
     scheduler.finish_requests("r", RequestStatus.FINISHED_ABORTED)
     scheduler.update_from_output(output, create_model_runner_output([]))
     assert _num_free(scheduler) == free_before - held
-    assert "r" in scheduler._joined_parked
+    assert "r" in scheduler._joined._parked
 
     scheduler.update_from_output(
         scheduler.schedule(), create_model_runner_output([], finished_recving={"r"})
     )
     assert _num_free(scheduler) == free_before
-    assert not scheduler._joined_parked and not scheduler._joined_loads
+    assert not scheduler._joined._parked and not scheduler._joined._loading
     assert "r" not in scheduler.requests
 
 
@@ -605,7 +605,7 @@ def test_late_failure_of_a_given_up_load_frees_parked_blocks(recompute):
     scheduler.update_from_output(
         output, create_model_runner_output([request], failed_recving={"r"})
     )
-    assert "r" in scheduler._joined_parked
+    assert "r" in scheduler._joined._parked
     assert _num_free(scheduler) < free_before
 
     output = scheduler.schedule()
@@ -618,7 +618,7 @@ def test_late_failure_of_a_given_up_load_frees_parked_blocks(recompute):
     )
 
     assert _num_free(scheduler) == free_before
-    assert not scheduler._joined_parked and not scheduler._joined_loads
+    assert not scheduler._joined._parked and not scheduler._joined._loading
     if recompute:
         assert request.status == RequestStatus.PREEMPTED
         output = scheduler.schedule()
