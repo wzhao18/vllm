@@ -88,10 +88,25 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     state.prompt_embeds_state = None
     state.num_accepted_tokens_gpu = torch.ones(2, dtype=torch.int32)
     state._mamba_state_idx_gpu = torch.zeros(2, dtype=torch.int32)
+    state._snapshot_start = np.full(2, -1, dtype=np.int64)
 
     state.add_request(1, SimpleNamespace(num_computed_tokens=107_360))
 
     assert state._mamba_state_idx_gpu[1] == 121
+    # The worker holds the new request's whole table: its first chunk may use
+    # the snapshot column.
+    assert state._snapshot_start[1] == 107_360
+
+
+def test_block_table_rewrite_marks_the_chunk_as_a_snapshot_row() -> None:
+    """A running request's snapshot column is fresh only for the chunk the
+    scheduler rewrote it for (SchedulerOutput.block_table_writes)."""
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._snapshot_start = np.full(2, -1, dtype=np.int64)
+    state._snapshot_start[0] = 119_936
+    state.block_table_rewritten(0, 121_856)
+    assert state._snapshot_start.tolist() == [121_856, -1]
 
 
 def test_padded_prompt_tail_builds_as_spec_decode(

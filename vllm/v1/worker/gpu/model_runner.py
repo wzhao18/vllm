@@ -1478,6 +1478,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        block_table_writes = scheduler_output.block_table_writes or {}
+        for req_id, writes in block_table_writes.items():
+            req_index = self.req_states.req_id_to_index[req_id]
+            for group_id, col, block_id in writes:
+                self.block_tables.write_block_id(req_index, group_id, col, block_id)
+            self.model_state.block_table_rewritten(
+                req_index, int(num_computed_tokens_np[req_index])
+            )
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(

@@ -1808,12 +1808,16 @@ class MambaManager(SingleTypeKVCacheManager):
             self._chunk_starts: dict[str, int] = {}
         # CacheConfig.mamba_internal_snapshot: requests on their first scheduled
         # chunk (set by KVCacheManager.allocate_slots), and the block-table column
-        # of each one's first-chunk snapshot in the current allocation.
+        # of each one's snapshot in the current allocation.
         self.prefill_snapshot = (
             self.has_prefill_checkpoint_blocks and kv_cache_spec.prefill_snapshot
         )
         self._first_chunk_reqs: set[str] = set()
         self._snapshot_cols: dict[str, int] = {}
+        # (request, column, block) of each snapshot block placed for a running
+        # request this step. Its worker block table is append-only, so the
+        # scheduler ships the column (SchedulerOutput.block_table_writes).
+        self._pending_block_table_writes: list[tuple[str, int, int]] = []
         # Request -> (checkpoint block it resumed from, that block's hash, hit
         # tokens). Demoted once the request registers its own prompt checkpoint
         # past it: the parent's state is then superseded.
@@ -2054,14 +2058,15 @@ class MambaManager(SingleTypeKVCacheManager):
         query_end: int,
         prefill_end: int,
     ) -> int:
-        """First-chunk snapshot column for this allocation, or -1.
+        """Snapshot column for this allocation, or -1.
 
         Mirrors the worker's ``compute_mamba_prefill_checkpoints`` rule for a
-        first-chunk row. The column sits below the initial-state column, where
+        snapshot row. The column sits below the initial-state column, where
         the request's table holds a null placeholder (local hits and external
-        loads pad the skipped columns with nulls).
+        loads pad the skipped columns with nulls; a running request's columns
+        below its running state are retired to nulls).
         """
-        if not self.prefill_snapshot or request_id not in self._first_chunk_reqs:
+        if not self.prefill_snapshot:
             return -1
         if query_end < prefill_end:
             return -1
@@ -2087,12 +2092,35 @@ class MambaManager(SingleTypeKVCacheManager):
             return col if new_computed_blocks[col - len(blocks)].is_null else -1
         return col
 
+    def snapshot_col_available(
+        self, request_id: str, col: int, processed_computed_tokens: int
+    ) -> bool:
+        """Whether this allocation can place a running request's snapshot block
+        at ``col``: the column is a null placeholder, or the retirement that
+        runs first (``remove_skipped_blocks`` on the processed-token basis)
+        frees it. Under async scheduling the previous chunk is still in flight,
+        so the column below the new initial state can hold that chunk's initial
+        state, which is not retired yet."""
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks or col >= len(blocks) or blocks[col].is_null:
+            return True
+        num_skipped = self.get_num_skipped_tokens(processed_computed_tokens)
+        return num_skipped > 0 and col < min(
+            num_skipped // self.block_size, len(blocks)
+        )
+
     def _place_snapshot_block(
         self, request_id: str, returned_blocks: list[KVCacheBlock]
     ) -> list[KVCacheBlock]:
-        """Put a fresh block at the first-chunk snapshot column. If the column
-        is not a null placeholder, decline: the worker reads null there and
-        skips the export, and no checkpoint is registered."""
+        """Put a fresh block at the snapshot column. If the column is not a
+        null placeholder, decline: no checkpoint is registered, and the worker
+        skips the export (a first chunk reads null there; a running request's
+        column is not rewritten, so its row is no snapshot row).
+
+        A first chunk's worker receives the whole block table. A running
+        request's worker table is append-only and may hold a stale id in this
+        column, so the block goes to the worker as a block-table write instead
+        of a new block."""
         col = self._snapshot_cols.get(request_id)
         if col is None:
             return returned_blocks
@@ -2103,7 +2131,12 @@ class MambaManager(SingleTypeKVCacheManager):
             # Retire it with the other columns below the running state.
             if self._num_retired_blocks.get(request_id, 0) > col:
                 self._num_retired_blocks[request_id] = col
-            return [*returned_blocks, block]
+            if request_id in self._first_chunk_reqs:
+                return [*returned_blocks, block]
+            self._pending_block_table_writes.append(
+                (request_id, col, block.block_id)
+            )
+            return returned_blocks
         del self._snapshot_cols[request_id]
         self._checkpoints.pop(request_id, None)
         return returned_blocks
@@ -2505,7 +2538,20 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            # A request freed in the step that placed its snapshot (preempted)
+            # is re-added with its whole table: its column write is void.
+            self._pending_block_table_writes = [
+                entry
+                for entry in self._pending_block_table_writes
+                if entry[0] != request_id
+            ]
         return super().pop_blocks_for_free(request_id)
+
+    def take_pending_block_table_writes(self) -> list[tuple[str, int, int]]:
+        """Drain this step's ``(request_id, column, block_id)`` writes."""
+        writes = self._pending_block_table_writes
+        self._pending_block_table_writes = []
+        return writes
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only

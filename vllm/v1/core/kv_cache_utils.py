@@ -186,6 +186,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # BlockFreeClock epoch of the block's last return to its pool (-1: never
+    # returned, or returned by a fenced free). See block_pool.BlockFreeClock.
+    free_epoch: int = field(default=-1, repr=False, compare=False)
+
     def set_block_hash(
         self,
         block_hash: BlockHashWithGroupId,

@@ -119,6 +119,32 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# DP lockstep step cap: floor when the model has no CUDA-graph capture sizes,
+# and the granularity the cap is rounded up to.
+DP_STEP_TOKEN_FLOOR = 2048
+DP_STEP_TOKEN_ALIGN = 128
+
+
+def dp_step_token_cap(
+    total_demand: int, dp_size: int, max_tokens: int, floor: int
+) -> int | None:
+    """Token budget of a DP rank's next lockstep steps (None = uncapped).
+
+    The steps of an EP group's DP ranks run in lockstep and cost the busiest
+    rank's chunk, while a request's admission and each of its chunks wait for
+    whole steps. The cap is the group's outstanding prompt tokens per rank
+    (rounded up), so the group finishes that work in short steps instead of
+    one rank's full-budget chunk holding every rank; at saturation it reaches
+    the configured budget (no cap). It never goes below ``floor`` (the largest
+    CUDA-graph batch), where shorter steps stop paying off.
+    """
+    floor = min(floor, max_tokens)
+    mean = -(-total_demand // max(dp_size, 1))
+    cap = -(-mean // DP_STEP_TOKEN_ALIGN) * DP_STEP_TOKEN_ALIGN
+    if cap >= max_tokens:
+        return None
+    return max(cap, floor)
+
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -2498,6 +2524,13 @@ class DPEngineCoreProc(EngineCoreProc):
             and not vllm_config.parallel_config.enable_elastic_ep
         )
         self._dp_prefill_exchanged = False
+        # DP lockstep step cap floor: the largest captured CUDA-graph batch
+        # (steps up to it replay a graph), never above the token budget.
+        self._dp_step_token_floor = min(
+            vllm_config.compilation_config.max_cudagraph_capture_size
+            or DP_STEP_TOKEN_FLOOR,
+            scheduler_config.max_num_batched_tokens,
+        )
         if (
             scheduler_config.long_prefill_token_threshold > 0
             and not self.dp_prefill_pull_up
@@ -2751,29 +2784,46 @@ class DPEngineCoreProc(EngineCoreProc):
         if not self._dp_prefill_exchanged:
             # No schedule() this step (no local requests): take part with 0
             # tokens, before this rank's dummy forward.
-            self._exchange_dp_prefill_tokens(0)
+            self._exchange_dp_prefill_tokens(0, self.scheduler.dp_prefill_demand({}))
         return executed
 
-    def _exchange_dp_prefill_tokens(self, num_tokens: int) -> int:
-        """All-reduce this step's scheduled token count over the engine DP group;
-        returns the largest count of any DP rank (DP prefill pull-up)."""
+    def _exchange_dp_prefill_tokens(self, num_tokens: int, demand: int = 0) -> int:
+        """All-reduce this step's scheduled token count and the prompt tokens
+        still to compute over the engine DP group; returns the largest count of
+        any DP rank (DP prefill pull-up) and sets the DP lockstep step cap of
+        the next steps from the group's outstanding prefill work."""
         self._dp_prefill_exchanged = True
         size = self.dp_group.size()
-        counts = torch.zeros(size + 1, dtype=torch.int64)
+        counts = torch.zeros(2 * size + 1, dtype=torch.int64)
         counts[self.dp_group.rank()] = num_tokens
+        counts[size + self.dp_group.rank()] = demand
         # Every rank adds 1: a collective paired with a different one on some
         # rank shows up here instead of returning a wrong count.
-        counts[size] = 1
+        counts[2 * size] = 1
         cpu_all_reduce_(
             counts,
             self.dp_group,
             timeout=self.vllm_config.parallel_config.cpu_distributed_timeout,
         )
-        if int(counts[size]) != size:
+        if int(counts[2 * size]) != size:
             raise RuntimeError(
                 "DP prefill pull-up exchange is out of step across DP ranks "
-                f"({int(counts[size])} of {size} ranks)."
+                f"({int(counts[2 * size])} of {size} ranks)."
             )
+        self.scheduler.set_dp_step_token_cap(
+            dp_step_token_cap(
+                # A rank runs at most the budget per step, so a long cold
+                # prompt counts as one full step, not all of its tokens.
+                int(
+                    counts[size : 2 * size]
+                    .clamp(max=self.scheduler.max_num_scheduled_tokens)
+                    .sum()
+                ),
+                size,
+                self.scheduler.max_num_scheduled_tokens,
+                self._dp_step_token_floor,
+            )
+        )
         return int(counts[:size].max())
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:

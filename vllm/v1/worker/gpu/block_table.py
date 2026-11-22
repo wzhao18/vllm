@@ -144,6 +144,20 @@ class BlockTables:
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
 
+    def write_block_id(
+        self, req_index: int, group_id: int, col: int, block_id: int
+    ) -> None:
+        """Overwrite one existing entry of a request's block table."""
+        if not 0 <= col < self.num_blocks.np[group_id, req_index]:
+            raise RuntimeError(
+                f"Block table write for request {req_index}, group {group_id} at "
+                f"column {col} is outside its "
+                f"{self.num_blocks.np[group_id, req_index]} blocks"
+            )
+        if self.redirect_writes_to_null_block:
+            block_id = 0
+        self.block_tables[group_id].stage_write(req_index, col, [block_id])
+
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
             return

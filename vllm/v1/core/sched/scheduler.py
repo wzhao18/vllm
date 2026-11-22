@@ -36,7 +36,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.block_pool import SlotBlockPool
+from vllm.v1.core.block_pool import BLOCK_FREE_CLOCK, SlotBlockPool
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -304,7 +304,11 @@ class Scheduler(SchedulerInterface):
         self.running: list[Request] = []
         # DP prefill pull-up: set by the DP engine core before each step (see
         # set_dp_prefill_exchange) and consumed by that step's schedule().
-        self._dp_prefill_exchange: Callable[[int], int] | None = None
+        self._dp_prefill_exchange: Callable[[int, int], int] | None = None
+        # DP lockstep step cap: the token budget of this rank's next steps, set
+        # by the DP engine core from the DP group's outstanding prefill work at
+        # each exchange (see set_dp_step_token_cap). None = no cap.
+        self._dp_step_token_cap: int | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -559,7 +563,7 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
-        # CacheConfig.mamba_internal_snapshot: a request's first chunk may also
+        # CacheConfig.mamba_internal_snapshot: a prefill's last chunk may also
         # export its prompt checkpoint when it crosses at most one mamba block
         # boundary, into a fresh block below its initial state. Every mamba
         # group's backend must declare the snapshot column.
@@ -694,13 +698,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
-        first_chunk: bool = False,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
-
-        ``first_chunk``: the request is scheduled from the waiting queue, so
-        the worker receives its whole block table this step (the only case the
-        first-chunk snapshot may serve, CacheConfig.mamba_internal_snapshot).
 
         In "align" cache mode reusable SSM states are materialized at block
         boundaries, plus mandatory early stops (the prompt's partial-tail hash
@@ -774,22 +773,29 @@ class Scheduler(SchedulerInterface):
         )
         if (
             not use_internal_checkpoint
-            and first_chunk
             and getattr(self, "mamba_internal_snapshot", False)
             and end >= prefill_end
         ):
-            # A small turn: the chunk crosses at most one block boundary, so the
-            # checkpoint goes to the snapshot column below the initial state.
-            use_internal_checkpoint = (
-                get_mamba_prefill_snapshot_col(
-                    query_start=start,
-                    query_end=end,
-                    checkpoint_position=checkpoint_position,
-                    hash_block_size=self.hash_block_size,
-                    mamba_block_size=block_size,
-                    checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
-                )
-                >= 0
+            # The chunk crosses at most one block boundary (a small turn, or the
+            # last chunk of a chunked one), so the checkpoint goes to the
+            # snapshot column below the initial state. A running request's
+            # worker gets that column as a block-table write.
+            snapshot_col = get_mamba_prefill_snapshot_col(
+                query_start=start,
+                query_end=end,
+                checkpoint_position=checkpoint_position,
+                hash_block_size=self.hash_block_size,
+                mamba_block_size=block_size,
+                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+            )
+            # The KV cache manager must be able to place the block, or the chunk
+            # would run past the checkpoint without caching it (async
+            # scheduling: the column can still hold the in-flight chunk's
+            # initial state). Then stop at the checkpoint as before.
+            kv_cache_manager = getattr(self, "kv_cache_manager", None)
+            use_internal_checkpoint = snapshot_col >= 0 and (
+                kv_cache_manager is None
+                or kv_cache_manager.mamba_snapshot_col_available(request, snapshot_col)
             )
         if use_internal_checkpoint:
             last_cache_position = 0
@@ -800,12 +806,25 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end:
             max_prefill_tokens = self.max_num_scheduled_tokens
+            # getattr: the split is also called on bare scheduler stand-ins
+            # (unit tests), like the other optional attributes it reads.
+            step_cap = getattr(self, "_dp_step_token_cap", None)
+            if step_cap is not None:
+                max_prefill_tokens = min(max_prefill_tokens, step_cap)
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
+            elif self.mamba_partial_cache_hit:
+                # A sub-block end, e.g. a budget cut: keep it on the hash grid,
+                # so that the next chunk, starting there, can export the prompt
+                # checkpoint internally (`is_mamba_prefill_checkpoint_valid` and
+                # the snapshot need a hash-aligned query start).
+                grid_end = end // self.hash_block_size * self.hash_block_size
+                if grid_end > start:
+                    end = grid_end
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
@@ -889,6 +908,9 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # Frees from here until this call returns are "recent" for connector
+        # loads issued during the next call (BlockFreeClock).
+        BLOCK_FREE_CLOCK.tick()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -908,6 +930,8 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        if self._dp_step_token_cap is not None:
+            token_budget = min(token_budget, self._dp_step_token_cap)
         # DSA-DP: each owner card of the TP group gets an equal share of the step's
         # tokens, so the cards' DSA work (owned rows only) stays balanced.
         owner_left = self._dsa_owner_budgets(token_budget)
@@ -1692,13 +1716,6 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
-                            # Only the snapshot reads it; flag off, the call is
-                            # unchanged.
-                            **(
-                                {"first_chunk": True}
-                                if self.mamba_internal_snapshot
-                                else {}
-                            ),
                         )
                         if num_new_tokens == 0:
                             break
@@ -1787,7 +1804,7 @@ class Scheduler(SchedulerInterface):
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
                     reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
+                        self._inflight_prefill_reserved_blocks(exclude=request)
                         + self._spec_decode_step_blocks
                     )
 
@@ -2095,6 +2112,14 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        block_table_writes = self.kv_cache_manager.take_block_table_writes()
+        # Only a running request places its snapshot as a write (a new one gets
+        # it in its whole table), and a request preempted later in the step had
+        # its write dropped with its blocks.
+        assert all(
+            req_id in num_scheduled_tokens and req_id in cached_reqs_data.req_ids
+            for req_id in block_table_writes
+        ), block_table_writes
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -2133,6 +2158,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            block_table_writes=block_table_writes or None,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
@@ -2176,6 +2202,9 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if total_num_scheduled_tokens > 0:
+            # This step may now be in flight: later frees are recent.
+            BLOCK_FREE_CLOCK.step_built()
         return scheduler_output
 
     def _trim_new_reqs_for_workers(
@@ -3370,7 +3399,48 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
 
-    def set_dp_prefill_exchange(self, exchange: Callable[[int], int] | None) -> None:
+    def set_dp_step_token_cap(self, cap: int | None) -> None:
+        """Token budget of the next steps (DP lockstep step cap), None for none.
+
+        Every DP rank of an EP group waits in each MoE layer for the rank with
+        the most tokens, so a lockstep step costs the busiest rank's chunk, and
+        every request's admission (prefix lookup, connector load, its report)
+        and each of its prefill chunks waits for whole steps. While the DP
+        group's outstanding prefill work is small, steps capped near its mean
+        per rank finish the same work in shorter steps; the DP engine core sets
+        the cap from that work at each exchange (it reaches the configured
+        budget once the group is saturated).
+        """
+        self._dp_step_token_cap = cap
+
+    def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
+        """Prompt tokens this rank can compute after this step's schedule:
+        running prefills plus waiting requests whose prefix hit is known and
+        in place (resumed, or loaded by a KV connector). Requests whose prefix
+        lookup or connector load is still in flight count once it completes:
+        until then no step can run them."""
+        demand = 0
+        for request in self.running:
+            left = request.num_prompt_tokens - request.num_computed_tokens
+            if left > 0:
+                demand += max(left - num_scheduled_tokens.get(request.request_id, 0), 0)
+        for queue in (self.kv_holding_waiting, self.waiting):
+            for request in queue:
+                if request.num_computed_tokens > 0 and (
+                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or request.request_id in self.finished_recving_kv_req_ids
+                ):
+                    demand += max(
+                        request.num_prompt_tokens
+                        - request.num_computed_tokens
+                        - num_scheduled_tokens.get(request.request_id, 0),
+                        0,
+                    )
+        return demand
+
+    def set_dp_prefill_exchange(
+        self, exchange: Callable[[int, int], int] | None
+    ) -> None:
         """DP prefill pull-up for the next schedule() only.
 
         Every DP rank of an EP group waits in each MoE layer for the rank with the
@@ -3454,14 +3524,18 @@ class Scheduler(SchedulerInterface):
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
-            busiest = exchange(int(max(used)))
+            busiest = exchange(int(max(used)), self.dp_prefill_demand(num_scheduled_tokens))
             room_o = [max(busiest - u, 0.0) for u in used]
             extra = 1 << 62
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
         else:
             num_tokens = sum(num_scheduled_tokens.values())
-            extra = max(exchange(num_tokens) - num_tokens, 0)
+            extra = max(
+                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
+                - num_tokens,
+                0,
+            )
         for request_id, (request, num_unclipped) in pull_reqs.items():
             if request_id not in num_scheduled_tokens:
                 # Preempted later in the step (priority policy); its booking was
@@ -3986,7 +4060,12 @@ class Scheduler(SchedulerInterface):
         pool when an in-flight GPU step may still write them.
         """
         if self._request_blocks_can_be_freed(request):
-            self.kv_cache_manager.free(request)
+            if self.defer_block_free:
+                # Its last step has been processed: no GPU user is left.
+                with BLOCK_FREE_CLOCK.fenced():
+                    self.kv_cache_manager.free(request)
+            else:
+                self.kv_cache_manager.free(request)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
@@ -3998,8 +4077,12 @@ class Scheduler(SchedulerInterface):
         """Release CoW copy retentions, deferring their return to the block
         pool while the step that runs the copy may still be in flight.
         """
-        if not self.defer_block_free or fence_seq <= self.processed_step_seq:
+        if not self.defer_block_free:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
+            return
+        if fence_seq <= self.processed_step_seq:
+            with BLOCK_FREE_CLOCK.fenced():
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
@@ -4016,7 +4099,8 @@ class Scheduler(SchedulerInterface):
                 break
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            with BLOCK_FREE_CLOCK.fenced():
+                self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     def _drain_deferred_loads(self) -> None:
         """Start deferred async loads whose fence step has completed."""
@@ -4347,16 +4431,20 @@ class Scheduler(SchedulerInterface):
         regions = coordinator.dsa_regions
         owner = getattr(request, "dsa_owner", 0)
         need = 0
-        for req in itertools.chain((request,), self._inflight_prefills):
+        others = (req for req in self._inflight_prefills if req is not request)
+        for req in itertools.chain((request,), others):
             if req is request or getattr(req, "dsa_owner", 0) == owner:
                 self._request_remaining_blocks(req)
                 need += coordinator.last_num_region_blocks
         return need <= regions.get_num_free_blocks_of(owner)
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(self, exclude: Request | None = None) -> int:
+        """Num blocks in-flight prefills other than ``exclude`` still need to
+        finish (their reservation)."""
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if req is not exclude
         )
 
     def _load_restores_replay_window(self, request: Request) -> bool:
@@ -4417,6 +4505,11 @@ class Scheduler(SchedulerInterface):
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
+                # It holds nothing now, so it no longer reserves the blocks of
+                # an in-flight prefill: kept in the set, its full sequence would
+                # be reserved against every later async load, its own retry
+                # included, and they could never be admitted.
+                self._inflight_prefills.discard(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:

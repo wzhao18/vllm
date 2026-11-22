@@ -146,7 +146,6 @@ def _split(
     extra_tail_tokens: int = 0,
     extra_tail_min_span: int = 0,
     snapshot: bool = False,
-    first_chunk: bool = False,
     cache_block_size: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
@@ -182,9 +181,7 @@ def _split(
         ),
         mamba_internal_snapshot=snapshot,
     )
-    return Scheduler._mamba_block_aligned_split(
-        stub, request, num_new_tokens, first_chunk=first_chunk
-    )
+    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 @pytest.mark.parametrize(
@@ -581,8 +578,9 @@ def test_extra_tail_checkpoint_state_is_retained_and_exact(
         # Inside one block (the initial state's): the snapshot sits one below.
         (1984, 2600, 2560, 0),
         (3584, 4400, 4352, 1),
-        # Crossing one boundary: the regular column would alias the initial one.
-        (1984, 3602, 3584, 0),
+        # A mid-block start crossing one boundary: the regular column (the
+        # resumed block's) applies instead.
+        (1984, 3602, 3584, -1),
         # Block-aligned start, crossing one boundary.
         (3200, 4700, 4672, 0),
         # Crossing two boundaries: the regular internal checkpoint applies.
@@ -626,12 +624,12 @@ def test_mamba_prefill_snapshot_col(
 @pytest.mark.parametrize("resume_at", [1984, 2400, 3200, 4000])
 @pytest.mark.parametrize("new_tokens", [300, 900, 1500])
 @pytest.mark.parametrize("use_eagle", [False, True])
-def test_first_chunk_snapshot_runs_a_small_turn_in_one_step(
+def test_snapshot_runs_a_small_turn_in_one_step(
     resume_at: int, new_tokens: int, use_eagle: bool
 ) -> None:
-    """With the snapshot, a small turn's first chunk covers the whole remainder;
-    a running request (not its first chunk) and the flag off keep today's
-    split."""
+    """With the snapshot, a chunk reaching the prompt end covers the whole
+    remainder (a first chunk, or a running request's last chunk: the manager
+    rewrites its worker column); the flag off keeps today's split."""
     prompt_len = resume_at + new_tokens
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
     request.num_computed_tokens = resume_at
@@ -639,9 +637,7 @@ def test_first_chunk_snapshot_runs_a_small_turn_in_one_step(
         use_eagle=use_eagle, partial_hit=True, num_prefill_checkpoint_blocks=1
     )
     base = _split(request, new_tokens, **kwargs)
-    assert _split(request, new_tokens, snapshot=True, **kwargs) == base
-    assert _split(request, new_tokens, first_chunk=True, **kwargs) == base
-    snap = _split(request, new_tokens, snapshot=True, first_chunk=True, **kwargs)
+    snap = _split(request, new_tokens, snapshot=True, **kwargs)
     checkpoint = (prompt_len if use_eagle else prompt_len - 1) // 16 * 16 - (
         16 if use_eagle else 0
     )
