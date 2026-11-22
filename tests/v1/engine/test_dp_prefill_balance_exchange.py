@@ -38,6 +38,17 @@ class _Sched:
         return 0
 
 
+class _XLog:
+    """Records the per-iteration log's exchange (X) calls."""
+
+    def __init__(self):
+        self.xs = []
+
+    def dp_exchange(self, t0, t1, num_tokens, demand, max_tokens, in_sched):
+        assert t0 <= t1
+        self.xs.append((num_tokens, demand, max_tokens, in_sched))
+
+
 def _fake_core(pg, sched, engines_running=True, pull_up=True):
     core = SimpleNamespace(
         dp_group=pg,
@@ -49,9 +60,12 @@ def _fake_core(pg, sched, engines_running=True, pull_up=True):
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(cpu_distributed_timeout=None)
         ),
+        iterlog=_XLog(),
     )
     core._exchange_dp_prefill_tokens = (
-        lambda n, d=0: DPEngineCoreProc._exchange_dp_prefill_tokens(core, n, d)
+        lambda n, d=0, in_sched=True: DPEngineCoreProc._exchange_dp_prefill_tokens(
+            core, n, d, in_sched
+        )
     )
 
     def step():
@@ -146,6 +160,11 @@ def _cap_worker(rank, world_size, port, out):
     # A long cold prompt on one rank counts as one full step (the budget):
     # 16384 (clipped from 10**6) + 0 + 0 + 0 -> 4096 per rank.
     DPEngineCoreProc._exchange_dp_prefill_tokens(core, 0, 10**6 if rank == 0 else 0)
+    # The log sees each exchange once, with the group's max token count.
+    assert core.iterlog.xs == [
+        (100 * rank, 4096 * rank, got, True),
+        (0, 10**6 if rank == 0 else 0, 0, True),
+    ]
     out[rank] = (got, sched.caps)
 
 

@@ -103,4 +103,7 @@ def test_scheduler_reports_async_load_stages():
     )
     out = scheduler.schedule()
     assert "r" in out.num_scheduled_tokens
-    assert seen == [("r", "in_progress"), ("r", "completed_waiting"), ("r", None)]
+    stages = [stage for rid, stage in seen if rid == "r"]
+    # Queued for a remote prefill on arrival (the mock connector's params), then
+    # issued, completed, and admitted to compute.
+    assert stages == ["waiting_to_start", "in_progress", "completed_waiting", None]
