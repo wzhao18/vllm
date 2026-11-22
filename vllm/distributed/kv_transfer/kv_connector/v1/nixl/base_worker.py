@@ -318,9 +318,10 @@ class NixlBaseConnectorWorker:
     # register caches (and the zeroing bookkeeping behind it) inert.
     _page_zeroer: PageZeroer | None = None
 
-    # Pull cap / disconnect retry (set from the KV transfer config in __init__).
-    # The class defaults keep workers built without __init__ (unit tests) on the
-    # uncapped, no-retry path; the retry bookkeeping is touched only with retry on.
+    # Pull cap (from the KV transfer config) and disconnect retry (always on in
+    # pull mode), both set in __init__. The class defaults keep workers built
+    # without __init__ (unit tests) on the uncapped, no-retry path; the retry
+    # bookkeeping is touched only with retry on.
     _pull_max_blocks_per_xfer: int = 0
     _pull_retry_disconnect: bool = False
     _pull_retry_window_s: float = 10.0
@@ -1109,20 +1110,15 @@ class NixlBaseConnectorWorker:
             )
         )
         # Pull mode: re-post a request's reads once after its peer reported a
-        # remote disconnect (re-handshaking first), instead of failing it. Reads
-        # then defer their P-side notification until the request completes, so P
-        # keeps its blocks (under the lease) until the retry is done.
-        self._pull_retry_disconnect: bool = bool(
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "pull_retry_remote_disconnect", False
-            )
-        )
-        # A pending retry that cannot re-post within this window fails as before.
-        self._pull_retry_window_s: float = float(
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "pull_retry_window_s", 10.0
-            )
-        )
+        # remote disconnect (re-handshaking first), instead of failing it and
+        # recomputing the whole prompt on this instance. Reads then defer their
+        # P-side notification until the request completes, so P keeps its blocks
+        # (pinned by the posted reads, see _handle_lease_pins) until the retry
+        # is done; the lease check still gates any read that ends late.
+        self._pull_retry_disconnect: bool = self._TRANSFER_MODE == "pull"
+        # A pending retry that cannot re-post within half the KV lease fails as
+        # before (recompute or abort per kv_load_failure_policy).
+        self._pull_retry_window_s: float = kv_lease_duration / 2
         # Decoder opt-in: pull at DCP interleave 1 from peers with half this
         # DCP size, partner ranks swapping half-blocks after the reads. Kept
         # raw so that a truthy non-boolean fails the startup checks.

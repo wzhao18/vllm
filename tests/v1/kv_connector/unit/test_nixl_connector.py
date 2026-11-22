@@ -3938,9 +3938,6 @@ class TestPullRetryAndChunking:
             for c in self.transport.make_prepped_xfer.call_args_list
         ]
 
-    @pytest.mark.parametrize(
-        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
-    )
     @pytest.mark.parametrize("where", ["status", "post"])
     def test_disconnect_is_retried_once_and_succeeds(self, where):
         if where == "post":
@@ -3978,9 +3975,6 @@ class TestPullRetryAndChunking:
         assert not self.worker._pull_retry_attempted
         assert not self.worker._pending_recv_notifs
 
-    @pytest.mark.parametrize(
-        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
-    )
     def test_second_disconnect_fails_without_notifying(self):
         self.transport.transfer.side_effect = _remote_disconnect()
         self.worker.start_load_kv(self._request())
@@ -3997,12 +3991,8 @@ class TestPullRetryAndChunking:
         assert not self.worker._pull_retry_pending
         assert not self.worker._pull_retry_attempted
 
-    @pytest.mark.parametrize(
-        "extra",
-        [{"pull_retry_remote_disconnect": True, "pull_retry_window_s": 0}],
-        indirect=True,
-    )
     def test_retry_gives_up_while_peer_cannot_be_released(self):
+        self.worker._pull_retry_window_s = 0
         # Another read keeps the invalid peer's descriptors alive.
         self.worker._recving_metadata.update(self._request(req_id="slow").reqs_to_recv)
         self.worker._recving_transfers["slow"] = [11]
@@ -4019,9 +4009,6 @@ class TestPullRetryAndChunking:
         assert result.finished_recving == result.failed_recving == {"old-req"}
         self.transport.remove_remote_agent.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
-    )
     def test_request_arriving_at_invalid_peer_is_parked_then_read(self):
         self.worker._recving_metadata.update(self._request(req_id="slow").reqs_to_recv)
         self.worker._recving_transfers["slow"] = [11]
@@ -4053,14 +4040,64 @@ class TestPullRetryAndChunking:
         assert result.finished_recving == {"old-req", "late"}
         assert not result.failed_recving
 
-    def test_retry_disabled_by_default(self):
+    def test_retry_is_always_on_in_pull_mode(self):
+        # No config switch: a pull worker retries and defers its notification.
+        assert self.worker._pull_retry_disconnect
         self.transport.transfer.side_effect = _remote_disconnect()
         self.worker.start_load_kv(self._request())
         result = self.worker.get_transfer_results()
-        assert result.finished_recving == result.failed_recving == {"old-req"}
+        assert not result.finished_recving and not result.failed_recving
+        assert "old-req" in self.worker._pull_retry_pending
+        assert self._xfer_notifs() == [None]
+
+    @pytest.mark.parametrize(
+        ("extra", "window"),
+        [({}, 15.0), ({"kv_lease_duration": 60}, 30.0)],
+        indirect=["extra"],
+    )
+    def test_retry_window_is_half_the_kv_lease(self, window):
+        assert self.worker._pull_retry_window_s == window
+
+    @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
+    def test_qp_dropped_mid_read_is_retried_and_notifies_once(self):
+        """Fault injection: the RC QP under one chunk dies while the read is in
+        flight (the other chunk already landed). The request is not reported,
+        not recomputed, and P is not notified until the re-posted read of the
+        whole request lands; then it is notified exactly once."""
+        self.transport.check_xfer_state.return_value = "PROC"
+        self.worker.start_load_kv(self._request(blocks=(1, 2, 3, 4)))
+        handles = list(self.worker._recving_transfers["old-req"])
+        assert len(handles) == 2 and self._xfer_notifs() == [None, None]
+
+        # Chunk 0 lands; chunk 1's QP is lost mid-read (UCX: retry exceeded ->
+        # endpoint error -> NIXL_ERR_REMOTE_DISCONNECT on the status poll).
+        def state(handle):
+            if handle == handles[1]:
+                raise _remote_disconnect()
+            return "DONE"
+
+        self.transport.check_xfer_state.side_effect = state
+        result = self.worker.get_transfer_results()
+        assert not result.finished_recving and not result.failed_recving
+        assert "old-req" in self.worker._pull_retry_pending
+        assert not self.worker._invalid_block_ids.qsize()
+        assert not self._notif_calls()
+        self.transport.remove_remote_agent.assert_called_once_with("old")
+
+        # Re-handshake, then the whole request is re-read.
+        self.transport.check_xfer_state.side_effect = None
+        self.transport.check_xfer_state.return_value = "DONE"
+        self.transport.make_prepped_xfer.reset_mock()
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        self.transport.make_prepped_xfer.assert_not_called()
+        self._connect("old")
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        assert self.transport.make_prepped_xfer.call_count == 2
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"old-req"} and not result.failed_recving
+        assert self._notif_calls() == [b"old-prefill:1"]
         assert not self.worker._pull_retry_pending
-        # Unchanged single read: the notification rides on the transfer.
-        assert self._xfer_notifs() == [b"old-prefill:1"]
+        assert not self.worker._pending_recv_notifs
 
     @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
     def test_large_read_is_split_and_notifies_once(self):
