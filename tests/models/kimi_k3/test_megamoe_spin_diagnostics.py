@@ -124,3 +124,15 @@ def test_host_stamp_skips_capture():
     assert src.index("is_current_stream_capturing") < src.index("copy_(")
     launch = inspect.getsource(S.RubinMegaMoeSession.launch)
     assert launch.index("_stamp_issued()") < launch.index("self.compiled[")
+
+
+def test_one_printer_per_rank_and_site():
+    """Trap lines from every spinning CTA flooded the printf FIFO and dropped the MISSING lines of one rank
+    (injected-hang check, 2026-11-22): every dedup guard elects one printer through the per-rank flag word."""
+    src = (PKG / "src_gp/sources/communication/nvlink_domain/token_comm_dedup.py").read_text()
+    sites = re.findall(r"spin_guard(?:_value|_ranks)?\(\s*spin_start_ns, (2\d),", src)
+    assert sorted(set(sites)) == [str(s) for s in range(20, 28)]
+    calls = re.findall(r"spin_guard(?:_value|_ranks)?\(\s*spin_start_ns, 2\d,", src)
+    assert len(calls) == src.count("print_flag=") == 8
+    guard = (PKG / "src_gp/common/spin_guard.py").read_text()
+    assert guard.count("if _elect_printer(site, print_flag):") == 3

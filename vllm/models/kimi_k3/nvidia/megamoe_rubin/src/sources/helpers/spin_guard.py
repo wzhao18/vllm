@@ -45,33 +45,62 @@ def _trap(*, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [], "trap;", "", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def _atom_or_b32(address, value: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(), [address.toint(loc=loc, ip=ip).ir_value(), value.ir_value()], "atom.global.or.b32 $0, [$1], $2;",
+            "=r,l,r", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
+        )
+    )
+
+
 @cute.jit
-def spin_guard(start_ns: cutlass.Uint64, site: int, word, target: Int32) -> None:
+def _elect_printer(site: int, print_flag) -> cutlass.Boolean:
+    """One printer per rank and site (the primary fix against trap-line floods; a larger printf FIFO is only
+    the backstop). With ``print_flag`` (an Int32 workspace word, never reset: a trap ends the context) the
+    first timed-out thread that sets the site's bit prints; every other spinner traps silently. Without one
+    (generic helpers that do not see the workspace), only lane 0 of CTA 0 prints."""
+    elected = cutlass.Boolean(False)
+    if cutlass.const_expr(print_flag is None):
+        bidx, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        elected = (bidx == Int32(0)) & ((tidx % Int32(32)) == Int32(0))
+    else:
+        bit = Int32(1) << Int32(site % 32)
+        elected = (_atom_or_b32(print_flag, bit) & bit) == Int32(0)
+    return elected
+
+
+@cute.jit
+def spin_guard(start_ns: cutlass.Uint64, site: int, word, target: Int32, print_flag=None) -> None:
     """Trap with a diagnostic once a spin on the Int32 ``word`` (a pointer) that started
     at ``start_ns`` exceeds ``SPIN_GUARD_NS``; ``site`` is a constant id of the wait."""
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
-        cute.printf(
-            "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
-            Int32(site),
-            cute.arch.load(word, Int32, sem="relaxed", scope="sys"),
-            Int32(target),
-            _smid(),
-        )
+        if _elect_printer(site, print_flag):
+            cute.printf(
+                "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
+                Int32(site),
+                cute.arch.load(word, Int32, sem="relaxed", scope="sys"),
+                Int32(target),
+                _smid(),
+            )
         _trap()
 
 
 @cute.jit
-def spin_guard_value(start_ns: cutlass.Uint64, site: int, observed: Int32, target: Int32) -> None:
+def spin_guard_value(start_ns: cutlass.Uint64, site: int, observed: Int32, target: Int32, print_flag=None) -> None:
     """``spin_guard`` for waits whose condition is not one Int32 word (flag sets, 64-bit tokens, polled
     planes): the caller passes the observed and target values it compares (or a count of what is missing)."""
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
-        cute.printf(
-            "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
-            Int32(site),
-            Int32(observed),
-            Int32(target),
-            _smid(),
-        )
+        if _elect_printer(site, print_flag):
+            cute.printf(
+                "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
+                Int32(site),
+                Int32(observed),
+                Int32(target),
+                _smid(),
+            )
         _trap()
 
 
@@ -114,35 +143,37 @@ def spin_guard_ranks(
     peer_rank_ptr_mapper,
     world_size: cutlass.Constexpr[int],
     expected: Int32,
+    print_flag=None,
 ) -> None:
     """``spin_guard`` for a wait on one arrival per rank: on timeout, besides the count, print one line per
     rank whose bit is missing in ``arrived_mask`` (Int32 pointer, local) with its progress words read
     remotely (``progress``: this rank's local [issued, entered] pointer; the peer mapper gives the peer's)."""
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
-        mask = cute.arch.load(arrived_mask, Int32, sem="relaxed", scope="sys")
-        cute.printf(
-            "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} arrived_mask={} expected_call={} smid={}",
-            Int32(site), cute.arch.load(word, Int32, sem="relaxed", scope="sys"), Int32(target), mask,
-            Int32(expected), _smid(),
-        )
-        base = progress.toint()
-        for rank in cutlass.range_constexpr(world_size):
-            if ((mask >> Int32(rank)) & Int32(1)) == Int32(0):
-                issued = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(0)))
-                entered = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(4)))
-                if issued < expected:
-                    cute.printf(
-                        "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=H1_host_never_issued",
-                        Int32(site), Int32(rank), issued, entered, Int32(expected),
-                    )
-                elif entered < expected:
-                    cute.printf(
-                        "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=H2_gpu_stuck_before_call",
-                        Int32(site), Int32(rank), issued, entered, Int32(expected),
-                    )
-                else:
-                    cute.printf(
-                        "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=IN_call_not_published",
-                        Int32(site), Int32(rank), issued, entered, Int32(expected),
-                    )
+        if _elect_printer(site, print_flag):
+            mask = cute.arch.load(arrived_mask, Int32, sem="relaxed", scope="sys")
+            cute.printf(
+                "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} arrived_mask={} expected_call={} smid={}",
+                Int32(site), cute.arch.load(word, Int32, sem="relaxed", scope="sys"), Int32(target), mask,
+                Int32(expected), _smid(),
+            )
+            base = progress.toint()
+            for rank in cutlass.range_constexpr(world_size):
+                if ((mask >> Int32(rank)) & Int32(1)) == Int32(0):
+                    issued = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(0)))
+                    entered = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(4)))
+                    if issued < expected:
+                        cute.printf(
+                            "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=H1_host_never_issued",
+                            Int32(site), Int32(rank), issued, entered, Int32(expected),
+                        )
+                    elif entered < expected:
+                        cute.printf(
+                            "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=H2_gpu_stuck_before_call",
+                            Int32(site), Int32(rank), issued, entered, Int32(expected),
+                        )
+                    else:
+                        cute.printf(
+                            "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=IN_call_not_published",
+                            Int32(site), Int32(rank), issued, entered, Int32(expected),
+                        )
         _trap()

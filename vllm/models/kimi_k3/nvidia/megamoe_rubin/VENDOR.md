@@ -200,6 +200,12 @@ scan; the backend's own modules stay covered.
   IN = entered but not published. ``spin_guard.py`` stays identical in ``src`` and ``src_gp``.
   (c) The dedup reduce (``TopkReduceDedup``) is a plain launch with no poll, so the next call's router always reads
   the epoch after its own previous main kernel completed: no stale-epoch window (F3 needs no change on this path).
+  (d) One printer per rank and guard site (PRIMARY fix for lost trap lines): ``spin_guard._elect_printer``. On the
+  dedup path the first timed-out thread that sets the site's bit in the per-rank ``guard_printed`` word (local,
+  never reset: a trap ends the context) prints the header and the MISSING lines; every other spinner traps
+  silently. Generic helpers without a workspace pointer print from lane 0 of CTA 0 only. Before this, every
+  waiting CTA printed (~180 lines per rank) and the injected-hang check lost one peer's MISSING lines. Backstop
+  only: ``runtime._raise_printf_fifo`` raises the device printf FIFO to 8 MB at RubinMegaMoE construction.
 
 ## sha256 manifest of `src/sources`
 
@@ -222,7 +228,7 @@ c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3  sources/helper
 215675b7f0def6526bb3c75b385cf12ccf0a5a35e8816c68bffbda03eaeabd9c  sources/helpers/ptx_helpers.py
 91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c  sources/helpers/smem_workspace.py
 fc131f9575b733b1f0a79a2f63d5221f810d64b4f05c2c34b47bf33842559a4f  sources/helpers/software_sync.py
-aa8cc617627b60b988d41bde8712a56a2f5c891c13b69fe307e3122149e64332  sources/helpers/spin_guard.py
+000c15c6aafe2af3147ea35fc495cc188e2ceeb1f362a32e31a7f5fb10f1a48c  sources/helpers/spin_guard.py
 39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22  sources/helpers/utils.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/__init__.py
 81689f9850af024d9ec22416d4c2a1535d73946d455b7e22042d321534918642  sources/kernel_src/function_mapping.py
