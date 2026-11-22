@@ -100,6 +100,9 @@ def _core(pg, sched, local_size):
     core._dp_moved_to = {}
     core._dp_abort_forward = {}
     core._dp_move_stats = [0, 0, 0, 0]
+    core._dp_foreign = {}
+    core._dp_out_forward = {}
+    core._dp_out_counts = []
     core.iterlog = None
     core.mm_receiver_cache = None
     core.request_block_hasher = None
@@ -209,3 +212,78 @@ def test_balanced_group_moves_nothing():
         p.join(timeout=60)
         assert p.exitcode == 0
     assert got == {0: ([], ["r0"]), 1: ([], ["r1"])}
+
+
+def _cross_worker(rank, world_size, port, out):
+    import queue
+
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+
+    pg = stateless_init_torch_distributed_process_group(
+        "127.0.0.1", port, rank, world_size, backend="gloo"
+    )
+    # Two "nodes" of two ranks. Node 0 is busy on both ranks: the queued
+    # 20000-token prompt on rank 0 cannot go to rank 1, only to node 1.
+    if rank == 0:
+        sched = _Sched(16000, [_request("x", 20000)])
+    else:
+        sched = _Sched(30000 if rank == 1 else 0)
+    core = _core(pg, sched, 2)
+    core.output_queue = queue.Queue()
+    core.engine_index = rank
+    DPEngineCoreProc._process_engine_step_dp(core)
+    planned = [(m.src, m.dst) for m in core._dp_moves]
+    DPEngineCoreProc._process_engine_step_dp(core)
+    foreign = dict(core._dp_foreign)
+    if "x" in sched.requests:
+        # This rank computes it: its finished output is diverted to the home rank.
+        sched.requests.pop("x")
+        outputs = {
+            0: EngineCoreOutputs(
+                engine_index=rank,
+                outputs=[
+                    EngineCoreOutput(
+                        request_id="x",
+                        new_token_ids=[7],
+                        finish_reason=FinishReason.LENGTH,
+                        kv_transfer_params={"remote_engine_id": f"e{rank}"},
+                    )
+                ],
+            )
+        }
+        DPEngineCoreProc._dp_divert_foreign_outputs(core, outputs)
+        assert outputs[0].outputs == []
+    DPEngineCoreProc._process_engine_step_dp(core)
+    DPEngineCoreProc._process_engine_step_dp(core)
+    emitted = []
+    while not core.output_queue.empty():
+        client_index, eco = core.output_queue.get()
+        emitted.extend(
+            (client_index, eco.engine_index, o.request_id, o.new_token_ids,
+             o.kv_transfer_params)
+            for o in eco.outputs
+        )
+    out.put((rank, planned, foreign, emitted, dict(core._dp_moved_to),
+             dict(core._dp_foreign)))
+
+
+def test_cross_node_move_forwards_output_to_home_rank():
+    ctx = mp.get_context("spawn")
+    port = get_open_port()
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_cross_worker, args=(r, 4, port, out)) for r in range(4)]
+    for p in procs:
+        p.start()
+    got = dict((x[0], x[1:]) for x in (out.get(timeout=120) for _ in procs))
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    for rank in range(4):
+        assert got[rank][0] == [(0, 2)]
+    # Rank 2 (node 1) took it in as a foreign request.
+    assert got[2][1] == {"x": 0}
+    # The home rank emitted the output to its client as its own engine; nothing
+    # is left in either side's bookkeeping.
+    assert got[0][2] == [(0, 0, "x", [7], {"remote_engine_id": "e2"})]
+    assert got[2][2] == []
+    assert got[0][3] == {} and got[2][4] == {}

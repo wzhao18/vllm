@@ -77,3 +77,19 @@ def test_one_huge_prompt_alone_stays():
 def test_small_gain_stays_home():
     # Moving 1K to save little is not worth a migration.
     assert plan_dp_moves([5000, 4800], [[1000], []], step_budget=16384) == []
+
+
+def test_cross_node_move_needs_the_larger_gain_and_prefers_same_node():
+    node = [0, 0, 1, 1]
+    # Same-node rank 1 idle: the move stays on node 0 even though node 1 is idle too.
+    moves = plan_dp_moves([16000, 0, 0, 0], [[12000], [], [], []], 16384,
+                          node_of=node, cross_min_gain=8192)
+    assert [(m.src, m.dst) for m in moves] == [(0, 1)]
+    # Node 0 full: only a cross-node move helps, and it clears 8192.
+    moves = plan_dp_moves([16000, 30000, 0, 0], [[20000], [], [], []], 16384,
+                          node_of=node, cross_min_gain=8192)
+    assert [(m.src, m.dst) for m in moves] == [(0, 2)]
+    # A cross-node gain below the bar (4000 < 8192) stays home.
+    moves = plan_dp_moves([1000, 30000, 0, 0], [[4000], [], [], []], 16384,
+                          node_of=node, cross_min_gain=8192)
+    assert moves == []

@@ -32,6 +32,8 @@ def plan_dp_moves(
     step_budget: int,
     max_moves_per_rank: int = 2,
     min_gain: int = 2048,
+    node_of: list[int] | None = None,
+    cross_min_gain: int | None = None,
 ) -> list[DPMove]:
     """Plan cross-rank moves of uncommitted requests.
 
@@ -46,6 +48,10 @@ def plan_dp_moves(
             per plan (bounds per-step migration work).
         min_gain: a move must lower the larger of the two ranks' outstanding
             loads by at least this many tokens.
+        node_of: per rank, its node (client); None = all on one node.
+        cross_min_gain: the gain a move to another node must reach (default
+            min_gain); a cross-node move also wins over the best same-node
+            move only by more than the difference.
 
     Places all movable work by longest-processing-time-first on top of each
     rank's committed demand (largest request to the least-loaded rank), which
@@ -66,18 +72,35 @@ def plan_dp_moves(
     left = [0] * n
     entered = [0] * n
     moves: list[DPMove] = []
+    node = node_of if node_of is not None else [0] * n
+    cross_gain = min_gain if cross_min_gain is None else max(cross_min_gain, min_gain)
+
+    def gain(home: int, dst: int, size: int) -> int:
+        # The larger of the two end loads drops by this much.
+        return max(load[home] + size, load[dst]) - max(load[home], load[dst] + size)
+
     for size, home, index in items:
-        best = min(range(n), key=lambda r: (load[r], r))
-        move_ok = (
-            best != home
-            and left[home] < max_moves_per_rank
-            and entered[best] < max_moves_per_rank
-            # Worth it: the larger of the two end loads drops by at least
-            # min_gain tokens (one CUDA-graph step's worth by default).
-            and max(load[home] + size, load[best])
-            - max(load[home], load[best] + size)
-            >= min_gain
-        )
+        best = None
+        if left[home] < max_moves_per_rank:
+            # The least-loaded rank on the home node, and overall. A move off the
+            # home node must clear cross_min_gain (it costs an output hop back to
+            # the home node's client) and wins only by more than that premium.
+            local = min(
+                (r for r in range(n) if node[r] == node[home]), key=lambda r: (load[r], r)
+            )
+            anywhere = min(range(n), key=lambda r: (load[r], r))
+            score = None
+            for dst in (local, anywhere):
+                if dst == home or entered[dst] >= max_moves_per_rank:
+                    continue
+                cross = node[dst] != node[home]
+                g = gain(home, dst, size)
+                if g < (cross_gain if cross else min_gain):
+                    continue
+                sc = g - (cross_gain - min_gain if cross else 0)
+                if score is None or sc > score:
+                    best, score = dst, sc
+        move_ok = best is not None
         if move_ok:
             load[best] += size
             left[home] += 1

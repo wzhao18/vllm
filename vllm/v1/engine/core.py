@@ -151,6 +151,11 @@ def dp_step_token_cap(
 DP_MOVE_SLOTS = 4
 # Moved request ids a source rank remembers to forward client aborts.
 DP_MOVED_MEMORY = 65536
+# A move to another node's rank (its output goes back to the home node's client
+# over the DP group, one lockstep step later) must lower the larger end load by
+# at least this much (planner units: short-context tokens), and beats the best
+# same-node move only by more than its premium over the same-node bar.
+DP_CROSS_NODE_MIN_GAIN = 8192
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -2530,16 +2535,19 @@ class DPEngineCoreProc(EngineCoreProc):
             and not vllm_config.parallel_config.enable_elastic_ep
         )
         self._dp_prefill_exchanged = False
-        # Cross-rank moves of uncommitted prompts (dp_rebalance.plan_dp_moves),
-        # among the DP ranks served by the same client (one front-end per node
-        # in hybrid/external DP load balancing: an engine's outputs go to its
-        # client, so a request may only move between engines of one client).
+        # Cross-rank moves of uncommitted prompts (dp_rebalance.plan_dp_moves)
+        # over the whole DP group. An engine's outputs go to its own client (one
+        # front-end per node in hybrid/external DP load balancing): a request
+        # moved to another node's rank has its outputs forwarded back to its
+        # home rank over the DP group, which emits them to the home client.
         local_size = vllm_config.parallel_config.data_parallel_size_local or 1
         self._dp_move_group = (
             vllm_config.parallel_config.data_parallel_rank // max(local_size, 1)
         )
         self._dp_move_local_size = max(local_size, 1)
-        self._dp_move_slots = DP_MOVE_SLOTS if local_size > 1 else 0
+        self._dp_move_slots = (
+            DP_MOVE_SLOTS if vllm_config.parallel_config.data_parallel_size > 1 else 0
+        )
         self._dp_movable_ids: list[str] = []
         self._dp_moves: list = []
         self._dp_abort_counts: list[list[int]] = []
@@ -2547,6 +2555,11 @@ class DPEngineCoreProc(EngineCoreProc):
         self._dp_abort_forward: dict[int, list[str]] = {}
         # Requests this rank moved away / took in, and their prompt tokens.
         self._dp_move_stats = [0, 0, 0, 0]
+        # Requests taken in from another node's rank: request id -> home rank;
+        # their outputs wait in _dp_out_forward[home] for the next hand-over.
+        self._dp_foreign: dict[str, int] = {}
+        self._dp_out_forward: dict[int, list] = {}
+        self._dp_out_counts: list[list[int]] = []
         # DP lockstep step cap floor: the largest captured CUDA-graph batch
         # (steps up to it replay a graph), never above the token budget.
         self._dp_step_token_floor = min(
@@ -2572,6 +2585,16 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+        if self._dp_move_slots:
+            step_fn = self.step_fn
+
+            def step_and_divert():
+                outputs, executed = step_fn()
+                if outputs and self._dp_foreign:
+                    self._dp_divert_foreign_outputs(outputs)
+                return outputs, executed
+
+            self.step_fn = step_and_divert
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -2801,7 +2824,11 @@ class DPEngineCoreProc(EngineCoreProc):
         if not (self.dp_prefill_pull_up and self.engines_running):
             return self._process_engine_step()
         self._dp_prefill_exchanged = False
-        if self._dp_moves or any(any(row) for row in self._dp_abort_counts):
+        if (
+            self._dp_moves
+            or any(any(row) for row in self._dp_abort_counts)
+            or any(any(row) for row in getattr(self, "_dp_out_counts", ()))
+        ):
             # Hand over the requests planned at the previous exchange before
             # this step's schedule() (every rank runs the same plan).
             self._dp_run_moves()
@@ -2828,7 +2855,8 @@ class DPEngineCoreProc(EngineCoreProc):
         pd_base = 2 * size + 1
         mv_base = pd_base + (size if slots else 0)
         ab_base = mv_base + size * slots
-        counts = torch.zeros(ab_base + (size * size if slots else 0), dtype=torch.int64)
+        of_base = ab_base + (size * size if slots else 0)
+        counts = torch.zeros(of_base + (size * size if slots else 0), dtype=torch.int64)
         counts[rank] = num_tokens
         counts[size + rank] = demand
         movable: list[tuple[str, int]] = []
@@ -2839,6 +2867,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 counts[mv_base + rank * slots + i] = n_tok
             for dst, ids in self._dp_abort_forward.items():
                 counts[ab_base + rank * size + dst] = len(ids)
+            for home, outs in self._dp_out_forward.items():
+                counts[of_base + rank * size + home] = len(outs)
         # Every rank adds 1: a collective paired with a different one on some
         # rank shows up here instead of returning a wrong count.
         counts[2 * size] = 1
@@ -2856,6 +2886,10 @@ class DPEngineCoreProc(EngineCoreProc):
             self._dp_plan_moves(
                 counts, size, slots, pd_base, mv_base, ab_base, movable
             )
+            self._dp_out_counts = [
+                [int(counts[of_base + s * size + d]) for d in range(size)]
+                for s in range(size)
+            ]
         sched_counts = counts[:size]
         demands = counts[size : 2 * size]
         # Some rank has neither scheduled tokens nor computable prompt tokens
@@ -2895,16 +2929,13 @@ class DPEngineCoreProc(EngineCoreProc):
             for r in range(size)
         ]
         local = self._dp_move_local_size
-        moves = []
-        for g in range(-(-size // local)):
-            lo, hi = g * local, min(size, (g + 1) * local)
-            for mv in plan_dp_moves(
-                demand[lo:hi],
-                per_rank[lo:hi],
-                self.scheduler.max_num_scheduled_tokens,
-            ):
-                moves.append(type(mv)(mv.src + lo, mv.index, mv.dst + lo, mv.num_tokens))
-        self._dp_moves = moves
+        self._dp_moves = plan_dp_moves(
+            demand,
+            per_rank,
+            self.scheduler.max_num_scheduled_tokens,
+            node_of=[r // local for r in range(size)],
+            cross_min_gain=DP_CROSS_NODE_MIN_GAIN,
+        )
         self._dp_movable_ids = [rid for rid, _ in movable]
         self._dp_abort_counts = [
             [int(counts[ab_base + s * size + d]) for d in range(size)]
@@ -2937,6 +2968,8 @@ class DPEngineCoreProc(EngineCoreProc):
         moves, self._dp_moves = self._dp_moves, []
         ids, self._dp_movable_ids = self._dp_movable_ids, []
         aborts, self._dp_abort_counts = self._dp_abort_counts, []
+        out_counts = getattr(self, "_dp_out_counts", [])
+        self._dp_out_counts = []
         for mv in moves:
             if mv.src == rank:
                 payload = b""
@@ -2954,7 +2987,11 @@ class DPEngineCoreProc(EngineCoreProc):
             elif mv.dst == rank:
                 payload = self._dp_recv_bytes(mv.src)
                 if payload:
-                    self._dp_import_moved(payload)
+                    req_id = self._dp_import_moved(payload)
+                    if mv.src // self._dp_move_local_size != (
+                        rank // self._dp_move_local_size
+                    ):
+                        self._dp_foreign[req_id] = mv.src
                     self._dp_count_move(2, mv.num_tokens)
         for src, row in enumerate(aborts):
             for dst, n in enumerate(row):
@@ -2968,6 +3005,16 @@ class DPEngineCoreProc(EngineCoreProc):
                     fwd_ids = pickle.loads(data) if data else []
                     if fwd_ids:
                         self.abort_requests(fwd_ids)
+        for src, row in enumerate(out_counts):
+            for home, n in enumerate(row):
+                if not n:
+                    continue
+                if src == rank:
+                    outs = self._dp_out_forward.pop(home, [])
+                    self._dp_send_bytes(pickle.dumps(outs), home)
+                elif home == rank:
+                    data = self._dp_recv_bytes(src)
+                    self._dp_emit_forwarded(pickle.loads(data) if data else [])
 
     def _dp_encode_moved(self, req, dst: int) -> bytes:
         """The moved request as the EngineCoreRequest the receiving rank adds
@@ -3014,6 +3061,54 @@ class DPEngineCoreProc(EngineCoreProc):
             self.add_request(req, wave)
         finally:
             self._kv_connector_arrival_handled(req)
+        return req.request_id
+
+    def _dp_divert_foreign_outputs(self, outputs: dict) -> None:
+        """Take the outputs of requests whose home is another node's rank out
+        of this step's outputs; they go to that rank at the next hand-over
+        (its client knows the request, this rank's client does not)."""
+        foreign = self._dp_foreign
+        for client_index, eco in list(outputs.items()):
+            keep = []
+            for out in eco.outputs:
+                home = foreign.get(out.request_id)
+                if home is None:
+                    keep.append(out)
+                    continue
+                self._dp_out_forward.setdefault(home, []).append(
+                    (client_index, out, False)
+                )
+                if out.finish_reason is not None:
+                    del foreign[out.request_id]
+            eco.outputs = keep
+            if eco.finished_requests:
+                for rid in list(eco.finished_requests):
+                    home = foreign.pop(rid, None)
+                    if home is not None:
+                        eco.finished_requests.discard(rid)
+                        self._dp_out_forward.setdefault(home, []).append(
+                            (client_index, rid, True)
+                        )
+
+    def _dp_emit_forwarded(self, items: list) -> None:
+        """Emit outputs another rank computed for requests this rank handed
+        over, to this rank's client, as if computed here."""
+        by_client: dict[int, EngineCoreOutputs] = {}
+        for client_index, item, finished_only in items:
+            eco = by_client.setdefault(
+                client_index, EngineCoreOutputs(engine_index=self.engine_index)
+            )
+            if finished_only:
+                if eco.finished_requests is None:
+                    eco.finished_requests = set()
+                eco.finished_requests.add(item)
+                self._dp_moved_to.pop(item, None)
+            else:
+                eco.outputs.append(item)
+                if item.finish_reason is not None:
+                    self._dp_moved_to.pop(item.request_id, None)
+        for client_index, eco in by_client.items():
+            self.output_queue.put_nowait((client_index, eco))
 
     def _dp_count_move(self, i: int, num_tokens: int) -> None:
         st = self._dp_move_stats
@@ -3034,6 +3129,9 @@ class DPEngineCoreProc(EngineCoreProc):
     def abort_requests(self, request_ids: list[str]):
         """Client aborts arrive at the rank the client sent the request to:
         forward those for requests this rank moved away (at the next step)."""
+        for rid in request_ids:
+            # A taken-in request aborted here (forwarded by its home rank).
+            self._dp_foreign.pop(rid, None)
         moved = [rid for rid in request_ids if rid in self._dp_moved_to]
         if moved:
             for rid in moved:
