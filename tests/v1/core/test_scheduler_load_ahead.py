@@ -39,6 +39,7 @@ def _scheduler(num_blocks=200, mnbt=64):
     scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     scheduler.connector.request_finished.return_value = (False, None)
     scheduler.connector.take_events.return_value = ()
+    scheduler.connector.take_deferred_recving.return_value = set()
     return scheduler
 
 
