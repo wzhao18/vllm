@@ -22,12 +22,15 @@ import threading
 
 import torch
 
-SHIFT = 6
-PERIOD = 1 << SHIFT
-SLOTS = 256
-HEADER_WORDS = 8
-MAX_EXPERTS = 512
-SLOT_WORDS = HEADER_WORDS + MAX_EXPERTS
+from .src_gp.common.ep_balance_layout import (  # the device layout (pure Python: no CuTe import)
+    EPBAL_HEADER_WORDS as HEADER_WORDS,
+    EPBAL_MAX_EXPERTS as MAX_EXPERTS,
+    EPBAL_PERIOD as PERIOD,
+    EPBAL_SHIFT as SHIFT,
+    EPBAL_SLOT_WORDS as SLOT_WORDS,
+    EPBAL_SLOTS as SLOTS,
+    epbal_checksum,
+)
 
 _lock = threading.Lock()
 _rings: list["EpBalanceRing"] = []
@@ -75,7 +78,7 @@ class EpBalanceRing:
             if call <= self._last:
                 break
             w = self._slot(i)
-            if w[0] != call:  # being rewritten: take it on the next drain
+            if w[0] != call or not slot_complete(w):  # being (re)written: take it on the next drain
                 break
             self.lost += max(0, (call - self._last) // PERIOD - 1)
             self._last = call
@@ -107,6 +110,17 @@ class EpBalanceRing:
         r["layer"] = (r["call"] - 1) % _moe_layers if _moe_layers else -1
         r["lost"] = self.lost
         return r
+
+
+def slot_complete(w: list[int]) -> bool:
+    """A local record (word 6 > 0) is published behind a system fence. A global record (dedup router) is written
+    without one, so it is complete only when word 7 matches the checksum of its call id and counts."""
+    if w[6] > 0:
+        return True
+    entries = w[3]
+    if not 0 < entries <= MAX_EXPERTS:
+        return False
+    return w[7] == epbal_checksum(w[0], sum(w[HEADER_WORDS : HEADER_WORDS + entries]))
 
 
 def summarize(w: list[int]) -> dict:

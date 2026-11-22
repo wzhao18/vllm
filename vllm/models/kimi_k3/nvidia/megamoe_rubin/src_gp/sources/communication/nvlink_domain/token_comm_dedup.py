@@ -49,7 +49,7 @@ from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
 
 
 from ....common.ep_balance_layout import (  # noqa: E402
-    EPBAL_HEADER_WORDS, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
+    EPBAL_CHECKSUM_MUL, EPBAL_CHECKSUM_SALT, EPBAL_HEADER_WORDS, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
 )
 
 
@@ -1454,10 +1454,13 @@ class _DedupMetadataPushRouter(KernelComponent):
         """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
         CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
         so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the host-mapped
-        ring, with a %globaltimer stamp; the call id is written last (slot complete). The caller runs it after this
-        CTA's dispatch pulls are published, so the host-memory stores and system fences sit in the window where the
-        warp waits for FC2 results, not in front of the pulls. 16-byte system stores; no launch, no sync: the other
-        calls, warps and CTAs read nothing and skip."""
+        ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
+
+        No fence: a system-scope fence here waits behind the kernel's in-flight NVLink/HBM traffic (~100 us
+        measured per logging call; the same stores + fence cost 2.4 us on an idle GPU). Instead word 7 carries
+        ``epbal_checksum(call, sum(counts))`` and the host takes a slot only when the call id and the checksum agree
+        (a slot read while its stores are still landing is retried on the next drain). Stores only: 16-byte
+        relaxed system stores, no launch, no sync; the other calls, warps and CTAs read nothing and skip."""
         linear_cta_idx, _, _ = cute.arch.block_idx()
         # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
         if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS and self.expert_count_padded % 4 == 0):
@@ -1467,25 +1470,26 @@ class _DedupMetadataPushRouter(KernelComponent):
                 if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
                     base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
                     sizes = device_workspace.tensor(self.sizes_region)
+                    total = Int32(0)
                     for vector_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded // 4, 32)):
                         expert = (Int32(vector_round * 32) + lane_idx) * Int32(4)
                         if expert < Int32(self.expert_count_padded):
-                            _st_sys_v4_s32(
-                                base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4),
-                                sizes[expert], sizes[expert + Int32(1)], sizes[expert + Int32(2)], sizes[expert + Int32(3)],
-                            )
-                    cute.arch.sync_warp()
+                            c0 = sizes[expert]
+                            c1 = sizes[expert + Int32(1)]
+                            c2 = sizes[expert + Int32(2)]
+                            c3 = sizes[expert + Int32(3)]
+                            _st_sys_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
+                            total = total + c0 + c1 + c2 + c3
+                    for shift in cutlass.range_constexpr(5):
+                        total = total + cute.arch.shuffle_sync_bfly(total, 16 >> shift)
                     if lane_idx == Int32(0):
                         t_ready = globaltimer_ns()
-                        # words 1..7: t_ready lo/hi, entries, world, experts_per_rank, 0 = global record, pad
-                        _st_sys_v4_s32(
-                            base + Int64(16),
-                            Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), Int32(0),
-                        )
+                        checksum = (total ^ Int32(EPBAL_CHECKSUM_SALT)) + call * Int32(EPBAL_CHECKSUM_MUL)
+                        # words 4..7: world, experts_per_rank, 0 = global record, checksum
+                        _st_sys_v4_s32(base + Int64(16), Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), checksum)
                         _st_sys_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
                         _st_sys_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
                         _st_sys_s32(base + Int64(12), Int32(self.expert_count_padded))
-                        cute.arch.fence_acq_rel_sys()
                         _st_sys_s32(base, call)
                     cute.arch.sync_warp()
 

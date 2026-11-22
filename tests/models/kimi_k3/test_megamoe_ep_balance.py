@@ -20,7 +20,9 @@ def _write(ring, call, sizes, world, epr, t=123456789):
     buf[base + 3] = len(sizes)
     buf[base + 4] = world
     buf[base + 5] = epr
-    buf[base] = call  # written last by the kernel
+    buf[base + 6] = 0  # global record
+    buf[base + 7] = E.epbal_checksum(call, sum(sizes))
+    buf[base] = call
 
 
 @cuda
@@ -54,6 +56,34 @@ def test_slot_being_rewritten_waits_for_the_next_drain():
     _write(ring, 128, [9, 1], world=2, epr=1)
     out = ring.drain()
     assert [r["call"] for r in out] == [128] and out[0]["rank_loads"] == [9, 1]
+
+
+@cuda
+def test_global_record_without_matching_checksum_waits():
+    """The dedup router writes global records without a system fence: a slot whose call id is visible but whose
+    counts (or checksum) are still landing fails the checksum and is taken on a later drain."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    ring = E.EpBalanceRing("test")
+    _write(ring, 64, [4, 4], world=2, epr=1)
+    i = (64 >> E.SHIFT) % E.SLOTS
+    ring.buffer[i * E.SLOT_WORDS + E.HEADER_WORDS + 1] = 3  # one count not landed yet
+    assert ring.drain() == []
+    ring.buffer[i * E.SLOT_WORDS + E.HEADER_WORDS + 1] = 4
+    out = ring.drain()
+    assert [r["call"] for r in out] == [64] and out[0]["routes"] == 8
+
+
+def test_checksum_matches_device_int32_arithmetic():
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    def dev(call, total):  # (total ^ SALT) + call * MUL in wrapping int32, as the kernel computes it
+        v = (((total ^ 0x5BD1E995) & 0xFFFFFFFF) + ((call * 65599) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        return v - (1 << 32) if v >= 1 << 31 else v
+
+    for call, total in ((64, 0), (1 << 30, 123456), (64 * 999_999, 2_000_000_000)):
+        assert E.epbal_checksum(call, total) == dev(call, total)
+        assert -(1 << 31) <= E.epbal_checksum(call, total) < 1 << 31
 
 
 @cuda
