@@ -1646,13 +1646,26 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // ---- T3: radix select of the K-th largest composite (key << 24 | 0xFFFFFF - gid)
     if (!kFast && K31_RARE(tier == 3)) {
       V2STAT(3);
-      if (tid == 0) { s_pref = 0ull; s_cnt = K; }
+      if (tid == 0) { s_pref = 0ull; s_cnt = K; s_u[12] = 0; }
       __syncthreads();
       for (int rd = 0; rd < kV2RadR; ++rd) {
         const int shb = 32 - 8 * rd;
         const unsigned long long pref = s_pref;
         if (tid < 256) hist[tid] = 0;
         __syncthreads();
+        // id rounds 3-4 walk the positions of the keys equal to tau, collected in round 2
+        // (cpos is free in the complete body's radix tier), when they all fit; else the pass
+        const uint32_t ncomp = s_u[12];
+        if (rd >= 3 && ncomp <= (uint32_t)kV2Cand) {
+          const uint32_t kt = (uint32_t)(pref >> (24 - shb - 8));
+          for (uint32_t i = tid; i < ncomp; i += kV2T) {
+            const unsigned long long c =
+                ((unsigned long long)kt << 24) | (0xFFFFFFu - gid_of((int)cpos[i]));
+            if ((c >> (shb + 8)) != pref) continue;
+            atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
+          }
+          __syncthreads();  // as for_keys: the histogram is complete before it is sent
+        } else
         for_keys(0, ng, [&](int i0, const uint4& r) {
           const uint32_t valid = 0xFFu;
           const Keys8 k8(r);
@@ -1668,6 +1681,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               continue;
             }
             if (k != (uint32_t)(pref >> (24 - shb - 8))) continue;
+            if (rd == 2) {  // collect the positions of the keys equal to tau (count past the cap)
+              const uint32_t slot = atomicAdd(&s_u[12], 1u);
+              if (slot < (uint32_t)kV2Cand) cpos[slot] = (uint32_t)(i0 + j);
+            }
             const unsigned long long c =
                 ((unsigned long long)k << 24) | (0xFFFFFFu - gid_of(i0 + j));
             if ((c >> (shb + 8)) != pref) continue;
@@ -1697,11 +1714,22 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tid < 256 && ex < want && ex + hb >= want) {
           s_pref = (pref << 8) | (unsigned long long)(255 - tid);
           s_cnt = (int)(want - ex);
-          s_n = 1;
+          // After the last key-bit round (rd == 1) the prefix is the full 16-bit key tau.
+          // When every key equal to tau over all ranks is needed (the bucket count is the
+          // remaining want: no ties to break), the id rounds 2-4 would only confirm "take
+          // all": skip them. Decided from the exchanged words, so the same on every rank;
+          // the unused id-round slots stay armed (they are written only on rows that run them).
+          s_n = (rd == 1 && want - ex == hb) ? 2 : 1;
         }
         for (int i = tid; i < W * 256; i += kV2T) st_u32(p.box + rrow + i, kSent);
         __syncthreads();
-        if (tid == 0 && s_n != 1) spin_fail(p.err, 39);  // >= K distinct composites exist
+        if (tid == 0 && s_n < 1) spin_fail(p.err, 39);  // >= K distinct composites exist
+        if (s_n == 2) {
+          // composite cut = (tau << 24) | 0: every id of tau qualifies (gid <= 0xFFFFFF)
+          if (tid == 0) s_pref = s_pref << 24;
+          __syncthreads();
+          break;
+        }
       }
       if (tid == 0) {
         s_tau = (int)(s_pref >> 24);
