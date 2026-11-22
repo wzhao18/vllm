@@ -321,6 +321,8 @@ class Scheduler(SchedulerInterface):
         # This step's scheduled tokens while its DP exchange runs (see
         # dp_move_demand); empty outside schedule().
         self._dp_scheduled_now: dict[str, int] = {}
+        # Requests offered as movable in the current DP exchange.
+        self._dp_listed: set[str] = set()
         try:
             from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
 
@@ -3574,7 +3576,10 @@ class Scheduler(SchedulerInterface):
         for request in self.waiting:
             if len(out) >= limit:
                 break
-            if not self._dp_movable(request):
+            if not self._dp_movable(request) or (
+                getattr(request, "dp_pinned_size", None) is not None
+            ):
+                # A request moved here once stays (no ping-pong between ranks).
                 continue
             num_tokens = (
                 request.num_prompt_tokens
@@ -3586,6 +3591,7 @@ class Scheduler(SchedulerInterface):
                     num_tokens, request.num_prompt_tokens - num_tokens
                 )
                 out.append((request.request_id, max(cost, 1)))
+        self._dp_listed = {rid for rid, _ in out}
         return out
 
     def _dp_plan_cost(self, num_tokens: int, ctx: int) -> int:
@@ -3597,12 +3603,15 @@ class Scheduler(SchedulerInterface):
         return int(self._prompt_cost.prompt_cost(num_tokens, ctx) + 0.5)
 
     def dp_move_demand(self) -> int:
-        """Committed prompt work of this rank after the step being scheduled
-        (``dp_prefill_demand``), in the units of ``dp_movable_requests``
-        (predicted cost with a prompt cost model), for cross-rank planning."""
+        """This rank's prompt work after the step being scheduled, in the units
+        of ``dp_movable_requests`` (predicted cost with a prompt cost model),
+        for cross-rank planning: committed work (``dp_prefill_demand``) plus
+        every waiting request not committed yet and not offered as movable in
+        this exchange whose size is known (moved-in requests, which stay here,
+        and requests past the movable slots). Leaving those out makes a rank
+        that just took work in look idle, so the next plans pile more onto it."""
         scheduled = self._dp_scheduled_now
-        if self._prompt_cost is None:
-            return self.dp_prefill_demand(scheduled)
+        listed = self._dp_listed
         demand = 0
         for request in self.running:
             ctx = request.num_computed_tokens + scheduled.get(request.request_id, 0)
@@ -3611,16 +3620,33 @@ class Scheduler(SchedulerInterface):
                 demand += self._dp_plan_cost(left, ctx)
         for queue in (self.kv_holding_waiting, self.waiting):
             for request in queue:
-                if request.num_computed_tokens > 0 and (
-                    request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
-                    or request.request_id in self.finished_recving_kv_req_ids
-                ):
-                    ctx = request.num_computed_tokens + scheduled.get(
-                        request.request_id, 0
+                if request.num_computed_tokens > 0:
+                    if (
+                        request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                        or request.request_id in self.finished_recving_kv_req_ids
+                    ):
+                        ctx = request.num_computed_tokens + scheduled.get(
+                            request.request_id, 0
+                        )
+                        left = request.num_prompt_tokens - ctx
+                        if left > 0:
+                            demand += self._dp_plan_cost(left, ctx)
+                    continue
+                if request.request_id in listed or request.request_id in scheduled:
+                    continue
+                pinned = getattr(request, "dp_pinned_size", None)
+                if pinned is not None:
+                    demand += pinned
+                    continue
+                num_tokens = (
+                    request.num_prompt_tokens
+                    if self.connector is None
+                    else self.connector.dp_move_tokens(request)
+                )
+                if num_tokens:
+                    demand += self._dp_plan_cost(
+                        num_tokens, request.num_prompt_tokens - num_tokens
                     )
-                    left = request.num_prompt_tokens - ctx
-                    if left > 0:
-                        demand += self._dp_plan_cost(left, ctx)
         return demand
 
     def dp_export_request(self, request_id: str) -> Request | None:

@@ -3005,7 +3005,7 @@ class DPEngineCoreProc(EngineCoreProc):
             return b""
         return bytes(frames[0])
 
-    def _dp_import_moved(self, payload: bytes) -> None:
+    def _dp_import_moved(self, payload: bytes) -> str:
         """Take in a request another rank of this engine handed over, exactly
         like a client ADD (arrival hooks, then add, then arrival handled)."""
         ecr = MsgpackDecoder(EngineCoreRequest).decode([payload])
@@ -3014,6 +3014,7 @@ class DPEngineCoreProc(EngineCoreProc):
             self.add_request(req, wave)
         finally:
             self._kv_connector_arrival_handled(req)
+        return req.request_id
 
     def _dp_count_move(self, i: int, num_tokens: int) -> None:
         st = self._dp_move_stats
