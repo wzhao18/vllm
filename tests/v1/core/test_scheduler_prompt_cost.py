@@ -111,3 +111,18 @@ def test_planning_units_are_predicted_cost():
     assert step_cost.prompt_cost(1000, 600_000) == pytest.approx(
         1000 * step_cost.weight(600_500)
     )
+
+
+def test_moved_in_requests_stay_and_count_in_demand():
+    scheduler = create_scheduler(max_num_batched_tokens=64, long_prefill_token_threshold=0)
+    reqs = create_requests(num_requests=3, num_tokens=256)
+    for r in reqs:
+        scheduler.add_request(r)
+    # reqs[0] was moved here (pinned with its planned size): never offered
+    # again, but its size counts in this rank's demand.
+    reqs[0].dp_pinned_size = 500
+    listed = scheduler.dp_movable_requests(1)
+    assert listed == [(reqs[1].request_id, 256)]
+    # Demand: the pinned request + reqs[2] (past the movable slots); not the
+    # listed one (the planner adds it).
+    assert scheduler.dp_move_demand() == 500 + 256
