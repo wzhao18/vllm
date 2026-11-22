@@ -223,9 +223,10 @@ def _cross_worker(rank, world_size, port, out):
         "127.0.0.1", port, rank, world_size, backend="gloo"
     )
     # Two "nodes" of two ranks. Node 0 is busy on both ranks: the queued
-    # 20000-token prompt on rank 0 cannot go to rank 1, only to node 1.
+    # 24000-token prompt on rank 0 cannot go to rank 1, only to node 1 (gain
+    # 20000 >= DP_CROSS_NODE_MIN_GAIN).
     if rank == 0:
-        sched = _Sched(16000, [_request("x", 20000)])
+        sched = _Sched(20000, [_request("x", 24000)])
     else:
         sched = _Sched(30000 if rank == 1 else 0)
     core = _core(pg, sched, 2)
