@@ -62,7 +62,7 @@ def test_consumer_adopts_exact_hashes_and_hashes_only_the_witness(monkeypatch):
     consumer = _req(tokens, params)
     assert consumer.block_hashes == producer.block_hashes
     assert len(calls) == 1  # the witness block only
-    assert kcu._remote_hash_counts == {"adopted": 1}
+    assert kcu._remote_hash_counts == {"exported": 1, "adopted": 1}
 
 
 def test_longer_consumer_prompt_hashes_the_extra_block_locally(monkeypatch):
@@ -104,8 +104,9 @@ def test_mismatch_falls_back_to_local_hashes_and_warns(mutate, reason, caplog):
     with caplog.at_level(logging.WARNING):
         consumer = _req(tokens, params)
     assert consumer.block_hashes == producer.block_hashes  # recomputed, exact
-    assert kcu._remote_hash_counts == {reason: 1}
+    assert kcu._remote_hash_counts == {"exported": 1, reason: 1}
     assert reason in caplog.text
+    assert f"fallback 1 ({reason} 1)" in kcu._remote_hash_summary()
 
 
 def test_different_cache_salt_is_never_adopted():
@@ -113,14 +114,30 @@ def test_different_cache_salt_is_never_adopted():
     producer = _req(tokens, cache_salt="a")
     consumer = _req(tokens, _handover(producer), cache_salt="b")
     assert consumer.block_hashes == _req(tokens, cache_salt="b").block_hashes
-    assert kcu._remote_hash_counts == {"fingerprint mismatch": 1}
+    assert kcu._remote_hash_counts == {"exported": 1, "fingerprint mismatch": 1}
 
 
 def test_more_hashes_than_consumer_blocks_is_rejected():
     producer = _req(range(8 * BS))
     consumer = _req(range(4 * BS), _handover(producer))
     assert consumer.block_hashes == _req(range(4 * BS)).block_hashes
-    assert kcu._remote_hash_counts == {"more blocks than tokens": 1}
+    assert kcu._remote_hash_counts == {"exported": 1, "more blocks than tokens": 1}
+
+
+def test_adoption_is_logged_positively(caplog):
+    tokens = list(range(2 * BS))
+    with caplog.at_level(logging.INFO):
+        # 500 handovers = 1000 events (an export and an adoption each): the
+        # summary is logged at the first event and again at the 1000th.
+        for i in range(500):
+            _req(tokens, _handover(_req(tokens, rid=f"p{i}")), rid=f"d{i}")
+    summary = kcu._remote_hash_summary()
+    assert summary == (
+        "pd-block-hashes: adopted 500 / fallback 0 (); exported 500, not exported 0"
+    )
+    lines = [r.getMessage() for r in caplog.records if "pd-block-hashes" in r.getMessage()]
+    assert lines[0] == "pd-block-hashes: adopted 0 / fallback 0 (); exported 1, not exported 0"
+    assert lines[-1] == summary and len(lines) == 2
 
 
 def test_requests_without_handover_are_unchanged():
