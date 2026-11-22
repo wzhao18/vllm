@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-STALL_S = 120.0
+STALL_S = 60.0  # REPRO ONLY: report before the 120 s repro guards trap the peers
 OP_FWD_BEGIN, OP_FWD_END, OP_LAYER, OP_MOE_IN, OP_MOE_OUT, OP_CAPTURE_SIZE, OP_ATTN_OUT = 1, 2, 3, 4, 5, 6, 7
 _OPS = {1: "forward_begin", 2: "forward_end", 3: "layer", 4: "megamoe_in", 5: "megamoe_out", 6: "capture_size", 7: "attn_out"}
 
