@@ -29,21 +29,15 @@ class _Cost:
         return int(cost / (1 + ctx / 64) + 1e-9) if cost > 0 else 0
 
 
-def test_step_cost_table():
+def test_step_cost_weight():
     assert step_cost.weight(0) == 1.0
-    assert step_cost.weight(30_000) == 1.0
-    assert step_cost.weight(600_000) == pytest.approx(2270.1 / 768.7)
-    assert step_cost.weight(130_000) == pytest.approx(822.8 / 768.7)
-    # Linear in between and past the last point; monotone.
-    assert step_cost.weight(215_000) == pytest.approx((822.8 + 1137.8) / 2 / 768.7)
-    assert step_cost.weight(900_000) == pytest.approx(
-        (2270.1 + (2270.1 - 1137.8)) / 768.7
-    )
+    assert step_cost.weight(130_000) == pytest.approx(1.13)
+    assert step_cost.weight(600_000) == pytest.approx(1.6)
     ws = [step_cost.weight(c) for c in range(0, 1_000_000, 10_000)]
     assert ws == sorted(ws)
-    # A 16K budget at 600K context buys 16384 / 2.953 tokens.
+    # A 16K budget at 600K context buys 16384 / 1.6 tokens.
     n = step_cost.max_tokens_for_cost(16384, 600_000)
-    assert n == int(16384 * 768.7 / 2270.1)
+    assert n == int(16384 / 1.6)
     assert step_cost.chunk_cost(n, 600_000) <= 16384 < step_cost.chunk_cost(
         n + 1, 600_000
     )

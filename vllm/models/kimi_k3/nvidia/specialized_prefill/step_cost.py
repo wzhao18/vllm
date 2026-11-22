@@ -9,35 +9,24 @@ chunks by this cost instead of by tokens alone, so that a long-context chunk
 does not set the step for every rank (see ``Scheduler._prompt_chunk_cost``).
 
 Costs are in "short-context tokens": a token at context ``ctx`` costs
-``weight(ctx)``, 1.0 up to 30K. The weights are the measured DEP16 prefill
-step time of a 16K-token chunk at each prefix length (PSOL, int58 build,
-milliseconds): <=30K 768.7, 60K 776.3, 130K 822.8, 300K 1137.8, 600K 2270.1,
-linear in between and past the last point. Scheduling only: no computation
-changes, the cost only decides how many prompt tokens a step takes.
+``weight(ctx) = 1 + CTX_WEIGHT * ctx``. CTX_WEIGHT is fitted on served lockstep
+steps of the int62 build (Hecate 4n DEP16 prefill testbed, c512, 1219 steps):
+step time vs the busiest rank's sum of n * weight(ctx) is best at 1.0e-6 per
+context token (R^2 0.943, vs 0.920 for tokens alone and 0.856 for the older
+PSOL whole-step table, which overstated long context on this build: w(600K)
+1.6 here vs 2.95). Scheduling only: no computation changes, the cost only
+decides how many prompt tokens a step takes.
 """
 
 from typing import Any
 
-# (context tokens, ms per 16K-token chunk) at the chunk start.
-_SOL_MS = (
-    (30_000, 768.7),
-    (60_000, 776.3),
-    (130_000, 822.8),
-    (300_000, 1137.8),
-    (600_000, 2270.1),
-)
-_BASE_MS = _SOL_MS[0][1]
+# Cost of one prompt token per context token, relative to a short-context token.
+CTX_WEIGHT = 1.0e-6
 
 
 def weight(ctx: int) -> float:
     """Cost of one prompt token computed at context ``ctx`` (>= 1.0)."""
-    if ctx <= _SOL_MS[0][0]:
-        return 1.0
-    for (c0, t0), (c1, t1) in zip(_SOL_MS, _SOL_MS[1:]):
-        if ctx <= c1:
-            return (t0 + (t1 - t0) * (ctx - c0) / (c1 - c0)) / _BASE_MS
-    (c0, t0), (c1, t1) = _SOL_MS[-2], _SOL_MS[-1]
-    return (t1 + (t1 - t0) * (ctx - c1) / (c1 - c0)) / _BASE_MS
+    return 1.0 + CTX_WEIGHT * max(ctx, 0)
 
 
 def chunk_cost(num_tokens: int, ctx: int) -> float:
