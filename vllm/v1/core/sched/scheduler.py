@@ -634,15 +634,25 @@ class Scheduler(SchedulerInterface):
             )
         )
         # Crossing chunks (get_mamba_crossing_checkpoint_position) export a
-        # crossed block boundary from inside an intermediate chunk. Under dense
-        # retention every chunk already publishes a checkpoint at its own end
-        # (one export per sequence per step), so they need sparse retention
-        # (prefix_cache_retention_interval == 0), where intermediate chunks
-        # publish only full blocks.
+        # crossed block boundary from inside an intermediate chunk. That is the
+        # one state an intermediate chunk publishes under sparse retention (0)
+        # or a retention grid of one Mamba block (the boundary is a grid point,
+        # the mid-block chunk end is not). Under finer (dense) retention every
+        # chunk end is published too, and a sequence exports at most one
+        # checkpoint per step, so crossing chunks are not formed there. A
+        # capability check: on wherever the backend's prefill snapshot and such
+        # a retention are present (production K3.1 prefill), no switch.
         self.mamba_crossing_chunks = (
             self.mamba_internal_snapshot
-            and kv_cache_config.prefix_cache_retention_interval == 0
+            and kv_cache_config.prefix_cache_retention_interval
+            in (0, self.mamba_block_size)
         )
+        if self.mamba_crossing_chunks:
+            logger.info_once(
+                "Mamba crossing chunks: ON (intermediate prefill chunks cross one "
+                "%d-token block boundary and export it in-step)",
+                self.mamba_block_size,
+            )
         if (
             self.cache_config.mamba_internal_snapshot
             and not self.mamba_internal_snapshot

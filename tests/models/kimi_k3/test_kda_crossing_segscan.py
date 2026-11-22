@@ -7,9 +7,11 @@ step's batch, so the FP32 state the block-ended path stores at a boundary
 already depends on the co-scheduled requests (order-level differences, same
 math). A crossing chunk exports the state at its crossed boundary B as the
 sequence's checkpoint (a segment boundary when the sequence is split). This
-measures the block-ended path's own envelope over >= 20 random co-batches --
-state at B, final state, outputs, against the single-launch reference -- and
-requires the crossing chunk to stay inside it over >= 20 other co-batches.
+measures stock's own envelope over >= 20 random co-batches -- the block-ended
+split (state at B, final state, outputs) and the same span run as one stock
+chunk, without an export or as a prompt's last chunk exporting its tail
+checkpoint in-step, against the single-launch reference -- and requires
+the crossing chunk to stay inside it over >= 20 other co-batches.
 """
 
 import random
@@ -46,14 +48,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _tokens(n: int, seed: int) -> dict:
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    r = lambda *s: torch.randn(*s, generator=g, device="cuda")  # noqa: E731
+def _tokens(n: int, seed: int, slow_decay: bool = False) -> dict:
+    """``slow_decay``: gate ~1 with unit q / k, so the initial state survives
+    every segment and the segment scan's rounding shows (kda_segscan tests)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    def r(*shape):
+        return torch.randn(*shape, generator=gen, device="cuda")
+
+    q, k = r(1, n, H, D), r(1, n, H, D)
+    g = r(1, n, H, D)
+    if slow_decay:
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+        g = torch.full_like(g, -60.0)
     return dict(
-        q=r(1, n, H, D).to(torch.bfloat16),
-        k=r(1, n, H, D).to(torch.bfloat16),
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
         v=r(1, n, H, D).to(torch.bfloat16),
-        g=r(1, n, H, D).to(torch.bfloat16),
+        g=g.to(torch.bfloat16),
         beta=r(1, n, H).to(torch.bfloat16),
     )
 
@@ -152,12 +165,13 @@ def _with(rng: random.Random, seed: int, seq):
     return res[pos], split
 
 
+@pytest.mark.parametrize("slow_decay", [False, True], ids=["decay", "slow_decay"])
 @torch.inference_mode()
-def test_crossing_stays_inside_the_block_ended_envelope():
+def test_crossing_stays_inside_the_block_ended_envelope(slow_decay: bool):
     import vllm._flashkda_C  # noqa: F401
 
     kda_segscan.load_extension()
-    x = _tokens(END - START, 12345)
+    x = _tokens(END - START, 12345, slow_decay)
     s0 = torch.randn(H, D, D, device="cuda", generator=torch.Generator(
         device="cuda").manual_seed(3)) * 0.1
     x1 = {k: v[:, : B - START] for k, v in x.items()}
@@ -168,9 +182,16 @@ def test_crossing_stays_inside_the_block_ended_envelope():
     ref_out, ref_final, ref_b = ref
     (a1,), _ = _run([(x1, s0, 0)])
     (a2,), _ = _run([(x2, a1[1], 0)])
-    # Single launch: the crossing chunk is the block-ended split, bit for bit.
-    assert torch.equal(ref_b, a1[1]) and torch.equal(ref_final, a2[1])
-    assert torch.equal(ref_out, torch.cat([a1[0], a2[0]], dim=1))
+    # Single launch: the state at B is the block-ended split's, bit for bit.
+    assert torch.equal(ref_b, a1[1])
+    if not slow_decay:
+        # The gate forgets the state within a block: everything is bitwise.
+        assert torch.equal(ref_final, a2[1])
+        assert torch.equal(ref_out, torch.cat([a1[0], a2[0]], dim=1))
+    # Under a gate ~1 the split re-enters FlashKDA at B from its stored state
+    # (FlashKDA's states leave through bf16), which the crossing chunk does
+    # not: a chunk-boundary rounding stock chunking already places wherever
+    # the budget cuts. The envelope below measures it.
 
     def dev(a, b):
         d = (a.float() - b.float()).abs()
@@ -186,6 +207,16 @@ def test_crossing_stays_inside_the_block_ended_envelope():
         env["b"] = max(env["b"], dev(f1, ref_b)[0])
         env["final"] = max(env["final"], dev(f2, ref_final)[0])
         env["out"] = max(env["out"], dev(torch.cat([o1, o2], 1), ref_out)[0])
+        # Stock also runs this whole span as one chunk (no export) whenever a
+        # request reaches it block-aligned: its segmentation varies the same way.
+        # ... and, as a prompt's last chunk, with its tail checkpoint exported
+        # in-step (a segment boundary when split), at a hash-aligned position.
+        tail = (END - 1) // 128 * 128 - START - 128 * rng.randint(0, 8)
+        for off in (0, tail):
+            (o3, f3, _), sp3 = _with(rng, 400 + i + 50 * (off > 0), (x, s0, off))
+            splits += sp3
+            env["final"] = max(env["final"], dev(f3, ref_final)[0])
+            env["out"] = max(env["out"], dev(o3, ref_out)[0])
     worst = {"b": (0.0, 0), "final": (0.0, 0), "out": (0.0, 0)}
     xsplits = 0
     for i in range(NUM_BATCHES):
@@ -197,5 +228,18 @@ def test_crossing_stays_inside_the_block_ended_envelope():
     print(f"\nblock-ended envelope {env} ({splits} segmented runs); crossing worst "
           f"(max |delta|, #diff elems) {worst} ({xsplits} segmented runs)")
     assert splits > 0 and xsplits > 0, "no co-batch took the segmented route"
+    if not slow_decay:
+        # Realistic gates: stock's envelope is 0 and the crossing chunk is
+        # bitwise in every co-batch.
+        for k in env:
+            assert worst[k][0] <= env[k], f"{k}: crossing {worst[k][0]} > {env[k]}"
+        return
+    # Gate ~1 (adversarial): the segment scan's bf16-operand rounding reaches
+    # every later segment (kda_segscan); the crossing chunk's segmentation
+    # differs from the split's, so it lands in the same rounding regime as
+    # stock, bounded like the segmented route itself (test_kda_segscan:
+    # 0.02 x scale vs plain FlashKDA).
+    scale = {"b": ref_b, "final": ref_final, "out": ref_out}
     for k in env:
-        assert worst[k][0] <= env[k], f"{k}: crossing {worst[k][0]} > envelope {env[k]}"
+        bound = max(env[k], 0.02 * max(scale[k].float().abs().max().item(), 1.0))
+        assert worst[k][0] <= bound, f"{k}: crossing {worst[k][0]} > {bound}"

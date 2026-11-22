@@ -136,18 +136,7 @@ class MambaHybridModelState(DefaultModelState):
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
             self._snapshot_start[req_index] = new_req_data.num_computed_tokens
-            prompt_len = (
-                new_req_data.num_prompt_tokens
-                if new_req_data.num_prompt_tokens is not None
-                else len(new_req_data.prompt_token_ids or ())
-            )
-            token_ids = new_req_data.prefill_token_ids
-            num_tokens = (
-                new_req_data.prefill_token_start + len(token_ids)
-                if token_ids is not None
-                else prompt_len
-            )
-            self._prefill_end[req_index] = max(prompt_len, num_tokens - 1)
+            self._prefill_end[req_index] = mamba_prefill_end(new_req_data)
 
     def block_table_rewritten(self, req_index: int, num_computed_tokens: int) -> None:
         if self._align_mode:
@@ -329,7 +318,7 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         if self._align_mode:
-            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
             aligned_index_builders = []
             for group_idx, group_id in enumerate(mamba_group_ids):
                 for group in attn_groups[group_id]:
@@ -355,8 +344,11 @@ class MambaHybridModelState(DefaultModelState):
                 )
                 # Where each row's prefill ends (the scheduler's prefill_end),
                 # for the crossing-chunk boundary export; the scheduler only
-                # forms crossing chunks under sparse retention.
-                if kv_cache_config.prefix_cache_retention_interval == 0:
+                # forms crossing chunks under sparse or one-block-grid retention.
+                if kv_cache_config.prefix_cache_retention_interval in (
+                    0,
+                    mamba_spec.block_size,
+                ):
                     prefill_ends = np.zeros(num_reqs, dtype=np.int64)
                     prefill_ends[:n] = self._prefill_end[
                         input_batch.idx_mapping_np[:n]
@@ -512,3 +504,13 @@ def _fill_num_accepted_kernel(
     if req_state_idx < 0:
         return
     tl.store(num_accepted_ptr + req_state_idx, num_sampled)
+
+
+def mamba_prefill_end(new_req_data: NewRequestData) -> int:
+    """The scheduler's ``max(num_prompt_tokens, num_tokens - 1)`` for a request
+    the worker receives: a resumed (preempted) request ships all of its tokens,
+    prompt and outputs, from ``prefill_token_start`` on."""
+    prompt_len = new_req_data.prompt_len
+    if new_req_data.prefill_token_ids is None:
+        return prompt_len
+    return max(prompt_len, new_req_data.prefill_len - 1)

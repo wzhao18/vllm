@@ -1814,6 +1814,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.has_prefill_checkpoint_blocks and kv_cache_spec.prefill_snapshot
         )
         self._first_chunk_reqs: set[str] = set()
+        # Request -> real prefill end, for crossing chunks (set_prefill_end).
+        self._prefill_ends: dict[str, int] = {}
         self._snapshot_cols: dict[str, int] = {}
         # (request, column, block) of each snapshot block placed for a running
         # request this step. Its worker block table is append-only, so the
@@ -2045,6 +2047,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
+    def set_prefill_end(self, request_id: str, prefill_end: int) -> None:
+        """The request's real prefill end for crossing chunks (0: crossing
+        chunks are not formed, e.g. under dense retention). The allocation's
+        own ``prefill_end`` is zeroed under any retention but sparse."""
+        if prefill_end:
+            self._prefill_ends[request_id] = prefill_end
+        else:
+            self._prefill_ends.pop(request_id, None)
+
     def set_first_chunk(self, request_id: str, first_chunk: bool) -> None:
         if first_chunk:
             self._first_chunk_reqs.add(request_id)
@@ -2256,7 +2267,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
             )
             snapshot_col = -1
-            if not self._needs_internal_checkpoint(
+            # A crossing chunk exports only its crossed block boundary B, a
+            # full block (and a retention grid point); it reserves no chunk-end
+            # checkpoint, so it publishes what a chunk stopping at B would.
+            crossing = self._is_crossing_chunk(
+                total_computed_tokens,
+                num_tokens,
+                self._prefill_ends.get(request_id, 0),
+            )
+            if crossing:
+                checkpoint_position = 0
+            elif not self._needs_internal_checkpoint(
                 request_id,
                 total_computed_tokens,
                 num_tokens,
@@ -2314,9 +2335,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.has_prefill_checkpoint_blocks
                     and total_computed_tokens % self.block_size != 0
                     and checkpoint_position == 0
-                    and not self._is_crossing_chunk(
-                        total_computed_tokens, num_tokens, prefill_end
-                    )
+                    and not crossing
                     and num_tokens - total_computed_tokens
                     > self.block_pool.hash_block_size
                     and num_tokens > cdiv(total_computed_tokens, self.block_size)
@@ -2530,6 +2549,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._chunk_starts.pop(request_id, None)
             self._snapshot_cols.pop(request_id, None)
             self._first_chunk_reqs.discard(request_id)
+            self._prefill_ends.pop(request_id, None)
             self._checkpoints_in_initial_state_block.discard(request_id)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
@@ -2717,7 +2737,7 @@ class MambaManager(SingleTypeKVCacheManager):
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if start >= prefill_end:
             return
-        if retention_interval == 0 and self._is_crossing_chunk(
+        if retention_interval in (0, self.block_size) and self._is_crossing_chunk(
             start, num_tokens, prefill_end
         ):
             # The chunk exported the state at the block end into this column

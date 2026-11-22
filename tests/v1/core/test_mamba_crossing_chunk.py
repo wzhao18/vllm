@@ -137,10 +137,10 @@ def test_stop_at_block_end_keeps_a_crossing_chunk() -> None:
     assert sched_mod._stop_at_block_end(stub, request, 800, 1600) == 800
 
 
-def _manager() -> KVCacheManager:
+def _manager(retention: int | None = 0) -> KVCacheManager:
     config = KVCacheConfig(
-        # Production (sparse) retention: crossing chunks need it.
-        prefix_cache_retention_interval=0,
+        # Sparse (0) or a one-block grid: the retentions crossing chunks use.
+        prefix_cache_retention_interval=retention,
         num_blocks=10000,
         kv_cache_tensors=[],
         kv_cache_groups=[
@@ -174,13 +174,19 @@ def _manager() -> KVCacheManager:
     )
 
 
-def _prefill(snapshot: bool, prompt_len: int, budgets: list[int], resume_at: int):
+def _prefill(
+    snapshot: bool,
+    prompt_len: int,
+    budgets: list[int],
+    resume_at: int,
+    retention: int = 0,
+):
     """Chunked prefill through the real split and MambaManager. Simulates the
     kernel: the running column ends at the chunk end; a crossing chunk also
     writes the state at its boundary into the column it resumed from (the
     worker's checkpoint rule, checked against the manager's here)."""
     init_none_hash(sha256)
-    manager = _manager()
+    manager = _manager(retention)
     mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=HASH)
     # Resume from a private mid-block state (an earlier turn's checkpoint).
@@ -238,16 +244,20 @@ def _prefill(snapshot: bool, prompt_len: int, budgets: list[int], resume_at: int
     return cached, crossings
 
 
+@pytest.mark.parametrize("retention", [0, BLK], ids=["sparse", "grid"])
 @pytest.mark.parametrize("resume_at", [0, 800, 2416])
 @pytest.mark.parametrize(
     "budgets", [[2400, 2400, 2400], [700, 2000, 1500, 3000], [1000] * 12]
 )
-def test_crossing_prefill_publishes_the_same_exact_boundaries(resume_at, budgets):
+def test_crossing_prefill_publishes_the_same_exact_boundaries(
+    resume_at, budgets, retention
+):
     """Every cached Mamba block holds the state its hash claims, and crossing
-    chunks publish exactly the boundary hashes block-ended chunks do."""
+    chunks publish exactly the checkpoint set (positions and hashes) the
+    block-ended chunks do, under sparse and one-block-grid retention."""
     prompt_len = 6 * BLK + 123
-    aligned, n0 = _prefill(False, prompt_len, budgets, resume_at)
-    crossed, n1 = _prefill(True, prompt_len, budgets, resume_at)
+    aligned, n0 = _prefill(False, prompt_len, budgets, resume_at, retention)
+    crossed, n1 = _prefill(True, prompt_len, budgets, resume_at, retention)
     assert n0 == 0
     assert set(crossed) == set(aligned)
     assert all(crossed[k] == aligned[k] for k in aligned)
@@ -296,3 +306,33 @@ def test_dp_pull_chunk_keeps_the_crossing() -> None:
     assert 1600 < 800 + n <= 3200
     stub.mamba_crossing_chunks = False
     assert Scheduler._dp_pull_chunk(stub, request, 2000, 2000) == 800
+
+
+def test_crossing_is_off_under_dense_retention() -> None:
+    """Dense retention publishes every chunk end, so crossing chunks are not
+    formed there (one checkpoint export per sequence per step)."""
+    manager = _manager(retention=None)
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    (request,) = create_requests(1, num_tokens=6 * BLK, block_size=HASH)
+    assert manager.allocate_slots(request, 800) is not None
+    assert request.request_id not in mamba._prefill_ends
+
+
+@pytest.mark.parametrize("num_output_tokens", [0, 1, 7])
+@pytest.mark.parametrize("trim", [False, True])
+def test_worker_and_scheduler_prefill_end_agree(num_output_tokens, trim) -> None:
+    """The V2 Mamba model state derives each request's prefill end from what
+    it is shipped; it must equal the scheduler's for fresh requests and for
+    resumed (preempted) ones carrying output tokens, trimmed or not."""
+    from vllm.v1.core.sched.output import NewRequestData, trim_new_request_data
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import mamba_prefill_end
+
+    (request,) = create_requests(1, num_tokens=3 * BLK + 5, block_size=HASH)
+    for t in range(num_output_tokens):
+        request.append_output_token_ids(1000 + t)
+    request.num_computed_tokens = 800 if trim else 0
+    new = NewRequestData.from_request(request, ([],), request.prefill_token_ids)
+    if trim:
+        trim_new_request_data(new, request)
+    expected = max(request.num_prompt_tokens, request.num_tokens - 1)
+    assert mamba_prefill_end(new) == expected
