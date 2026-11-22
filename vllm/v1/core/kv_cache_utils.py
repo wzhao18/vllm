@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+import atexit
 import base64
 import copy
 import hashlib
@@ -1004,7 +1005,9 @@ def export_block_hashes(
     handed over)."""
     n = min(len(request.block_hashes), request.num_prompt_tokens // hash_block_size)
     if n <= 0 or request.mm_features or request.prompt_embeds is not None:
+        _count_remote_hashes("not exported")
         return {}
+    _count_remote_hashes("exported")
     return {
         REMOTE_BLOCK_HASHES_KEY: base64.b64encode(
             b"".join(request.block_hashes[:n])
@@ -1015,9 +1018,38 @@ def export_block_hashes(
     }
 
 
+_HANDOVER_KEYS = ("adopted", "exported", "not exported")
+
+
+def _remote_hash_summary() -> str:
+    c = _remote_hash_counts
+    reasons = {k: v for k, v in c.items() if k not in _HANDOVER_KEYS}
+    return (
+        f"pd-block-hashes: adopted {c.get('adopted', 0)} / fallback "
+        f"{sum(reasons.values())} ({', '.join(f'{k} {v}' for k, v in reasons.items())})"
+        f"; exported {c.get('exported', 0)}, not exported {c.get('not exported', 0)}"
+    )
+
+
+def _count_remote_hashes(key: str) -> int:
+    """Count one handover outcome; log the per-process summary on the first
+    event and then every 1000 events (and at exit)."""
+    count = _remote_hash_counts.get(key, 0) + 1
+    _remote_hash_counts[key] = count
+    total = sum(_remote_hash_counts.values())
+    if total == 1 or total % 1000 == 0:
+        logger.info("%s", _remote_hash_summary())
+    return count
+
+
+@atexit.register
+def _log_remote_hash_counts() -> None:
+    if _remote_hash_counts:
+        logger.info("%s", _remote_hash_summary())
+
+
 def _remote_hashes_not_adopted(request: Request, reason: str) -> list[BlockHash]:
-    count = _remote_hash_counts.get(reason, 0) + 1
-    _remote_hash_counts[reason] = count
+    count = _count_remote_hashes(reason)
     if count == 1 or count % 1000 == 0:
         logger.warning(
             "Not adopting the KV producer's block hashes for request %s (%s; %d "
@@ -1076,7 +1108,7 @@ def adopt_remote_block_hashes(
     )
     if witness != hashes[-1]:
         return _remote_hashes_not_adopted(request, "witness mismatch")
-    _remote_hash_counts["adopted"] = _remote_hash_counts.get("adopted", 0) + 1
+    _count_remote_hashes("adopted")
     return hashes
 
 
