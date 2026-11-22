@@ -158,3 +158,47 @@ def test_gqa_draft_gets_its_own_group_and_a_fitting_block(
     assert GQADraftKVCacheGrouping.get_kv_cache_groups(
         vllm_config, target
     ) == get_kv_cache_groups(vllm_config, target)
+
+
+@pytest.mark.parametrize(
+    ("retention", "prefix_caching", "kv_transfer_config", "expected"),
+    [
+        # A prefix store persists KDA boundary states: keep one per block.
+        (
+            0,
+            True,
+            {
+                "kv_connector": "MultiConnector",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {"kv_connector": "NixlConnector"},
+                        {"kv_connector": "MooncakeStoreConnector"},
+                    ]
+                },
+            },
+            "auto",
+        ),
+        # Decode (NIXL only), no connector or no prefix caching: unchanged.
+        (0, True, {"kv_connector": "NixlConnector"}, 0),
+        (0, True, None, 0),
+        (0, False, {"kv_connector": "MooncakeStoreConnector"}, 0),
+        # An explicit non-default interval is kept.
+        (32768, True, {"kv_connector": "MooncakeStoreConnector"}, 32768),
+    ],
+)
+def test_kimi_k3_prefix_store_selects_auto_retention(
+    retention, prefix_caching, kv_transfer_config, expected
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        cache_config=SimpleNamespace(
+            cache_dtype="auto",
+            prefix_cache_retention_interval=retention,
+            enable_prefix_caching=prefix_caching,
+        ),
+        attention_config=SimpleNamespace(backend=None),
+        speculative_config=None,
+        kv_transfer_config=kv_transfer_config,
+    )
+    KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.cache_config.prefix_cache_retention_interval == expected
