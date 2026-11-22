@@ -3419,6 +3419,11 @@ class TestPeerReplacement:
             self.nixl = self.worker.nixl_wrapper
             self.transport = MagicMock(wraps=self.nixl)
             self.worker.nixl_wrapper = self.transport
+            # These tests cover peer invalidation, release and backoff on the
+            # path a pull takes once its one retry is spent (or a read fails
+            # with another error): reads fail and are reported. The retry
+            # itself is covered by TestPullRetryAndChunking.
+            self.worker._pull_retry_disconnect = False
             monkeypatch.setattr(
                 self.worker._handshake_initiation_executor,
                 "submit",
@@ -4118,9 +4123,16 @@ class TestPullRetryAndChunking:
         assert notifs == [b"old-prefill:1"]
 
     @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
-    def test_small_read_keeps_a_single_notifying_transfer(self):
+    def test_small_read_keeps_a_single_transfer_and_notifies_once(self):
+        # Pull mode always defers the notification (the read may be retried),
+        # so it is sent once after the single transfer lands, not with it.
+        self.transport.check_xfer_state.return_value = "DONE"
         self.worker.start_load_kv(self._request(blocks=(1, 2)))
-        assert self._xfer_notifs() == [b"old-prefill:1"]
+        assert self._xfer_notifs() == [None]
+        assert not self._notif_calls()
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"old-req"} and not result.failed_recving
+        assert self._notif_calls() == [b"old-prefill:1"]
 
     @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
     def test_failed_chunk_fails_request_after_others_drain(self):
