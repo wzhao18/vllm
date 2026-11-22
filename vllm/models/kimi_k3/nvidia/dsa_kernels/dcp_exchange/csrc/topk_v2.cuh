@@ -1665,11 +1665,68 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2STAT(3);
       if (tid == 0) { s_pref = 0ull; s_cnt = K; s_u[12] = 0; }
       __syncthreads();
+      // Id rounds from one pass: every global id of this row is < Gl + W * IL <= 2^20 (the same
+      // bound on every rank), so the ties at tau fit a 4096-bin histogram by gid >> 8 (in `hist`).
+      // Round 2 takes its 256 digits from sums of that histogram, round 3 from its bins, and
+      // round 4 walks only the positions of the chosen 256-id block: 1 full pass instead of 3.
+      // The digits are those of the composite's inverted id (0xFFFFFF - gid = ~gid: each byte
+      // inverted), so the exchanged histograms are exactly the full-pass ones.
+      const bool fine = (int64_t)Gl + (int64_t)W * IL <= (int64_t)(1 << 20);
+      uint32_t* const rh_fine = cpos;  // round histograms in the fine mode (cpos is free in T3)
       for (int rd = 0; rd < kV2RadR; ++rd) {
         const int shb = 32 - 8 * rd;
         const unsigned long long pref = s_pref;
-        if (tid < 256) hist[tid] = 0;
+        const bool fr = fine && rd >= 2;
+        uint32_t* const rh = fr ? rh_fine : hist;
+        if (fr && rd == 2) {
+          for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
+        }
+        if (tid < 256) rh[tid] = 0;
         __syncthreads();
+        if (fr) {
+          const uint32_t kt = (uint32_t)(pref >> (24 - shb - 8));
+          if (rd == 2) {
+            // the one pass: ties at tau by gid >> 8
+            for_keys(0, ng, [&](int i0, const uint4& r) {
+              const Keys8 k8(r);
+#pragma unroll 1
+              for (int j = 0; j < 8; ++j) {
+                const uint32_t k = k8.key(j);
+                if (!k || k != kt) continue;
+                atomicAdd(&hist[gid_of(i0 + j) >> 8], 1u);
+              }
+            });
+            // round-2 digit d = 255 - (gid >> 16): the sum of fine bins [g16 * 256, + 256)
+            if (tid < 16) {
+              uint32_t sum = 0;
+              for (int b = 0; b < 256; ++b) sum += hist[tid * 256 + b];
+              rh[255 - tid] = sum;
+            }
+            __syncthreads();
+          } else if (rd == 3) {
+            const int g16 = 255 - (int)(pref & 0xFFull);
+            if (tid < 256) rh[255 - tid] = g16 < 16 ? hist[g16 * 256 + tid] : 0u;
+            __syncthreads();
+          } else {
+            // rd == 4: the positions of the chosen 256-id block [g8 << 8, + 256) on this rank
+            const int g8 = ((255 - (int)((pref >> 8) & 0xFFull)) << 8) | (255 - (int)(pref & 0xFFull));
+            const int64_t G0 = (int64_t)g8 << 8, ilw = (int64_t)IL * W;
+            const int64_t plo = (G0 / ilw) * IL, phi = ((G0 + 255) / ilw) * IL + IL - 1;
+            const int64_t ga64 = (plo + sh) >> 3, gb64 = ((phi + sh) >> 3) + 1;
+            const int ga = ga64 < 0 ? 0 : (int)ga64, gb = gb64 > ng ? ng : (int)gb64;
+            for_keys(ga, max(ga, gb), [&](int i0, const uint4& r) {
+              const Keys8 k8(r);
+#pragma unroll 1
+              for (int j = 0; j < 8; ++j) {
+                const uint32_t k = k8.key(j);
+                if (!k || k != kt) continue;
+                const unsigned long long c = ((unsigned long long)k << 24) | (0xFFFFFFu - gid_of(i0 + j));
+                if ((c >> (shb + 8)) != pref) continue;
+                atomicAdd(&rh[(c >> shb) & 0xFFu], 1u);
+              }
+            });
+          }
+        } else {
         // id rounds 3-4 walk the positions of the keys equal to tau, collected in round 2
         // (cpos is free in the complete body's radix tier), when they all fit; else the pass
         const uint32_t ncomp = s_u[12];
@@ -1708,11 +1765,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
           }
         });
+        }
         const int64_t rrow = p.off_rad + (((int64_t)(par * p.cap + row) * kV2RadR + rd) * W) * 256;
         if (tid < 64) {
           const int j = tid * 4;
-          const uint4 v = make_uint4(tagw(tag, hist[j]), tagw(tag, hist[j + 1]), tagw(tag, hist[j + 2]),
-                                     tagw(tag, hist[j + 3]));
+          const uint4 v = make_uint4(tagw(tag, rh[j]), tagw(tag, rh[j + 1]), tagw(tag, rh[j + 2]),
+                                     tagw(tag, rh[j + 3]));
           const int64_t off = rrow + (int64_t)p.rank * 256 + j;
           if (p.mc) mc_st_v4(p.mc + off * 4, v);
           else

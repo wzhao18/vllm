@@ -1625,13 +1625,15 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
                 # The persistent prefill kernel reads and writes the state
-                # cache rows in place (no gather / row-scatter launches).
+                # cache rows in place (no gather / row-scatter launches). It
+                # also exports prefill checkpoints: each one is a sequence
+                # boundary of its schedule (persistent_prefill).
                 inplace_state = (
                     self.kda_prefill_backend == "flashkda"
                     and self._frost
                     and self._kda_persistent
-                    and checkpoint is None
                     and m.non_spec_query_start_loc_cpu is not None
+                    and (checkpoint is None or checkpoint.offsets is not None)
                 )
                 initial_state = (
                     None
@@ -1715,7 +1717,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                 recurrent_state=recurrent_state,
                                 cu_seqlens=ckpt_cu_seqlens,
                             )
-                    elif checkpoint is not None:
+                    elif checkpoint is not None and not inplace_state:
                         assert non_spec_query_start_loc is not None
                         num_sequences = initial_state.shape[0]
                         assert checkpoint.checkpoint_offsets.shape == (num_sequences,)
@@ -1777,8 +1779,31 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     has_initial_state=has_initial_state,
                                     out=flashkda_out,
                                     step_memo=specialized_prefill_kda.step_memo_for(m),
+                                    checkpoint_offsets=(
+                                        checkpoint.offsets
+                                        if checkpoint is not None
+                                        else None
+                                    ),
+                                    checkpoint_out=(
+                                        checkpoint_state
+                                        if checkpoint is not None
+                                        else None
+                                    ),
                                 )
                             )
+                            if checkpoint is not None:
+                                num_sequences = checkpoint.checkpoint_offsets.numel()
+                                assert self._checkpoint_exporter is not None
+                                self._checkpoint_exporter.export(
+                                    checkpoint,
+                                    raw_qkv=ckpt_raw_qkv,
+                                    conv_state=conv_state,
+                                    recurrent_checkpoint=checkpoint_state[
+                                        :num_sequences
+                                    ],
+                                    recurrent_state=recurrent_state,
+                                    cu_seqlens=ckpt_cu_seqlens,
+                                )
                         else:
                             frost_out, last_recurrent_state = (
                                 specialized_prefill_kda.frost_prefill(
