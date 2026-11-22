@@ -72,3 +72,23 @@ def test_megamoe_guard_copies_agree():
 def test_guard_fires_before_megamoe(family):
     bound = _OTHER[family]()
     assert 0 < bound < min(_megamoe_ns()), f"{family}: {bound / 1e9:g} s is not below MegaMoE's guard"
+
+
+def test_runtime_bounds_keep_the_order():
+    # The CuTe guards read their bound at runtime (guard_config.py, patched into every kernel after load); the
+    # built-in defaults above apply only if a patch fails. Both sets must keep non-MegaMoE < MegaMoE.
+    assert 0 < _py_const("guard_config.py", "GUARD_NS") < _py_const("guard_config.py", "MEGAMOE_GUARD_NS")
+    assert _py_const("guard_config.py", "MEGAMOE_GUARD_NS") <= min(_megamoe_ns())
+
+
+def test_runtime_bounds_are_not_in_the_compile_cache_key():
+    # cute_cache keys a kernel on the vllm files that ran during its trace plus their direct imports. The guard
+    # code that runs in a trace (guard_global, k31_spin_guard, both MegaMoE spin_guard copies) and cute_cache
+    # itself must not import guard_config, so a retune re-keys nothing (int64.3 item 1).
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    executed = [os.path.abspath(os.path.join(_NV, rel)) for rel in (
+        "guard_global.py", "k31_spin_guard.py", "cute_cache.py",
+        "megamoe_rubin/src/sources/helpers/spin_guard.py", "megamoe_rubin/src_gp/common/spin_guard.py")]
+    files = cute_cache._sources(set(), set(executed))
+    assert files and not any(f.endswith("guard_config.py") for f in files), sorted(files)
