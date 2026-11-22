@@ -22,6 +22,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -586,6 +588,7 @@ class RubinExpertsKernel(ExpertsKernel):
             mine[j] = Int32(-1)
         if cutlass.const_expr(self.polled):  # Lamport: all ones until written
             ready = False
+            sgn, sgt = spin_start()
             while not ready:
                 words = load_words(ids + base, count=4, scope="gpu")
                 for j in cutlass.range_constexpr(4):
@@ -595,6 +598,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 ready = cute.arch.vote_all_sync((not valid) | (not armed))
                 if not ready:
                     sleep_ns(32)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             if not valid:
                 for j in cutlass.range_constexpr(4):
                     mine[j] = Int32(-1)
@@ -1008,6 +1012,7 @@ class RubinExpertsKernel(ExpertsKernel):
         for t in cutlass.range_constexpr(8):
             bad |= words[j, t] == Uint32(4294967295)
         ready = cute.arch.vote_all_sync(not bad)
+        sgn, sgt = spin_start()
         while not ready:
             bad = False
             for half in cutlass.range_constexpr(2):
@@ -1016,6 +1021,7 @@ class RubinExpertsKernel(ExpertsKernel):
                     words[j, 4 * half + i] = got[i]
                     bad |= got[i] == Uint32(4294967295)
             ready = cute.arch.vote_all_sync(not bad)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
 
     @cute.jit
     def rearm_peers(self, workspace, parity, cta):
@@ -1044,12 +1050,14 @@ class RubinExpertsKernel(ExpertsKernel):
             for slot in cutlass.range_constexpr(16):
                 bad |= has_ff_half(words[slot])
             ready = cute.arch.vote_all_sync(not bad)
+        sgn, sgt = spin_start()
         while not ready:
             bad = False
             for slot in cutlass.range_constexpr(16):
                 words[slot] = load_volatile(source + slot * 7168)[0]
                 bad |= has_ff_half(words[slot])
             ready = cute.arch.vote_all_sync(not bad)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         # Re-arm, the slot-order FMA sum (bitwise), each lane's latent word.
         low, high = Float32(0), Float32(0)
         for slot in cutlass.range_constexpr(16):
@@ -1411,10 +1419,12 @@ class RubinExpertsKernel(ExpertsKernel):
                 # Every copy CTA's image part is written (acquire); the producer waits
                 # for this arrival before its claim, so the read precedes the re-arm.
                 ready = False
+                sgn, sgt = spin_start()
                 while not ready:
                     ready = load_acquire(source + 128) == Uint32(2 * self.capacity - 1)
                     if not ready:
                         sleep_ns(64)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 xcount = view(sm.iterator, self.off_misc + self.bar_xcount, Uint64, 1)
                 cute.arch.mbarrier_arrive(xcount.iterator)
                 fence_proxy_global()  # the image, before this thread's bulk copies

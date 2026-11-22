@@ -22,6 +22,7 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     to_cute,
     to_cute_dynamic_m,
 )
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 
 class LamportCopy:
@@ -80,8 +81,10 @@ class LamportCopy:
                 assumed_align=16,
             )
             packed = load_global_u32x4(source, volatile=True)
+            sgn, sgt = spin_start()
             while fragment_is_dirty(packed):
                 packed = load_global_u32x4(source, volatile=True)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
 
             destination = cutlass.Int64((local_output.iterator + element).toint())
             store_global_u32x4(destination, packed, volatile=False)

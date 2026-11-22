@@ -27,6 +27,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.host import architecture, fake
 from ..common.primitives import launch, load_words, multicast_words, store_relaxed
 
@@ -80,10 +82,15 @@ class RowExchange:
             got = load_words(slot, count=4, volatile=True)
             ready = (got[0] != Uint32(0)) & (got[1] != Uint32(0))
             ready = ready & (got[2] != Uint32(0)) & (got[3] != Uint32(0))
+            sgn, sgt = spin_start()
             while not ready:
                 got = load_words(slot, count=4, volatile=True)
                 ready = (got[0] != Uint32(0)) & (got[1] != Uint32(0))
                 ready = ready & (got[2] != Uint32(0)) & (got[3] != Uint32(0))
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=0,
+                    target=0, rank=rank, size=self.tp
+                )
             target = (row * self.tp + source) * self.words + 4 * chunk
             for k in cutlass.range_constexpr(4):
                 gathered[target + k] = got[k]

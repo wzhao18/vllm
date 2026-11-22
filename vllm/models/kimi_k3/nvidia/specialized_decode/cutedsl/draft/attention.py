@@ -62,6 +62,8 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ...shapes import Shape, full_capture, refuse
 from ..common.host import (
     dynamic_fake,
@@ -248,8 +250,13 @@ class QGather:
             loads = [load_volatile(source, count=4) for source in sources]
             for i in cutlass.range_constexpr(n):
                 words = loads[i]
+                sgn, sgt = spin_start()
                 while not published(words, sentinel=Q_SENT):
                     words = load_volatile(sources[i], count=4)
+                    sgn, sgt = spin_tick(
+                        sgn, sgt, observed=0,
+                        target=0, rank=rank, size=self.size
+                    )
         cute.arch.griddepcontrol_launch_dependents()
 
 

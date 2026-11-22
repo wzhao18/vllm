@@ -26,6 +26,12 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from . import dies
 from .host import _checked, resolve_kernel
 from .primitives import asm
@@ -145,5 +151,11 @@ def wait_landed(landed, launch, grid: cutlass.Constexpr[int]):
     long true by the time a CTA is done)."""
     target = (Uint64(launch) + 1) * grid
     seen = _landed(landed)
+    sgn, sgt = spin_start()
     while seen < target:
         seen = _landed(landed)
+        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "wait_landed")

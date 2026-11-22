@@ -33,6 +33,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia import k31_spin_guard as k31sg
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import tensormap
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import asm
 
@@ -102,11 +103,12 @@ def mbar_arrive_tx(bar, nbytes):
             (Uint32(bar), Uint32(nbytes)))
 
 
-@asm()
 def mbar_wait(bar, parity):
-    code = ("{ .reg .pred p; WAIT_${:uid}: mbarrier.try_wait.parity.shared::cta.b64 "
-            "p, [$0], $1; @!p bra WAIT_${:uid}; }")
-    return code, "r,r,~{memory}", (Uint32(bar), Uint32(parity))
+    """Bounded parity wait (k31_spin_guard); timeouts name the caller's line."""
+    return k31sg.mbar_wait(bar, parity)
+
+
+k31sg.register_poll_helper(__file__, "mbar_wait")
 
 
 @asm()

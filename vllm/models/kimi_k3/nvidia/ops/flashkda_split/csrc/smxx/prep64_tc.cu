@@ -29,6 +29,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cudaTypedefs.h>
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
+K31SG_DEFINE_SET_RANK(prep64_tc)  // rank of the timeout line (binding: set_spin_rank)
 
 namespace prep64tc {
 
@@ -227,6 +229,7 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t addr, uint32_t (&r)[4]) {
 __device__ __forceinline__ void stg32(void* p, uint32_t v) { *reinterpret_cast<uint32_t*>(p) = v; }
 
 __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_constant__ Params p) {
+  k31sg::begin_call((long long)(p.T));  // timeout lines: call index and size
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
   const int ci = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
@@ -306,17 +309,7 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   if (tid < kD) s.dt[tid] = p.dt_bias[h * kD + tid];
   const float amp = expf(p.a_log[h]);
   __syncthreads();  // barrier init, weights visible
-  {
-    uint32_t ok = 0;
-    while (!ok) {
-      asm volatile(
-          "{\n .reg .pred P1;\n mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], 0;\n"
-          " selp.u32 %0, 1, 0, P1;\n}"
-          : "=r"(ok)
-          : "r"(bar)
-          : "memory");
-    }
-  }
+  k31sg::mbar_wait(bar, 0u, "flashkda_prep64_tc", __LINE__);
   stamp(15);
 #pragma unroll 1
   for (int xi = 0; xi < 3; ++xi) {
@@ -760,6 +753,7 @@ struct SmemK {
 };
 
 __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant__ Params p) {
+  k31sg::begin_call((long long)(p.T));  // timeout lines: call index and size
   extern __shared__ __align__(128) unsigned char smem_raw[];
   SmemK& sk = *reinterpret_cast<SmemK*>(smem_raw);
   Smem& s = sk.s;
@@ -822,10 +816,7 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
   if (tid < kD) s.dt[tid] = p.dt_bias[h * kD + tid];
   const float amp = expf(p.a_log[h]);
   __syncthreads();  // barrier init, dt visible
-  asm volatile(
-      "{\n .reg .pred P1;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], 0;\n"
-      " @!P1 bra W_%=;\n}" ::"r"(bar)
-      : "memory");
+  k31sg::mbar_wait(bar, 0u, "flashkda_prep64_tc", __LINE__);
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const int t = t_first + j;
@@ -1714,6 +1705,7 @@ constexpr int kStage = 74752;
 constexpr int kSmemV2 = kPrepBytes + kStage + 64;
 
 __global__ void __launch_bounds__(256, 1) kp64v2_kernel(const __grid_constant__ prep64tc::Params p) {
+  k31sg::begin_call((long long)(p.T));  // timeout lines: call index and size
   extern __shared__ __align__(1024) unsigned char sm[];
   unsigned char* stage = sm;
   unsigned char* ps = sm + kStage;
@@ -1747,10 +1739,7 @@ __global__ void __launch_bounds__(256, 1) kp64v2_kernel(const __grid_constant__ 
   if (tid < kD) reinterpret_cast<float*>(ps + kDt)[tid] = p.dt_bias[h * kD + tid];
   const float amp = expf(p.a_log[h]);
   __syncthreads();
-  asm volatile(
-      "{\n .reg .pred P1;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], 0;\n"
-      " @!P1 bra W_%=;\n}" ::"r"(bar)
-      : "memory");
+  k31sg::mbar_wait(bar, 0u, "flashkda_prep64_tc", __LINE__);
   prep_chunk(p, ps, h, tok0, valid, tid, tid >> 5, tid & 31, amp, stage);
   __syncthreads();
   const int64_t img = int64_t(h) * p.C_total + ci;

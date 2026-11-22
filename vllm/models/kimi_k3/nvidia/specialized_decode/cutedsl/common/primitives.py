@@ -12,6 +12,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as nvvm
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 
 def ptx(assembly, constraints, operands=(), result=None, *, effects, loc=None, ip=None):
     """One verbatim asm block; a tuple ``result`` (even a 1-tuple) returns a tuple."""
@@ -775,9 +781,15 @@ def try_wait(barrier, phase=0, *, test=False, scope="cluster"):
 
 @cute.jit
 def wait(barrier, phase=0, test: cutlass.Constexpr[bool] = False, scope="cluster"):
+    """Bounded parity wait (k31_spin_guard; a timeout names the caller's line)."""
     done = try_wait(barrier, phase, test=test, scope=scope)
+    n, t0 = spin_start()
     while done == 0:
         done = try_wait(barrier, phase, test=test, scope=scope)
+        n, t0 = spin_tick(n, t0, observed=Int32(phase) ^ Int32(1), target=phase)
+
+
+register_poll_helper(__file__, "wait", "wait_tmem")
 
 
 @asm(Int32)

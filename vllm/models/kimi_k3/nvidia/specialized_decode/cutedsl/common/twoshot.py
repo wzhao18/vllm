@@ -26,6 +26,12 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from .mailbox import rearm
 from .primitives import (
     add_rn,
@@ -105,6 +111,7 @@ def poll_slots(recv, raw, token, local):
     o-projection: owner reduce done 4.03 -> 3.39 us after the last push)."""
     tp: cutlass.Constexpr = recv.shape[0]
     pending = Int32(1)
+    sgn, sgt = spin_start()
     while pending != 0:
         for slot in cutlass.range_constexpr(tp):
             words = load_vector(at(recv, slot, token, local), cache="volatile")
@@ -114,6 +121,7 @@ def poll_slots(recv, raw, token, local):
         for slot in cutlass.range_constexpr(tp):
             if not published(raw[slot, j] for j in range(4)):
                 pending |= 1 << slot
+        sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=tp)
 
 
 @cute.jit
@@ -133,6 +141,7 @@ def reduce(
         poll_slots(recv, raw, token, local)
     else:
         pending = Int32((1 << tp) - 1)
+        sgn, sgt = spin_start()
         while pending != 0:
             for slot in cutlass.range_constexpr(tp):
                 if (pending & (1 << slot)) != 0:
@@ -141,6 +150,10 @@ def reduce(
                         raw[slot, j] = words[j]
                     if published(words):
                         pending &= ~(1 << slot)
+            sgn, sgt = spin_tick(
+                sgn, sgt, observed=pending,
+                target=0, rank=rank, size=tp
+            )
     values = cute.make_rmem_tensor(8, Float32)
     for j in cutlass.range_constexpr(4):
         low, high = unpack_bf16(raw[0, j])
@@ -155,3 +168,7 @@ def reduce(
     multicast_words(gather_mc + Int64(offset) * 2, words)
     for slot in cutlass.range_constexpr(tp):
         rearm(at(recv, slot, token, local))
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "poll_slots", "reduce")

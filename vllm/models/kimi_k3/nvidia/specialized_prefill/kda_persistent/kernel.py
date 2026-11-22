@@ -35,6 +35,9 @@ from cutlass.cute.arch import nvvm_wrappers
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from vllm.models.kimi_k3.nvidia import k31_spin_guard as k31sg
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 
 @dsl_user_op
 def _bulk_prefetch_l2(addr, size, *, loc=None, ip=None):
@@ -47,23 +50,13 @@ def _bulk_prefetch_l2(addr, size, *, loc=None, ip=None):
     nvvm_wrappers.nvvm.cp_async_bulk_prefetch(gmem_addr, size, loc=loc, ip=ip)
 
 
-@dsl_user_op
-def _mbar_wait_hint(bar, phase, *, loc=None, ip=None):
-    """Parity wait on a CTA mbarrier with a 10 ms suspend-time hint."""
-    addr = llvm.ptrtoint(T.i32(), bar.to_llvm_ptr(loc=loc, ip=ip), loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [addr, cutlass.Int32(phase).ir_value(loc=loc, ip=ip)],
-        "{\n.reg .pred P1;\nLAB_WAIT:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1, 0x989680;\n"
-        "@P1 bra DONE;\nbra LAB_WAIT;\nDONE:\n}",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
+def _mbar_wait_hint(bar, phase):
+    """Parity wait on a CTA mbarrier with a 10 ms suspend-time hint, bounded
+    (k31_spin_guard)."""
+    return k31sg.mbar_wait(bar, phase, hint=", 0x989680")
+
+
+k31sg.register_poll_helper(__file__, "_mbar_wait_hint")
 
 
 @dsl_user_op
@@ -765,6 +758,7 @@ def _pkd(
                         sem="acquire",
                         scope="gpu",
                     )
+                    sgn, sgt = spin_start()
                     while fcur < ftgt:
                         fcur = cute.arch.atomic_add(
                             mflags.iterator + simp,
@@ -772,6 +766,7 @@ def _pkd(
                             sem="acquire",
                             scope="gpu",
                         )
+                        sgn, sgt = spin_tick(sgn, sgt, observed=fcur, target=0)
             # epilogue WG seeds + decays master windows 2-3
             for win in cutlass.range_constexpr(2):
                 msth = cute.make_tensor(
@@ -1333,6 +1328,7 @@ def _pkd(
                         sem="acquire",
                         scope="gpu",
                     )
+                    sgn, sgt = spin_start()
                     while fcur < ftgt:
                         fcur = cute.arch.atomic_add(
                             mflags.iterator + simp,
@@ -1340,6 +1336,7 @@ def _pkd(
                             sem="acquire",
                             scope="gpu",
                         )
+                        sgn, sgt = spin_tick(sgn, sgt, observed=fcur, target=0)
             # seed master windows 2-3 (four 16-ch halves; compute seeds 0-1)
             for hh in cutlass.range_constexpr(4):
                 hten = cute.make_tensor(

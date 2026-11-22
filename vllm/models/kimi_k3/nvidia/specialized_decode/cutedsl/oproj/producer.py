@@ -16,6 +16,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Constexpr, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     add_rn,
     alloc,
@@ -341,11 +343,15 @@ class OprojProducer:
                         if not chunk_ready((held[i, v] for v in range(4)), half_x):
                             pending |= 1 << i
                 if cutlass.const_expr(self.vote):
+                    sgn, sgt = spin_start()
                     while not cute.arch.vote_all_sync(pending == 0):
                         pending = self.repoll_x(x, held, pending, rounds, half_x)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 else:
+                    sgn, sgt = spin_start()
                     while pending != 0:
                         pending = self.repoll_x(x, held, pending, rounds, half_x)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
             for i in cutlass.range_constexpr(rounds):
                 chunk = tid + i * 512
                 if chunk < chunks:
