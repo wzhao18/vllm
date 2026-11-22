@@ -2273,6 +2273,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        # Served EP-balance log: records map to MoE layers by call order (megamoe_rubin/ep_balance.py).
+        n_mega = sum(
+            bool(getattr(getattr(layer, "block_sparse_moe", None), "use_mega_moe", False)
+                 or getattr(getattr(layer, "mlp", None), "use_mega_moe", False))
+            for layer in self.layers[self.start_layer : self.end_layer]
+        )
+        if n_mega:
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
+
+            ep_balance.configure(n_mega)
 
         if config.dsa_config is not None:
             # A DSA layer silently built as dense MLA would be invisible in

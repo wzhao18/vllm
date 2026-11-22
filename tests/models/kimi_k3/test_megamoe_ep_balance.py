@@ -54,3 +54,34 @@ def test_slot_being_rewritten_waits_for_the_next_drain():
     _write(ring, 128, [9, 1], world=2, epr=1)
     out = ring.drain()
     assert [r["call"] for r in out] == [128] and out[0]["rank_loads"] == [9, 1]
+
+
+@cuda
+def test_lapped_slot_counts_lost_calls_and_layer_index():
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    E.configure(4)
+    ring = E.EpBalanceRing("test")
+    _write(ring, 64, [1, 1], world=2, epr=1)
+    assert [(r["call"], r["layer"]) for r in ring.drain()] == [(64, (64 - 1) % 4)]
+    # the next slot (call 128's) was lapped by call 128 + SLOTS * PERIOD before this drain
+    lapped = 128 + E.SLOTS * E.PERIOD
+    _write(ring, lapped, [2, 2], world=2, epr=1)
+    out = ring.drain()
+    assert [r["call"] for r in out] == [lapped]
+    assert out[0]["lost"] == E.SLOTS  # calls 128 .. lapped - PERIOD were overwritten
+    E.configure(0)
+
+
+@cuda
+def test_call_id_reset_resyncs_after_rescan():
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance as E
+
+    ring = E.EpBalanceRing("test")
+    _write(ring, 64 * 10, [1, 1], world=2, epr=1, t=100)
+    ring._last = 64 * 10  # as if drained
+    _write(ring, 64, [3, 1], world=2, epr=1, t=200)  # later: the session restarted its call ids
+    for _ in range(E.RESCAN_EVERY - 1):
+        assert ring.drain() == []
+    out = ring.drain()  # the rescan resyncs the cursor; the restarted sequence drains from the next call
+    assert [r["call"] for r in out] == [64] and out[0]["rank_loads"] == [3, 1]

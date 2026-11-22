@@ -7,7 +7,11 @@ GLOBAL per-expert token counts of that call (complete on every rank once ``sizes
 %globaltimer stamp into a slot of its session's host-mapped ring (token_comm_dedup.py ``_log_ep_balance``, same
 constants). ``drain_all()`` reads completed slots with plain loads on the caller's thread (no watcher thread) and
 returns per-call summaries: per-EP-rank token load and max / mean over ranks. The worker iterlog writes them as
-"E" lines (rank 0 is enough: every rank sees the global counts). Always on; the device cost is one sampled slot
+"E" lines (rank 0 is enough: every rank sees the global counts).
+
+Assumptions (recorded in the iterlog header): experts are owned contiguously, rank r holds experts
+[r * experts_per_rank, (r + 1) * experts_per_rank) (static placement: dynamic EPLB is off); a session's calls cycle
+through the model's MoE layers in order, so layer = (call - 1) % moe_layers once ``configure`` set the count. Always on; the device cost is one sampled slot
 of stores per 64 calls, the host cost one word read per ring per step (iterlog only).
 """
 
@@ -27,6 +31,14 @@ SLOT_WORDS = HEADER_WORDS + MAX_EXPERTS
 
 _lock = threading.Lock()
 _rings: list["EpBalanceRing"] = []
+_moe_layers = 0
+RESCAN_EVERY = 64  # drains without progress between full scans (resync after a call-id reset)
+
+
+def configure(moe_layers: int) -> None:
+    """MoE layer count of the model (layer index of each record)."""
+    global _moe_layers
+    _moe_layers = int(moe_layers)
 
 
 class EpBalanceRing:
@@ -36,6 +48,8 @@ class EpBalanceRing:
         self.tag = tag
         self.buffer = torch.zeros(SLOTS * SLOT_WORDS, dtype=torch.int32, pin_memory=True)
         self._last = 0  # last call id drained
+        self._idle = 0  # drains without progress
+        self.lost = 0  # sampled calls overwritten before they were drained
 
     @property
     def address(self) -> int:
@@ -49,9 +63,11 @@ class EpBalanceRing:
         base = self.buffer.data_ptr() + 4 * i * SLOT_WORDS
         return list((ctypes.c_int32 * SLOT_WORDS).from_address(base))
 
-    def drain(self) -> list[dict]:
+    def drain(self, _retry: bool = True) -> list[dict]:
         """Summaries of the calls completed since the last drain, in call order. The next sampled call has id
-        last + PERIOD in slot ((last >> SHIFT) + 1) % SLOTS: one word read per drain when nothing is new."""
+        last + PERIOD in slot ((last >> SHIFT) + 1) % SLOTS: one word read per drain when nothing is new. A lapped
+        slot (a newer call) is taken and the skipped calls are counted as lost; after RESCAN_EVERY drains without
+        progress all slots are scanned, which resyncs after a call-id reset (session re-carve)."""
         out = []
         for _ in range(SLOTS):
             i = ((self._last >> SHIFT) + 1) % SLOTS
@@ -61,11 +77,36 @@ class EpBalanceRing:
             w = self._slot(i)
             if w[0] != call:  # being rewritten: take it on the next drain
                 break
+            self.lost += max(0, (call - self._last) // PERIOD - 1)
             self._last = call
-            r = summarize(w)
-            r["session"] = self.tag
-            out.append(r)
+            out.append(self._record(w))
+        if out:
+            self._idle = 0
+            return out
+        self._idle += 1
+        if self._idle >= RESCAN_EVERY:
+            self._idle = 0
+            calls = [self._word(i, 0) for i in range(SLOTS)]
+            stamps = [(self._word(i, 1) & 0xFFFFFFFF) | ((self._word(i, 2) & 0xFFFFFFFF) << 32) for i in range(SLOTS)]
+            newest = max(range(SLOTS), key=lambda i: stamps[i] if calls[i] > 0 else -1)
+            if 0 < calls[newest] < self._last:
+                # the most recently written slot holds an older id: the session restarted its call ids
+                self._last = calls[newest] - PERIOD
+            else:
+                newer = sorted(c for c in calls if c > self._last)
+                if newer and newer[0] > self._last + PERIOD:  # stuck behind a skipped slot: jump to the oldest newer
+                    self.lost += max(0, (newer[0] - self._last) // PERIOD - 1)
+                    self._last = newer[0] - PERIOD
+            if _retry:
+                return self.drain(_retry=False)
         return out
+
+    def _record(self, w: list[int]) -> dict:
+        r = summarize(w)
+        r["session"] = self.tag
+        r["layer"] = (r["call"] - 1) % _moe_layers if _moe_layers else -1
+        r["lost"] = self.lost
+        return r
 
 
 def summarize(w: list[int]) -> dict:
@@ -110,5 +151,5 @@ def drain_all() -> list[dict]:
 
 
 def _iterlog_records() -> list[tuple]:
-    return [("E", r["session"], r["call"], r["t_ready_ns"], r["routes"], round(r["max_over_mean"], 4),
-             r["expert_max"], r["rank_loads"]) for r in drain_all()]
+    return [("E", r["session"], r["call"], r["layer"], r["t_ready_ns"], r["routes"], round(r["max_over_mean"], 4),
+             r["expert_max"], r["lost"], r["rank_loads"]) for r in drain_all()]

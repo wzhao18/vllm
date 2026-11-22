@@ -59,7 +59,10 @@ WORKER_FIELDS = {
 # Extra worker-side record sources (e.g. Kimi K3 MegaMoE EP balance): callables returning ready-made record
 # tuples, drained once per step on the worker thread after the step's own record.
 _WORKER_SOURCES: list = []
-EP_BALANCE_FIELDS = ["E", "session", "call", "t_ready_ns", "routes", "max_over_mean", "expert_max", "rank_loads"]
+EP_BALANCE_FIELDS = ["E", "session", "call", "layer", "t_ready_ns", "routes", "max_over_mean", "expert_max", "lost",
+                     "rank_loads"]
+EP_BALANCE_META = {"expert_placement": "contiguous per rank (static; dynamic EPLB off)",
+                   "layer": "(call - 1) % moe_layers"}
 
 
 def register_worker_source(fn) -> None:
@@ -305,7 +308,7 @@ class WorkerIterLog:
         self._level = level
         self._w = _Writer(f"worker-r{_global_rank()}", WORKER_FIELDS,
                           {"gpu_level": level, "rank": _global_rank(),
-                           "E_fields": EP_BALANCE_FIELDS})
+                           "E_fields": EP_BALANCE_FIELDS, "E_meta": EP_BALANCE_META})
         self._put = self._w.put
         n_ev = 6 if level >= 2 else (2 if level == 1 else 0)
         self._ring = [
