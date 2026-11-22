@@ -210,6 +210,9 @@ def _check_dcp_decode_topk_merge(
     )
 
 
+_GM_SEEN: set = set()
+
+
 def _decode_logits_profile_bytes(
     num_rows: int,
     max_model_len: int,
@@ -865,6 +868,15 @@ def sparse_attn_indexer(
     # profiling; a cudagraph memory-profiling capture arrives with real
     # (dict) metadata but the placeholder cache, and must only reserve
     # workspace -- exactly like a dummy run.
+    _gm_key = (
+        "fake" if (not isinstance(attn_metadata, dict) or kv_cache.numel() == 0)
+        else "real",
+        torch.cuda.is_current_stream_capturing(),
+    )
+    if _gm_key not in _GM_SEEN:
+        _GM_SEEN.add(_gm_key)
+        logger.info("GMDIAG indexer path=%s capturing=%s rows=%d kv_numel=%d",
+                    _gm_key[0], _gm_key[1], hidden_states.shape[0], kv_cache.numel())
     if not isinstance(attn_metadata, dict) or kv_cache.numel() == 0:
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(

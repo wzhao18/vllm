@@ -62,6 +62,39 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _gm_mem(tag: str) -> None:
+    """GRAPHMEM diagnostic: device free, allocator totals, private-pool and
+    general-pool usage, largest free general block."""
+    torch.accelerator.synchronize()
+    free, _ = torch.accelerator.get_memory_info()
+    st = torch.cuda.memory_stats()
+    pool_res = pool_alloc = gen_res = gen_alloc = 0
+    gen_max_free = 0
+    pools: dict = {}
+    for seg in torch.cuda.memory_snapshot():
+        pid = tuple(seg.get("segment_pool_id", (0, 0)))
+        if pid != (0, 0):
+            pool_res += seg["total_size"]
+            pool_alloc += seg["allocated_size"]
+            pools[pid] = pools.get(pid, 0) + seg["total_size"]
+        else:
+            gen_res += seg["total_size"]
+            gen_alloc += seg["allocated_size"]
+            for b in seg["blocks"]:
+                if b["state"] == "inactive":
+                    gen_max_free = max(gen_max_free, b["size"])
+    g = 1 << 30
+    logger.info(
+        "GMDIAG %s free=%.3f reserved=%.3f allocated=%.3f pool_res=%.3f "
+        "pool_alloc=%.3f gen_res=%.3f gen_alloc=%.3f gen_maxfree=%.3f "
+        "npools=%d peak_alloc=%.3f",
+        tag, free / g, st.get("reserved_bytes.all.current", 0) / g,
+        st.get("allocated_bytes.all.current", 0) / g, pool_res / g,
+        pool_alloc / g, gen_res / g, gen_alloc / g, gen_max_free / g,
+        len(pools), st.get("allocated_bytes.all.peak", 0) / g,
+    )
+
+
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
@@ -493,6 +526,8 @@ class CudaGraphManager:
                         forward_fn = create_forward_fn(desc, warmup=False)
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
+                            _gm_mem(f"cap PIECEWISE n={desc.num_tokens} "
+                                    f"prof={self._capture_mem_samples is not None}")
                             continue
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
@@ -527,6 +562,8 @@ class CudaGraphManager:
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+                        _gm_mem(f"cap {desc.cg_mode.name} n={desc.num_tokens} "
+                                f"prof={self._capture_mem_samples is not None}")
 
         self._graphs_captured = True
 
@@ -1037,6 +1074,13 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # double-counted.
             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
+            logger.info(
+                "GMDIAG profile measured=%.3f samples=%s nfull=%d full_est=%.3f "
+                "total_est=%.3f", measured / (1 << 30),
+                [round(x / (1 << 30), 3) for x in mem_samples], num_full_graphs,
+                full_estimate / (1 << 30),
+                max(measured - sum(mem_samples) + full_estimate, 0) / (1 << 30))
+            _gm_mem("profile end")
             return max(measured - sum(mem_samples) + full_estimate, 0)
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
