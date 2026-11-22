@@ -75,9 +75,9 @@ def test_stuck_stream_is_reported_with_its_position():
         B.crumb(B.OP_FWD_BEGIN, 0)
         B.crumb(B.OP_LAYER, 3)
         torch.cuda.synchronize()
-        torch.cuda._sleep(20_000_000_000)  # the stream is stuck in this kernel
+        torch.cuda._sleep(60_000_000_000)  # the stream is stuck in this kernel
         B.crumb(B.OP_MOE_IN, 4)            # issued by the host, not yet reached by the GPU
-        time.sleep(12)
+        time.sleep(30)
         """
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
@@ -148,10 +148,10 @@ def test_stall_inside_a_capture_eager_break_is_reported():
                 x.add_(1)
                 def eager_break():
                     B.crumb(B.OP_LAYER, 61)
-                    torch.cuda._sleep(20_000_000_000)  # the break's GPU work never finishes in time
+                    torch.cuda._sleep(60_000_000_000)  # the break's GPU work never finishes in time
                     B.crumb(B.OP_MOE_IN, 61)
                 cap.add_eager(eager_break)
-                time.sleep(12)
+                time.sleep(30)
         """
     )
     assert "K31_BREADCRUMB gpu_stuck" in text, text[-2000:]
