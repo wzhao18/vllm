@@ -1464,6 +1464,7 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
+                            request.padm_lp = getattr(request, "padm_lp", 0) + 1
                             pending_since = (
                                 self._connector_lookup_pending_since.setdefault(
                                     request_id, time.monotonic()
@@ -1904,6 +1905,7 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.padm_ta = time.perf_counter()
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -4601,6 +4603,7 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+                req.padm_tr = time.perf_counter()
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
                 assert RequestStatus.is_finished(req.status)

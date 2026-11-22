@@ -42,6 +42,12 @@ ENGINE_FIELDS = {
     "RF": "idx t k finish_reason n_out_tokens",
     "RX": "idx t",  # aborted
     "I": "t_idle0 t_idle1",  # engine waiting for work (no requests)
+    # PADMIT diag, at a request's first prefill chunk: remote-KV wait timeline
+    # (t_alloc = blocks allocated + load issued, t_recv = load reported done;
+    # early: 1 early load sent, 2 no load, 3 channel down, 10+g blocked by a
+    # recently freed block of group g; lookup_waits = schedules deferred on a
+    # pending store lookup)
+    "RP": "idx k t_sched t_alloc t_recv early lookup_waits",
 }
 WORKER_FIELDS = {
     "W": (
@@ -195,6 +201,20 @@ class EngineIterLog:
                 if prefills is None:
                     prefills = []
                 prefills.append((ri[0] if ri else -1, n, before, r.num_prompt_tokens))
+                if ri is not None and len(ri) == 2:
+                    ri.append(1)
+                    self._put(
+                        (
+                            "RP",
+                            ri[0],
+                            self._k,
+                            t0,
+                            getattr(r, "padm_ta", None),
+                            getattr(r, "padm_tr", None),
+                            getattr(r, "padm_early", None),
+                            getattr(r, "padm_lp", 0),
+                        )
+                    )
             else:
                 n_dec += 1
                 n_dec_tok += n

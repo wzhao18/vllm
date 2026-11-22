@@ -572,17 +572,24 @@ class MooncakeStoreScheduler:
         blocks; otherwise it goes with this step's metadata."""
         assert self._early_loads is not None
         load_spec = self.load_specs[request_id]
+        req = self._unfinished_requests[request_id][0]
         for group_id in self._store_group_ids:
             first = load_spec.vllm_cached_tokens // self._group_block_sizes[group_id]
             for block in blocks.blocks[group_id][first:]:
                 if not block.is_null and BLOCK_FREE_CLOCK.freed_recently(block):
+                    # PADMIT diag: 10 + group id that blocked the early load.
+                    req.padm_early = 10 + group_id
                     return
         req_meta = self._load_only_req_meta(request_id)
         if req_meta is None:
+            req.padm_early = 2
             return
         if not self._early_loads.send(req_meta):
             # Worker channel not connected yet: the step's metadata carries it.
             self.load_specs[request_id] = load_spec
+            req.padm_early = 3
+            return
+        req.padm_early = 1
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
