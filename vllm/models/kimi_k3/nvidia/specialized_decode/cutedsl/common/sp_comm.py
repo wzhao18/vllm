@@ -57,6 +57,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ...shapes import Choice, Path, Unsupported
 from ...symm import multicast_rendezvous, peer_rendezvous
 from . import mx_rows
@@ -184,6 +186,7 @@ class SpAllGather:
             for i in cutlass.range_constexpr(count):
                 if g + i * total < R * per:
                     pending |= Uint32(1 << i)
+            sgn, sgt = spin_start()
             while pending != 0:
                 again = Uint32(0)
                 for i in cutlass.range_constexpr(count):
@@ -195,6 +198,10 @@ class SpAllGather:
                         if not published(words):
                             again |= Uint32(1 << i)
                 pending = again
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=pending,
+                    target=0, rank=rank, size=self.tp
+                )
 
 
 class SpReduceScatter:
@@ -707,6 +714,7 @@ class SpGatherCopy:
                 c = base + i * total
                 if c < R * per:
                     pending |= Uint32(1 << i)
+            sgn, sgt = spin_start()
             while pending != 0:
                 again = Uint32(0)
                 for i in cutlass.range_constexpr(U):
@@ -720,6 +728,10 @@ class SpGatherCopy:
                         if not published(words):
                             again |= Uint32(1 << i)
                 pending = again
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=pending,
+                    target=0, rank=rank, size=self.tp
+                )
             for i in cutlass.range_constexpr(U):
                 c = base + i * total
                 if c < R * per:

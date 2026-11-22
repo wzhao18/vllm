@@ -33,6 +33,8 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.host import fake
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -278,8 +280,10 @@ class DcpCore:
         if tid < G:
             first = at(query, b, g * G + tid, 0)
             words = load_volatile(first, count=4)
+            sgn, sgt = spin_start()
             while not published(words, sentinel=Q_SENT):
                 words = load_volatile(first, count=4)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         cute.arch.sync_threads()
         for i in cutlass.range_constexpr(-(-G * 36 // self.threads)):
             c = tid + self.threads * i  # G query rows x 36 16 B chunks
@@ -287,8 +291,10 @@ class DcpCore:
                 r, k = c // 36, c % 36
                 source = at(query, b, g * G + r, k * 16)
                 words = load_volatile(source, count=4)
+                sgn, sgt = spin_start()
                 while not published(words, sentinel=Q_SENT):
                     words = load_volatile(source, count=4)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 out = [fp8x4_f16(words[e]) for e in range(4)]
                 target = query_s.iterator + r * KROW + k * 32
                 store_words(target, (*out[0], *out[1]), shared=True)

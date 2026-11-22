@@ -27,6 +27,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
     alloc,
     asm,
@@ -115,8 +120,10 @@ def try_wait_cta(barrier, phase):
 @cute.jit
 def wait_bar(barrier, phase):
     done = try_wait_cta(barrier, phase)
+    sgn, sgt = spin_start()
     while done == 0:
         done = try_wait_cta(barrier, phase)
+        sgn, sgt = spin_tick(sgn, sgt, observed=done, target=0)
 
 
 @asm(Float32, pure=True)
@@ -720,3 +727,7 @@ def at_address(tensor, *coord):
 
 def bf16_word(word, high):
     return bf16(word, high)
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "wait_bar")

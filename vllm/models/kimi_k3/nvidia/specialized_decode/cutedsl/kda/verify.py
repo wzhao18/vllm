@@ -12,6 +12,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     alloc,
     asm,
@@ -235,15 +237,18 @@ class KdaVerifyPrepared(KdaSplit):
         unwritten. (Its count, ``release_fa``, follows the decays' multicast.)"""
         if quarter == 0:
             waiting = Int32(1)
+            sgn, sgt = spin_start()
             while waiting != 0:
                 pointers = [at(f_a, token, 32 * owner + 30) for owner in range(4)]
                 watched = [load_volatile(p)[0] for p in pointers]
                 waiting = Int32(reduce(or_, map(front_dirty, watched)))
                 if waiting != 0:
                     sleep_ns(FA_BACKOFF_NS)
+                sgn, sgt = spin_tick(sgn, sgt, observed=waiting, target=0)
         cute.arch.sync_warp()
         values = cute.make_rmem_tensor((8, 2), Uint32)
         dirty = Int32(1)
+        sgn, sgt = spin_start()
         while dirty != 0:
             for c in cutlass.range_constexpr(8):
                 pointer = at(f_a, token, 16 * c + 4 * quarter)
@@ -252,6 +257,7 @@ class KdaVerifyPrepared(KdaSplit):
                 values[c, 1] = high
             words = [values[c, k] for c in range(8) for k in range(2)]
             dirty = Int32(cute.arch.vote_any_sync(reduce(or_, map(front_dirty, words))))
+            sgn, sgt = spin_tick(sgn, sgt, observed=dirty, target=0)
         return [(values[c, 0], values[c, 1]) for c in range(8)]
 
     @cute.jit
@@ -589,19 +595,23 @@ class KdaVerifyRows(KdaVerifyPrepared):
         if dirty != 0:
             if quarter == 0:
                 waiting = Int32(1)
+                sgn, sgt = spin_start()
                 while waiting != 0:
                     pointers = [at(f_a, token, 32 * owner + 30) for owner in range(4)]
                     watched = [load_volatile(p)[0] for p in pointers]
                     waiting = Int32(reduce(or_, map(front_dirty, watched)))
                     if waiting != 0:
                         sleep_ns(FA_BACKOFF_NS)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=waiting, target=0)
             cute.arch.sync_warp()
+            sgn, sgt = spin_start()
             while dirty != 0:
                 self.look_fa(f_a, token, quarter, values)
                 words = [values[c, k] for c in range(8) for k in range(2)]
                 dirty = Int32(
                     cute.arch.vote_any_sync(reduce(or_, map(front_dirty, words)))
                 )
+                sgn, sgt = spin_tick(sgn, sgt, observed=dirty, target=0)
         return [(values[c, 0], values[c, 1]) for c in range(8)]
 
     @cute.jit

@@ -48,6 +48,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.gumbel import (
     DRAFT_NOISE_SALT,
     drafted_value,
@@ -390,6 +392,7 @@ class MarkovWide:
                 if tid + j * THREADS < self.chunks:
                     pending |= Uint32(1 << j)
             spins = Int32(0)
+            sgn, sgt = spin_start()
             while pending != Uint32(0):
                 spins += 1
                 if cutlass.const_expr(self.spin_limit > 0):  # noqa: SIM102
@@ -413,6 +416,10 @@ class MarkovWide:
                             ready &= values[k] != Uint32(0)
                         if ready:
                             pending &= ~Uint32(1 << j)
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=pending,
+                    target=0, rank=rank, size=self.tp
+                )
             for j in cutlass.range_constexpr(self.per_thread):
                 c = tid + j * THREADS
                 if c < self.chunks:

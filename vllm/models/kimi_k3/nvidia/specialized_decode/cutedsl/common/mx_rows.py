@@ -23,6 +23,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from .mailbox import SENTINEL
 from .primitives import asm, bits_float, multicast_words, pack_fp8, store_words
 
@@ -195,6 +201,7 @@ def poll(data, scale, first, stride, count: cutlass.Constexpr[int], col,
     for i in cutlass.range_constexpr(count):
         if not _landed(data, scale, first + i * stride, col, width):
             pending = pending | Uint32(1 << i)
+    sgn, sgt = spin_start()
     while pending != 0:
         again = Uint32(0)
         for i in cutlass.range_constexpr(count):
@@ -202,6 +209,7 @@ def poll(data, scale, first, stride, count: cutlass.Constexpr[int], col,
                 if not _landed(data, scale, first + i * stride, col, width):
                     again = again | Uint32(1 << i)
         pending = again
+        sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
 
 
 @cute.jit
@@ -213,3 +221,6 @@ def rearm(data, scale, row, col, width: cutlass.Constexpr[int]):
         where = scale + scale_offset(row, col // BLOCK, width // BLOCK)
         store_words(where, (Uint32(SCALE_SENTINEL),), scope="sys")
 
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "poll")

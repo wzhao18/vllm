@@ -39,6 +39,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.dies import smid
 from ..common.primitives import asm
 from . import dense_stream as ds
@@ -564,8 +566,10 @@ class DenseFlow:
                         cute.copy(tma_b, tAgWb[(None, gob, k, 0)], tAsA[(None, s)],
                                   tma_bar_ptr=full + s)  # fmt: skip
                         if cutlass.const_expr(not (self.debug & NO_EPILOGUE)):
+                            sgn, sgt = spin_start()
                             while _lds_acquire(hready) <= j:
                                 _sleep(256)
+                                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                             _fence_proxy_global()
                         cute.copy(tma_ha, tBgH[(None, 0, k, 0)], tBsB[(None, s)],
                                   tma_bar_ptr=full + s)  # fmt: skip
@@ -641,6 +645,7 @@ class DenseFlow:
             n = uB1 - uB0
             done = Int32(0)
             polls = Int32(0)
+            sgn, sgt = spin_start()
             while done < n:  # one acquire per lane: up to 32 entries a round trip
                 j = done + lane
                 late = Int32(0)
@@ -658,6 +663,7 @@ class DenseFlow:
                     _sleep(64)
                 done = done + adv
                 polls += 1
+                sgn, sgt = spin_tick(sgn, sgt, observed=done, target=0)
             if lane == 0:
                 self.stamp(sync, slot, 4, Int64(polls))
                 self.stamp(sync, slot, 5)
@@ -805,10 +811,12 @@ class DenseFlow:
                 if pl <= last:
                     if _lds_s32(bp + pl * 4) < _lds_s32(bp + pl * 4 + 4):
                         late = Int32(1)
+                sgn, sgt = spin_start()
                 while _ballot(late) != 0:
                     if late != 0:
                         if _ld_acquire(flags + Int64(slot_base + pl) * 4) != 0:
                             late = Int32(0)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 if tid == 0:
                     if nst > 0:
                         _fence_proxy_global()

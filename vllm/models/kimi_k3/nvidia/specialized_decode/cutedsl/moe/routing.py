@@ -9,6 +9,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from ..common.primitives import (
     bits_float,
     copy_evict,
@@ -49,6 +55,7 @@ def gather_x(xmoe, par, cta, dst, first_chunk, active, tokens=1, h2=None):
     if cutlass.const_expr(h2 is not None):
         h2_words = zeros((tokens, 4, 4), Uint32)
     ready = False
+    sgn, sgt = spin_start()
     while not ready:
         valid = True
         for token in cutlass.range_constexpr(tokens):
@@ -65,6 +72,7 @@ def gather_x(xmoe, par, cta, dst, first_chunk, active, tokens=1, h2=None):
                         pointer = base + (32 * warp + lane + 224 * chunk) * 8
                         valid = poll_words(h2_words[token, chunk, None], pointer, valid)
         ready = cute.arch.vote_all_sync(valid)
+        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
     if active:
         for token in cutlass.range_constexpr(tokens):
             for chunk in cutlass.range_constexpr(2):
@@ -160,6 +168,7 @@ class Top16Fast:
         for i in cutlass.range_constexpr(4):
             if warp + 8 * i < 28:
                 pending |= Uint32(1 << i)
+        sgn, sgt = spin_start()
         while pending != 0:
             for i in cutlass.range_constexpr(4):
                 if (pending & Uint32(1 << i)) != 0:
@@ -171,6 +180,7 @@ class Top16Fast:
                 done = (pending & Uint32(1 << i)) != 0
                 if published((records[i, j] for j in range(2)), done):
                     pending &= Uint32(0xFFFFFFFF ^ (1 << i))
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
         cute.arch.barrier(barrier_id=1, number_of_threads=256)
         ids = ids.iterator + token * 16
         arrays = self.arrays(storage)
@@ -252,3 +262,7 @@ class Top16Fast:
                         mailbox_store(ids + rank, (Uint32(selected_expert),))
             cute.arch.sync_warp()
         return selected_scores
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "gather_x")

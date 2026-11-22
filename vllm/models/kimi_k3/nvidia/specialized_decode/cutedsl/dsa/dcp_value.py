@@ -20,6 +20,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ...symm import peer_rendezvous
 from ..common import tensormap
 from ..common.host import fake
@@ -839,6 +841,7 @@ class DcpValue:
             rows.append(t)
             lives.append(live)
         pending = self.unmerged(lses, words, lives)
+        sgn, sgt = spin_start()
         while pending:
             self.backoff()
             for n in cutlass.range_constexpr(N):
@@ -851,6 +854,7 @@ class DcpValue:
                         for e in cutlass.range_constexpr(4):
                             words[4 * k + e] = loaded[e]
             pending = self.unmerged(lses, words, lives)
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0, size=D)
         self.mark(y * self.heads + head, 9, tid)
         cute.arch.sync_warp()  # every thread of a row read its LSEs
         for n in cutlass.range_constexpr(N):
@@ -1067,8 +1071,10 @@ class DcpValue:
             if lane < D:
                 source = at(lbox, lane, head, t0 + warp)
                 word = load_volatile(source)[0]
+                sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0, size=D)
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
             top = lse
@@ -1153,8 +1159,10 @@ class DcpValue:
             if lane < D:
                 source = at(lbox, lane, t0 + warp, head)
                 word = load_volatile(source)[0]
+                sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0, size=D)
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
             top = lse
@@ -1230,9 +1238,11 @@ class DcpValue:
     def poll_pair(self, source, words, w, merged):
         """Polls a BF16 partial chunk (8 values) until published, re-arms it and adds
         it, weighted by ``w``, to ``merged``."""
+        sgn, sgt = spin_start()
         while not published(words):
             self.backoff()
             words = load_volatile(source, count=4)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         store_words(source, (Uint32(PAIR_SENT),) * 4)
         for e in cutlass.range_constexpr(4):
             lo, hi = unpack_bf16(words[e])
