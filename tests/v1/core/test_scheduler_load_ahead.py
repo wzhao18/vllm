@@ -197,8 +197,9 @@ def test_no_load_ahead_while_a_dp_rank_is_idle():
     assert a.status == RequestStatus.WAITING
     assert scheduler._load_ahead == set()
     assert [rid for rid, _ in scheduler.dp_movable_requests(4)] == [a.request_id]
-    scheduler.update_from_output(out, _outputs(scheduler, out))
+    # Next step (the long prompt's next chunk uses the budget again).
     scheduler.dp_group_has_idle_rank = False
-    scheduler.schedule()
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {long.request_id: 64}
     assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler._load_ahead == {a}
