@@ -295,7 +295,10 @@ class WorkerIterLog:
             return None
         import torch.distributed as dist
 
-        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        if (dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
+                and os.environ.get("VLLM_ITERLOG_ALL_RANKS") != "1"):
+            # DDSA diag: VLLM_ITERLOG_ALL_RANKS=1 keeps a worker iterlog (and so the PROFILE.<tag>
+            # CUPTI window) on EVERY rank, not just TP0 of each DP rank (RHEADEC2 straggler hunt).
             # DSTEP diag: also the first TP rank of every DP rank (DP lockstep:
             # each DP rank's GPU timeline).
             from vllm.distributed import parallel_state as ps
