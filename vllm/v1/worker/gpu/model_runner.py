@@ -211,6 +211,32 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+def _megamoefix_drop_megamoe_caches(runner) -> None:
+    """NEVER MERGE (arm C): forget every in-process MegaMoE compiled kernel and launch binding, so the next
+    cycle's first MoE call per layer re-binds and re-loads from the disk CuTe cache like a first pass."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
+
+    rubin_session._COMPILED.clear()
+    seen = set()
+    for m in runner.model.modules():
+        get = getattr(m, "get_runtime", None)
+        if get is None:
+            continue
+        try:
+            rt = get()
+        except Exception:  # noqa: BLE001
+            continue
+        if id(rt) in seen:
+            continue
+        seen.add(id(rt))
+        for sess in getattr(rt, "sessions", {}).values():
+            for name in ("compiled", "_bound", "_out_bound", "_norm_bound", "_shared_bound"):
+                d = getattr(sess, name, None)
+                if hasattr(d, "clear"):
+                    d.clear()
+    logger.info("MEGAMOEFIX_REPRO dropped MegaMoE in-process caches (%d runtimes)", len(seen))
+
+
 def _megamoefix_repro_cycles(runner) -> None:
     """NEVER MERGE (MEGAMOEFIX startup-stall repro, DCRIT r44): repeat the warmup + CUDA graph capture
     profiling pass K31_REPRO_CAPTURE_CYCLES times before the real one, each a full setup / capture /
@@ -232,7 +258,10 @@ def _megamoefix_repro_cycles(runner) -> None:
     except Exception:  # noqa: BLE001
         pass
     rng = random.Random(1000 + rank)
+    drop = os.environ.get("K31_REPRO_DROP_CACHES") == "1"
     for c in range(n):
+        if drop:
+            _megamoefix_drop_megamoe_caches(runner)
         if jit or stag:
             time.sleep(rng.uniform(0, jit) + rank * stag)
         t0 = time.perf_counter()
