@@ -71,6 +71,9 @@ class DedupCallTail(GenphaseTail):
     # One bit per guard site: the first timed-out thread of this rank that sets it prints, the rest trap
     # silently (spin_guard._elect_printer). Never reset: a trap ends the context.
     printed_region = "nvlink.token_comm_dedup.guard_printed"
+    # Device-accessible address of this process's host spin-record buffer (spin_record.py), written once by the
+    # host after the workspace is carved; 0 = no records (the guards then only print and trap).
+    record_region = "nvlink.token_comm_dedup.spin_record_addr"
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
         workspace.register(
@@ -81,6 +84,10 @@ class DedupCallTail(GenphaseTail):
         workspace.register(self.metadata_mask_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
         workspace.register(
             self.printed_region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16,
+            reset="zero_on_first_allocate",
+        )
+        workspace.register(
+            self.record_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
             reset="zero_on_first_allocate",
         )
         workspace.register(
@@ -754,7 +761,8 @@ class _DedupMetadataPushRouter(KernelComponent):
                 spin_start_ns = globaltimer_ns()
                 while cute.arch.load(source_base_ready, Int32, sem="acquire", scope="gpu") != Int32(1):
                     nanosleep(150)
-                    spin_guard(spin_start_ns, 23, source_base_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region))
+                    spin_guard(spin_start_ns, 23, source_base_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region))
             cute.arch.sync_threads()
             iket.range_pop()
 
@@ -799,7 +807,8 @@ class _DedupMetadataPushRouter(KernelComponent):
                 self.router_data_cta_count
             ):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 24, histogram_done, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region))
+                spin_guard(spin_start_ns, 24, histogram_done, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_threads()
         iket.range_pop()
 
@@ -850,11 +859,13 @@ class _DedupMetadataPushRouter(KernelComponent):
                 self.router_data_cta_count
             ):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 25, sorted_metadata_ready, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region))
+                spin_guard(spin_start_ns, 25, sorted_metadata_ready, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region))
             spin_start_ns = globaltimer_ns()
             while cute.arch.load(push_table_ready, Int32, sem="acquire", scope="gpu") != Int32(1):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 26, push_table_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region))
+                spin_guard(spin_start_ns, 26, push_table_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_threads()
 
         source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
@@ -1029,6 +1040,7 @@ class _DedupMetadataPushRouter(KernelComponent):
                     self._peer_rank_ptr_mapper, self.world_size,
                     self._call_tail.read_epoch(self._device_workspace) + Int32(1),
                     print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region),
                 )
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -1421,7 +1433,8 @@ class _DedupMetadataPushRouter(KernelComponent):
             spin_start_ns = globaltimer_ns()
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(sleep_cycles)
-                spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size), print_flag=device_workspace.ptr(self._call_tail.printed_region))
+                spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size), print_flag=device_workspace.ptr(self._call_tail.printed_region),
+                    record=device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_warp()
 
     @cute.jit
@@ -1435,7 +1448,8 @@ class _DedupMetadataPushRouter(KernelComponent):
                 self.metadata_ready_target
             ):
                 nanosleep(sleep_cycles)
-                spin_guard(spin_start_ns, 22, metadata_ready, Int32(self.metadata_ready_target), print_flag=device_workspace.ptr(self._call_tail.printed_region))
+                spin_guard(spin_start_ns, 22, metadata_ready, Int32(self.metadata_ready_target), print_flag=device_workspace.ptr(self._call_tail.printed_region),
+                    record=device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_warp()
 
     @cute.jit
@@ -2433,6 +2447,7 @@ class TokenCommDedup(KernelComponent):
                             spin_guard_value(
                                 spin_start_ns, 27, completed_expert_prefix, local_expert + Int32(1),
                                 print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region),
                             )
                     # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
                     cute.arch.sync_warp()

@@ -72,34 +72,107 @@ def _elect_printer(site: int, print_flag) -> cutlass.Boolean:
     return elected
 
 
+# -- host-visible records (shared contract: vllm/models/kimi_k3/nvidia/spin_record.py) ----------------------------
+# printf from a trapping kernel is only flushed if the host later synchronizes the context, so the elected printer also
+# writes a record into the process's pinned host buffer (UVA address in a workspace word), fences at system scope and
+# marks it done before the trap; the host watcher thread logs it even after the context is lost.
+RECORD_WORDS = 64
+RECORD_DONE = 0x5350494E
+RECORD_SOURCE_MEGAMOE = 1
+RECORD_MAX_ENTRIES = (RECORD_WORDS - 10) // 4
+
+
+@dsl_user_op
+def _st_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [address.ir_value(), value.ir_value()], "st.relaxed.sys.global.s32 [$0], $1;", "l,r",
+        has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _cas_sys_b32(address: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(), [address.ir_value(), compare.ir_value(), value.ir_value()],
+            "atom.relaxed.sys.global.cas.b32 $0, [$1], $2, $3;", "=r,l,r,r",
+            has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
+        )
+    )
+
+
 @cute.jit
-def spin_guard(start_ns: cutlass.Uint64, site: int, word, target: Int32, print_flag=None) -> None:
+def _record_open(record, index: int) -> Int64:
+    """Claim record ``index`` of the host buffer whose address the Int64 word ``record`` holds; 0 when
+    there is no buffer or another thread already claimed it."""
+    base = Int64(0)
+    if cutlass.const_expr(record is not None):
+        host = cute.arch.load(record, Int64, sem="relaxed", scope="gpu")
+        if host != Int64(0):
+            slot = host + Int64(index * RECORD_WORDS * 4)
+            if _cas_sys_b32(slot, Int32(0), Int32(1)) == Int32(0):
+                base = slot
+    return base
+
+
+@cute.jit
+def _record_word(base: Int64, word: int, value: Int32) -> None:
+    _st_sys_s32(base + Int64(word * 4), value)
+
+
+@cute.jit
+def _record_close(base: Int64) -> None:
+    cute.arch.fence_acq_rel_sys()
+    _st_sys_s32(base, Int32(RECORD_DONE))
+    cute.arch.fence_acq_rel_sys()
+
+
+@cute.jit
+def _record_header(base: Int64, site: int, call: Int32, observed: Int32, target: Int32, aux: Int32) -> None:
+    _record_word(base, 1, Int32(RECORD_SOURCE_MEGAMOE))
+    _record_word(base, 2, Int32(site))
+    _record_word(base, 4, call)
+    _record_word(base, 5, observed)
+    _record_word(base, 6, target)
+    _record_word(base, 7, _smid())
+    _record_word(base, 8, aux)
+
+
+@cute.jit
+def spin_guard(start_ns: cutlass.Uint64, site: int, word, target: Int32, print_flag=None, record=None) -> None:
     """Trap with a diagnostic once a spin on the Int32 ``word`` (a pointer) that started
     at ``start_ns`` exceeds ``SPIN_GUARD_NS``; ``site`` is a constant id of the wait."""
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
+            observed = cute.arch.load(word, Int32, sem="relaxed", scope="sys")
+            base = _record_open(record, 1)
+            if base != Int64(0):
+                _record_header(base, site, Int32(-1), observed, Int32(target), Int32(0))
+                _record_word(base, 9, Int32(0))
+                _record_close(base)
             cute.printf(
                 "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
-                Int32(site),
-                cute.arch.load(word, Int32, sem="relaxed", scope="sys"),
-                Int32(target),
-                _smid(),
+                Int32(site), observed, Int32(target), _smid(),
             )
         _trap()
 
 
 @cute.jit
-def spin_guard_value(start_ns: cutlass.Uint64, site: int, observed: Int32, target: Int32, print_flag=None) -> None:
+def spin_guard_value(
+    start_ns: cutlass.Uint64, site: int, observed: Int32, target: Int32, print_flag=None, record=None
+) -> None:
     """``spin_guard`` for waits whose condition is not one Int32 word (flag sets, 64-bit tokens, polled
     planes): the caller passes the observed and target values it compares (or a count of what is missing)."""
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
+            base = _record_open(record, 1)
+            if base != Int64(0):
+                _record_header(base, site, Int32(-1), Int32(observed), Int32(target), Int32(0))
+                _record_word(base, 9, Int32(0))
+                _record_close(base)
             cute.printf(
                 "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} smid={}",
-                Int32(site),
-                Int32(observed),
-                Int32(target),
-                _smid(),
+                Int32(site), Int32(observed), Int32(target), _smid(),
             )
         _trap()
 
@@ -144,6 +217,7 @@ def spin_guard_ranks(
     world_size: cutlass.Constexpr[int],
     expected: Int32,
     print_flag=None,
+    record=None,
 ) -> None:
     """``spin_guard`` for a wait on one arrival per rank: on timeout, besides the count, print one line per
     rank whose bit is missing in ``arrived_mask`` (Int32 pointer, local) with its progress words read
@@ -151,16 +225,32 @@ def spin_guard_ranks(
     if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
             mask = cute.arch.load(arrived_mask, Int32, sem="relaxed", scope="sys")
+            observed = cute.arch.load(word, Int32, sem="relaxed", scope="sys")
+            base_rec = _record_open(record, 0)
+            if base_rec != Int64(0):
+                _record_header(base_rec, site, Int32(expected), observed, Int32(target), mask)
+            entries = Int32(0)
             cute.printf(
                 "MEGAMOE_SPIN_TIMEOUT site={} observed={} target={} arrived_mask={} expected_call={} smid={}",
-                Int32(site), cute.arch.load(word, Int32, sem="relaxed", scope="sys"), Int32(target), mask,
-                Int32(expected), _smid(),
+                Int32(site), observed, Int32(target), mask, Int32(expected), _smid(),
             )
             base = progress.toint()
             for rank in cutlass.range_constexpr(world_size):
                 if ((mask >> Int32(rank)) & Int32(1)) == Int32(0):
                     issued = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(0)))
                     entered = ld_relaxed_sys_s32(peer_rank_ptr_mapper.map(base, Int32(rank), Int64(4)))
+                    verdict = Int32(3)
+                    if issued < expected:
+                        verdict = Int32(1)
+                    elif entered < expected:
+                        verdict = Int32(2)
+                    if (base_rec != Int64(0)) & (entries < Int32(RECORD_MAX_ENTRIES)):
+                        entry = base_rec + Int64(40) + Int64(entries) * Int64(16)
+                        _st_sys_s32(entry, Int32(rank))
+                        _st_sys_s32(entry + Int64(4), issued)
+                        _st_sys_s32(entry + Int64(8), entered)
+                        _st_sys_s32(entry + Int64(12), verdict)
+                    entries = entries + Int32(1)
                     if issued < expected:
                         cute.printf(
                             "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=H1_host_never_issued",
@@ -176,4 +266,7 @@ def spin_guard_ranks(
                             "MEGAMOE_SPIN_MISSING site={} rank={} issued={} entered={} expected={} verdict=IN_call_not_published",
                             Int32(site), Int32(rank), issued, entered, Int32(expected),
                         )
+            if base_rec != Int64(0):
+                _record_word(base_rec, 9, cutlass.min(entries, Int32(RECORD_MAX_ENTRIES)))
+                _record_close(base_rec)
         _trap()

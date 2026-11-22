@@ -401,6 +401,7 @@ class RubinMegaMoeSession:
         self.local_workspace = torch.zeros(
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
+        self._write_spin_record_address()
         # Per-launch scratch of the refreshed inference kernel (src_gp; any content
         # at launch, nothing survives it). The caching allocator aligns to 512 B.
         self.tmp_buffer = (
@@ -690,6 +691,20 @@ class RubinMegaMoeSession:
     # from a GPU that never started it (H2). Eager launches only: during CUDA graph capture the host does not
     # issue per launch, so graph replays leave it behind (the trap line reports raw ids).
     _PROGRESS_REGION = "nvlink.token_comm_dedup.call_progress"
+
+    _RECORD_REGION = "nvlink.token_comm_dedup.spin_record_addr"
+
+    def _write_spin_record_address(self) -> None:
+        """Point this session's guards at the process's host spin-record buffer (spin_record.py): a trap's
+        diagnostic then survives the context loss (printf alone is lost when the host never synchronizes)."""
+        ws = self.kernel._device_workspace
+        if self._RECORD_REGION not in {r.name for r in ws.regions("local")}:
+            return
+        from vllm.models.kimi_k3.nvidia import spin_record
+
+        records = spin_record.get(self.cfg.rank)
+        off = ws.offset(self._RECORD_REGION)
+        self.local_workspace[off : off + 8].view(torch.int64).fill_(records.address)
 
     def _stamp_issued(self) -> None:
         if torch.cuda.is_current_stream_capturing():
