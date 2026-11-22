@@ -86,10 +86,14 @@ FORMAT = 4
 VERIFY = False
 
 _MAX_NODES = 200_000  # fingerprint object-graph size limit (uncached above)
-# Per-run environment (paths, hosts, ports, timeouts): never read by a trace.
+# Per-run environment (paths, hosts, ports, timeouts, the launcher's container name,
+# node list and time budget: K31_CNAME / K31_NODES / K31_MIN_LEFT_S): never read by a
+# trace. K31_CNAME carries the launch timestamp, so keying on it missed every entry on
+# each restart (CUTECACHE keydiff of two decode starts on one hold, 2026-11-22).
 _RUN_ENV_SUFFIXES = (
     "_DIR", "_PATH", "_ROOT", "_HOST", "_PORT", "_ADDR", "_FILE", "_TIMEOUT",
-    "_TIMEOUT_S", "_TIMEOUT_SECONDS", "_URL", "_IP", "_ID", "_NAME",
+    "_TIMEOUT_S", "_TIMEOUT_SECONDS", "_URL", "_IP", "_ID", "_NAME", "_CNAME",
+    "_NODES", "_NODELIST", "_LEFT_S",
 )  # fmt: skip
 _ENV_PREFIXES = ("CUTE_DSL_", "CUTLASS_", "VLLM_", "K3", "K31", "KIMI")
 _PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(

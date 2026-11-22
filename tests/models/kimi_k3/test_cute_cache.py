@@ -66,6 +66,15 @@ def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     c = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
     monkeypatch.setenv("VLLM_ITERLOG_DIR", "/tmp/b")
     assert c == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+    # the launcher's per-start identity (container name with its timestamp, node list,
+    # time budget) is not a trace input either
+    for name, a1, a2 in (("K31_CNAME", "k31e2e-105921-1121222010", "k31e2e-105921-1121232827"),
+                         ("K31_NODES", "rhea0073,rhea0074", "rhea0055,rhea0056"),
+                         ("K31_MIN_LEFT_S", "2700", "900")):
+        monkeypatch.setenv(name, a1)
+        d = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+        monkeypatch.setenv(name, a2)
+        assert d == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3"), name
     # sources are not in the key (each entry records its own files)
     assert not hasattr(cute_cache, "_source_digest")
 
