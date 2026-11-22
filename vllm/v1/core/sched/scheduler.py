@@ -664,6 +664,7 @@ class Scheduler(SchedulerInterface):
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
+        self._kv_fetch_log: Callable[[Request, str | None], None] | None = None
         self._kv_fetch_stages: dict[Request, str] | None = (
             {} if self.log_stats and self.connector is not None else None
         )
@@ -4504,7 +4505,16 @@ class Scheduler(SchedulerInterface):
             check_dsa_region=False,
         )
 
+    def set_kv_fetch_log(
+        self, log: Callable[[Request, str | None], None] | None
+    ) -> None:
+        """Observer of KV connector fetch stage changes (per-iteration log only;
+        it does not change scheduling)."""
+        self._kv_fetch_log = log
+
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
+        if self._kv_fetch_log is not None:
+            self._kv_fetch_log(request, stage)
         kv_fetch_stages = self._kv_fetch_stages
         if kv_fetch_stages is not None:
             prev_stage = kv_fetch_stages.pop(request, None)

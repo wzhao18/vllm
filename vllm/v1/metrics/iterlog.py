@@ -46,6 +46,18 @@ ENGINE_FIELDS = {
     # cached_tokens): total, from the local prefix cache, from KV transfer
     "RC": "idx t n_cached n_local_cached n_external_cached",
     "I": "t_idle0 t_idle1",  # engine waiting for work (no requests)
+    # DP prefill pull-up exchange (one per DP lockstep step): t_xchg0 / t_xchg1
+    # bracket the cross-rank all-reduce, so t_xchg1 - t_xchg0 is the wait for
+    # the slowest rank plus the collective. in_sched 1: called from schedule()
+    # (k = that batch's S record); 0: a rank with nothing to schedule taking part
+    # with 0 tokens (k = the next S record).
+    "X": "k t_xchg0 t_xchg1 num_tokens demand max_tokens in_sched",
+    # one KV connector load (Mooncake store / NIXL), written when the request is
+    # admitted to compute (or finishes first): t_queued remote prefill queued
+    # (P/D decode side, else null), t_issue load issued at schedule(), t_done
+    # completion seen by the scheduler, t_admit first scheduled after the load
+    # (null if it finished first); n_computed = computed tokens incl. the load
+    "RK": "idx t_queued t_issue t_done t_admit n_computed",
 }
 WORKER_FIELDS = {
     "W": (
@@ -136,6 +148,8 @@ class EngineIterLog:
         # request_id -> [idx, n_out_tokens]
         self._reqs: dict[str, list[int]] = {}
         self._next_idx = 0
+        # request_id -> [t_queued, t_issue, t_done, n_computed] of a KV load
+        self._loads: dict[str, list] = {}
 
     @classmethod
     def maybe_create(cls, vllm_config) -> "EngineIterLog | None":
@@ -180,6 +194,40 @@ class EngineIterLog:
 
     def idle(self, t0: float, t1: float) -> None:
         self._put(("I", t0, t1))
+
+    def dp_exchange(
+        self,
+        t0: float,
+        t1: float,
+        num_tokens: int,
+        demand: int,
+        max_tokens: int,
+        in_sched: bool,
+    ) -> None:
+        self._put(("X", self._k, t0, t1, num_tokens, demand, max_tokens, int(in_sched)))
+
+    def kv_fetch(self, request, stage: str | None) -> None:
+        """A request's KV connector fetch stage changed (scheduler hook)."""
+        t = time.perf_counter()
+        rid = request.request_id
+        loads = self._loads
+        if stage == "waiting_to_start":
+            loads[rid] = [t, None, None, None]
+        elif stage == "in_progress":
+            rec = loads.setdefault(rid, [None, None, None, None])
+            rec[1] = t
+            rec[3] = request.num_computed_tokens
+        elif stage == "completed_waiting":
+            rec = loads.get(rid)
+            if rec is not None:
+                rec[2] = t
+        else:  # admitted to compute (or finished)
+            rec = loads.pop(rid, None)
+            if rec is None or rec[1] is None:
+                return
+            r = self._reqs.get(rid)
+            t_admit = None if request.is_finished() else t
+            self._put(("RK", r[0] if r else -1, rec[0], rec[1], rec[2], t_admit, rec[3]))
 
     def on_schedule(self, so, t0: float, t1: float, t2: float, scheduler) -> None:
         """After ``schedule()`` and the dispatch of its batch."""
