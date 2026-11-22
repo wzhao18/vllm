@@ -1318,7 +1318,9 @@ def test_reuse_guard_waits_for_earlier_exchanges(k31_env, fabric):
     earlier exchange before its first READ, once. The step's own pulls do not
     wait: they cannot target blocks of requests alive when it was scheduled.
     A pull into other blocks does not wait either (DSTEP: a full wait drains
-    the async-scheduling lookahead after every admission)."""
+    the async-scheduling lookahead after every admission), but a pull into
+    the exchanged pool block through another transfer group does: the groups
+    share the block pool and alias its bytes."""
     small = dict(block_size=64, num_dsa=2, num_kda=3)
     prefillers = {p: _Rank(fabric, P_DCP, p, 8, **small) for p in (1, 3)}
     decoder = _Rank(
@@ -1328,14 +1330,16 @@ def test_reuse_guard_waits_for_earlier_exchanges(k31_env, fabric):
     connector, log = _facade(decoder.worker), fabric.log
     dsa = decoder.dsa_group
 
-    def step(req_id: str, block: int, units: list[PairUnit]) -> list[str]:
+    def step(
+        req_id: str, block: int, units: list[PairUnit], other=([6], [7])
+    ) -> list[str]:
         """One step: the hook, then the pull of ``req_id`` into DSA block
         ``block``, posted after the forward. Returns the kinds of exchange,
         event and READ calls, in order."""
         log.clear()
         metadata = _recv_metadata(
             req_id,
-            _per_group(decoder, [block], [[6], [7]]),
+            _per_group(decoder, [block], [list(b) for b in other]),
             _per_group(decoder, 0, [0, 0]),
             _per_group(decoder, [1], [[2], [3]]),
             64,
@@ -1353,6 +1357,10 @@ def test_reuse_guard_waits_for_earlier_exchanges(k31_env, fabric):
     assert step("e", 6, []) == ["read", "read"]
     assert step("c", 5, []) == ["synchronize", "read", "read"]
     assert step("d", 3, []) == ["read", "read"]
+    # An exchange of pool block 2 runs in h's step; after an abort, block 2
+    # comes back to g in a KDA group: g's READs into it wait for the exchange.
+    assert step("h", 0, [PairUnit(dsa, 2, False)]) == ["exchange", "read", "read"]
+    assert step("g", 4, [], other=([2], [7])) == ["synchronize", "read", "read"]
 
 
 def test_pair_mode_startup_checks(k31_env, fabric):

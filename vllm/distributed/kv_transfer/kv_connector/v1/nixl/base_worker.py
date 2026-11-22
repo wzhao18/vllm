@@ -5243,12 +5243,21 @@ class NixlBaseConnectorWorker:
         self._pair_events = tuple(pending)
 
     def _pair_read_targets(self, metadata: NixlConnectorMetadata) -> set[int]:
-        """Blocks of the exchanged group that this step's pulls READ into."""
-        group = self._pair_group
+        """Pool blocks that this step's pulls READ into, in every transfer
+        group: the groups alias the pool blocks' bytes and share one block
+        pool, so a block an aborted request's exchange still rewrites can come
+        back in any group. Slot ids of slot-packed groups map to their pool
+        block; the exchanged group is not slot-packed, so its unit block ids
+        are pool blocks."""
+        groups = self.kv_cache_config.transfer_groups
         targets: set[int] = set()
         for meta in metadata.reqs_to_recv.values():
-            if group < len(meta.local_block_ids):
-                targets.update(meta.local_block_ids[group])
+            for g, block_ids in enumerate(meta.local_block_ids):
+                slots = groups[g].blocks_per_pool_block if g < len(groups) else 1
+                if slots > 1:
+                    targets.update(b // slots for b in block_ids)
+                else:
+                    targets.update(block_ids)
         return targets
 
     def get_finished(self) -> tuple[set[str], set[str]]:
