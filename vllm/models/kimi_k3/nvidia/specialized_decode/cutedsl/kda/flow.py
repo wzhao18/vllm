@@ -169,6 +169,24 @@ def max_stages(tokens, conv_dim_first, window, conv_size, limit):
     return int(shared_bytes(tokens, conv_dim_first, window, conv_size) <= limit)
 
 
+def page_barrier(state_full, j):
+    """The page barrier of item j: ring slot j % SLOTS, one of two barriers by the
+    slot's generation j // SLOTS. The two groups share the ring, so the consumer of
+    item j can reach its wait before item j - SLOTS's page has landed (the other
+    group's item, refilled by this group). On a single barrier per slot that wait
+    tests the parity of the phase two back, which is complete: it passes before the
+    page is loaded, and the refills then arrive in the wrong phase (a fifth arrival:
+    'Warp Barrier Arrival Mismatch'). With a barrier per generation parity, the
+    phase two back on item j's barrier is item j - 2 SLOTS's, which this group
+    consumed itself, so the parity wait is exact."""
+    return state_full + j % SLOTS + SLOTS * ((j // SLOTS) % 2)
+
+
+def page_parity(j):
+    """The mbarrier phase parity of item j's page on page_barrier(j)."""
+    return (j // (2 * SLOTS)) % 2
+
+
 def max_items_per_cta(requests):
     """KdaFlow tables the weights of two heads (a CTA's head-major item range may span
     at most two heads) and MAX_ITEMS items."""
@@ -386,7 +404,7 @@ class KdaFlow(KdaWS):
         page slot ``s``: one of the slot barrier's four arrivals (a padded row's
         arrival carries no bytes)."""
         slot, head = table[j, SLOT], table[j, HEAD]
-        barrier = state_full + s
+        barrier = page_barrier(state_full, j)
         if slot > 0:
             rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, COPY_BYTES)
@@ -501,9 +519,12 @@ class KdaFlow(KdaWS):
         uss = alloc(smem, Float32, (GROUPS, T, K), align=128)
         kgo = alloc(smem, BFloat16, (GROUPS, T, 2 * K), align=128)  # new key/gate
         sums = alloc(smem, Float32, (GROUPS, SUMS, 4))
-        bars = smem.allocate(cutlass.Uint64, SLOTS + GROUPS + 2)
-        state_full, stage_full = bars, bars + SLOTS
-        fb_full, fa_full = bars + SLOTS + GROUPS, bars + SLOTS + GROUPS + 1
+        # Two page barriers per ring slot, alternating by the slot's generation
+        # (item j // SLOTS): see page_barrier.
+        bars = smem.allocate(cutlass.Uint64, 2 * SLOTS + GROUPS + 2)
+        state_full, stage_full = bars, bars + 2 * SLOTS
+        fb_full = bars + 2 * SLOTS + GROUPS
+        fa_full = bars + 2 * SLOTS + GROUPS + 1
         # Prologue scratch: the F_B rows of the CTA's heads in the last page slot (its
         # page is loaded after the gate projection), the F_A rows of its items over
         # the q / k / v / decay blocks (unused until the first prep).
@@ -517,7 +538,7 @@ class KdaFlow(KdaWS):
         )
 
         if tid == 0:
-            for s in cutlass.range_constexpr(SLOTS):  # one arrival per warp quarter
+            for s in cutlass.range_constexpr(2 * SLOTS):  # one arrival per quarter
                 cute.arch.mbarrier_init(state_full + s, PAGE_BYTES // COPY_BYTES)
             for g in cutlass.range_constexpr(GROUPS):
                 cute.arch.mbarrier_init(stage_full + g, 1)
@@ -806,7 +827,7 @@ class KdaFlow(KdaWS):
                 tb = clock64()
                 tr[1] = tr[1] + (tb - ta)
             s = j % SLOTS
-            self.bwait(state_full + s, (j // SLOTS) % 2, "state_full")
+            self.bwait(page_barrier(state_full, j), page_parity(j), "state_full")
             if cutlass.const_expr(self.trace):
                 tc = clock64()
                 tr[2] = tr[2] + (tc - tb)
