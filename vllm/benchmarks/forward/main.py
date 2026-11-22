@@ -127,15 +127,16 @@ def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
     engine_args.enable_prefix_caching = False
     engine_args.compilation_config.mode = CompilationMode.NONE
     engine_args.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    lists = [rs for c in cases for rs in c.all_requests]
     if engine_args.max_num_seqs is None:
-        engine_args.max_num_seqs = max(len(c.requests) for c in cases)
+        engine_args.max_num_seqs = max(len(rs) for rs in lists)
     if engine_args.max_num_batched_tokens is None:
         # Prefix hits may replay up to a window more per request.
         engine_args.max_num_batched_tokens = max(
             8192,
             *(
-                c.num_tokens + 1024 * sum(r.prefix_hit for r in c.requests)
-                for c in cases
+                sum(r.query_len for r in rs) + 1024 * sum(r.prefix_hit for r in rs)
+                for rs in lists
             ),
         )
     return engine_args
@@ -249,10 +250,17 @@ def main(args: argparse.Namespace) -> None:
 
     llm = LLM.from_engine_args(_make_engine_args(args, cases))
     runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
-    # Same draw on every rank: shapes are balanced across DP ranks.
+    # Same draw on every rank: shapes are balanced across DP ranks, unless a
+    # case lists per-DP-rank requests (each rank then runs its own list).
     max_kv_len = runner.model_config.max_model_len
     cases = [
-        jitter_kv_lens(c, args.kv_len_jitter, max_kv_len, args.seed) for c in cases
+        jitter_kv_lens(
+            c.for_rank(runner.dp_rank, runner.dp_size),
+            args.kv_len_jitter,
+            max_kv_len,
+            args.seed,
+        )
+        for c in cases
     ]
     world = get_world_group()
     results = []

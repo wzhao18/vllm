@@ -56,6 +56,24 @@ class BenchRequest:
 class BenchCase:
     name: str
     requests: tuple[BenchRequest, ...]
+    # Optional per-DP-rank request lists (shape-matched replay of a served DP
+    # lockstep step): DP rank r runs ``per_rank[r]``. ``requests`` then holds
+    # the list with the most KV, for KV pool sizing.
+    per_rank: tuple[tuple[BenchRequest, ...], ...] = ()
+
+    def for_rank(self, dp_rank: int, dp_size: int) -> "BenchCase":
+        """This DP rank's case (itself when the case has no per-rank lists)."""
+        if not self.per_rank:
+            return self
+        if len(self.per_rank) != dp_size:
+            raise ValueError(
+                f"{self.name}: {len(self.per_rank)} per-rank lists for DP size {dp_size}"
+            )
+        return replace(self, requests=self.per_rank[dp_rank], per_rank=())
+
+    @property
+    def all_requests(self) -> tuple[tuple[BenchRequest, ...], ...]:
+        return self.per_rank or (self.requests,)
 
     @property
     def num_tokens(self) -> int:
@@ -126,12 +144,22 @@ def load_cases(path: str) -> list[BenchCase]:
         data = yaml.safe_load(text)
     else:
         data = json.loads(text)
-    cases = []
-    for case in data["cases"]:
+    def _reqs(items) -> tuple[BenchRequest, ...]:
         requests: list[BenchRequest] = []
-        for req in case["requests"]:
+        for req in items:
             req = dict(req)
             count = req.pop("count", 1)
             requests.extend([BenchRequest(**req)] * count)
-        cases.append(BenchCase(case["name"], tuple(requests)))
+        return tuple(requests)
+
+    cases = []
+    for case in data["cases"]:
+        if "ranks" in case:
+            per_rank = tuple(_reqs(items) for items in case["ranks"])
+            if not per_rank or not all(per_rank):
+                raise ValueError(f"{case['name']}: every DP rank needs a request")
+            widest = max(per_rank, key=lambda rs: sum(r.kv_len for r in rs))
+            cases.append(BenchCase(case["name"], widest, per_rank))
+        else:
+            cases.append(BenchCase(case["name"], _reqs(case["requests"])))
     return cases
