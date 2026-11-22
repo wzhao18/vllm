@@ -569,7 +569,7 @@ def main():
     if any(t > c for t, c in zip(tokens, caps)):
         raise SystemExit("a point's live tokens exceed its capacity.")
     points = sorted(
-        {(args.variant, c, t) for t, c in zip(tokens, caps)}, key=lambda p: p[1]
+        {(args.variant, c, t) for t, c in zip(tokens, caps)}, key=lambda p: (p[1], p[2])
     )
     # one bucket per capacity: the smallest live point of that capacity picks the knobs
     by_cap = {}
