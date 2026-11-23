@@ -126,7 +126,7 @@ def caches(slots, q, seed=1, heads=HEADS):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * 128 * heads, q + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, heads, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(CONV_DTYPE), state
+    return conv.bfloat16().to(CONV_DTYPE), state  # the window holds BF16 in-proj inputs
 
 
 def spec_inputs(requests, q, slots, seed=2):
