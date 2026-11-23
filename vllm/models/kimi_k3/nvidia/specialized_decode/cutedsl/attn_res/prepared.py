@@ -275,9 +275,7 @@ class PreparedAttnRes:
 # 256 rows the owner kernel + gather costs what the full-rows kernel does (TP16
 # geometry, us: nb 2 5.4 -> 5.9, nb 4 5.2 -> 5.4, nb 8 6.7 -> 5.6) and the post-tail
 # site pays one more hop; it pays from 384 rows (notes/comm3.md section 3e).
-# From 384 rows (TP16NV, LHF G-attn_res: the q8 M448-680 / q6 M640-1280 DA frontier;
-# 16-rank step ABBA vs 928a in perf/TP16NV.md).
-SHARDED: dict = {"*": "384-:1"}
+SHARDED: dict = {"*": ""}
 # Wide verify shapes whose AttnRes sites run the stock op (``runtime.seams
 # .StockAttnRes``: the stock forward's own kernel) instead of ClusterAttnRes (one
 # 7-CTA cluster per token, 181 clusters per wave), rows by q ("*": any). Above 256
