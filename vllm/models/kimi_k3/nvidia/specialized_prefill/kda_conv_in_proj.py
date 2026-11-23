@@ -24,6 +24,17 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 MIN_ROWS = 2048
 #: 512x256 B-reuse tile, 2x4 cluster (A multicast across N), drain epilogue.
 TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "")
+#: Per-shape tactics, keyed by the q|k|v width N = 3 P of a TP-sharded layer,
+#: where TACTIC's cluster columns (tile N x cluster N = 1024) do not tile N.
+#: TP8 (P 1536, N 4608 = 9 x 512): 2x2 cluster, swizzle fitted to 3.
+SHAPE_TACTICS = {
+    4608: ((512, 256), (2, 2), 256, 4, "m", 0, 0, ""),
+}
+
+
+def tactic_for(n: int):
+    """The tactic of an ``n``-column q|k|v problem (before ``shape_tactic``)."""
+    return SHAPE_TACTICS.get(n, TACTIC)
 
 
 def _qkv_rows(lin) -> torch.Tensor:
@@ -37,8 +48,8 @@ def _qkv_rows(lin) -> torch.Tensor:
 def unsupported_reason(layer) -> str | None:
     """None when the layer can run the fused GEMM: SM107, online-MXFP8 in_proj
     with K-major [N, K] rows (either kernel layout), FP32 width-4 conv
-    weights, 256-multiple planes that ``TACTIC``'s clusters tile exactly
-    (``kda_conv_gemm.shape_tactic``); else why not."""
+    weights, 256-multiple planes that the shape's tactic (``tactic_for``)
+    clusters tile exactly (``kda_conv_gemm.shape_tactic``); else why not."""
     from vllm.platforms import current_platform
 
     if not current_platform.is_device_capability((10, 7)):
@@ -58,7 +69,8 @@ def unsupported_reason(layer) -> str | None:
     from .sm107_gemm.kda_conv_gemm import shape_tactic
 
     try:
-        shape_tactic(3 * layer.local_projection_size, TACTIC)
+        n = 3 * layer.local_projection_size
+        shape_tactic(n, tactic_for(n))
     except ValueError as e:
         return str(e)
     return None
@@ -92,7 +104,9 @@ class PrefillKdaConvInProj:
         self.w_rest, self.s_rest = w[nq:], s[cut:]
         cw = self.layer.conv1d.weight
         self.conv_w = cw.view(cw.shape[0], cw.shape[-1])
-        self._gemm = KdaConvGemm(w[:nq], s[:cut], self.conv_w, self.p, tactic=TACTIC)
+        self._gemm = KdaConvGemm(
+            w[:nq], s[:cut], self.conv_w, self.p, tactic=tactic_for(nq)
+        )
         dev = w.device
         rows = MIN_ROWS
         x = torch.zeros((rows, k), dtype=torch.float8_e4m3fn, device=dev)

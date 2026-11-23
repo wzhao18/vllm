@@ -3022,14 +3022,20 @@ class KimiLinearForCausalLM(
                 "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
             )
-        # Prefill workers: shared gate_up GEMM with the SiTU + MXFP8 epilogue.
+        # P/D prefill workers: shared gate_up GEMM with the SiTU + MXFP8
+        # epilogue. Not beside a concurrent SM-capped MegaMoE (SP
+        # _shared_overlap: the persistent full-grid GEMM is not capped to the
+        # reserved SMs) or on the token-shard GEMM-AR path (it reads the
+        # un-interleaved gate_up rows).
         from .specialized_prefill import shared_situ
 
+        prefill_worker = pd_prefill_worker(self.vllm_config)
         fused_situ = 0
-        for module in self.model.modules():
+        for module in self.model.modules() if prefill_worker else ():
             if (
                 isinstance(module, KimiMoE)
-                and getattr(module, "_prefill_moe", None) is not None
+                and not module._shared_overlap
+                and not module.moe_token_shard
                 and getattr(module, "_packed_moe", None) is None
                 and isinstance(module.shared_experts, KimiMLP)
                 and not module.shared_experts.shard_sequence_parallel
@@ -3045,15 +3051,23 @@ class KimiLinearForCausalLM(
                 "SiTU + MXFP8 epilogue (sm_107).",
                 fused_situ,
             )
-        # Prefill workers (prefill MoE policy active): KDA q|k|v in_proj GEMM
-        # with the conv + SiLU in its epilogue.
+        if not fused_situ:
+            logger.info_once(
+                "Kimi K3: prefill shared experts keep the separate SiTU: %s",
+                "not a P/D prefill worker"
+                if not prefill_worker
+                else "unsupported layout or weights",
+            )
+        # P/D prefill workers: KDA q|k|v in_proj GEMM with the conv + SiLU in
+        # its epilogue, at every layout whose shape the kernel supports
+        # (kda_conv_in_proj.unsupported_reason).
         from .specialized_prefill import kda_conv_in_proj
 
-        prefill_worker = any(
-            getattr(module, "_prefill_moe", None) is not None
-            for module in self.model.modules()
-            if isinstance(module, KimiMoE)
-        )
+        if not prefill_worker:
+            logger.info_once(
+                "Kimi K3: prefill KDA in_proj keeps the separate conv: "
+                "not a P/D prefill worker"
+            )
         fused_conv = 0
         for module in self.model.modules() if prefill_worker else ():
             if not isinstance(module, KimiK3DeltaAttention):
