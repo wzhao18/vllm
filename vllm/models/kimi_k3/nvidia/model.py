@@ -261,10 +261,17 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
 
 
 def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
-    """Whether this instance is the prefill side of a P/D deployment (a KV producer:
-    kv_producer or kv_both)."""
+    """Whether this instance is the prefill side of a P/D deployment: a KV producer
+    (kv_producer, or kv_both) that is not a decode instance. A kv_both instance on the
+    latency-specialized decode backend is the decode side (Dynamo maps its decode
+    workers to kv_consumer, but kv_both decode recipes exist): it keeps the decode
+    MegaMoE buckets and die-local streams."""
     kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
-    return kv_transfer is not None and bool(kv_transfer.is_kv_producer)
+    if kv_transfer is None or not kv_transfer.is_kv_producer:
+        return False
+    extra = vllm_config.additional_config
+    backend = extra.get("decode_backend", "auto") if isinstance(extra, dict) else "auto"
+    return not (kv_transfer.is_kv_consumer and backend == "latency_specialized")
 
 
 # Smallest step (tokens, after CUDA-graph padding) whose token-shard MoE finishes with

@@ -47,6 +47,7 @@ def _vllm_config(mnbt=8192, dp=1):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=mnbt),
         parallel_config=SimpleNamespace(data_parallel_size=dp),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        additional_config={},
     )
 
 
@@ -277,6 +278,10 @@ def test_decode_bucket_admits_every_shipped_inference_record(world, kind, tokens
         ("kv_both", 8, 16384, 8, True, (2048,)),
         # C512 decode: DP4 x TP4 (EP16), MNBT 8192, sequence parallel
         ("kv_consumer", 16, 8192, 4, True, (256, 2048)),
+        # the same decode launched kv_both on the latency-specialized decode backend
+        ("kv_both+latency_specialized", 16, 8192, 4, True, (256, 2048)),
+        # a kv_producer is a prefill worker whatever its decode backend
+        ("kv_producer+latency_specialized", 16, 8192, 4, True, (2048,)),
         # unified serving decodes too
         (None, 16, 8192, 4, True, (256, 2048)),
     ],
@@ -292,9 +297,13 @@ def test_deployment_buckets_per_role(
     tokens = kimi_model.mega_moe_max_num_tokens(mnbt, tp, token_sharded)
     config = _vllm_config(mnbt=mnbt, dp=4)
     if role is not None:
+        role, _, backend = role.partition("+")
         config.kv_transfer_config = SimpleNamespace(
-            is_kv_producer=role in ("kv_producer", "kv_both")
+            is_kv_producer=role in ("kv_producer", "kv_both"),
+            is_kv_consumer=role in ("kv_consumer", "kv_both"),
         )
+        if backend:
+            config.additional_config = {"decode_backend": backend}
     with torch.device("meta"):
         module = _experts(config, ep=ep, max_num_tokens=tokens, **K31)
     assert tuple(b.max_tokens for b in module.buckets) == caps
