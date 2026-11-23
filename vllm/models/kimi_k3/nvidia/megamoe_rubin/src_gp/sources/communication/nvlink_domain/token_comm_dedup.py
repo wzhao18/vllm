@@ -44,13 +44,8 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
-from ....common.spin_guard import _st_gpu_s32, _st_gpu_v4_s32, _st_sys_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
+from ....common.spin_guard import globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
-
-
-from ....common.ep_balance_layout import (  # noqa: E402
-    EPBAL_CHECKSUM_MUL, EPBAL_CHECKSUM_SALT, EPBAL_HEADER_WORDS, EPBAL_POS_ADD, EPBAL_POS_MUL_S32, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
-)
 
 
 class DedupCallTail(GenphaseTail):
@@ -79,9 +74,6 @@ class DedupCallTail(GenphaseTail):
     # Device-accessible address of this process's host spin-record buffer (spin_record.py), written once by the
     # host after the workspace is carved; 0 = no records (the guards then only print and trap).
     record_region = "nvlink.token_comm_dedup.spin_record_addr"
-    # Device-accessible address of this process's EP-balance ring (megamoe_rubin/ep_balance.py), written once by
-    # the host after the workspace is carved; 0 = no logging.
-    epbal_region = "nvlink.token_comm_dedup.epbal_ring_addr"
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
         workspace.register(
@@ -96,10 +88,6 @@ class DedupCallTail(GenphaseTail):
         )
         workspace.register(
             self.record_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
-        workspace.register(
-            self.epbal_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
             reset="zero_on_first_allocate",
         )
         workspace.register(
@@ -1450,55 +1438,6 @@ class _DedupMetadataPushRouter(KernelComponent):
         cute.arch.sync_warp()
 
     @cute.jit
-    def log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32, warp_idx: Int32) -> None:
-        """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
-        CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
-        so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the session's
-        DEVICE-memory ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
-
-        Device memory, gpu-scope stores, no fence: pinned-host stores cost ~100 us under MegaMoE load to whatever
-        next orders at system scope (a sys fence, a sys acquire, the CTA exit; MEGAMOEFIX tasks C-Gp). The host
-        copies the slot out at drain time on its own stream; word 7 carries ``epbal_checksum(call, counts)``, a
-        position-weighted sum bound to the call id, and the host takes a slot only when the call id and the
-        checksum agree (a slot copied while its stores are still landing is retried on the next drain)."""
-        linear_cta_idx, _, _ = cute.arch.block_idx()
-        # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
-        if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS and self.expert_count_padded % 4 == 0):
-            if (linear_cta_idx == Int32(0)) & (warp_idx == Int32(0)):
-                ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
-                call = self._call_tail.read_epoch(device_workspace) + Int32(1)
-                if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
-                    base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
-                    sizes = device_workspace.tensor(self.sizes_region)
-                    total = Int32(0)
-                    for vector_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded // 4, 32)):
-                        expert = (Int32(vector_round * 32) + lane_idx) * Int32(4)
-                        if expert < Int32(self.expert_count_padded):
-                            c0 = sizes[expert]
-                            c1 = sizes[expert + Int32(1)]
-                            c2 = sizes[expert + Int32(2)]
-                            c3 = sizes[expert + Int32(3)]
-                            _st_gpu_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
-                            # position-weighted (odd weight (i * POS_MUL + POS_ADD) | 1 per expert), wrapping int32
-                            w0 = (expert * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w1 = ((expert + Int32(1)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w2 = ((expert + Int32(2)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w3 = ((expert + Int32(3)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            total = total + c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3
-                    for shift in cutlass.range_constexpr(5):
-                        total = total + cute.arch.shuffle_sync_bfly(total, 16 >> shift)
-                    if lane_idx == Int32(0):
-                        t_ready = globaltimer_ns()
-                        checksum = (total ^ Int32(EPBAL_CHECKSUM_SALT)) + call * Int32(EPBAL_CHECKSUM_MUL)
-                        # words 4..7: world, experts_per_rank, 0 = global record, checksum
-                        _st_gpu_v4_s32(base + Int64(16), Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), checksum)
-                        _st_gpu_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
-                        _st_gpu_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
-                        _st_gpu_s32(base + Int64(12), Int32(self.expert_count_padded))
-                        _st_gpu_s32(base, call)
-                    cute.arch.sync_warp()
-
-    @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
@@ -2249,8 +2188,6 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
-        # EP-balance log after this CTA's pulls are published: off the dispatch critical path (int64.3 item 3).
-        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode == "standalone_warps"):
             # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
             cute.arch.cp_async_bulk_wait_group(0, read=True)

@@ -105,35 +105,6 @@ def _st_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _st_sys_v4_s32(address: Int64, v0: Int32, v1: Int32, v2: Int32, v3: Int32, *, loc=None, ip=None) -> None:
-    """One 16-byte relaxed system-scope store (``address`` 16-byte aligned)."""
-    llvm.inline_asm(
-        None, [address.ir_value(), v0.ir_value(), v1.ir_value(), v2.ir_value(), v3.ir_value()],
-        "st.relaxed.sys.global.v4.s32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r",
-        has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
-    )
-
-
-@dsl_user_op
-def _st_gpu_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
-    """One 4-byte relaxed gpu-scope store (device memory: completes at L2, no system-scope wait)."""
-    llvm.inline_asm(
-        None, [address.ir_value(), value.ir_value()], "st.relaxed.gpu.global.s32 [$0], $1;", "l,r",
-        has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
-    )
-
-
-@dsl_user_op
-def _st_gpu_v4_s32(address: Int64, v0: Int32, v1: Int32, v2: Int32, v3: Int32, *, loc=None, ip=None) -> None:
-    """One 16-byte relaxed gpu-scope store (``address`` 16-byte aligned, device memory)."""
-    llvm.inline_asm(
-        None, [address.ir_value(), v0.ir_value(), v1.ir_value(), v2.ir_value(), v3.ir_value()],
-        "st.relaxed.gpu.global.v4.s32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r",
-        has_side_effects=True, asm_dialect=0, loc=loc, ip=ip,
-    )
-
-
-@dsl_user_op
 def _cas_sys_b32(address: Int64, compare: Int32, value: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
         llvm.inline_asm(
