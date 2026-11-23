@@ -5,12 +5,13 @@ not only C512's q4: the deferred serving path (records, fold, accepted counts, a
 request replaced mid-chain) and the fold-then-verify chain against the stock Triton
 verify / commit, re-run from the q4 tests at another q.
 
-Record cores per q (``cutedsl.kda.sp.RECORD_KINDS``): KdaSplit at n1-2; KdaWide at
-n3-20 and, q2 / q4, KdaFlow from n21; q3 and q5..q8 KdaWide from n3 (KdaFlow
-serves q2 / q4 only).
-The request counts pick one core each: n1 split, n9 wide, n33 flow (q2 / q4) or
-wide (q3, q5..q8). The tolerances are the q4 tests' (bitwise except KdaFlow's chunk
-order)."""
+Record cores per q (``cutedsl.kda.sp.RECORD_KINDS``): KdaSplit at n1-2, KdaWide at
+n3-20, KdaFlow from n21 at every q (q3 with padded scan vectors; q5..q8 with block-sum
+rounds, the two-half scan and the two-slot page ring).
+The request counts pick one core each: n1 split, n9 wide, n33 / n64 flow; plus each
+q's largest KdaFlow item build at the SP row cap (q5 n192: 24 items per CTA, q6
+n160: 20, q7 n136 / q8 n121: 16). The tolerances are the q4 tests' (bitwise except
+KdaFlow's chunk order)."""
 
 import sys
 
@@ -20,9 +21,7 @@ from tests.models.kimi_k3 import test_specialized_decode_sp_kda_deferred_path_gp
 from tests.models.kimi_k3 import test_specialized_decode_sp_kda_fold_gpu as fold
 from tests.models.kimi_k3 import test_specialized_decode_sp_kda_gpu as kda
 from tests.models.kimi_k3 import test_specialized_decode_sp_recoverssm_gpu as chain
-from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import sp
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.sp import record_kind
-from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
 
 QS = [2, 3, 5, 6, 7, 8]
 
@@ -40,16 +39,26 @@ def verify_length(monkeypatch, request):
 @pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
 def test_record_kind_per_q(verify_length):
     q = verify_length
-    flow = "flow" if q in (2, 4) else "wide"
+    flow = "flow"
     assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, 20, 21, 128, 212, 213)] == [
         "split", "split", "wide", "wide", flow, flow, flow, "wide",
     ]  # fmt: skip
 
 
-@pytest.mark.parametrize("n", [1, 9, 33], ids=lambda n: f"n{n}")
+@pytest.mark.parametrize("n", [1, 9, 33, 64], ids=lambda n: f"n{n}")
 @pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
 def test_deferred_serving_path_any_q(verify_length, n):
     path.test_deferred_serving_path_matches_stock(n, True, False)
+
+
+# The largest KdaFlow item build each q needs at its SP row cap (SDECK: R <= 968,
+# lcm(q, 4) alignment): items per CTA = ceil(24 n / 212).
+CAP_N = {2: 212, 3: 212, 5: 192, 6: 160, 7: 136, 8: 121}
+
+
+@pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
+def test_deferred_serving_path_flow_cap(verify_length):
+    path.test_deferred_serving_path_matches_stock(CAP_N[verify_length], True, False)
 
 
 @pytest.mark.parametrize("n", [9, 33], ids=lambda n: f"n{n}")
@@ -58,15 +67,12 @@ def test_fold_then_verify_any_q(verify_length, n):
     fold.test_fold_matches_stock_commit_then_verify(n, True)
 
 
-@pytest.mark.parametrize("verify_length", [3, 5, 8], indirect=True, ids=lambda q: f"q{q}")
-def test_kdaflow_refused_outside_q2_q4(verify_length, monkeypatch):
-    """No silent KdaFlow at a verify length it does not serve: forcing it raises
-    ``Unsupported`` at build (prepare_caches), naming KdaFlow."""
-    q, n = verify_length, 33
-    monkeypatch.setitem(sp.RECORD_KINDS, kda.HEADS, "1-:flow")
-    ours = kda.layer()
-    ours.deferred_recoverssm = True
-    core = sp.SpKdaCore(ours, (q * n,), records="triton", ctx=kda.context())
-    assert core.kinds[q * n] == "flow"
-    with pytest.raises(Unsupported, match="KdaFlow"):
-        core.prepare_caches(list(kda.caches(2 * n + 2)))
+@pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
+def test_kdaflow_builds_at_every_q(verify_length):
+    """KdaFlow builds at every DSpark q (no refusal) and keeps refusing a verify
+    length it does not serve (q9): ``Unsupported`` at build, naming KdaFlow."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+    q = verify_length
+    assert q in flow.FLOW_TOKENS
+    assert 9 not in flow.FLOW_TOKENS
