@@ -91,6 +91,14 @@ MX_TUNED: dict[tuple[int, int], dict] = {
     (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    # TP16 per-rank shapes (DA, NVFP4 checkpoint; TP16NV mx8bench, 1 VR200 GPU, CUDA
+    # graph of 16 calls on cold weight copies, us per call fi_cute / scaled_mm / pre):
+    #   kda_in 3216 x 7168  R8 4.69 / 7.29 / 17.7, R16 5.36 / 7.99 / 16.9, R24 8.05 /
+    #                       8.37 / 7.87, R64 8.16 / 8.40 / 7.94, R128 8.75 / 8.44 / 7.98
+    #   (pre bitwise fi_cute from 17 rows). o_proj 7168 x 768, shared gu 768 x 7168 and
+    #   shared down 7168 x 384: stock's rule (fi_cute <= 16, scaled_mm above) already
+    #   picks the fastest kind at every row (within 0.05 us), so no entry.
+    (3216, 7168): {"*": "1-16:fi_cute,17-128:pre"},
 }  # fmt: skip
 
 
