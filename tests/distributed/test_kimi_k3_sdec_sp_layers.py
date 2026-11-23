@@ -1878,7 +1878,7 @@ def test_sp_dsa_block_any_q(q):
 @pytest.mark.parametrize("q", [2, 3, 6, 8], ids=lambda q: f"q{q}")
 def test_sp_kda_block_any_q(q):
     """The KDA A/B (RecoverSSM records, two steps with partial acceptance) at q2 / q3
-    / q6 / q8 on aligned rows: KdaFlow (q <= 4) or KdaWide (q >= 5) from n21."""
+    / q6 / q8 on aligned rows: KdaFlow (q2 / q4) or KdaWide (q3, q5..q8) from n21."""
     pytest.importorskip("cutlass")
     _launch("kda", _any_q_rows(q), 2, False, False, q=q)
 

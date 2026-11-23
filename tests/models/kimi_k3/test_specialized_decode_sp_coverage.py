@@ -187,7 +187,7 @@ class Fakes:
         class Mlp:
             def __init__(self, mlp, rows, ctx, index):
                 assert mlp.use_mega_moe and ctx.sequence_parallel
-                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                assert tuple(rows) == tuple(sorted({r // TP for r in ROWS})), rows  # n = R / 4
                 gaps = fakes.gaps.get("moe_dense", ())
                 self.providers = {}
                 for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
@@ -204,7 +204,7 @@ class Fakes:
 
             def __init__(self, mlp, rows, device, index):
                 assert index == 0 and not mlp.use_mega_moe, index
-                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                assert tuple(rows) == tuple(sorted({r // TP for r in ROWS})), rows  # n = R / 4
                 super().__init__(rows, fakes.gaps.get("dense", ()))
 
             def serves(self, n):

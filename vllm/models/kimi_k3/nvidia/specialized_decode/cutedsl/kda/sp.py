@@ -75,9 +75,11 @@ from .wide import KdaWide
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above),
-# then by verify length q (exact q first, then "*"). KdaFlow is built for q = 2..4
-# (``flow.SUMS``: 2q + q^2 + q block sums <= 32, and its shared-memory budget), so at
-# q = 5..8 (DSpark k4..k7) KdaWide serves every n >= 3: the same deferred fold (FOLDS,
+# then by verify length q (exact q first, then "*"). KdaFlow serves q2 and q4 only
+# (``flow.FLOW_TOKENS``: at q5..8 its block sums, 2q + q^2 + q > 32, and shared memory
+# do not fit; at q3 its outputs are wrong: test_specialized_decode_sp_kda_anyq_gpu
+# q3-n33, output max abs error 9.8 with correct checkpoints / corrections), so at q3
+# and q5..q8 (DSpark k2, k4..k7) KdaWide serves every n >= 3: the same deferred fold (FOLDS,
 # the stock Triton commit's math bit for bit) and the same verify math (FP32 state and
 # recurrence, BF16 roundings), another FP32 reduction order of the recurrence's dot
 # products only, as between any two record cores. Cost at q4 sizes (deferred, us per
@@ -86,6 +88,7 @@ K = 128
 RECORD_KINDS = {
     24: {
         "*": "1-2:split,3-20:wide,21-:flow",
+        3: "1-2:split,3-:wide",
         5: "1-2:split,3-:wide",
         6: "1-2:split,3-:wide",
         7: "1-2:split,3-:wide",
@@ -201,8 +204,8 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
     if kind == "flow":
-        if not record or not 2 <= tokens <= 4:
-            cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
+        if not record or tokens not in flow.FLOW_TOKENS:
+            cause = f"KdaFlow runs RecoverSSM record steps of {flow.FLOW_TOKENS} tokens only"
             raise Unsupported("kda", shape, cause)
         budget = flow.smem_budget(device)
         # The smallest item-capacity build that serves this shape (flow.ITEM_BUILDS:

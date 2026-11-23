@@ -263,10 +263,11 @@ def test_sp_serves_dspark_k1_to_k7_on_aligned_graphs(k):
     assert decode.captured[-1] == config.scheduler_config.max_num_seqs * (k + 1)
 
 
-@pytest.mark.parametrize("k", [1, 2, 4, 5, 6])
+@pytest.mark.parametrize("k", [2, 4, 5, 6])
 def test_sp_refuses_unaligned_capture_rows(k):
     """Rows every 4 (the k3 renders) round up to q-multiples that do not split over
-    TP4 at k != 3, 7: refused at load, naming the aligned list."""
+    TP4 at k2 / k4 / k5 / k6 (k1, k3, k7 stay aligned): refused at load, naming the
+    aligned list."""
     config = deployment(
         **{
             "speculative_config.num_speculative_tokens": k,
