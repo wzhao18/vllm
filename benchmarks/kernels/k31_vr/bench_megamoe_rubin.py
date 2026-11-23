@@ -164,7 +164,12 @@ def parse_args():
         "(variant inference_dedup) with this token-back transport; wg2: two epilogue "
         "warpgroups (inference_dedup_wg2, reuse_dispatch_warps)",
     )
-    p.add_argument("--routing", choices=("random", "balanced"), default="random")
+    p.add_argument("--routing", choices=("random", "balanced", "replay"), default="random",
+                   help="replay: SERVED decode routes from --replay-pool (EPLB pool npz: blocks [N, 4, layers, top_k] "
+                        "int16 logical ids over 896 experts, linear placement), whole 4-row blocks drawn per (seed, "
+                        "rank), layer column --replay-layer")
+    p.add_argument("--replay-pool", default=None)
+    p.add_argument("--replay-layer", type=int, default=45)
     p.add_argument(
         "--active-experts",
         type=int,
@@ -389,12 +394,25 @@ def make_shared(W, shape, rows, seed, device):
     return args, ref
 
 
+_REPLAY = {}
+
+
 def make_routes(
     n, num_experts, topk, world, rank, kind, seed, device, ids_dtype, active=None
 ):
     g = torch.Generator(device=device)
     g.manual_seed(seed * 7919 + rank)
-    if kind == "random":
+    if kind == "replay":
+        import numpy as np
+
+        d = np.load(_REPLAY["pool"])
+        blocks = d["blocks"]
+        if int(blocks.max()) >= num_experts:
+            raise SystemExit(f"replay pool ids reach {int(blocks.max())}: needs --num-experts >= {int(blocks.max()) + 1}")
+        rng = np.random.default_rng([seed, rank, 0xB10C])
+        pick = rng.integers(blocks.shape[0], size=-(-n // blocks.shape[1]))
+        ids = torch.from_numpy(blocks[pick][:, :, _REPLAY["layer"], :topk].reshape(-1, topk)[:n].astype(np.int64)).to(device)
+    elif kind == "random":
         scores = torch.rand((n, num_experts), generator=g, device=device)
         if active is not None:
             local = torch.arange(num_experts, device=device) % (num_experts // world)
@@ -570,6 +588,10 @@ def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rm
 
 def main():
     args = parse_args()
+    if args.routing == "replay":
+        if not args.replay_pool:
+            raise SystemExit("--routing replay needs --replay-pool")
+        _REPLAY.update(pool=args.replay_pool, layer=args.replay_layer)
     rank, world, device = init_distributed()
     group = dist.group.WORLD if world > 1 else None
 
