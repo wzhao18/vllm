@@ -179,3 +179,18 @@ def test_deferred_serving_path_fp32_conv(verify_length, n, conv32):
 @pytest.mark.parametrize("verify_length", [4, 8], indirect=True, ids=lambda q: f"q{q}")
 def test_fold_then_verify_fp32_conv(verify_length, conv32):
     fold.test_fold_matches_stock_commit_then_verify(33, True)
+
+
+@pytest.mark.parametrize("verify_length", [2, 3, 4, 5, 6, 7, 8], indirect=True,
+                         ids=lambda q: f"q{q}")  # fmt: skip
+def test_kdaflow_conv_buffers_fp32(verify_length):
+    """FP32 conv state fits every build each q needs (VR200 budget): two window
+    buffers where they fit, one otherwise; BF16 keeps two everywhere."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+    q, limit = verify_length, flow.OVERSIZED_BUDGET
+    for items in flow.ITEM_BUILDS:
+        assert flow.conv_buffers(q, q + 2, 2, limit, items=items) == 2
+        need = {4: 24, 5: 24, 6: 20, 7: 16, 8: 16}.get(q, 24)
+        if items <= need:
+            assert flow.max_stages(q, True, q + 2, 4, limit, items=items) == 1, items

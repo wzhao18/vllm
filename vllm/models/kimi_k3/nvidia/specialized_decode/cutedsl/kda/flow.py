@@ -190,10 +190,12 @@ CONSTS = 17
 A_EXP, DT = 15, 16
 
 
-def group_bytes(tokens, window, conv_size):
-    """One group's operand block, staging and store buffers (bytes)."""
+def group_bytes(tokens, window, conv_size, conv_bufs=2):
+    """One group's operand block, staging and store buffers (bytes); ``conv_bufs``
+    convolution window buffers (see ``conv_buffers``)."""
     block = 6 * tokens * K * 4 + K * 4 + tokens * K * 2 + sums_count(tokens) * 16  # x v w u, D
-    staging = 4 * tokens * K * 2 + 6 * K * window * conv_size + tokens * K * 8
+    staging = (4 * tokens * K * 2 + conv_bufs * 3 * K * window * conv_size
+               + tokens * K * 8)  # fmt: skip
     stores = tokens * 2 * K * 2  # new key / gate records
     return block + staging + stores + 16 * 4 * 4
 
@@ -208,12 +210,14 @@ def fa_spill_bytes(tokens, items):
     return max(0, items * tokens * K * 2 - covered)
 
 
-def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS):
+def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS,
+                 conv_bufs=2):  # fmt: skip
     pages = ring_slots(tokens) * PAGE_BYTES
     heads = 2 * CONSTS * K * 4
     gates = items * tokens * K * 2
     tables = items * (META + 8) * 4
-    groups = GROUPS * (group_bytes(tokens, window, conv_size) + padded_vectors_bytes(tokens))
+    groups = GROUPS * (group_bytes(tokens, window, conv_size, conv_bufs)
+                       + padded_vectors_bytes(tokens))  # fmt: skip
     spill = fa_spill_bytes(tokens, items)
     return pages + heads + gates + tables + groups + spill + 64 * 8 + 4096  # (+ alignment)
 
@@ -229,11 +233,23 @@ def smem_budget(device):
 
 def max_stages(tokens, conv_dim_first, window, conv_size, limit, items=MAX_ITEMS):
     """1 when KdaFlow (an ``items``-item build) runs this layout (dim-first
-    convolution window) within ``limit`` bytes of shared memory, else 0."""
+    convolution window) within ``limit`` bytes of shared memory (with one window
+    buffer per group at least), else 0."""
     if not conv_dim_first:
         return 0
-    size = shared_bytes(tokens, conv_dim_first, window, conv_size, items=items)
+    size = shared_bytes(tokens, conv_dim_first, window, conv_size, items=items,
+                        conv_bufs=1)  # fmt: skip
     return int(size <= limit)
+
+
+def conv_buffers(tokens, window, conv_size, limit, items=MAX_ITEMS):
+    """Convolution window buffers per group: 2 (the next item's window streams in
+    while this item's leaves) where they fit ``limit``, else 1. One buffer is
+    refilled only after this item's window bulk store has read it (FP32 conv
+    state: q4 20- / 24-item builds, q7 / q8). The window bytes and the math are the
+    same either way; only when the next window copy is issued differs."""
+    two = shared_bytes(tokens, True, window, conv_size, items=items, conv_bufs=2)
+    return 2 if two <= limit else 1
 
 
 def page_barrier(state_full, j, slots=SLOTS):
@@ -352,14 +368,17 @@ class KdaFlow(KdaWS):
         stages=1,
         mx=False,
         items=MAX_ITEMS,
+        conv_bufs=2,
     ):
         assert tokens in FLOW_TOKENS and stages == 1 and conv_dim_first
+        assert conv_bufs in (1, 2), conv_bufs
         assert items in ITEM_BUILDS and items % 2 == 0, items
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
         self.slots = ring_slots(tokens)  # page ring depth (3 up to q4, 2 above)
+        self.conv_bufs = conv_bufs  # convolution window buffers per group
         self.items = items  # items per CTA this build tables (ITEM_BUILDS)
         # MXFP8 output (``quantize_outputs``): two more operands after the others,
         # the E4M3 bytes [R, D] and the F8_128x4 scales of the online-MXFP8
@@ -536,7 +555,12 @@ class KdaFlow(KdaWS):
                         copy_g2s(at(xs, t, part, 0),
                                  at(x, token + t, part * dim + head * K), K * 2,
                                  barrier)  # fmt: skip
-            if c == 32:
+            # The window: thread 32 with two buffers; with one, thread 0 once its
+            # bulk store of the current window (same buffer) has read it.
+            conv_thread: cutlass.Constexpr = 32 if self.conv_bufs == 2 else 0
+            if c == conv_thread:
+                if cutlass.const_expr(self.conv_bufs == 1):
+                    wait_bulk_reads()
                 page = conv_state[Int64(table[j, CONV_SLOT]), None, None]
                 for part in cutlass.range_constexpr(3):
                     copy_g2s(at(convs, part, 0), at(page, part * dim + head * K, 0),
@@ -602,7 +626,8 @@ class KdaFlow(KdaWS):
         fd_s = alloc(smem, Float32, (GROUPS, K))  # D_n
         ce_s = alloc(smem, Float32, (GROUPS, T * T))  # the scan's token couplings
         g_s = alloc(smem, BFloat16, (GROUPS, T, K))
-        convs = alloc(smem, conv_type, (GROUPS, 2, 3, K * self.window), align=128)
+        convs = alloc(smem, conv_type, (GROUPS, self.conv_bufs, 3, K * self.window),
+                      align=128)  # fmt: skip
         xs = alloc(smem, BFloat16, (GROUPS, T, 3, K), align=128)
         gs = alloc(smem, BFloat16, (GROUPS, T, K), align=128)
         kgs = alloc(smem, BFloat16, (GROUPS, T, 2 * K), align=128)
@@ -883,7 +908,7 @@ class KdaFlow(KdaWS):
             if cutlass.const_expr(self.trace):
                 tw = clock64()
                 tr[6] = tr[6] + (tw - ta)
-            item_buffers = (buffers[0][jj % 2, None, None], *buffers[1:])
+            item_buffers = (buffers[0][jj % self.conv_bufs, None, None], *buffers[1:])
             if cutlass.const_expr("prep" not in self.skip):
                 self.prep_item(args, g, c, j, slot, pending, table[j, CONV_OFFSET],
                                raw, hcs[head - h0, None, None], item_buffers, ops,
@@ -915,10 +940,10 @@ class KdaFlow(KdaWS):
                     for part in cutlass.range_constexpr(3):
                         store_bulk(at(page, part * dim + head * K, 0),
                                    at(convs, part, 0), part_bytes)  # fmt: skip
-                    bulk_commit()  # read by the next item's start (window: 2 buffers)
+                    bulk_commit()  # read by the next item's start (one window buffer: its stage)
             if jj + 1 < mine:  # the group's next item's inputs
                 self.stage_item(args, table, j + GROUPS, buffers, stage_full,
-                                (jj + 1) % 2, c)  # fmt: skip
+                                (jj + 1) % self.conv_bufs, c)  # fmt: skip
             cute.arch.sync_warp()
             if cutlass.const_expr(self.trace):
                 tb = clock64()

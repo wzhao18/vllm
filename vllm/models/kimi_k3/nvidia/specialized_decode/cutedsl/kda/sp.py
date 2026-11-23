@@ -230,8 +230,10 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
             raise Unsupported("kda", shape, cause)
         if build != flow.MAX_ITEMS:
             _log_build(shape, build, per_cta)
+        bufs = flow.conv_buffers(tokens, streamed[1], conv_size, budget, items=build)
         return flow.KdaFlow(
-            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build
+            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build,
+            conv_bufs=bufs,
         )
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
