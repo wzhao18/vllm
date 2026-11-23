@@ -283,28 +283,6 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_worker.get_kv_connector_stats()
 
     @classmethod
-    def get_reserved_device_memory(
-        cls, vllm_config: VllmConfig, kv_cache_spec: dict[str, Any]
-    ) -> int:
-        """The DCP pair exchange buffers of a decoder in pair mode
-        (``dcp_pair_exchange.reserved_device_bytes`` at the unit half bound
-        of ``pair_half_bytes_bound``); 0 otherwise."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-            dcp_pair_exchange as dpe,
-        )
-
-        config = vllm_config.kv_transfer_config
-        if (
-            config is None
-            or config.is_kv_producer
-            or config.get_from_extra_config("dcp_pair_exchange", False) is not True
-        ):
-            return 0
-        chunk_units = config.get_from_extra_config("dcp_pair_exchange_chunk_units", 4)
-        half = dpe.pair_half_bytes_bound(kv_cache_spec)
-        return dpe.reserved_device_bytes(half, chunk_units) if half else 0
-
-    @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
     ) -> KVConnectorStats | None:

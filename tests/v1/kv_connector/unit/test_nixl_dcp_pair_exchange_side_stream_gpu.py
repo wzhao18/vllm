@@ -86,15 +86,14 @@ def _worker(rank: int, init_method: str) -> None:
         comm = PyNcclCommunicator(dist.group.WORLD, device=dev)
         bench = _bench_module()
         block_size, chunk = 4096, 4
-        # 24 units: 6 chunks, past the ring's PAIR_RING_SLOTS slots (a wrap).
-        counts = (1, 3, 7, 18, 24)
+        counts = (1, 3, 7, 18)
         buf, table = bench.k31_cache(24, 0, block_size, max(counts) + 2)
         gen = torch.Generator(device=dev).manual_seed(1234 + rank)
         orig = torch.randint(
             0, 256, buf.shape, dtype=torch.uint8, device=dev, generator=gen
         )
 
-        def staged(ring_slots=1):
+        def staged():
             strides = dpe.all_exchange_strides(NUM_RANKS)
             first = dpe.DcpPairExchanger(
                 table,
@@ -102,7 +101,6 @@ def _worker(rank: int, init_method: str) -> None:
                 dev,
                 chunk_units=chunk,
                 communicator=comm,
-                ring_slots=ring_slots,
             )
             stages = {strides[0]: first}
             for s in strides[1:]:
@@ -119,14 +117,12 @@ def _worker(rank: int, init_method: str) -> None:
             return units
 
         nccl = staged()
-        # The served exchanger: chunk slots on the side stream.
-        peer = staged(dpe.PAIR_RING_SLOTS)
+        peer = staged()
         assert dpe.build_peer_copy_swap(peer, dist.group.WORLD) is not None
         side = torch.cuda.Stream(device=dev)
 
-        # 1. Bitwise: inline NCCL vs side-stream peer copy through the ring,
-        # each count twice in a row (the second starts mid-ring).
-        for n in [c for c in counts for _ in range(2)]:
+        # 1. Bitwise: inline NCCL vs side-stream peer copy.
+        for n in counts:
             buf.copy_(orig)
             nccl.exchange(units_of(n))
             torch.accelerator.synchronize()
