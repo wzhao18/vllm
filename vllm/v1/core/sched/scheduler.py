@@ -331,6 +331,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Async loads admitted in the step that issues them (join_load_in_step).
+        self._joined = self.connector and self.connector.joined_load_tracker(self)
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1237,6 +1239,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        delay_cache_blocks=self._joined_loading(request.request_id),
                     )
 
                     if new_blocks is not None:
@@ -1441,6 +1444,9 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if self._joined and self._joined.parked(request_id):
+                    skip_request(request_queue)  # its joined load not reported
+                    continue
 
                 if (
                     owner_decodes is not None
@@ -1893,7 +1899,8 @@ class Scheduler(SchedulerInterface):
                         new_computed_blocks=new_computed_blocks,
                         num_lookahead_tokens=effective_lookahead_tokens,
                         num_external_computed_tokens=num_external_computed_tokens,
-                        delay_cache_blocks=load_kv_async,
+                        delay_cache_blocks=load_kv_async
+                        or self._joined_loading(request_id),
                         skip_zeroing_group_ids=(
                             self.connector.get_loaded_kv_cache_group_ids(request)
                             if load_kv_async and self.connector is not None
@@ -1927,6 +1934,17 @@ class Scheduler(SchedulerInterface):
                         load_kv_async
                         and self.defer_async_loads
                         and self.sched_step_seq > self.processed_step_seq
+                    )
+                    # Same-step admission: only a request computing this step.
+                    join_load = (
+                        load_kv_async
+                        and not (load_ahead or defer_load or defer_prefills)
+                        and self.connector.join_load_in_step(
+                            request,
+                            self.kv_cache_manager.get_blocks(request_id),
+                            num_external_computed_tokens,
+                        )
+                        is True  # exactly a bool yes (a mock never joins)
                     )
                     if defer_load:
                         request.last_sched_seq = self.sched_step_seq
@@ -2003,6 +2021,14 @@ class Scheduler(SchedulerInterface):
                     if load_ahead:
                         self._load_ahead.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
+                    if join_load:
+                        # Taken as loaded: admit it again in this pass.
+                        request_queue.pop_request()
+                        self.deferred_waiting.discard(request)
+                        self.finished_recving_kv_req_ids.add(request_id)
+                        self._set_kv_fetch_stage(request, KV_FETCH_COMPLETED_WAITING)
+                        self.kv_holding_waiting.prepend_request(request)
+                        continue
                     skip_request(request_queue)
                     continue
 
@@ -2283,6 +2309,7 @@ class Scheduler(SchedulerInterface):
         if total_num_scheduled_tokens > 0:
             # This step may now be in flight: later frees are recent.
             BLOCK_FREE_CLOCK.step_built()
+            self._joined and self._joined.dispatched(id(scheduler_output))
         return scheduler_output
 
     def _trim_new_reqs_for_workers(
@@ -2791,6 +2818,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._joined and self._joined.done(id(scheduler_output))
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2819,6 +2847,10 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
+        if kv_connector_output and self._joined and self._joined.active():
+            kv_connector_output, failed_kv_load_req_ids = self._joined.settle(
+                kv_connector_output
+            )
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -3649,6 +3681,7 @@ class Scheduler(SchedulerInterface):
                 request,
                 num_new_tokens,
                 num_lookahead_tokens=self.num_lookahead_tokens,
+                delay_cache_blocks=self._joined_loading(request_id),
             )
             if new_blocks is None and num_new_tokens > num_stock:
                 num_new_tokens = num_stock
@@ -3656,6 +3689,7 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens,
+                    delay_cache_blocks=self._joined_loading(request_id),
                 )
             if new_blocks is None:
                 # Unreachable with _dp_pull_kv_headroom; like a stock allocation
@@ -4135,10 +4169,19 @@ class Scheduler(SchedulerInterface):
             request.last_sched_seq <= self.processed_step_seq
         )
 
+    def _joined_loading(self, request_id: str) -> bool:
+        """Its joined load has not reported done (blocks stay uncached)."""
+        return bool(self._joined) and self._joined.loading(request_id)
+
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self._joined_loading(request.request_id):
+            # A joined load still writes them outside the GPU stream: park.
+            blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+            self._joined.park(request.request_id, blocks)
+            return
         if self._request_blocks_can_be_freed(request):
             if self.defer_block_free:
                 # Its last step has been processed: no GPU user is left.
@@ -4614,7 +4657,7 @@ class Scheduler(SchedulerInterface):
                 self._inflight_prefills.discard(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
-        else:
+        elif not self._joined_loading(request.request_id):
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)

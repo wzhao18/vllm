@@ -856,6 +856,9 @@ class ReqMeta:
     # stream at bind) completes, and load_issue_time is when it was issued.
     load_ready_event: torch.cuda.Event | None = None
     load_issue_time: float | None = None
+    # The load joins its request's first step (join_load_in_step): that
+    # step's bind waits for it, and a failure is reported per request.
+    join: bool = False
 
     token_ids: list[int] | None = None
     # Absolute request offset represented by token_ids[0].
@@ -980,6 +983,13 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    # req_id -> seconds from issue to completion of a clean early load (the
+    # scheduler's load-time model for join_load_in_step). Slowest rank wins.
+    load_seconds: dict[str, float] = field(default_factory=dict)
+    # Seconds each bind waited for its step's joined loads, and joined loads
+    # given up at bind (logging only: the scheduler's join summary).
+    join_waits: list[float] = field(default_factory=list)
+    join_timeouts: int = 0
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -989,6 +999,10 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
             )
+        for req_id, seconds in other.load_seconds.items():
+            self.load_seconds[req_id] = max(self.load_seconds.get(req_id, 0.0), seconds)
+        self.join_waits.extend(other.join_waits)
+        self.join_timeouts += other.join_timeouts
         return self
 
 
@@ -1003,6 +1017,12 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # Joined loads (join_load_in_step) of this step's new requests: the
+        # worker waits for each before this step's forward.
+        # (req_id, seconds the worker may wait for it before giving up).
+        self.join_wait: list[tuple[str, float]] = []
+        # This engine's step index (logging: the worker's per-step J record).
+        self.step_seq = -1
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)
