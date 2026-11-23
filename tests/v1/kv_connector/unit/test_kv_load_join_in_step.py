@@ -688,3 +688,20 @@ def test_tracker_on_real_async_scheduler_park_fail_free_readmit():
     new_ids = {b.block_id for b in scheduler.kv_cache_manager.get_blocks("r").blocks[0]}
     # Returned to the pool (or reused for its own recompute), never leaked.
     assert all(b.ref_cnt == 0 or b.block_id in new_ids for b in old_blocks)
+
+
+def test_join_summary_logs_window_and_total(monkeypatch):
+    # Logging only: eligible / joined / timeouts / bind wait mean and p90.
+    logged = MagicMock()
+    monkeypatch.setattr(store_scheduler, "logger", logged)
+    summary = store_scheduler.JoinSummary(interval_s=3600.0)
+    for outcome in ("joined", "joined", "no_headroom", "cold"):
+        summary.count(outcome)
+    summary.add_waits([0.001, 0.002, 0.010], 1)
+    assert not logged.info.called  # inside the interval
+    summary.log(True)
+    fmt, *args = logged.info.call_args.args
+    line = fmt % tuple(args)
+    assert "eligible 4 | 4" in line and "joined 2 | 2" in line
+    assert "join-wait timeouts 1 | 1" in line
+    assert "mean 4.3 ms p90 10.0 ms (n=3)" in line

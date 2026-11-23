@@ -2043,6 +2043,8 @@ class MooncakeStoreWorker:
         # req_id -> seconds of clean early loads, for the scheduler's model.
         self._load_seconds_lock = threading.Lock()
         self._load_seconds: dict[str, float] = {}
+        self._join_waits: list[float] = []
+        self._join_timeouts = 0
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
         if vllm_config.parallel_config.rank == 0:
@@ -2657,6 +2659,7 @@ class MooncakeStoreWorker:
         if not getattr(metadata, "join_wait", None):
             return
         start = time.perf_counter()
+        timeouts = 0
         registry = self._joined_registry()
         for req_id, bound_s in metadata.join_wait:
             remaining = max(start + bound_s - time.perf_counter(), 0.0)
@@ -2665,6 +2668,7 @@ class MooncakeStoreWorker:
                 continue
             self._join_poisoned.add(req_id)
             if outcome == "timeout":
+                timeouts += 1
                 # The recv thread reports the transfer itself when it ends.
                 self._join_timed_out_report().add(req_id)
                 self._increment_kv_connector_counter("join_wait_timeout", 1)
@@ -2677,6 +2681,10 @@ class MooncakeStoreWorker:
             else:
                 self._increment_kv_connector_counter("join_load_failed", 1)
         waited = time.perf_counter() - start
+        if getattr(self, "_load_seconds_lock", None) is not None:
+            with self._load_seconds_lock:  # for the scheduler's join summary
+                self._join_waits.append(waited)
+                self._join_timeouts += timeouts
         self._record_kv_connector_operation("join_wait", waited, len(metadata.join_wait))
         self._increment_kv_connector_counter("join_loads", len(metadata.join_wait))
         if waited > 1e-3:
@@ -2949,13 +2957,20 @@ class MooncakeStoreWorker:
             return None
         completed_saves = self.kv_send_thread.take_completed_saves()
         load_seconds: dict[str, float] = {}
+        join_waits: list[float] = []
+        join_timeouts = 0
         if getattr(self, "_load_seconds_lock", None) is not None:
             with self._load_seconds_lock:
                 load_seconds, self._load_seconds = self._load_seconds, {}
-        if not completed_saves and not load_seconds:
+                join_waits, self._join_waits = self._join_waits, []
+                join_timeouts, self._join_timeouts = self._join_timeouts, 0
+        if not completed_saves and not load_seconds and not join_waits:
             return None
         return MooncakeStoreWorkerMetadata(
-            completed_saves=completed_saves, load_seconds=load_seconds
+            completed_saves=completed_saves,
+            load_seconds=load_seconds,
+            join_waits=join_waits,
+            join_timeouts=join_timeouts,
         )
 
     def lookup(

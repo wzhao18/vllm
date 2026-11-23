@@ -986,6 +986,10 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     # req_id -> seconds from issue to completion of a clean early load (the
     # scheduler's load-time model for join_load_in_step). Slowest rank wins.
     load_seconds: dict[str, float] = field(default_factory=dict)
+    # Seconds each bind waited for its step's joined loads, and joined loads
+    # given up at bind (logging only: the scheduler's join summary).
+    join_waits: list[float] = field(default_factory=list)
+    join_timeouts: int = 0
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -997,6 +1001,8 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
             )
         for req_id, seconds in other.load_seconds.items():
             self.load_seconds[req_id] = max(self.load_seconds.get(req_id, 0.0), seconds)
+        self.join_waits.extend(other.join_waits)
+        self.join_timeouts += other.join_timeouts
         return self
 
 

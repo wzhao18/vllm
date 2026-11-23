@@ -5,6 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import atexit
+import time
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 
@@ -225,6 +227,70 @@ def join_wait_bound_s(predicted_s: float) -> float:
     return min(JOIN_WAIT_MAX_S, JOIN_WAIT_FACTOR * predicted_s)
 
 
+class JoinSummary:
+    """Per-engine summary of same-step joined loads, logged every
+    ``interval_s`` and at exit (logging only): eligible loads (offered a
+    join), joined loads, joined loads given up at bind, and the bind's wait
+    for its step's joined loads (mean, p90), for the window and in total."""
+
+    def __init__(self, interval_s: float = 60.0) -> None:
+        self._interval_s = interval_s
+        self._last = time.monotonic()
+        self._window = {"eligible": 0, "joined": 0, "timeouts": 0}
+        self._total = dict(self._window)
+        self._waits: list[float] = []
+        self._total_waits: list[float] = []
+
+    def count(self, outcome: str) -> None:
+        self._window["eligible"] += 1
+        if outcome == "joined":
+            self._window["joined"] += 1
+        self.log()
+
+    def add_waits(self, waits: Sequence[float], timeouts: int) -> None:
+        self._waits.extend(waits)
+        self._window["timeouts"] += timeouts
+        self.log()
+
+    @staticmethod
+    def _wait_ms(waits: list[float]) -> str:
+        if not waits:
+            return "n/a"
+        ordered = sorted(waits)
+        p90 = ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))]
+        return (
+            f"mean {1e3 * sum(ordered) / len(ordered):.1f} ms "
+            f"p90 {1e3 * p90:.1f} ms (n={len(ordered)})"
+        )
+
+    def log(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last < self._interval_s:
+            return
+        for key, value in self._window.items():
+            self._total[key] += value
+        self._total_waits.extend(self._waits)
+        if len(self._total_waits) > 100_000:
+            del self._total_waits[:-100_000]
+        w, t = self._window, self._total
+        logger.info(
+            "Mooncake joined loads (last %.0f s | total): eligible %d | %d, "
+            "joined %d | %d, join-wait timeouts %d | %d, join wait %s | %s",
+            now - self._last,
+            w["eligible"],
+            t["eligible"],
+            w["joined"],
+            t["joined"],
+            w["timeouts"],
+            t["timeouts"],
+            self._wait_ms(self._waits),
+            self._wait_ms(self._total_waits),
+        )
+        self._last = now
+        self._window = {key: 0 for key in self._window}
+        self._waits = []
+
+
 class LoadTimeModel:
     """Conservative load time of an early load from its token count.
 
@@ -398,6 +464,8 @@ class MooncakeStoreScheduler:
         self._early_tokens: dict[str, int] = {}
         self._load_model = LoadTimeModel()
         self.join_stats = {"joined": 0, "no_headroom": 0, "cold": 0, "recent": 0}
+        self._join_summary = JoinSummary()
+        atexit.register(self._join_summary.log, True)
         # Tokens per block of each KV cache group (indexes the request's blocks).
         self._group_block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
@@ -693,6 +761,9 @@ class MooncakeStoreScheduler:
 
     def _count_join(self, outcome: str) -> None:
         self.join_stats[outcome] += 1
+        summary = getattr(self, "_join_summary", None)
+        if summary is not None:
+            summary.count(outcome)
         if sum(self.join_stats.values()) % 2000 == 0:
             logger.info("Mooncake same-step load joins: %s", dict(self.join_stats))
 
@@ -1234,6 +1305,7 @@ class MooncakeStoreScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
+        self._join_summary.add_waits(meta.join_waits, meta.join_timeouts)
         for req_id, seconds in meta.load_seconds.items():
             tokens = getattr(self, "_early_tokens", {}).pop(req_id, None)
             if tokens is not None:
