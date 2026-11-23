@@ -787,3 +787,27 @@ def test_tp8_rubin_prefetch_tables():
     assert grid == 96 and front == ""
     table = prefetch.batch_table(spec)
     assert [table.get(b) for b in (1, 7, 8, 9)] == [48, 48, 24, None]
+
+
+def test_plain_lm_head_methods():
+    """The fused verify LM head takes the BF16 LM head of the NVFP4 checkpoint too
+    (``modelopt_mixed`` lists it in ``ignore``: ``UnquantizedLinearMethod``), as the
+    MXFP4 one's ``UnquantizedEmbeddingMethod``; both run the default unquantized
+    GEMM. A non-default linear backend or a quantized method is refused."""
+    pytest.importorskip("cutlass")
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.verify import (
+        plain_lm_head,
+    )
+
+    assert plain_lm_head(UnquantizedEmbeddingMethod())
+    linear = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+    linear._gemm_impl = dispatch_unquantized_gemm()
+    assert plain_lm_head(linear)
+    linear._gemm_impl = lambda *args: None  # another linear backend
+    assert not plain_lm_head(linear)
+    assert not plain_lm_head(object())
