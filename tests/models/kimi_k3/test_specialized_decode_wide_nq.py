@@ -755,3 +755,21 @@ def test_wide_experts_single_launch_only():
             note,
         )
         assert "wide engines lose above one launch" in note, (rows, note)
+
+
+def test_tp8_rubin_shared_down_splits():
+    """TP8 on Rubin-class devices (DFn) takes ``SPLITS_WIDE``'s verify entries as TP16
+    does (SharedDown on 8 SMs at 13-63 rows, 4 at 64); GB300 keeps its TP8 tables, and
+    q = 1 steps are unchanged."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.front import (
+        split_table,
+    )
+
+    rubin, gb300 = split_table(8, True, True), split_table(8, True, False)
+    assert [rubin.get(b) for b in (12, 13, 16, 32, 48, 63, 64)] == [6, 8, 8, 8, 8, 8, 4]
+    assert [gb300.get(b) for b in (13, 16, 24, 32, 48, 64)] == [6, 6, 4, 4, 3, 3]
+    plain = split_table(8, False, True), split_table(8, False, False)
+    assert all(plain[0].get(b) == plain[1].get(b) for b in range(1, 65))
+    tp16 = split_table(16, True, True)
+    assert [tp16.get(b) for b in (13, 32, 64)] == [8, 8, 4]
