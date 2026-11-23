@@ -43,7 +43,12 @@ from ..cutedsl.moe.experts_runtime import (
 )
 from ..cutedsl.moe.front import SharedFront
 from ..cutedsl.moe.front_rows import FrontRows
-from ..cutedsl.moe.nvfp4 import Nvfp4MoE, is_nvfp4_moe, mxfp8_shared_cause
+from ..cutedsl.moe.nvfp4 import (
+    Nvfp4Front,
+    Nvfp4MoE,
+    is_nvfp4_moe,
+    mxfp8_shared_cause,
+)
 from ..cutedsl.moe.prepared import (
     WIDE_FRONT,
     MoEScratch,
@@ -462,6 +467,13 @@ class SpecializedDecode:
             if d.is_moe_layer and d.layer_idx not in nvfp4
         }
         self.nvfp4_layers = frozenset(nvfp4)
+        # NVFP4 layers' tuned front (``moe.nvfp4.Nvfp4Front``, <= 64 rows): the same
+        # packed [router; latent-down] shard rows as the MXFP4 layers' front
+        nv_packed = {
+            d.layer_idx: pack_front(d.mlp, rank, tp)
+            for d in layers
+            if d.layer_idx in nvfp4
+        }
         for d in layers:  # before the prefetch tables take the weight addresses
             if attention_kind(d.self_attn) == "dsa":
                 pack_dsa_projection(d.self_attn)
@@ -529,9 +541,13 @@ class SpecializedDecode:
                     sharded=(self.sharded, self.shard_box),
                     deferred=deferred_rows(module, moe_batches),
                 )  # fmt: skip
+                fronted = [b for b in moe_batches if b <= Nvfp4Front.MAX]
+                front = None
+                if fronted:
+                    front = Nvfp4Front(module, nv_packed[index], front_box, fronted)
                 self.feed_forward[index] = Nvfp4MoE(
                     module, state, rows, moe_batches, prefetch=prefetch,
-                    layer_idx=index,
+                    layer_idx=index, front=front,
                 )  # fmt: skip
                 continue
             args = (module, packed[index], front_box, state.front, tuned_moe, beta)
