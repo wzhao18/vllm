@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.benchmarks.forward.capture import ForwardBench, _compare, write_input_ids
+from vllm.benchmarks.forward.kv_init import restore_state, snapshot_state
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -144,7 +145,7 @@ class PipelineBench(ForwardBench):
             for key, tensor in self.input_tensors.tensors.items():
                 tensor.copy_(received[key])
         self._run_model = self._make_forward(inputs)
-        self.snapshots = [(view, view.clone()) for view in self.state_views]
+        self.snapshots, self.state_snapshot = snapshot_state(self.state_views)
         self.input_snapshots = (
             {k: v.clone() for k, v in self.input_tensors.tensors.items()}
             if self.input_tensors is not None
@@ -158,8 +159,7 @@ class PipelineBench(ForwardBench):
         return output
 
     def _restore(self):
-        for view, snapshot in self.snapshots:
-            view.copy_(snapshot)
+        restore_state(self.snapshots)
 
     def _capture_stage(self):
         with graph_capture(self.device) as capture_context:
@@ -191,6 +191,7 @@ class PipelineBench(ForwardBench):
             state_reset_bytes=sum(
                 v.numel() * v.element_size() for v in self.state_views
             ),
+            state_snapshot=self.state_snapshot,
         )
         if self.drafter is not None:
             self.result["drafter"] = self.drafter.check(self.draft_reference)

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from vllm.benchmarks.forward.batch import BenchBatch
+from vllm.benchmarks.forward.kv_init import restore_state, snapshot_state
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_world_group, graph_capture
 from vllm.forward_context import get_forward_context, override_forward_context
@@ -190,11 +191,10 @@ class ForwardBench:
         world = get_world_group()
         # The forward mutates state it reads (e.g. compressor state), so
         # every run starts by restoring the KV blocks the step writes.
-        snapshots = [(view, view.clone()) for view in self.state_views]
+        snapshots, self.result["state_snapshot"] = snapshot_state(self.state_views)
 
         def restore() -> None:
-            for view, saved in snapshots:
-                view.copy_(saved)
+            restore_state(snapshots)
 
         # A rendezvous and the timing events live inside the graph, after the
         # restore: neither rank skew, the restore nor host launch gaps reach
