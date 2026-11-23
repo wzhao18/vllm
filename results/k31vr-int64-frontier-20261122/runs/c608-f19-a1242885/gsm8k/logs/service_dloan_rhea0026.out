@@ -1,0 +1,10 @@
+mc_exec_0314: /usr/bin/bash (/opt/k3/mooncake-0.3.14)
+[dloan rhea0026 2026-11-22 08:25:15] cpus allowed: 0-351; master 10.66.53.37:8700 admin 10.66.53.37:8702; 950 GB in 2 segment(s)
+[dloan rhea0026 2026-11-22 08:25:15] monitor pinned to 64-79,240-255,120-135,296-311
+[dloan rhea0026 2026-11-22 08:25:15] client 0 pid 1008455 (numactl --physcpubind=64-79,240-255 --membind=0) 475GB devices roce_vf0_r1,roce_vf0_r2,roce_vf0_r3,roce_vf0_r4,roce_vf1_r1,roce_vf1_r2,roce_vf1_r3,roce_vf1_r4 port 50052
+[dloan rhea0026 2026-11-22 08:25:15] client 1 pid 1008462 (numactl --physcpubind=120-135,296-311 --membind=1) 475GB devices roce_vf0_r1,roce_vf0_r2,roce_vf0_r3,roce_vf0_r4,roce_vf1_r1,roce_vf1_r2,roce_vf1_r3,roce_vf1_r4 port 50053
+[dloan rhea0026 2026-11-22 08:25:35] master lists 2 segment(s) for 10.66.53.51
+DLOAN-READY rhea0026 1795364735
+[2026-11-22T08:41:34.260] error: *** STEP 110790.69 ON rhea0026 CANCELLED AT 2026-11-22T08:41:34 DUE to SIGNAL Terminated ***
+[dloan rhea0026 2026-11-22 08:41:34] stopping clients 1008455 1008462
+[dloan rhea0026 2026-11-22 08:41:34] stopping clients 1008455 1008462

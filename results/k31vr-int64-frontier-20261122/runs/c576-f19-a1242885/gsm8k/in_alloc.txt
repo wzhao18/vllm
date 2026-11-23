@@ -1,0 +1,5 @@
+alloc=110790 run_id=a110790-agx-r8-k3-c512-f19-ev-1122082418 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/agx-r8-k3-c512-f19-ev nodes=rhea0019,rhea0020,rhea0021,rhea0022,rhea0024,rhea0025,rhea0026,rhea0027 need=8 left=7885s start=2026-11-22T08:24:18-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-110790-1122082354
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/agx-r8-k3-c512-f19-ev/srtslurm.yaml
+rc=0 end=2026-11-22T08:41:59-08:00

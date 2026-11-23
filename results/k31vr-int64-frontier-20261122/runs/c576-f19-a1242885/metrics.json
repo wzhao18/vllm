@@ -1,0 +1,1 @@
+{"label": "c576-f19", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c576-f19-1122085528", "gpus": 32, "ok": 82486, "err": 12, "span_min": 60.5, "tput_per_gpu": 101936.8, "p90_itl_ms": 7.448, "p90_intvty": 134.26, "p90_e2e_norm_intvty": 38.07, "p90_e2el_s": 19.778, "p90_ttft_s": 3.496, "p50_ttft_s": 1.799}

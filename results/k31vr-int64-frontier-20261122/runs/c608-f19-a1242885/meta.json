@@ -1,0 +1,20 @@
+{
+ "label": "c608-f19",
+ "conc": 608,
+ "run": "a1242885-agx-x8-k3-c608-f19-1122104139",
+ "time": "2026-11-22 10:41-12:16 PST",
+ "ledger": "minutes 10-60: 113.09K tok/s/GPU @ x 133.7 (ATTRIBUTION), 113.11K (E2E12 winwin); official process_agentic_result regen (32 GPUs) full span 107,447 @ x 128.2, TTFT p90 4.01 s",
+ "validity": "real errors 0 (14 expected-empty); NIXL xferwatch failed 0; as-run bound check g-15c281dc32 PASS; start smoke PASS",
+ "note": "8n record (RECORD-ELIGIBLE: gsm8k-f19 0.9795 + H8 stress 0)",
+ "topology": "8n 1P1D: P DEP16 (TP1 x DP16, EP16), D DP4 x (TP4+DCP4), EP16 (k3)",
+ "chosen": true,
+ "gpus": 32,
+ "nodes": "4 P + 4 D (4 GPUs/node, VR200 NVL72, Hecate)",
+ "build": "int64.2 = f19, overlay g-15c281dc32 (commit 15c281dc32 = wzhao18 wzhao/k31ws-int642-cand; ancestor of Inferact wzhao/k31-agentx-dev)",
+ "model": "NVFP4 real weights 1d820323 (served name moonshotai/Kimi-K3), release DSpark drafter e4e6e626, k=3, synthetic AL 3.08 (release golden)",
+ "precision": "fp8 MLA KV cache",
+ "container": "k31ws/img:kimi-k31-wzhao-nov-11, dynamo 1.6.1+k31, frontend dynbl-e65a5f734",
+ "decode_cap": "max-num-seqs 160 per decode rank (640 rows); time at decode cap 0.00%",
+ "gsm8k_twin": "rhea:a110790-agx-r8-k3-c512-f19-ev-1122082418 (Rhea VR200 8n, same build g-15c281dc32 and topology, real rejection, FlashInfer autotune off, EVAL_CONC 256)",
+ "windows": "metrics.json = full profiling phase (frz_metrics.py); metrics_win10_60.json = minutes 10-60 ('end' = ATTRIBUTION.md section 0, 'start' = E2E12 winwin.py)"
+}

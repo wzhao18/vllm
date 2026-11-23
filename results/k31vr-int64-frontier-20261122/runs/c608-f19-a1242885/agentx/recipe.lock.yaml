@@ -1,0 +1,1976 @@
+name: coreai_comparch_inferencex-k31e2e.agx-x8-k3-c608-f19
+schema: 2
+model:
+  path: hf:moonshotai/Kimi-K3
+  container: k31ws/img:kimi-k31-wzhao-nov-11
+  precision: fp4
+identity:
+  model:
+    repo: moonshotai/Kimi-K3
+  container:
+    image: k31ws/img:kimi-k31-wzhao-nov-11
+  frameworks:
+    vllm: k31ws E2E overlay g-15c281dc32 (int64.2 = race fix; was g-b5ceb707a7 landed int63.1rcf), f17 = decode mns 160/rank (640 rows), frontend dynbl-e65a5f734 (prefill AND decode, at /k31ov), NVFP4 real weights 1d820323, release DSpark drafter e4e6e626 (sha256 83a4f35d), k=3 synthetic AL 3.08, load-format safetensors
+    dynamo: 1.6.1+k31
+dynamo:
+  install: false
+slurm:
+  time_limit: 05:00:00
+health_check:
+  max_attempts: 720
+  interval_seconds: 10
+resources:
+  gpu_type: vrnvl72
+  gpus_per_node: 4
+services:
+- name: etcd
+  type: etcd
+  placement:
+    node: infra
+- name: nats
+  type: nats
+  placement:
+    node: infra
+  options:
+    max_payload_mb: 32
+- name: mooncake-master
+  type: mooncake-master
+  args:
+  - --default_kv_lease_ttl=5000
+  - --eviction_high_watermark_ratio=0.95
+  - --eviction_ratio=0.10
+  options:
+    store_config:
+      metadata_server: P2PHANDSHAKE
+      global_segment_size: 250GB
+      local_buffer_size: 4GB
+      protocol: rdma
+      device_name: mlx5_1,mlx5_5,mlx5_6,mlx5_7
+      mode: embedded
+      enable_offload: false
+  command:
+  - bash
+  - /opt/k3/bin/mc_exec_0314.sh
+  - mooncake_master
+  - --port=8700
+  - --enable_http_metadata_server=true
+  - --http_metadata_server_port=8701
+  - --rpc_thread_num=16
+  - --enable_metric_reporting=true
+  - --metrics_port=8702
+- name: dloan
+  type: generic
+  start: before_workers
+  placement:
+    node: decode
+  command:
+  - bash
+  - /opt/k3/bin/mc_exec_0314.sh
+  - bash
+  - /opt/k3/bin/dloan.sh
+  cpu_bind: none
+  env:
+    DLOAN_MASTER: '{infra_ip}:8700'
+    DLOAN_ADMIN: '{infra_ip}:8702'
+    DLOAN_HOST: '{node_ip}'
+    DLOAN_INDEX: '{index}'
+    DLOAN_GB: '950'
+    DLOAN_NICS0: mlx5_1,mlx5_5
+    DLOAN_NICS1: mlx5_6,mlx5_7
+    DLOAN_SPLIT: '2'
+    DLOAN_OUT: /logs/dloan
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: kv
+    router-policy-config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/agx-x8-k3-c608-f19/pval-policy.yaml
+    trust-remote-code: true
+  env:
+    DYN_FORWARD_SESSION_ID: '1'
+    DYN_METADATA_HEADER: x-dynamo-
+    DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: '3600'
+    DYN_TOKENIZER_CACHE_BYTES: '8589934592'
+    DYN_TCP_REQUEST_TIMEOUT: '120'
+    PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/ov-dyn/dynbl-e65a5f734:/opt/k3/ov-fe:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+    HF_HUB_OFFLINE: '1'
+    HF_HUB_CACHE: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/E2E-PERF/hfhub
+engine:
+  type: vllm
+  connector: null
+environment:
+  W1_MC_OVERLAY: /opt/k3/mooncake-0.3.14
+  UCX_GPU_NIC_ASSIGNMENT_MODE: 'off'
+  DYN_TCP_REQUEST_TIMEOUT: '120'
+  DYN_REQUEST_PLANE: tcp
+  ETCD_LEASE_TTL: '600'
+  VLLM_USE_DIRECT_DCP_A2A: '1'
+  VLLM_USE_DIRECT_DCP_Q_GATHER: '1'
+  VLLM_USE_DIRECT_DCP_KV_GATHER: '1'
+  VLLM_ALLREDUCE_USE_FLASHINFER: '1'
+  VLLM_RPC_TIMEOUT: '600000'
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  VLLM_USE_RUST_FRONTEND: '1'
+  VLLM_SERVER_DEV_MODE: '1'
+  VLLM_ENGINE_READY_TIMEOUT_S: '5400'
+  VLLM_MOONCAKE_LOAD_RECV_THREADS: '4'
+  MC_SLICE_SIZE: '1048576'
+  MC_MAX_MR_SIZE: '4294967296'
+  WITH_NVIDIA_PEERMEM: '0'
+  NCCL_MNNVL_ENABLE: '1'
+  NCCL_CUMEM_ENABLE: '1'
+  NCCL_NVLS_ENABLE: '1'
+  NCCL_P2P_LEVEL: NVL
+  NCCL_NET_PLUGIN: none
+  VLLM_USE_NCCL_SYMM_MEM: '0'
+  UCX_TLS: rc,cuda_copy
+  UCX_NET_DEVICES: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_11:1
+  UCX_MEMTYPE_CACHE: n
+  UCX_MEMTYPE_REG_WHOLE: n
+  UCX_RCACHE_MAX_UNRELEASED: '1024'
+  UCX_TCP_AF_PRIO: inet
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  TRITON_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/triton
+  CUDA_CACHE_PATH: /raid/scratch/k31ws-agx/nvcache
+  CUDA_CACHE_MAXSIZE: '4294967296'
+  VLLM_CACHE_ROOT: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/vllm
+  CUTE_DSL_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/cutedsl
+  TORCHINDUCTOR_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/inductor
+  FLASHINFER_WORKSPACE_BASE: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/fi
+  DG_JIT_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/deepgemm
+  FLASHINFER_CUBIN_DIR: /opt/k3/fi-cubins-0.7.3.dev20261031
+  TVM_FFI_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/tvmffi
+  VLLM_ENABLE_CUDA_COMPATIBILITY: '0'
+  TORCH_EXTENSIONS_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/g-15c281dc32/torch_ext
+  NQ_BUILD: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared
+  K31_DCPX_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dcpx
+  K31_DSAC_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dsac
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+roles:
+  prefill:
+    nodes: 4
+    workers: 1
+    gpus: 16
+    env:
+      HF_HUB_OFFLINE: '1'
+      VLLM_ITERLOG_DIR: /logs/iterlog
+      PYTHONPATH: /opt/k3/mooncake-0.3.14:/k31ov:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/venvs/cudnnfe133/site:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+      VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: '1'
+      VLLM_PACKED_KV_STATE_GROUPS: '2'
+      VLLM_ITERLOG_GPU: '1'
+      VLLM_ITERLOG_ALL_RANKS: '1'
+    args:
+      prefix-cache-policy: v2
+      enable-mamba-shared-prefix-checkpoint: true
+      mamba-conversation-max-turns: 5
+      mamba-conversation-max-turns-mode: demote
+      mamba-low-priority-snapshot-prompt-len: 16384
+      mamba-internal-snapshot: true
+      kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k31agx-dep16tp1-nvfp4-fp8kv-mx4idx-fp32ssm-rel","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":true,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1;1=mlx5_2:1;2=mlx5_8:1;3=mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":330,"enable_cross_layers_blocks":false,"cache_prefix":"k31agx-dep16tp1-nvfp4-fp8kv-mx4idx-fp32ssm-rel"}}]}}'
+      served-model-name: moonshotai/Kimi-K3
+      load-format: safetensors
+      kv-cache-dtype: fp8
+      mamba-ssm-cache-dtype: float32
+      gpu-memory-utilization: 0.92
+      tensor-parallel-size: 1
+      long-prefill-token-threshold: 16384
+      long-prefill-token-threshold-adaptive: true
+      enable-cumem-allocator: true
+      trust-remote-code: true
+      language-model-only: true
+      enable-expert-parallel: true
+      moe-backend: kimi_k3_mega_moe
+      no-enable-flashinfer-autotune: true
+      attention-backend: FLASHINFER_MLA_SPARSE
+      sparse-indexer-topk-backend: trtllm_gvr2
+      enable-prefix-caching: true
+      prefix-match-unit: 128
+      max-model-len: 1048576
+      max-num-batched-tokens: 16384
+      max-num-seqs: 32
+      max-cudagraph-capture-size: 2048
+      compilation-config: '{"cudagraph_capture_sizes":[7,8,14,16,28,32,56,64,112,128,168,192,224,256,384,512,640,768,896,1024,1280,1536,1792,2048]}'
+      stream-interval: 10
+      numa-bind: true
+      numa-bind-nodes:
+      - 0
+      - 0
+      - 1
+      - 1
+      distributed-timeout-seconds: 1800
+      cpu-distributed-timeout-seconds: 1800
+      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 3, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.08}'
+      data-parallel-size: 16
+      data-parallel-rpc-port: 13345
+      enable-ep-weight-filter: true
+      attention-config: '{"indexer_kv_dtype":"mxfp4"}'
+      additional-config: '{"decode_backend":"auto"}'
+      use-replayssm: true
+      mamba-extra-tail-checkpoint-tokens: 1024
+    kv_events: true
+  decode:
+    nodes: 4
+    workers: 1
+    gpus: 16
+    env:
+      PYTHONPATH: /k31ov:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/venvs/cudnnfe133/site:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
+      HF_HUB_OFFLINE: '1'
+      VLLM_ITERLOG_DIR: /logs/iterlog
+      K3_PIN_CPUS: '0'
+      VLLM_MM_EMBEDS_ON_CONSUMERS: '0'
+      VLLM_USE_NCCL_SYMM_MEM: '0'
+      K31_DCPX_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dcpx
+      K31_DSAC_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dsac
+      VLLM_PACKED_KV_STATE_GROUPS: '2'
+      VLLM_ITERLOG_GPU: '1'
+      VLLM_ITERLOG_ALL_RANKS: '1'
+    args:
+      kv-transfer-config: '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"recompute","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":true,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1;1=mlx5_2:1;2=mlx5_8:1;3=mlx5_11:1","kv_lease_duration":60,"kv_lease_check_timeout_s":10,"dcp_pair_exchange":true}}'
+      served-model-name: moonshotai/Kimi-K3
+      load-format: safetensors
+      kv-cache-dtype: fp8
+      mamba-ssm-cache-dtype: float32
+      gpu-memory-utilization: 0.93
+      tensor-parallel-size: 4
+      decode-context-parallel-size: 4
+      cp-kv-cache-interleave-size: 1
+      enable-cumem-allocator: true
+      dcp-comm-backend: a2a
+      trust-remote-code: true
+      language-model-only: true
+      moe-backend: kimi_k3_mega_moe
+      no-enable-flashinfer-autotune: true
+      attention-backend: FLASHINFER_MLA_SPARSE
+      sparse-indexer-topk-backend: deep_select
+      enable-prefix-caching: true
+      prefix-match-unit: 128
+      max-model-len: 1048576
+      max-num-batched-tokens: 640
+      stream-interval: 10
+      additional-config: '{"decode_backend":"latency_specialized"}'
+      kernel-config: '{"flashinfer_sparse_mla_kernel":"trtllm"}'
+      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 3, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.08}'
+      distributed-timeout-seconds: 1800
+      cpu-distributed-timeout-seconds: 1800
+      data-parallel-size: 4
+      data-parallel-rpc-port: 13345
+      enable-expert-parallel: true
+      enable-ep-weight-filter: true
+      attention-config: '{"indexer_kv_dtype":"mxfp4"}'
+      use-replayssm: true
+      numa-bind: true
+      numa-bind-nodes:
+      - 0
+      - 0
+      - 1
+      - 1
+      max-num-seqs: 160
+      watermark: 0.05
+      max-cudagraph-capture-size: 640
+      compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256,260,264,268,272,276,280,284,288,292,296,300,304,308,312,316,320,324,328,332,336,340,344,348,352,356,360,364,368,372,376,380,384,388,392,396,400,404,408,412,416,420,424,428,432,436,440,444,448,452,456,460,464,468,472,476,480,484,488,492,496,500,504,508,512,516,520,524,528,532,536,540,544,548,552,556,560,564,568,572,576,580,584,588,592,596,600,604,608,612,616,620,624,628,632,636,640]}'
+extra_mount:
+- /raid/scratch:/raid/scratch
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/dspark-release:/raid/common-models/kimi-k3.1-pro-dspark:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/ov/g-15c281dc32:/k31ov:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws
+- /lustre/share/coreai_comparch_aarwlt/models/nvidia_kimi-k31-pro-nvfp4:/lustre/share/coreai_comparch_aarwlt/models/nvidia_kimi-k31-pro-nvfp4:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e
+sbatch_directives:
+  mem: '0'
+  cpus-per-task: '352'
+srun_options:
+  mem: '0'
+  cpu-bind: none
+  container-workdir: /infmax-workspace
+host_setup:
+  commands:
+  - python3 -c 'import subprocess,sys; r=subprocess.run(["nvidia-smi","--query-gpu=index,clocks.mem","--format=csv,noheader,nounits"],stdout=subprocess.PIPE,text=True); rows=[l.split(",") for l in r.stdout.splitlines() if l.strip()]; sys.exit(0 if len(rows)==4 and all(x[1].strip()=="4752" for x in rows) else "memory clock != 4752 MHz")'
+  nodes: workers
+  ignore_failure: false
+  timeout_seconds: 120
+benchmark:
+  placement:
+    node: head
+  env:
+    AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING: '0'
+    AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID: 'true'
+    AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS: '14400'
+    AIPERF_DATASET_CONFIGURATION_TIMEOUT: '5400'
+    AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT: '5400'
+    RESULT_DIR: /logs/agentic
+    AIPERF_DATASET_MMAP_CACHE_DIR: /aiperf_mmap_cache
+    HF_HUB_CACHE: /hf_hub_cache
+    IS_MULTINODE: 'true'
+    ENABLE_AGENTX_POWER: '0'
+    REQUIRE_POWER: '0'
+    TOKENIZER: /model
+  type: custom
+  command: bash /infmax-workspace/benchmarks/srt_agentic.sh
+  stream_output: true
+observability:
+  tachometer:
+    enabled: false
+post_eval:
+  command:
+  - env
+  - HF_HUB_OFFLINE=0
+  - HF_DATASETS_OFFLINE=0
+  - TRANSFORMERS_OFFLINE=0
+  - MODEL_PATH=/model
+  - bash
+  - '{infmax_workspace}/benchmarks/multi_node/srt_eval.sh'
+  - '{endpoint}'
+  - '{infmax_workspace}'
+  passthrough_env:
+  - AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS
+  - AIPERF_EXPERIMENTAL_FAST
+  - AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID
+  - AIPERF_RUNTIME_DIR
+  - AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING
+  - CONC
+  - ENABLE_AGENTX_POWER
+  - EVAL_ENDPOINT_READY_TIMEOUT_SECONDS
+  - EVAL_MODEL_STABILIZATION_SECONDS
+  - EVAL_ONLY
+  - IS_AGENTIC
+  - OPENAI_API_KEY
+  - PREFILL_DWDP_SIZE
+  - REQUIRE_POWER
+  - SCENARIO_TYPE
+  - SGLANG_TORCH_PROFILER_DIR
+  - VLLM_ENGINE_READY_TIMEOUT_S
+  - VLLM_TORCH_PROFILER_DIR
+
+# ============================================================================
+# Lock section — generated by srtctl after a run. DO NOT edit manually.
+#
+# This records exactly what happened when this recipe was executed.
+# To reproduce on another cluster:
+#   1. Ensure your srtslurm.yaml has the same model/container aliases
+#   2. Run: srtctl apply -f this-file.lock.yaml
+#   3. srtctl will compare your runtime against the original fingerprints
+#
+# The recipe above is unchanged from what the author wrote.
+# ============================================================================
+lock:
+  version: 2
+  generated_at: '2026-11-22T20:15:20Z'
+  slurm:
+    job_id: '1242885'
+    job_name: pdacc-evtask
+    cluster: hecate
+    account: coreai_comparch_inferencex
+    partition: batch-xdr
+    nodelist: hecate[0146,0148-0149,0151-0153,0157-0158]
+    num_nodes: '8'
+    cpus_on_node: '352'
+    user: weizha
+    cwd: /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/srt-slurm
+    srtctl_version: 2.59.1.post0+gae3d6877c.d20261121
+    srtctl_commit: ae3d6877c46f3147e3a5dafa46ee4cd89322e52f
+  resolved:
+    model_path: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/E2E-EVAL/k31-nvfp4-real
+    container_path: /lustre/fsw/coreai_comparch_inferencex/weizha/images/kimi-k31-wzhao-nov-11-aarch64.sqsh
+    log_dir: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c608-f19-1122104139/logs
+  verification:
+    result: 2 declared, 2 FAILED
+    verified: 0
+    declared: 2
+    failed: 2
+    checks:
+    - field: model.repo
+      status: DECLARED
+      message: moonshotai/Kimi-K3 (declared, not verifiable at runtime)
+    - field: container.image
+      status: DECLARED
+      message: k31ws/img:kimi-k31-wzhao-nov-11 (declared, not verifiable at runtime)
+    - field: frameworks.vllm
+      status: FAIL
+      message: expected 'k31ws E2E overlay g-15c281dc32 (int64.2 = race fix; was g-b5ceb707a7
+        landed int63.1rcf), f17 = decode mns 160/rank (640 rows), frontend dynbl-e65a5f734
+        (prefill AND decode, at /k31ov), NVFP4 real weights 1d820323, release DSpark
+        drafter e4e6e626 (sha256 83a4f35d), k=3 synthetic AL 3.08, load-format safetensors',
+        got '0.32.0rc2.dev0+g242fb49cd4.jh'
+    - field: frameworks.dynamo
+      status: FAIL
+      message: expected '1.6.1+k31', got '1.5.0'
+  fingerprints:
+    decode_w0:
+      hostname: hecate0158.hecate.clusters.nvidia.com
+      timestamp: '2026-11-22T18:43:42Z'
+      arch: aarch64
+      os: Ubuntu 24.04.5 LTS
+      cpu:
+        model: ARM CPU implementer 0x4e part 0x010 (architecture 8, variant 0x0, revision
+          0)
+        logical_cpus: 352
+        affinity_cpus: 352
+        affinity_list: 0-351
+        slurm:
+          SLURM_CPUS_ON_NODE: '352'
+          SLURM_JOB_CPUS_PER_NODE: 352(x8)
+      gpu:
+        available: true
+        driver: 620.70.10
+        gpus:
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+      python_version: 3.12.3
+      cuda_version: Cuda compilation tools, release 13.4, V13.4.92
+      nccl_version: (2, 30, 7)
+      frameworks:
+        vllm: 0.32.0rc2.dev0+g242fb49cd4.jh
+        dynamo: 1.5.0
+      model: null
+      env:
+        CUDA_CACHE_DISABLE: '1'
+        CUDA_CACHE_MAXSIZE: '4294967296'
+        CUDA_CACHE_PATH: /raid/scratch/k31ws-agx/nvcache
+        CUDA_DEVICE_ORDER: PCI_BUS_ID
+        CUDA_HOME: /usr/local/cuda
+        CUDA_MPS_PIPE_DIRECTORY: /var/tmp/nvidia-mps
+        CUDA_VERSION: 13.4.1
+        DYN_LIFECYCLE_TRACE_ENABLED: '1'
+        DYN_LOG: info,dynamo_runtime::pipeline::network::ingress::push_handler=warn
+        DYN_REQUEST_PLANE: tcp
+        DYN_SKIP_SGLANG_LOG_FORMATTING: '1'
+        DYN_SYSTEM_PORT: '7507'
+        DYN_TCP_REQUEST_TIMEOUT: '120'
+        DYN_VLLM_KV_EVENT_PORT: '5219'
+        HF_HUB_OFFLINE: '1'
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_IB_SL: '1'
+        NCCL_MNNVL_ENABLE: '1'
+        NCCL_NET_PLUGIN: none
+        NCCL_NVLINK_UTIL_CENTRIC_SCHED_ENABLE: '0'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        NCCL_SOCKET_IFNAME: os_p1s0
+        NVIDIA_DRIVER_CAPABILITIES: compute,utility
+        NVIDIA_REQUIRE_CUDA: cuda>=13.4 brand=unknown,driver>=535,driver<536 brand=grid,driver>=535,driver<536
+          brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=535,driver<536 brand=quadro,driver>=535,driver<536
+          brand=quadrortx,driver>=535,driver<536 brand=nvidiartx,driver>=535,driver<536
+          brand=vapps,driver>=535,driver<536 brand=vpc,driver>=535,driver<536 brand=vcs,driver>=535,driver<536
+          brand=vws,driver>=535,driver<536 brand=cloudgaming,driver>=535,driver<536
+          brand=unknown,driver>=570,driver<571 brand=grid,driver>=570,driver<571 brand=tesla,driver>=570,driver<571
+          brand=nvidia,driver>=570,driver<571 brand=quadro,driver>=570,driver<571
+          brand=quadrortx,driver>=570,driver<571 brand=nvidiartx,driver>=570,driver<571
+          brand=vapps,driver>=570,driver<571 brand=vpc,driver>=570,driver<571 brand=vcs,driver>=570,driver<571
+          brand=vws,driver>=570,driver<571 brand=cloudgaming,driver>=570,driver<571
+          brand=unknown,driver>=580,driver<581 brand=grid,driver>=580,driver<581 brand=tesla,driver>=580,driver<581
+          brand=nvidia,driver>=580,driver<581 brand=quadro,driver>=580,driver<581
+          brand=quadrortx,driver>=580,driver<581 brand=nvidiartx,driver>=580,driver<581
+          brand=vapps,driver>=580,driver<581 brand=vpc,driver>=580,driver<581 brand=vcs,driver>=580,driver<581
+          brand=vws,driver>=580,driver<581 brand=cloudgaming,driver>=580,driver<581
+          brand=unknown,driver>=590,driver<591 brand=grid,driver>=590,driver<591 brand=tesla,driver>=590,driver<591
+          brand=nvidia,driver>=590,driver<591 brand=quadro,driver>=590,driver<591
+          brand=quadrortx,driver>=590,driver<591 brand=nvidiartx,driver>=590,driver<591
+          brand=vapps,driver>=590,driver<591 brand=vpc,driver>=590,driver<591 brand=vcs,driver>=590,driver<591
+          brand=vws,driver>=590,driver<591 brand=cloudgaming,driver>=590,driver<591
+          brand=unknown,driver>=595,driver<596 brand=grid,driver>=595,driver<596 brand=tesla,driver>=595,driver<596
+          brand=nvidia,driver>=595,driver<596 brand=quadro,driver>=595,driver<596
+          brand=quadrortx,driver>=595,driver<596 brand=nvidiartx,driver>=595,driver<596
+          brand=vapps,driver>=595,driver<596 brand=vpc,driver>=595,driver<596 brand=vcs,driver>=595,driver<596
+          brand=vws,driver>=595,driver<596 brand=cloudgaming,driver>=595,driver<596
+          brand=unknown,driver>=610,driver<611 brand=grid,driver>=610,driver<611 brand=tesla,driver>=610,driver<611
+          brand=nvidia,driver>=610,driver<611 brand=quadro,driver>=610,driver<611
+          brand=quadrortx,driver>=610,driver<611 brand=nvidiartx,driver>=610,driver<611
+          brand=vapps,driver>=610,driver<611 brand=vpc,driver>=610,driver<611 brand=vcs,driver>=610,driver<611
+          brand=vws,driver>=610,driver<611 brand=cloudgaming,driver>=610,driver<611
+        NVIDIA_VISIBLE_DEVICES: all
+        OMPI_MCA_btl_openib_warn_default_gid_prefix: '0'
+        OMPI_MCA_btl_tcp_if_include: os_p1s0
+        OMPI_MCA_plm_slurm_args: --external-launcher
+        SGLANG_TORCH_PROFILER_DIR: /workspace
+        TORCH_CUDA_ARCH_LIST: 8.0 8.7 8.9 9.0 10.0 11.0 12.0
+        TORCH_EXTENSIONS_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/g-15c281dc32/torch_ext
+        UCX_GPU_NIC_ASSIGNMENT_MODE: 'off'
+        UCX_MEMTYPE_CACHE: n
+        UCX_MEMTYPE_REG_WHOLE: n
+        UCX_NET_DEVICES: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_11:1
+        UCX_RCACHE_MAX_UNRELEASED: '1024'
+        UCX_TCP_AF_PRIO: inet
+        UCX_TLS: rc,cuda_copy
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+        VLLM_ALLREDUCE_USE_FLASHINFER: '1'
+        VLLM_BUILD_COMMIT: 3f1bcfd82bb2e93fcd364fc7a5491718453a77e2
+        VLLM_BUILD_PIPELINE: 019d130e-464e-4ff7-b84b-492992c0c06b
+        VLLM_BUILD_URL: https://buildkite.com/vllm/release-v2/builds/8443
+        VLLM_CACHE_ROOT: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/vllm
+        VLLM_ENABLE_CUDA_COMPATIBILITY: '0'
+        VLLM_ENGINE_READY_TIMEOUT_S: '5400'
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+        VLLM_IMAGE_TAG: vllm/vllm-openai:cu134-nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2
+        VLLM_ITERLOG_ALL_RANKS: '1'
+        VLLM_ITERLOG_DIR: /logs/iterlog
+        VLLM_ITERLOG_GPU: '1'
+        VLLM_MM_EMBEDS_ON_CONSUMERS: '0'
+        VLLM_MOONCAKE_LOAD_RECV_THREADS: '4'
+        VLLM_NIXL_SIDE_CHANNEL_HOST: 10.66.26.27
+        VLLM_NIXL_SIDE_CHANNEL_PORT: '5416'
+        VLLM_PACKED_KV_STATE_GROUPS: '2'
+        VLLM_RPC_TIMEOUT: '600000'
+        VLLM_SERVER_DEV_MODE: '1'
+        VLLM_SSM_CONV_STATE_LAYOUT: DS
+        VLLM_TORCH_PROFILER_DIR: /workspace
+        VLLM_USAGE_SOURCE: production-docker-image
+        VLLM_USE_DIRECT_DCP_A2A: '1'
+        VLLM_USE_DIRECT_DCP_KV_GATHER: '1'
+        VLLM_USE_DIRECT_DCP_Q_GATHER: '1'
+        VLLM_USE_NCCL_SYMM_MEM: '0'
+        VLLM_USE_RUST_FRONTEND: '1'
+        VLLM_USE_V2_MODEL_RUNNER: '1'
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+      pip_packages:
+        python3:
+        - accelerate==1.15.0
+        - agent-detector==2.0.0
+        - ai-dynamo-runtime==1.5.0
+        - ai-dynamo==1.5.0
+        - aiofile==3.12.3
+        - aiofiles==25.1.0
+        - aiohappyeyeballs==2.7.1
+        - aiohttp==3.14.5
+        - aiosignal==1.4.0
+        - annotated-doc==0.0.5
+        - annotated-types==0.8.0
+        - anthropic==1.14.0
+        - anyio==4.15.1
+        - apache-tvm-ffi==0.1.11
+        - astor==0.8.1
+        - attrs==26.1.0
+        - awscrt==0.37.0
+        - azure-core==1.41.0
+        - azure-identity==1.26.0
+        - azure-storage-blob==12.31.0
+        - blake3==1.0.11
+        - blinker==1.7.0
+        - boto3==1.43.114
+        - botocore==1.43.114
+        - cachetools==7.2.1
+        - caio==0.12.9
+        - cbor2==6.1.5
+        - certifi==2026.7.22
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - cloudpickle==3.1.2
+        - compressed-tensors==0.17.0
+        - cryptography==50.0.2
+        - cuda-bindings==13.4.1
+        - cuda-core==1.2.1
+        - cuda-pathfinder==1.8.3
+        - cuda-python==13.4.1
+        - cuda-tile==1.6.0
+        - cuda-toolkit==13.4.1
+        - cufile-python==0.2.0
+        - cupti-python==13.4.0
+        - cupy-cuda13x==14.2.0
+        - dbus-python==1.3.2
+        - deep_ep @ file:///vllm-workspace/ep_kernels/dist/deep_ep-2.0.0+local-cp312-cp312-linux_aarch64.whl
+        - depyf==0.20.0
+        - detect-installer==0.2.1
+        - dill==0.4.1
+        - distro==1.9.0
+        - dnspython==2.9.0
+        - docstring_parser==0.18.0
+        - einops==0.8.2
+        - email-validator==2.3.0
+        - fastapi-cli==0.0.32
+        - fastapi-cloud-cli==0.26.0
+        - fastapi==0.136.3
+        - fastar==0.12.0
+        - fastsafetensors==0.4.0
+        - filelock==4.2.0
+        - flashinfer-cubin==0.7.1
+        - flashinfer-jit-cache @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=283561806a425c1c48e3bbe47f1a47a4abad226a173dc35dd6b7d31ea1ce87ec
+        - flashinfer-jit-cache-sm100a==0.7.1+cu134
+        - flashinfer-jit-cache-sm103a==0.7.1+cu134
+        - flashinfer-jit-cache-sm107a @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache_sm107a-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=73da4fb2f3c0ea9b9c7072dec10cb96317d83285239ba8e07a12dbfca3a89725
+        - flashinfer-jit-cache-sm110a==0.7.1+cu134
+        - flashinfer-jit-cache-sm120f==0.7.1+cu134
+        - flashinfer-jit-cache-sm121a==0.7.1+cu134
+        - flashinfer-jit-cache-sm80==0.7.1+cu134
+        - flashinfer-jit-cache-sm89==0.7.1+cu134
+        - flashinfer-jit-cache-sm90a==0.7.1+cu134
+        - flashinfer-python @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_python-0.7.3.dev20261031-py3-none-any.whl#sha256=42265b88b2a812790ca5d9da74e6653d1bf38150105496ebb9e7f261515438a0
+        - frozenlist==1.8.0
+        - fsspec==2026.9.0
+        - google-api-core==2.34.0
+        - google-auth==2.62.0
+        - google-cloud-bigtable==2.50.0
+        - google-cloud-core==2.8.0
+        - google-cloud-monitoring==2.32.0
+        - google-cloud-storage==3.17.0
+        - google-crc32c==1.9.0
+        - google-resumable-media==2.11.0
+        - googleapis-common-protos==1.75.5
+        - grpc-google-iam-v1==0.14.5
+        - grpcio-observability==1.78.0
+        - grpcio-status==1.78.0
+        - grpcio==1.78.0
+        - h11==0.16.0
+        - hf-xet==1.7.0
+        - httpcore2==2.13.1
+        - httpcore==1.0.9
+        - httplib2==0.20.4
+        - httptools==0.9.0
+        - httpx2==2.13.1
+        - httpx==0.28.1
+        - huggingface_hub==2.2.0
+        - humanize==4.16.0
+        - humming-kernels @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/humming_kernels-0.1.18-cp310-abi3-manylinux_2_28_aarch64.whl#sha256=3d291339f8e8d8903df4f5005ba263c213a3cd4f233508d8e01c6ea64a40a107
+        - idna==3.20
+        - ijson==3.6.0
+        - importlib_metadata==8.7.1
+        - iniconfig==2.3.1
+        - instanttensor==0.2.2
+        - interegular==0.3.3
+        - isodate==0.7.2
+        - Jinja2==3.1.6
+        - jiter==0.17.0
+        - jmespath==1.1.0
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - lark==1.2.2
+        - launchpadlib==1.11.0
+        - lazr.restfulclient==0.14.6
+        - lazr.uri==1.0.6
+        - llguidance==1.7.6
+        - llvmlite==0.47.0
+        - lm-format-enforcer==0.11.3
+        - lmcache==0.5.6
+        - loguru==0.7.3
+        - markdown-it-py==4.2.0
+        - MarkupSafe==3.0.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mistral_common==1.12.0
+        - ml_dtypes==0.6.0
+        - model-hosting-container-standards==0.1.16
+        - modelscope==1.37.1
+        - mooncake-transfer-engine-cuda13==0.3.13.post1
+        - mpmath==1.3.0
+        - msal-extensions==1.3.1
+        - msal==1.39.0
+        - msgpack==1.2.3
+        - msgspec==0.22.0
+        - multidict==7.1.0
+        - nccl-extensions==0.1.0
+        - nccl4py==0.6.0
+        - networkx==3.7
+        - ninja==1.13.2
+        - nixl @ file:///tmp/nixl-dist/nixl-1.5.0-py3-none-any.whl
+        - nixl-cu13 @ file:///tmp/nixl-dist/nixl_cu13-1.5.0-cp312-cp312-manylinux_2_28_aarch64.whl
+        - numba==0.65.0
+        - numpy==2.2.6
+        - nvidia-cublas==13.8.1.7
+        - nvidia-cuda-cccl==13.3.4.3.1
+        - nvidia-cuda-crt==13.4.92
+        - nvidia-cuda-cupti==13.4.58
+        - nvidia-cuda-nvcc==13.4.92
+        - nvidia-cuda-nvrtc==13.4.59
+        - nvidia-cuda-runtime==13.4.49
+        - nvidia-cudnn-cu13==9.26.0.51
+        - nvidia-cudnn-frontend==1.33.0
+        - nvidia-cufft==12.4.0.34
+        - nvidia-cufile==1.19.0.109
+        - nvidia-cusolver==12.3.2.15
+        - nvidia-cusparse==12.8.6.49
+        - nvidia-cusparselt-cu13==0.8.1
+        - nvidia-cutlass-dsl-libs-base==4.8.0
+        - nvidia-cutlass-dsl-libs-core==4.8.0
+        - nvidia-cutlass-dsl-libs-cu12==4.8.0
+        - nvidia-cutlass-dsl-libs-cu13==4.8.0
+        - nvidia-cutlass-dsl==4.8.0
+        - nvidia-ml-py==13.615.71
+        - nvidia-nccl-cu13==2.32.3
+        - nvidia-nvjitlink==13.4.92
+        - nvidia-nvshmem-cu13==3.7.2
+        - nvidia-nvtx==13.4.49
+        - nvidia-nvvm==13.4.92
+        - nvtx==0.2.15
+        - oauthlib==3.2.2
+        - openai==3.31.0
+        - opencv-python-headless==5.0.0.93
+        - opentelemetry-api==1.40.0
+        - opentelemetry-exporter-http-transport==0.66b1
+        - opentelemetry-exporter-otlp-common==0.66b1
+        - opentelemetry-exporter-otlp-proto-common==1.40.0
+        - opentelemetry-exporter-otlp-proto-grpc==1.40.0
+        - opentelemetry-exporter-otlp-proto-http==1.40.0
+        - opentelemetry-exporter-otlp==1.40.0
+        - opentelemetry-exporter-prometheus==0.61b0
+        - opentelemetry-proto==1.40.0
+        - opentelemetry-sdk==1.40.0
+        - opentelemetry-semantic-conventions-ai==0.5.1
+        - opentelemetry-semantic-conventions==0.61b0
+        - orjson==3.13.0
+        - oss-harmony==0.0.11
+        - outlines_core==0.2.14
+        - packaging==26.3
+        - partial-json-parser==0.2.1.1.post7
+        - pillow==12.3.0
+        - pluggy==1.6.0
+        - prometheus-fastapi-instrumentator==8.1.0
+        - prometheus_client==0.24.1
+        - propcache==0.5.4
+        - proto-plus==1.29.0
+        - protobuf==6.33.6
+        - psutil==7.2.2
+        - py-cpuinfo==9.0.0
+        - pyasn1==0.6.4
+        - pyasn1_modules==0.4.2
+        - pybase64==1.5.1
+        - pycountry==26.2.16
+        - pycparser==3.11
+        - pydantic-extra-types==2.11.1
+        - pydantic-settings==2.16.0
+        - pydantic==2.14.1
+        - pydantic_core==2.50.1
+        - pyelftools==0.33
+        - Pygments==2.21.0
+        - PyGObject==3.48.2
+        - PyJWT==2.15.1
+        - pynvvideocodec==2.0.4
+        - pyparsing==3.1.1
+        - pytest==9.1.1
+        - python-apt==2.7.7+ubuntu5.3
+        - python-dateutil==2.9.0.post0
+        - python-dotenv==1.2.4
+        - python-json-logger==4.2.0
+        - python-multipart==0.0.32
+        - PyYAML==6.0.3
+        - pyzmq==27.2.0
+        - quack-kernels==0.6.5
+        - redis==8.1.0
+        - referencing==0.37.0
+        - regex==2026.9.29
+        - requests==2.34.2
+        - rich-toolkit==0.20.6
+        - rich==15.0.0
+        - rignore==0.8.1
+        - rpds-py==2026.9.1
+        - runai-model-streamer-azure==0.17.0
+        - runai-model-streamer-gcs==0.17.0
+        - runai-model-streamer-s3==0.17.0
+        - runai-model-streamer==0.17.0
+        - s3transfer==0.19.2
+        - safetensors==0.8.0
+        - sentencepiece==0.2.2
+        - sentry-sdk==2.72.0
+        - setproctitle==1.3.8
+        - setuptools-scm==10.3.4
+        - setuptools==80.10.2
+        - shellingham==1.5.4
+        - six==1.17.0
+        - sniffio==1.3.1
+        - sortedcontainers==2.4.0
+        - sse-starlette==3.5.0
+        - starlette==1.8.0
+        - supervisor==4.3.0
+        - sympy==1.14.0
+        - tabulate==0.10.0
+        - tiktoken==0.14.0
+        - tilelang==0.1.12
+        - timm==1.0.30
+        - tokenizers==0.23.3
+        - tokenspeed-mla @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/tokenspeed_mla-2.0.3-py3-none-any.whl#sha256=576ce91e861598347f09c429fe41269863d351bf3de8410a845dae39fa172e4a
+        - tokenspeed-triton==3.9.10.post20261008
+        - torch==2.16.0.dev20261009+cu134
+        - torch_c_dlpack_ext==0.1.5
+        - torchaudio==2.11.0.dev20261009+cu134
+        - torchcodec==0.17.0
+        - torchvision==0.30.0.dev20261009+cu134
+        - tqdm==4.70.1
+        - transformers==5.19.0
+        - triton @ file:///tmp/triton-source-dist/triton-3.8.0+git3f6e4113-cp312-cp312-linux_aarch64.whl
+        - truststore==0.10.5
+        - typer==0.27.3
+        - typing-inspection==0.4.4
+        - typing_extensions==4.16.0
+        - urllib3==2.8.0
+        - uv==0.13.1
+        - uvicorn==0.54.0
+        - uvloop==0.23.0
+        - vcs-versioning==2.6.0
+        - vllm==0.32.0rc2.dev0+g242fb49cd4.jh
+        - wadllib==1.3.6
+        - watchfiles==1.3.0
+        - websockets==17.2
+        - xgrammar==0.2.8
+        - yarl==1.25.1
+        - z3-solver==4.15.4.0
+        - zipp==4.1.1
+        pip:
+        - accelerate==1.15.0
+        - agent-detector==2.0.0
+        - ai-dynamo-runtime==1.5.0
+        - ai-dynamo==1.5.0
+        - aiofile==3.12.3
+        - aiofiles==25.1.0
+        - aiohappyeyeballs==2.7.1
+        - aiohttp==3.14.5
+        - aiosignal==1.4.0
+        - annotated-doc==0.0.5
+        - annotated-types==0.8.0
+        - anthropic==1.14.0
+        - anyio==4.15.1
+        - apache-tvm-ffi==0.1.11
+        - astor==0.8.1
+        - attrs==26.1.0
+        - awscrt==0.37.0
+        - azure-core==1.41.0
+        - azure-identity==1.26.0
+        - azure-storage-blob==12.31.0
+        - blake3==1.0.11
+        - blinker==1.7.0
+        - boto3==1.43.114
+        - botocore==1.43.114
+        - cachetools==7.2.1
+        - caio==0.12.9
+        - cbor2==6.1.5
+        - certifi==2026.7.22
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - cloudpickle==3.1.2
+        - compressed-tensors==0.17.0
+        - cryptography==50.0.2
+        - cuda-bindings==13.4.1
+        - cuda-core==1.2.1
+        - cuda-pathfinder==1.8.3
+        - cuda-python==13.4.1
+        - cuda-tile==1.6.0
+        - cuda-toolkit==13.4.1
+        - cufile-python==0.2.0
+        - cupti-python==13.4.0
+        - cupy-cuda13x==14.2.0
+        - dbus-python==1.3.2
+        - deep_ep @ file:///vllm-workspace/ep_kernels/dist/deep_ep-2.0.0+local-cp312-cp312-linux_aarch64.whl
+        - depyf==0.20.0
+        - detect-installer==0.2.1
+        - dill==0.4.1
+        - distro==1.9.0
+        - dnspython==2.9.0
+        - docstring_parser==0.18.0
+        - einops==0.8.2
+        - email-validator==2.3.0
+        - fastapi-cli==0.0.32
+        - fastapi-cloud-cli==0.26.0
+        - fastapi==0.136.3
+        - fastar==0.12.0
+        - fastsafetensors==0.4.0
+        - filelock==4.2.0
+        - flashinfer-cubin==0.7.1
+        - flashinfer-jit-cache @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=283561806a425c1c48e3bbe47f1a47a4abad226a173dc35dd6b7d31ea1ce87ec
+        - flashinfer-jit-cache-sm100a==0.7.1+cu134
+        - flashinfer-jit-cache-sm103a==0.7.1+cu134
+        - flashinfer-jit-cache-sm107a @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache_sm107a-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=73da4fb2f3c0ea9b9c7072dec10cb96317d83285239ba8e07a12dbfca3a89725
+        - flashinfer-jit-cache-sm110a==0.7.1+cu134
+        - flashinfer-jit-cache-sm120f==0.7.1+cu134
+        - flashinfer-jit-cache-sm121a==0.7.1+cu134
+        - flashinfer-jit-cache-sm80==0.7.1+cu134
+        - flashinfer-jit-cache-sm89==0.7.1+cu134
+        - flashinfer-jit-cache-sm90a==0.7.1+cu134
+        - flashinfer-python @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_python-0.7.3.dev20261031-py3-none-any.whl#sha256=42265b88b2a812790ca5d9da74e6653d1bf38150105496ebb9e7f261515438a0
+        - frozenlist==1.8.0
+        - fsspec==2026.9.0
+        - google-api-core==2.34.0
+        - google-auth==2.62.0
+        - google-cloud-bigtable==2.50.0
+        - google-cloud-core==2.8.0
+        - google-cloud-monitoring==2.32.0
+        - google-cloud-storage==3.17.0
+        - google-crc32c==1.9.0
+        - google-resumable-media==2.11.0
+        - googleapis-common-protos==1.75.5
+        - grpc-google-iam-v1==0.14.5
+        - grpcio-observability==1.78.0
+        - grpcio-status==1.78.0
+        - grpcio==1.78.0
+        - h11==0.16.0
+        - hf-xet==1.7.0
+        - httpcore2==2.13.1
+        - httpcore==1.0.9
+        - httplib2==0.20.4
+        - httptools==0.9.0
+        - httpx2==2.13.1
+        - httpx==0.28.1
+        - huggingface_hub==2.2.0
+        - humanize==4.16.0
+        - humming-kernels @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/humming_kernels-0.1.18-cp310-abi3-manylinux_2_28_aarch64.whl#sha256=3d291339f8e8d8903df4f5005ba263c213a3cd4f233508d8e01c6ea64a40a107
+        - idna==3.20
+        - ijson==3.6.0
+        - importlib_metadata==8.7.1
+        - iniconfig==2.3.1
+        - instanttensor==0.2.2
+        - interegular==0.3.3
+        - isodate==0.7.2
+        - Jinja2==3.1.6
+        - jiter==0.17.0
+        - jmespath==1.1.0
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - lark==1.2.2
+        - launchpadlib==1.11.0
+        - lazr.restfulclient==0.14.6
+        - lazr.uri==1.0.6
+        - llguidance==1.7.6
+        - llvmlite==0.47.0
+        - lm-format-enforcer==0.11.3
+        - lmcache==0.5.6
+        - loguru==0.7.3
+        - markdown-it-py==4.2.0
+        - MarkupSafe==3.0.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mistral_common==1.12.0
+        - ml_dtypes==0.6.0
+        - model-hosting-container-standards==0.1.16
+        - modelscope==1.37.1
+        - mooncake-transfer-engine-cuda13==0.3.13.post1
+        - mpmath==1.3.0
+        - msal-extensions==1.3.1
+        - msal==1.39.0
+        - msgpack==1.2.3
+        - msgspec==0.22.0
+        - multidict==7.1.0
+        - nccl-extensions==0.1.0
+        - nccl4py==0.6.0
+        - networkx==3.7
+        - ninja==1.13.2
+        - nixl @ file:///tmp/nixl-dist/nixl-1.5.0-py3-none-any.whl
+        - nixl-cu13 @ file:///tmp/nixl-dist/nixl_cu13-1.5.0-cp312-cp312-manylinux_2_28_aarch64.whl
+        - numba==0.65.0
+        - numpy==2.2.6
+        - nvidia-cublas==13.8.1.7
+        - nvidia-cuda-cccl==13.3.4.3.1
+        - nvidia-cuda-crt==13.4.92
+        - nvidia-cuda-cupti==13.4.58
+        - nvidia-cuda-nvcc==13.4.92
+        - nvidia-cuda-nvrtc==13.4.59
+        - nvidia-cuda-runtime==13.4.49
+        - nvidia-cudnn-cu13==9.26.0.51
+        - nvidia-cudnn-frontend==1.33.0
+        - nvidia-cufft==12.4.0.34
+        - nvidia-cufile==1.19.0.109
+        - nvidia-cusolver==12.3.2.15
+        - nvidia-cusparse==12.8.6.49
+        - nvidia-cusparselt-cu13==0.8.1
+        - nvidia-cutlass-dsl-libs-base==4.8.0
+        - nvidia-cutlass-dsl-libs-core==4.8.0
+        - nvidia-cutlass-dsl-libs-cu12==4.8.0
+        - nvidia-cutlass-dsl-libs-cu13==4.8.0
+        - nvidia-cutlass-dsl==4.8.0
+        - nvidia-ml-py==13.615.71
+        - nvidia-nccl-cu13==2.32.3
+        - nvidia-nvjitlink==13.4.92
+        - nvidia-nvshmem-cu13==3.7.2
+        - nvidia-nvtx==13.4.49
+        - nvidia-nvvm==13.4.92
+        - nvtx==0.2.15
+        - oauthlib==3.2.2
+        - openai==3.31.0
+        - opencv-python-headless==5.0.0.93
+        - opentelemetry-api==1.40.0
+        - opentelemetry-exporter-http-transport==0.66b1
+        - opentelemetry-exporter-otlp-common==0.66b1
+        - opentelemetry-exporter-otlp-proto-common==1.40.0
+        - opentelemetry-exporter-otlp-proto-grpc==1.40.0
+        - opentelemetry-exporter-otlp-proto-http==1.40.0
+        - opentelemetry-exporter-otlp==1.40.0
+        - opentelemetry-exporter-prometheus==0.61b0
+        - opentelemetry-proto==1.40.0
+        - opentelemetry-sdk==1.40.0
+        - opentelemetry-semantic-conventions-ai==0.5.1
+        - opentelemetry-semantic-conventions==0.61b0
+        - orjson==3.13.0
+        - oss-harmony==0.0.11
+        - outlines_core==0.2.14
+        - packaging==26.3
+        - partial-json-parser==0.2.1.1.post7
+        - pillow==12.3.0
+        - pluggy==1.6.0
+        - prometheus-fastapi-instrumentator==8.1.0
+        - prometheus_client==0.24.1
+        - propcache==0.5.4
+        - proto-plus==1.29.0
+        - protobuf==6.33.6
+        - psutil==7.2.2
+        - py-cpuinfo==9.0.0
+        - pyasn1==0.6.4
+        - pyasn1_modules==0.4.2
+        - pybase64==1.5.1
+        - pycountry==26.2.16
+        - pycparser==3.11
+        - pydantic-extra-types==2.11.1
+        - pydantic-settings==2.16.0
+        - pydantic==2.14.1
+        - pydantic_core==2.50.1
+        - pyelftools==0.33
+        - Pygments==2.21.0
+        - PyGObject==3.48.2
+        - PyJWT==2.15.1
+        - pynvvideocodec==2.0.4
+        - pyparsing==3.1.1
+        - pytest==9.1.1
+        - python-apt==2.7.7+ubuntu5.3
+        - python-dateutil==2.9.0.post0
+        - python-dotenv==1.2.4
+        - python-json-logger==4.2.0
+        - python-multipart==0.0.32
+        - PyYAML==6.0.3
+        - pyzmq==27.2.0
+        - quack-kernels==0.6.5
+        - redis==8.1.0
+        - referencing==0.37.0
+        - regex==2026.9.29
+        - requests==2.34.2
+        - rich-toolkit==0.20.6
+        - rich==15.0.0
+        - rignore==0.8.1
+        - rpds-py==2026.9.1
+        - runai-model-streamer-azure==0.17.0
+        - runai-model-streamer-gcs==0.17.0
+        - runai-model-streamer-s3==0.17.0
+        - runai-model-streamer==0.17.0
+        - s3transfer==0.19.2
+        - safetensors==0.8.0
+        - sentencepiece==0.2.2
+        - sentry-sdk==2.72.0
+        - setproctitle==1.3.8
+        - setuptools-scm==10.3.4
+        - setuptools==80.10.2
+        - shellingham==1.5.4
+        - six==1.17.0
+        - sniffio==1.3.1
+        - sortedcontainers==2.4.0
+        - sse-starlette==3.5.0
+        - starlette==1.8.0
+        - supervisor==4.3.0
+        - sympy==1.14.0
+        - tabulate==0.10.0
+        - tiktoken==0.14.0
+        - tilelang==0.1.12
+        - timm==1.0.30
+        - tokenizers==0.23.3
+        - tokenspeed-mla @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/tokenspeed_mla-2.0.3-py3-none-any.whl#sha256=576ce91e861598347f09c429fe41269863d351bf3de8410a845dae39fa172e4a
+        - tokenspeed-triton==3.9.10.post20261008
+        - torch==2.16.0.dev20261009+cu134
+        - torch_c_dlpack_ext==0.1.5
+        - torchaudio==2.11.0.dev20261009+cu134
+        - torchcodec==0.17.0
+        - torchvision==0.30.0.dev20261009+cu134
+        - tqdm==4.70.1
+        - transformers==5.19.0
+        - triton @ file:///tmp/triton-source-dist/triton-3.8.0+git3f6e4113-cp312-cp312-linux_aarch64.whl
+        - truststore==0.10.5
+        - typer==0.27.3
+        - typing-inspection==0.4.4
+        - typing_extensions==4.16.0
+        - urllib3==2.8.0
+        - uv==0.13.1
+        - uvicorn==0.54.0
+        - uvloop==0.23.0
+        - vcs-versioning==2.6.0
+        - vllm==0.32.0rc2.dev0+g242fb49cd4.jh
+        - wadllib==1.3.6
+        - watchfiles==1.3.0
+        - websockets==17.2
+        - xgrammar==0.2.8
+        - yarl==1.25.1
+        - z3-solver==4.15.4.0
+        - zipp==4.1.1
+        uv:
+        - -e file:///lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/srt-slurm
+        - annotated-types==0.8.0
+        - anyio==4.15.1
+        - attrs==26.1.0
+        - certifi==2026.10.23
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - contourpy==1.4.0
+        - cryptography==50.0.2
+        - cycler==0.12.1
+        - fonttools==4.68.0
+        - h11==0.16.0
+        - httpcore2==2.16.0
+        - httpx2==2.16.0
+        - idna==3.20
+        - jinja2==3.1.6
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - kiwisolver==1.5.1
+        - markdown-it-py==4.2.0
+        - markupsafe==3.0.4
+        - marshmallow-dataclass==8.7.1
+        - marshmallow==4.3.1
+        - matplotlib==3.11.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mypy-extensions==1.1.0
+        - numpy==2.5.4
+        - opentelemetry-api==1.45.2
+        - packaging==26.3
+        - pillow==12.3.0
+        - prometheus-client==0.23.1
+        - prompt-toolkit==3.0.53
+        - pyarrow==26.0.0
+        - pycparser==3.12
+        - pydantic-core==2.50.2
+        - pydantic==2.14.2
+        - pygments==2.21.0
+        - pyjwt==2.15.1
+        - pyparsing==3.3.3
+        - python-dateutil==3.0.0
+        - python-multipart==0.0.32
+        - pyyaml==6.0.3
+        - questionary==2.1.1
+        - referencing==0.37.0
+        - requests==2.34.2
+        - rich==14.1.0
+        - rpds-py==2026.9.1
+        - ruamel-yaml-clib==0.2.15
+        - ruamel-yaml==0.18.17
+        - six==1.17.0
+        - sse-starlette==3.6.0
+        - starlette==1.10.0
+        - tomli==2.5.0
+        - truststore==0.10.5
+        - typeguard==4.6.0
+        - typing-extensions==4.16.0
+        - typing-inspect==0.9.0
+        - typing-inspection==0.4.4
+        - tzdata==2026.6
+        - urllib3==2.8.0
+        - uvicorn==0.54.0
+        - wcwidth==0.9.4
+    prefill_w0:
+      hostname: hecate0151.hecate.clusters.nvidia.com
+      timestamp: '2026-11-22T18:43:39Z'
+      arch: aarch64
+      os: Ubuntu 24.04.5 LTS
+      cpu:
+        model: ARM CPU implementer 0x4e part 0x010 (architecture 8, variant 0x0, revision
+          0)
+        logical_cpus: 352
+        affinity_cpus: 352
+        affinity_list: 0-351
+        slurm:
+          SLURM_CPUS_ON_NODE: '352'
+          SLURM_JOB_CPUS_PER_NODE: 352(x8)
+      gpu:
+        available: true
+        driver: 620.70.10
+        gpus:
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+        - name: NVIDIA VR NVL72
+          driver: 620.70.10
+          memory: 286524 MiB
+      python_version: 3.12.3
+      cuda_version: Cuda compilation tools, release 13.4, V13.4.92
+      nccl_version: (2, 30, 7)
+      frameworks:
+        vllm: 0.32.0rc2.dev0+g242fb49cd4.jh
+        dynamo: 1.5.0
+      model: null
+      env:
+        CUDA_CACHE_DISABLE: '1'
+        CUDA_CACHE_MAXSIZE: '4294967296'
+        CUDA_CACHE_PATH: /raid/scratch/k31ws-agx/nvcache
+        CUDA_DEVICE_ORDER: PCI_BUS_ID
+        CUDA_HOME: /usr/local/cuda
+        CUDA_MPS_PIPE_DIRECTORY: /var/tmp/nvidia-mps
+        CUDA_VERSION: 13.4.1
+        DYN_LIFECYCLE_TRACE_ENABLED: '1'
+        DYN_LOG: info,dynamo_runtime::pipeline::network::ingress::push_handler=warn
+        DYN_REQUEST_PLANE: tcp
+        DYN_SKIP_SGLANG_LOG_FORMATTING: '1'
+        DYN_SYSTEM_PORT: '7503'
+        DYN_TCP_REQUEST_TIMEOUT: '120'
+        DYN_VLLM_KV_EVENT_PORT: '5212'
+        HF_HUB_OFFLINE: '1'
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_IB_SL: '1'
+        NCCL_MNNVL_ENABLE: '1'
+        NCCL_NET_PLUGIN: none
+        NCCL_NVLINK_UTIL_CENTRIC_SCHED_ENABLE: '0'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        NCCL_SOCKET_IFNAME: os_p1s0
+        NVIDIA_DRIVER_CAPABILITIES: compute,utility
+        NVIDIA_REQUIRE_CUDA: cuda>=13.4 brand=unknown,driver>=535,driver<536 brand=grid,driver>=535,driver<536
+          brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=535,driver<536 brand=quadro,driver>=535,driver<536
+          brand=quadrortx,driver>=535,driver<536 brand=nvidiartx,driver>=535,driver<536
+          brand=vapps,driver>=535,driver<536 brand=vpc,driver>=535,driver<536 brand=vcs,driver>=535,driver<536
+          brand=vws,driver>=535,driver<536 brand=cloudgaming,driver>=535,driver<536
+          brand=unknown,driver>=570,driver<571 brand=grid,driver>=570,driver<571 brand=tesla,driver>=570,driver<571
+          brand=nvidia,driver>=570,driver<571 brand=quadro,driver>=570,driver<571
+          brand=quadrortx,driver>=570,driver<571 brand=nvidiartx,driver>=570,driver<571
+          brand=vapps,driver>=570,driver<571 brand=vpc,driver>=570,driver<571 brand=vcs,driver>=570,driver<571
+          brand=vws,driver>=570,driver<571 brand=cloudgaming,driver>=570,driver<571
+          brand=unknown,driver>=580,driver<581 brand=grid,driver>=580,driver<581 brand=tesla,driver>=580,driver<581
+          brand=nvidia,driver>=580,driver<581 brand=quadro,driver>=580,driver<581
+          brand=quadrortx,driver>=580,driver<581 brand=nvidiartx,driver>=580,driver<581
+          brand=vapps,driver>=580,driver<581 brand=vpc,driver>=580,driver<581 brand=vcs,driver>=580,driver<581
+          brand=vws,driver>=580,driver<581 brand=cloudgaming,driver>=580,driver<581
+          brand=unknown,driver>=590,driver<591 brand=grid,driver>=590,driver<591 brand=tesla,driver>=590,driver<591
+          brand=nvidia,driver>=590,driver<591 brand=quadro,driver>=590,driver<591
+          brand=quadrortx,driver>=590,driver<591 brand=nvidiartx,driver>=590,driver<591
+          brand=vapps,driver>=590,driver<591 brand=vpc,driver>=590,driver<591 brand=vcs,driver>=590,driver<591
+          brand=vws,driver>=590,driver<591 brand=cloudgaming,driver>=590,driver<591
+          brand=unknown,driver>=595,driver<596 brand=grid,driver>=595,driver<596 brand=tesla,driver>=595,driver<596
+          brand=nvidia,driver>=595,driver<596 brand=quadro,driver>=595,driver<596
+          brand=quadrortx,driver>=595,driver<596 brand=nvidiartx,driver>=595,driver<596
+          brand=vapps,driver>=595,driver<596 brand=vpc,driver>=595,driver<596 brand=vcs,driver>=595,driver<596
+          brand=vws,driver>=595,driver<596 brand=cloudgaming,driver>=595,driver<596
+          brand=unknown,driver>=610,driver<611 brand=grid,driver>=610,driver<611 brand=tesla,driver>=610,driver<611
+          brand=nvidia,driver>=610,driver<611 brand=quadro,driver>=610,driver<611
+          brand=quadrortx,driver>=610,driver<611 brand=nvidiartx,driver>=610,driver<611
+          brand=vapps,driver>=610,driver<611 brand=vpc,driver>=610,driver<611 brand=vcs,driver>=610,driver<611
+          brand=vws,driver>=610,driver<611 brand=cloudgaming,driver>=610,driver<611
+        NVIDIA_VISIBLE_DEVICES: all
+        OMPI_MCA_btl_openib_warn_default_gid_prefix: '0'
+        OMPI_MCA_btl_tcp_if_include: os_p1s0
+        OMPI_MCA_plm_slurm_args: --external-launcher
+        SGLANG_TORCH_PROFILER_DIR: /workspace
+        TORCH_CUDA_ARCH_LIST: 8.0 8.7 8.9 9.0 10.0 11.0 12.0
+        TORCH_EXTENSIONS_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/g-15c281dc32/torch_ext
+        UCX_GPU_NIC_ASSIGNMENT_MODE: 'off'
+        UCX_MEMTYPE_CACHE: n
+        UCX_MEMTYPE_REG_WHOLE: n
+        UCX_NET_DEVICES: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_11:1
+        UCX_RCACHE_MAX_UNRELEASED: '1024'
+        UCX_TCP_AF_PRIO: inet
+        UCX_TLS: rc,cuda_copy
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+        VLLM_ALLREDUCE_USE_FLASHINFER: '1'
+        VLLM_BUILD_COMMIT: 3f1bcfd82bb2e93fcd364fc7a5491718453a77e2
+        VLLM_BUILD_PIPELINE: 019d130e-464e-4ff7-b84b-492992c0c06b
+        VLLM_BUILD_URL: https://buildkite.com/vllm/release-v2/builds/8443
+        VLLM_CACHE_ROOT: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/vllm
+        VLLM_ENABLE_CUDA_COMPATIBILITY: '0'
+        VLLM_ENGINE_READY_TIMEOUT_S: '5400'
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+        VLLM_IMAGE_TAG: vllm/vllm-openai:cu134-nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2
+        VLLM_ITERLOG_ALL_RANKS: '1'
+        VLLM_ITERLOG_DIR: /logs/iterlog
+        VLLM_ITERLOG_GPU: '1'
+        VLLM_MOONCAKE_LOAD_RECV_THREADS: '4'
+        VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: '1'
+        VLLM_NIXL_SIDE_CHANNEL_HOST: 10.66.26.13
+        VLLM_NIXL_SIDE_CHANNEL_PORT: '5400'
+        VLLM_PACKED_KV_STATE_GROUPS: '2'
+        VLLM_RPC_TIMEOUT: '600000'
+        VLLM_SERVER_DEV_MODE: '1'
+        VLLM_SSM_CONV_STATE_LAYOUT: DS
+        VLLM_TORCH_PROFILER_DIR: /workspace
+        VLLM_USAGE_SOURCE: production-docker-image
+        VLLM_USE_DIRECT_DCP_A2A: '1'
+        VLLM_USE_DIRECT_DCP_KV_GATHER: '1'
+        VLLM_USE_DIRECT_DCP_Q_GATHER: '1'
+        VLLM_USE_NCCL_SYMM_MEM: '0'
+        VLLM_USE_RUST_FRONTEND: '1'
+        VLLM_USE_V2_MODEL_RUNNER: '1'
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+      pip_packages:
+        python3:
+        - accelerate==1.15.0
+        - agent-detector==2.0.0
+        - ai-dynamo-runtime==1.5.0
+        - ai-dynamo==1.5.0
+        - aiofile==3.12.3
+        - aiofiles==25.1.0
+        - aiohappyeyeballs==2.7.1
+        - aiohttp==3.14.5
+        - aiosignal==1.4.0
+        - annotated-doc==0.0.5
+        - annotated-types==0.8.0
+        - anthropic==1.14.0
+        - anyio==4.15.1
+        - apache-tvm-ffi==0.1.11
+        - astor==0.8.1
+        - attrs==26.1.0
+        - awscrt==0.37.0
+        - azure-core==1.41.0
+        - azure-identity==1.26.0
+        - azure-storage-blob==12.31.0
+        - blake3==1.0.11
+        - blinker==1.7.0
+        - boto3==1.43.114
+        - botocore==1.43.114
+        - cachetools==7.2.1
+        - caio==0.12.9
+        - cbor2==6.1.5
+        - certifi==2026.7.22
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - cloudpickle==3.1.2
+        - compressed-tensors==0.17.0
+        - cryptography==50.0.2
+        - cuda-bindings==13.4.1
+        - cuda-core==1.2.1
+        - cuda-pathfinder==1.8.3
+        - cuda-python==13.4.1
+        - cuda-tile==1.6.0
+        - cuda-toolkit==13.4.1
+        - cufile-python==0.2.0
+        - cupti-python==13.4.0
+        - cupy-cuda13x==14.2.0
+        - dbus-python==1.3.2
+        - deep_ep @ file:///vllm-workspace/ep_kernels/dist/deep_ep-2.0.0+local-cp312-cp312-linux_aarch64.whl
+        - depyf==0.20.0
+        - detect-installer==0.2.1
+        - dill==0.4.1
+        - distro==1.9.0
+        - dnspython==2.9.0
+        - docstring_parser==0.18.0
+        - einops==0.8.2
+        - email-validator==2.3.0
+        - fastapi-cli==0.0.32
+        - fastapi-cloud-cli==0.26.0
+        - fastapi==0.136.3
+        - fastar==0.12.0
+        - fastsafetensors==0.4.0
+        - filelock==4.2.0
+        - flashinfer-cubin==0.7.1
+        - flashinfer-jit-cache @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=283561806a425c1c48e3bbe47f1a47a4abad226a173dc35dd6b7d31ea1ce87ec
+        - flashinfer-jit-cache-sm100a==0.7.1+cu134
+        - flashinfer-jit-cache-sm103a==0.7.1+cu134
+        - flashinfer-jit-cache-sm107a @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache_sm107a-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=73da4fb2f3c0ea9b9c7072dec10cb96317d83285239ba8e07a12dbfca3a89725
+        - flashinfer-jit-cache-sm110a==0.7.1+cu134
+        - flashinfer-jit-cache-sm120f==0.7.1+cu134
+        - flashinfer-jit-cache-sm121a==0.7.1+cu134
+        - flashinfer-jit-cache-sm80==0.7.1+cu134
+        - flashinfer-jit-cache-sm89==0.7.1+cu134
+        - flashinfer-jit-cache-sm90a==0.7.1+cu134
+        - flashinfer-python @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_python-0.7.3.dev20261031-py3-none-any.whl#sha256=42265b88b2a812790ca5d9da74e6653d1bf38150105496ebb9e7f261515438a0
+        - frozenlist==1.8.0
+        - fsspec==2026.9.0
+        - google-api-core==2.34.0
+        - google-auth==2.62.0
+        - google-cloud-bigtable==2.50.0
+        - google-cloud-core==2.8.0
+        - google-cloud-monitoring==2.32.0
+        - google-cloud-storage==3.17.0
+        - google-crc32c==1.9.0
+        - google-resumable-media==2.11.0
+        - googleapis-common-protos==1.75.5
+        - grpc-google-iam-v1==0.14.5
+        - grpcio-observability==1.78.0
+        - grpcio-status==1.78.0
+        - grpcio==1.78.0
+        - h11==0.16.0
+        - hf-xet==1.7.0
+        - httpcore2==2.13.1
+        - httpcore==1.0.9
+        - httplib2==0.20.4
+        - httptools==0.9.0
+        - httpx2==2.13.1
+        - httpx==0.28.1
+        - huggingface_hub==2.2.0
+        - humanize==4.16.0
+        - humming-kernels @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/humming_kernels-0.1.18-cp310-abi3-manylinux_2_28_aarch64.whl#sha256=3d291339f8e8d8903df4f5005ba263c213a3cd4f233508d8e01c6ea64a40a107
+        - idna==3.20
+        - ijson==3.6.0
+        - importlib_metadata==8.7.1
+        - iniconfig==2.3.1
+        - instanttensor==0.2.2
+        - interegular==0.3.3
+        - isodate==0.7.2
+        - Jinja2==3.1.6
+        - jiter==0.17.0
+        - jmespath==1.1.0
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - lark==1.2.2
+        - launchpadlib==1.11.0
+        - lazr.restfulclient==0.14.6
+        - lazr.uri==1.0.6
+        - llguidance==1.7.6
+        - llvmlite==0.47.0
+        - lm-format-enforcer==0.11.3
+        - lmcache==0.5.6
+        - loguru==0.7.3
+        - markdown-it-py==4.2.0
+        - MarkupSafe==3.0.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mistral_common==1.12.0
+        - ml_dtypes==0.6.0
+        - model-hosting-container-standards==0.1.16
+        - modelscope==1.37.1
+        - mooncake-transfer-engine-cuda13 @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/env/mooncake-0.3.14.tmp/whl/mooncake_transfer_engine_cuda13-0.3.14-cp312-cp312-manylinux_2_28_aarch64.whl#sha256=15c54971584f1d16e939a6c4b05af0a8447a19f5a59ad70a58962786b0bdb0f3
+        - mpmath==1.3.0
+        - msal-extensions==1.3.1
+        - msal==1.39.0
+        - msgpack==1.2.3
+        - msgspec==0.22.0
+        - multidict==7.1.0
+        - nccl-extensions==0.1.0
+        - nccl4py==0.6.0
+        - networkx==3.7
+        - ninja==1.13.2
+        - nixl @ file:///tmp/nixl-dist/nixl-1.5.0-py3-none-any.whl
+        - nixl-cu13 @ file:///tmp/nixl-dist/nixl_cu13-1.5.0-cp312-cp312-manylinux_2_28_aarch64.whl
+        - numba==0.65.0
+        - numpy==2.2.6
+        - nvidia-cublas==13.8.1.7
+        - nvidia-cuda-cccl==13.3.4.3.1
+        - nvidia-cuda-crt==13.4.92
+        - nvidia-cuda-cupti==13.4.58
+        - nvidia-cuda-nvcc==13.4.92
+        - nvidia-cuda-nvrtc==13.4.59
+        - nvidia-cuda-runtime==13.4.49
+        - nvidia-cudnn-cu13==9.26.0.51
+        - nvidia-cudnn-frontend==1.33.0
+        - nvidia-cufft==12.4.0.34
+        - nvidia-cufile==1.19.0.109
+        - nvidia-cusolver==12.3.2.15
+        - nvidia-cusparse==12.8.6.49
+        - nvidia-cusparselt-cu13==0.8.1
+        - nvidia-cutlass-dsl-libs-base==4.8.0
+        - nvidia-cutlass-dsl-libs-core==4.8.0
+        - nvidia-cutlass-dsl-libs-cu12==4.8.0
+        - nvidia-cutlass-dsl-libs-cu13==4.8.0
+        - nvidia-cutlass-dsl==4.8.0
+        - nvidia-ml-py==13.615.71
+        - nvidia-nccl-cu13==2.32.3
+        - nvidia-nvjitlink==13.4.92
+        - nvidia-nvshmem-cu13==3.7.2
+        - nvidia-nvtx==13.4.49
+        - nvidia-nvvm==13.4.92
+        - nvtx==0.2.15
+        - oauthlib==3.2.2
+        - openai==3.31.0
+        - opencv-python-headless==5.0.0.93
+        - opentelemetry-api==1.40.0
+        - opentelemetry-exporter-http-transport==0.66b1
+        - opentelemetry-exporter-otlp-common==0.66b1
+        - opentelemetry-exporter-otlp-proto-common==1.40.0
+        - opentelemetry-exporter-otlp-proto-grpc==1.40.0
+        - opentelemetry-exporter-otlp-proto-http==1.40.0
+        - opentelemetry-exporter-otlp==1.40.0
+        - opentelemetry-exporter-prometheus==0.61b0
+        - opentelemetry-proto==1.40.0
+        - opentelemetry-sdk==1.40.0
+        - opentelemetry-semantic-conventions-ai==0.5.1
+        - opentelemetry-semantic-conventions==0.61b0
+        - orjson==3.13.0
+        - oss-harmony==0.0.11
+        - outlines_core==0.2.14
+        - packaging==26.3
+        - partial-json-parser==0.2.1.1.post7
+        - pillow==12.3.0
+        - pluggy==1.6.0
+        - prometheus-fastapi-instrumentator==8.1.0
+        - prometheus_client==0.24.1
+        - propcache==0.5.4
+        - proto-plus==1.29.0
+        - protobuf==6.33.6
+        - psutil==7.2.2
+        - py-cpuinfo==9.0.0
+        - pyasn1==0.6.4
+        - pyasn1_modules==0.4.2
+        - pybase64==1.5.1
+        - pycountry==26.2.16
+        - pycparser==3.11
+        - pydantic-extra-types==2.11.1
+        - pydantic-settings==2.16.0
+        - pydantic==2.14.1
+        - pydantic_core==2.50.1
+        - pyelftools==0.33
+        - Pygments==2.21.0
+        - PyGObject==3.48.2
+        - PyJWT==2.15.1
+        - pynvvideocodec==2.0.4
+        - pyparsing==3.1.1
+        - pytest==9.1.1
+        - python-apt==2.7.7+ubuntu5.3
+        - python-dateutil==2.9.0.post0
+        - python-dotenv==1.2.4
+        - python-json-logger==4.2.0
+        - python-multipart==0.0.32
+        - PyYAML==6.0.3
+        - pyzmq==27.2.0
+        - quack-kernels==0.6.5
+        - redis==8.1.0
+        - referencing==0.37.0
+        - regex==2026.9.29
+        - requests==2.34.2
+        - rich-toolkit==0.20.6
+        - rich==15.0.0
+        - rignore==0.8.1
+        - rpds-py==2026.9.1
+        - runai-model-streamer-azure==0.17.0
+        - runai-model-streamer-gcs==0.17.0
+        - runai-model-streamer-s3==0.17.0
+        - runai-model-streamer==0.17.0
+        - s3transfer==0.19.2
+        - safetensors==0.8.0
+        - sentencepiece==0.2.2
+        - sentry-sdk==2.72.0
+        - setproctitle==1.3.8
+        - setuptools-scm==10.3.4
+        - setuptools==80.10.2
+        - shellingham==1.5.4
+        - six==1.17.0
+        - sniffio==1.3.1
+        - sortedcontainers==2.4.0
+        - sse-starlette==3.5.0
+        - starlette==1.8.0
+        - supervisor==4.3.0
+        - sympy==1.14.0
+        - tabulate==0.10.0
+        - tiktoken==0.14.0
+        - tilelang==0.1.12
+        - timm==1.0.30
+        - tokenizers==0.23.3
+        - tokenspeed-mla @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/tokenspeed_mla-2.0.3-py3-none-any.whl#sha256=576ce91e861598347f09c429fe41269863d351bf3de8410a845dae39fa172e4a
+        - tokenspeed-triton==3.9.10.post20261008
+        - torch==2.16.0.dev20261009+cu134
+        - torch_c_dlpack_ext==0.1.5
+        - torchaudio==2.11.0.dev20261009+cu134
+        - torchcodec==0.17.0
+        - torchvision==0.30.0.dev20261009+cu134
+        - tqdm==4.70.1
+        - transformers==5.19.0
+        - triton @ file:///tmp/triton-source-dist/triton-3.8.0+git3f6e4113-cp312-cp312-linux_aarch64.whl
+        - truststore==0.10.5
+        - typer==0.27.3
+        - typing-inspection==0.4.4
+        - typing_extensions==4.16.0
+        - urllib3==2.8.0
+        - uv==0.13.1
+        - uvicorn==0.54.0
+        - uvloop==0.23.0
+        - vcs-versioning==2.6.0
+        - vllm==0.32.0rc2.dev0+g242fb49cd4.jh
+        - wadllib==1.3.6
+        - watchfiles==1.3.0
+        - websockets==17.2
+        - xgrammar==0.2.8
+        - yarl==1.25.1
+        - z3-solver==4.15.4.0
+        - zipp==4.1.1
+        pip:
+        - accelerate==1.15.0
+        - agent-detector==2.0.0
+        - ai-dynamo-runtime==1.5.0
+        - ai-dynamo==1.5.0
+        - aiofile==3.12.3
+        - aiofiles==25.1.0
+        - aiohappyeyeballs==2.7.1
+        - aiohttp==3.14.5
+        - aiosignal==1.4.0
+        - annotated-doc==0.0.5
+        - annotated-types==0.8.0
+        - anthropic==1.14.0
+        - anyio==4.15.1
+        - apache-tvm-ffi==0.1.11
+        - astor==0.8.1
+        - attrs==26.1.0
+        - awscrt==0.37.0
+        - azure-core==1.41.0
+        - azure-identity==1.26.0
+        - azure-storage-blob==12.31.0
+        - blake3==1.0.11
+        - blinker==1.7.0
+        - boto3==1.43.114
+        - botocore==1.43.114
+        - cachetools==7.2.1
+        - caio==0.12.9
+        - cbor2==6.1.5
+        - certifi==2026.7.22
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - cloudpickle==3.1.2
+        - compressed-tensors==0.17.0
+        - cryptography==50.0.2
+        - cuda-bindings==13.4.1
+        - cuda-core==1.2.1
+        - cuda-pathfinder==1.8.3
+        - cuda-python==13.4.1
+        - cuda-tile==1.6.0
+        - cuda-toolkit==13.4.1
+        - cufile-python==0.2.0
+        - cupti-python==13.4.0
+        - cupy-cuda13x==14.2.0
+        - dbus-python==1.3.2
+        - deep_ep @ file:///vllm-workspace/ep_kernels/dist/deep_ep-2.0.0+local-cp312-cp312-linux_aarch64.whl
+        - depyf==0.20.0
+        - detect-installer==0.2.1
+        - dill==0.4.1
+        - distro==1.9.0
+        - dnspython==2.9.0
+        - docstring_parser==0.18.0
+        - einops==0.8.2
+        - email-validator==2.3.0
+        - fastapi-cli==0.0.32
+        - fastapi-cloud-cli==0.26.0
+        - fastapi==0.136.3
+        - fastar==0.12.0
+        - fastsafetensors==0.4.0
+        - filelock==4.2.0
+        - flashinfer-cubin==0.7.1
+        - flashinfer-jit-cache @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=283561806a425c1c48e3bbe47f1a47a4abad226a173dc35dd6b7d31ea1ce87ec
+        - flashinfer-jit-cache-sm100a==0.7.1+cu134
+        - flashinfer-jit-cache-sm103a==0.7.1+cu134
+        - flashinfer-jit-cache-sm107a @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_jit_cache_sm107a-0.7.3.dev20261031%2Bcu134-cp39-abi3-manylinux_2_28_aarch64.whl#sha256=73da4fb2f3c0ea9b9c7072dec10cb96317d83285239ba8e07a12dbfca3a89725
+        - flashinfer-jit-cache-sm110a==0.7.1+cu134
+        - flashinfer-jit-cache-sm120f==0.7.1+cu134
+        - flashinfer-jit-cache-sm121a==0.7.1+cu134
+        - flashinfer-jit-cache-sm80==0.7.1+cu134
+        - flashinfer-jit-cache-sm89==0.7.1+cu134
+        - flashinfer-jit-cache-sm90a==0.7.1+cu134
+        - flashinfer-python @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/fi-0.7.3.dev20261031/flashinfer_python-0.7.3.dev20261031-py3-none-any.whl#sha256=42265b88b2a812790ca5d9da74e6653d1bf38150105496ebb9e7f261515438a0
+        - frozenlist==1.8.0
+        - fsspec==2026.9.0
+        - google-api-core==2.34.0
+        - google-auth==2.62.0
+        - google-cloud-bigtable==2.50.0
+        - google-cloud-core==2.8.0
+        - google-cloud-monitoring==2.32.0
+        - google-cloud-storage==3.17.0
+        - google-crc32c==1.9.0
+        - google-resumable-media==2.11.0
+        - googleapis-common-protos==1.75.5
+        - grpc-google-iam-v1==0.14.5
+        - grpcio-observability==1.78.0
+        - grpcio-status==1.78.0
+        - grpcio==1.78.0
+        - h11==0.16.0
+        - hf-xet==1.7.0
+        - httpcore2==2.13.1
+        - httpcore==1.0.9
+        - httplib2==0.20.4
+        - httptools==0.9.0
+        - httpx2==2.13.1
+        - httpx==0.28.1
+        - huggingface_hub==2.2.0
+        - humanize==4.16.0
+        - humming-kernels @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/humming_kernels-0.1.18-cp310-abi3-manylinux_2_28_aarch64.whl#sha256=3d291339f8e8d8903df4f5005ba263c213a3cd4f233508d8e01c6ea64a40a107
+        - idna==3.20
+        - ijson==3.6.0
+        - importlib_metadata==8.7.1
+        - iniconfig==2.3.1
+        - instanttensor==0.2.2
+        - interegular==0.3.3
+        - isodate==0.7.2
+        - Jinja2==3.1.6
+        - jiter==0.17.0
+        - jmespath==1.1.0
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - lark==1.2.2
+        - launchpadlib==1.11.0
+        - lazr.restfulclient==0.14.6
+        - lazr.uri==1.0.6
+        - llguidance==1.7.6
+        - llvmlite==0.47.0
+        - lm-format-enforcer==0.11.3
+        - lmcache==0.5.6
+        - loguru==0.7.3
+        - markdown-it-py==4.2.0
+        - MarkupSafe==3.0.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mistral_common==1.12.0
+        - ml_dtypes==0.6.0
+        - model-hosting-container-standards==0.1.16
+        - modelscope==1.37.1
+        - mooncake-transfer-engine-cuda13 @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/env/mooncake-0.3.14.tmp/whl/mooncake_transfer_engine_cuda13-0.3.14-cp312-cp312-manylinux_2_28_aarch64.whl#sha256=15c54971584f1d16e939a6c4b05af0a8447a19f5a59ad70a58962786b0bdb0f3
+        - mpmath==1.3.0
+        - msal-extensions==1.3.1
+        - msal==1.39.0
+        - msgpack==1.2.3
+        - msgspec==0.22.0
+        - multidict==7.1.0
+        - nccl-extensions==0.1.0
+        - nccl4py==0.6.0
+        - networkx==3.7
+        - ninja==1.13.2
+        - nixl @ file:///tmp/nixl-dist/nixl-1.5.0-py3-none-any.whl
+        - nixl-cu13 @ file:///tmp/nixl-dist/nixl_cu13-1.5.0-cp312-cp312-manylinux_2_28_aarch64.whl
+        - numba==0.65.0
+        - numpy==2.2.6
+        - nvidia-cublas==13.8.1.7
+        - nvidia-cuda-cccl==13.3.4.3.1
+        - nvidia-cuda-crt==13.4.92
+        - nvidia-cuda-cupti==13.4.58
+        - nvidia-cuda-nvcc==13.4.92
+        - nvidia-cuda-nvrtc==13.4.59
+        - nvidia-cuda-runtime==13.4.49
+        - nvidia-cudnn-cu13==9.26.0.51
+        - nvidia-cudnn-frontend==1.33.0
+        - nvidia-cufft==12.4.0.34
+        - nvidia-cufile==1.19.0.109
+        - nvidia-cusolver==12.3.2.15
+        - nvidia-cusparse==12.8.6.49
+        - nvidia-cusparselt-cu13==0.8.1
+        - nvidia-cutlass-dsl-libs-base==4.8.0
+        - nvidia-cutlass-dsl-libs-core==4.8.0
+        - nvidia-cutlass-dsl-libs-cu12==4.8.0
+        - nvidia-cutlass-dsl-libs-cu13==4.8.0
+        - nvidia-cutlass-dsl==4.8.0
+        - nvidia-ml-py==13.615.71
+        - nvidia-nccl-cu13==2.32.3
+        - nvidia-nvjitlink==13.4.92
+        - nvidia-nvshmem-cu13==3.7.2
+        - nvidia-nvtx==13.4.49
+        - nvidia-nvvm==13.4.92
+        - nvtx==0.2.15
+        - oauthlib==3.2.2
+        - openai==3.31.0
+        - opencv-python-headless==5.0.0.93
+        - opentelemetry-api==1.40.0
+        - opentelemetry-exporter-http-transport==0.66b1
+        - opentelemetry-exporter-otlp-common==0.66b1
+        - opentelemetry-exporter-otlp-proto-common==1.40.0
+        - opentelemetry-exporter-otlp-proto-grpc==1.40.0
+        - opentelemetry-exporter-otlp-proto-http==1.40.0
+        - opentelemetry-exporter-otlp==1.40.0
+        - opentelemetry-exporter-prometheus==0.61b0
+        - opentelemetry-proto==1.40.0
+        - opentelemetry-sdk==1.40.0
+        - opentelemetry-semantic-conventions-ai==0.5.1
+        - opentelemetry-semantic-conventions==0.61b0
+        - orjson==3.13.0
+        - oss-harmony==0.0.11
+        - outlines_core==0.2.14
+        - packaging==26.3
+        - partial-json-parser==0.2.1.1.post7
+        - pillow==12.3.0
+        - pluggy==1.6.0
+        - prometheus-fastapi-instrumentator==8.1.0
+        - prometheus_client==0.24.1
+        - propcache==0.5.4
+        - proto-plus==1.29.0
+        - protobuf==6.33.6
+        - psutil==7.2.2
+        - py-cpuinfo==9.0.0
+        - pyasn1==0.6.4
+        - pyasn1_modules==0.4.2
+        - pybase64==1.5.1
+        - pycountry==26.2.16
+        - pycparser==3.11
+        - pydantic-extra-types==2.11.1
+        - pydantic-settings==2.16.0
+        - pydantic==2.14.1
+        - pydantic_core==2.50.1
+        - pyelftools==0.33
+        - Pygments==2.21.0
+        - PyGObject==3.48.2
+        - PyJWT==2.15.1
+        - pynvvideocodec==2.0.4
+        - pyparsing==3.1.1
+        - pytest==9.1.1
+        - python-apt==2.7.7+ubuntu5.3
+        - python-dateutil==2.9.0.post0
+        - python-dotenv==1.2.4
+        - python-json-logger==4.2.0
+        - python-multipart==0.0.32
+        - PyYAML==6.0.3
+        - pyzmq==27.2.0
+        - quack-kernels==0.6.5
+        - redis==8.1.0
+        - referencing==0.37.0
+        - regex==2026.9.29
+        - requests==2.34.2
+        - rich-toolkit==0.20.6
+        - rich==15.0.0
+        - rignore==0.8.1
+        - rpds-py==2026.9.1
+        - runai-model-streamer-azure==0.17.0
+        - runai-model-streamer-gcs==0.17.0
+        - runai-model-streamer-s3==0.17.0
+        - runai-model-streamer==0.17.0
+        - s3transfer==0.19.2
+        - safetensors==0.8.0
+        - sentencepiece==0.2.2
+        - sentry-sdk==2.72.0
+        - setproctitle==1.3.8
+        - setuptools-scm==10.3.4
+        - setuptools==80.10.2
+        - shellingham==1.5.4
+        - six==1.17.0
+        - sniffio==1.3.1
+        - sortedcontainers==2.4.0
+        - sse-starlette==3.5.0
+        - starlette==1.8.0
+        - supervisor==4.3.0
+        - sympy==1.14.0
+        - tabulate==0.10.0
+        - tiktoken==0.14.0
+        - tilelang==0.1.12
+        - timm==1.0.30
+        - tokenizers==0.23.3
+        - tokenspeed-mla @ file:///lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/wheels/tokenspeed_mla-2.0.3-py3-none-any.whl#sha256=576ce91e861598347f09c429fe41269863d351bf3de8410a845dae39fa172e4a
+        - tokenspeed-triton==3.9.10.post20261008
+        - torch==2.16.0.dev20261009+cu134
+        - torch_c_dlpack_ext==0.1.5
+        - torchaudio==2.11.0.dev20261009+cu134
+        - torchcodec==0.17.0
+        - torchvision==0.30.0.dev20261009+cu134
+        - tqdm==4.70.1
+        - transformers==5.19.0
+        - triton @ file:///tmp/triton-source-dist/triton-3.8.0+git3f6e4113-cp312-cp312-linux_aarch64.whl
+        - truststore==0.10.5
+        - typer==0.27.3
+        - typing-inspection==0.4.4
+        - typing_extensions==4.16.0
+        - urllib3==2.8.0
+        - uv==0.13.1
+        - uvicorn==0.54.0
+        - uvloop==0.23.0
+        - vcs-versioning==2.6.0
+        - vllm==0.32.0rc2.dev0+g242fb49cd4.jh
+        - wadllib==1.3.6
+        - watchfiles==1.3.0
+        - websockets==17.2
+        - xgrammar==0.2.8
+        - yarl==1.25.1
+        - z3-solver==4.15.4.0
+        - zipp==4.1.1
+        uv:
+        - -e file:///lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/srt-slurm
+        - annotated-types==0.8.0
+        - anyio==4.15.1
+        - attrs==26.1.0
+        - certifi==2026.10.23
+        - cffi==2.1.1
+        - charset-normalizer==3.5.2
+        - click==8.5.0
+        - contourpy==1.4.0
+        - cryptography==50.0.2
+        - cycler==0.12.1
+        - fonttools==4.68.0
+        - h11==0.16.0
+        - httpcore2==2.16.0
+        - httpx2==2.16.0
+        - idna==3.20
+        - jinja2==3.1.6
+        - jsonschema-specifications==2025.9.1
+        - jsonschema==4.26.0
+        - kiwisolver==1.5.1
+        - markdown-it-py==4.2.0
+        - markupsafe==3.0.4
+        - marshmallow-dataclass==8.7.1
+        - marshmallow==4.3.1
+        - matplotlib==3.11.2
+        - mcp-types==2.3.0
+        - mcp==2.3.0
+        - mdurl==0.1.2
+        - mypy-extensions==1.1.0
+        - numpy==2.5.4
+        - opentelemetry-api==1.45.2
+        - packaging==26.3
+        - pillow==12.3.0
+        - prometheus-client==0.23.1
+        - prompt-toolkit==3.0.53
+        - pyarrow==26.0.0
+        - pycparser==3.12
+        - pydantic-core==2.50.2
+        - pydantic==2.14.2
+        - pygments==2.21.0
+        - pyjwt==2.15.1
+        - pyparsing==3.3.3
+        - python-dateutil==3.0.0
+        - python-multipart==0.0.32
+        - pyyaml==6.0.3
+        - questionary==2.1.1
+        - referencing==0.37.0
+        - requests==2.34.2
+        - rich==14.1.0
+        - rpds-py==2026.9.1
+        - ruamel-yaml-clib==0.2.15
+        - ruamel-yaml==0.18.17
+        - six==1.17.0
+        - sse-starlette==3.6.0
+        - starlette==1.10.0
+        - tomli==2.5.0
+        - truststore==0.10.5
+        - typeguard==4.6.0
+        - typing-extensions==4.16.0
+        - typing-inspect==0.9.0
+        - typing-inspection==0.4.4
+        - tzdata==2026.6
+        - urllib3==2.8.0
+        - uvicorn==0.54.0
+        - wcwidth==0.9.4
+  resource_snapshot:
+    version: 1
+    captured_at: '2026-11-22T18:41:42Z'
+    job_id: '1242885'
+    tool:
+      srtctl_version: 2.59.1.post0+gae3d6877c.d20261121
+      srtctl_commit: ae3d6877c46f
+    hardware:
+      architecture: aarch64
+      cpu_model: ARM CPU implementer 0x4e part 0x010 (architecture 8, variant 0x0,
+        revision 0)
+      host_logical_cpus: 352
+    nodes:
+      count: 8
+      names:
+      - hecate0146
+      - hecate0148
+      - hecate0149
+      - hecate0151
+      - hecate0152
+      - hecate0153
+      - hecate0157
+      - hecate0158
+    gpus:
+      type: vrnvl72
+      configured_per_node: 4
+      configured_total: 32
+      backend_total: 32
+    cpus:
+      allocated_total: null
+      allocated_per_node: []
+      current_node_allocated: 352
+      process_affinity_count: 352
+      process_affinity_list: 0-351
+      effective_for_check: null
+      backend_node_allocations: []
+    slurm_environment:
+      SLURM_CPUS_ON_NODE: '352'
+    cpu_check:
+      status: unknown
+      gpu_count_basis: 32
+      minimum_cpu_count: 32
+      available_cpu_count: null
+      available_cpu_source: unknown
+      node: null
+      message: Could not determine effective CPU capacity from SLURM or process affinity.
+  integrity: ccc8bb9564d05fd7c7b9385351fc229b79a558baaae47e3edcd69e2ba5e34066

@@ -1,0 +1,29 @@
+[1872034] 2026/11/22 10:42:03.406571 [INF] Starting nats-server
+[1872034] 2026/11/22 10:42:03.406671 [INF]   Version:  2.10.28
+[1872034] 2026/11/22 10:42:03.406673 [INF]   Git:      [e0b99bd]
+[1872034] 2026/11/22 10:42:03.406675 [INF]   Name:     NAIUTL5ZHPED74XUCN2KNOC3P2Y3ACCZRLV4C2OFPBNRGFLY6UVW7PRL
+[1872034] 2026/11/22 10:42:03.406677 [INF]   Node:     4oTv2B9r
+[1872034] 2026/11/22 10:42:03.406678 [INF]   ID:       NAIUTL5ZHPED74XUCN2KNOC3P2Y3ACCZRLV4C2OFPBNRGFLY6UVW7PRL
+[1872034] 2026/11/22 10:42:03.406684 [INF] Using configuration file: /tmp/nats.conf
+[1872034] 2026/11/22 10:42:03.406692 [WRN] Maximum payloads over 8.00 MB are generally discouraged and could lead to poor performance
+[1872034] 2026/11/22 10:42:03.406895 [INF] Starting JetStream
+[1872034] 2026/11/22 10:42:03.407002 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[1872034] 2026/11/22 10:42:03.407005 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[1872034] 2026/11/22 10:42:03.407006 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[1872034] 2026/11/22 10:42:03.407007 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[1872034] 2026/11/22 10:42:03.407008 [INF] 
+[1872034] 2026/11/22 10:42:03.407009 [INF]          https://docs.nats.io/jetstream
+[1872034] 2026/11/22 10:42:03.407010 [INF] 
+[1872034] 2026/11/22 10:42:03.407010 [INF] ---------------- JETSTREAM ----------------
+[1872034] 2026/11/22 10:42:03.407013 [INF]   Max Memory:      1.05 TB
+[1872034] 2026/11/22 10:42:03.407014 [INF]   Max Storage:     536.25 GB
+[1872034] 2026/11/22 10:42:03.407015 [INF]   Store Directory: "/tmp/nats/jetstream"
+[1872034] 2026/11/22 10:42:03.407016 [INF] -------------------------------------------
+[1872034] 2026/11/22 10:42:03.407258 [INF] Listening for client connections on 0.0.0.0:4222
+[1872034] 2026/11/22 10:42:03.408847 [INF] Server is ready
+[2026-11-22T12:15:20.511] error: *** STEP 1242885.360 ON hecate0146 CANCELLED AT 2026-11-22T12:15:20 DUE to SIGNAL Terminated ***
+[1872034] 2026/11/22 12:15:20.515205 [INF] Trapped "terminated" signal
+[1872034] 2026/11/22 12:15:20.523734 [INF] Initiating Shutdown...
+[1872034] 2026/11/22 12:15:20.523758 [INF] Initiating JetStream Shutdown...
+[1872034] 2026/11/22 12:15:20.524348 [INF] JetStream Shutdown
+[1872034] 2026/11/22 12:15:20.524895 [INF] Server Exiting..

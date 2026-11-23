@@ -1,0 +1,4 @@
+a1242885-agx-x8-k3-c576-f19-1122085528 vs agx-x8-k3-c576-f19: OK
+  config md5 run 052f915d044d88abd9e79d0d04a0931b render 052f915d044d88abd9e79d0d04a0931b
+  frontend prefill_router_mode=KV (config router-mode kv)
+  frontend router_policy_config=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/agx-x8-k3-c576-f19/pval-policy.yaml

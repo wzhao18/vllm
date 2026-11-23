@@ -39,3 +39,17 @@ Green squares in the plots.
 | C48 1P1D checkpoint CK-1 | 24 | 15,580 | 309.6 | 4.72 | 0.968 | flat y, +1.5% x vs 15,593 @ 305 (projection missed; root cause in its README) |
 
 Details: `k31vr-c160-1p1d-wm05-llinteg-20261114/`, `k31vr-c48-1p1d-ck1-llinteg-20261114/`; config `srt-configs/c160-1p1d-wm05.yaml`.
+
+## Current code frontier (2026-11-22, int64.2 / f19 `15c281dc32`)
+
+`k31vr-int64-frontier-20261122/`: the 8-node record points on the current code: P DEP16 + D DP4 x (TP4+DCP4) EP16,
+32 GPUs, gsm8k strict 0.9795 on the same build. It has a 4-way pareto (per GPU and per MW) against the
+2026-11-17 release-draft sweep and the InferenceX VR200 dynamo-sglang baseline (2026-11-20).
+
+| point | full profiling: tok/s/GPU @ P90 intvty | minutes 10-60: tok/s/GPU @ P90 intvty |
+|---|---|---|
+| c608-f19 | 107,447 @ 128.2 | 113,087 @ 133.7 |
+| c576-f19 | 101,937 @ 134.3 | 107,208 @ 136.9 |
+
+InferenceX's per-point mean input differs from our ~149K trace (315K at c1, 135-150K at c156-c720). Details and caveats
+are in its README.
