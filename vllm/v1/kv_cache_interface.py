@@ -1270,49 +1270,6 @@ def is_mamba_prefill_checkpoint_valid(
     )
 
 
-def get_mamba_crossing_checkpoint_position(
-    query_start: int,
-    query_end: int,
-    prefill_end: int,
-    mamba_block_size: int,
-    hash_block_size: int,
-    checkpoint_alignment: int | None,
-) -> int:
-    """Boundary an intermediate prefill chunk exports when it crosses a Mamba
-    block boundary, or 0.
-
-    In "align" mode block column p holds the state after exactly
-    ``(p + 1) * mamba_block_size`` tokens. A chunk that resumes mid-block p used
-    to stop at that boundary B, so the state at B was its final state. With the
-    backend's internal prefill checkpoint, an intermediate chunk (it does not
-    finish the prefill) may instead run past B into block p + 1 -- never past
-    a second boundary -- and export the state at B into column p, the column it
-    resumed from (``get_mamba_prefill_checkpoint_col``; the worker pre-copies
-    that state into the running column before the forward, so column p is not
-    read during the step). The running state at the chunk end stays in column
-    p + 1. Block p then holds the same boundary state as with the B-ended chunk.
-
-    The scheduler, ``MambaManager`` and the worker's
-    ``compute_mamba_prefill_checkpoints`` all derive the decision from this one
-    rule, so they agree on every chunk. Used under sparse retention only
-    (``prefix_cache_retention_interval == 0``): under dense retention every
-    chunk end already publishes a checkpoint, and a sequence exports at most
-    one per step.
-    """
-    if checkpoint_alignment is None:
-        return 0
-    if query_start % mamba_block_size == 0 or query_end >= prefill_end:
-        return 0
-    if query_start % hash_block_size != 0:
-        return 0
-    boundary = (query_start // mamba_block_size + 1) * mamba_block_size
-    if not boundary < query_end <= boundary + mamba_block_size:
-        return 0
-    if (boundary - query_start) % checkpoint_alignment != 0:
-        return 0
-    return boundary
-
-
 def get_mamba_prefill_snapshot_col(
     query_start: int,
     query_end: int,

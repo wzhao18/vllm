@@ -113,10 +113,6 @@ class MambaHybridModelState(DefaultModelState):
             # the column for. Only a batch row starting there may export there.
             self._snapshot = self.cache_config.mamba_internal_snapshot
             self._snapshot_start = np.full(self.max_num_reqs, -1, dtype=np.int64)
-            # Per request slot: where its prefill ends, exactly the scheduler's
-            # max(num_prompt_tokens, num_tokens - 1) (a resumed request ships
-            # all of its tokens), for the crossing-chunk boundary export.
-            self._prefill_end = np.zeros(self.max_num_reqs, dtype=np.int64)
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
@@ -136,7 +132,6 @@ class MambaHybridModelState(DefaultModelState):
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
             self._snapshot_start[req_index] = new_req_data.num_computed_tokens
-            self._prefill_end[req_index] = mamba_prefill_end(new_req_data)
 
     def block_table_rewritten(self, req_index: int, num_computed_tokens: int) -> None:
         if self._align_mode:
@@ -318,7 +313,7 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         if self._align_mode:
-            mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
             aligned_index_builders = []
             for group_idx, group_id in enumerate(mamba_group_ids):
                 for group in attn_groups[group_id]:
@@ -332,7 +327,6 @@ class MambaHybridModelState(DefaultModelState):
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
             first_chunk = None
-            prefill_ends = None
             if self._snapshot and not for_capture:
                 n = input_batch.num_reqs
                 starts = np.asarray(seq_lens_cpu_upper_bound[:n]) - np.asarray(
@@ -342,22 +336,9 @@ class MambaHybridModelState(DefaultModelState):
                 first_chunk[:n] = (
                     self._snapshot_start[input_batch.idx_mapping_np[:n]] == starts
                 )
-                # Where each row's prefill ends (the scheduler's prefill_end),
-                # for the crossing-chunk boundary export; the scheduler only
-                # forms crossing chunks under sparse or one-block-grid retention.
-                if kv_cache_config.prefix_cache_retention_interval in (
-                    0,
-                    mamba_spec.block_size,
-                ):
-                    prefill_ends = np.zeros(num_reqs, dtype=np.int64)
-                    prefill_ends[:n] = self._prefill_end[
-                        input_batch.idx_mapping_np[:n]
-                    ]
             for _, builder in aligned_index_builders:
                 if hasattr(builder, "mamba_snapshot_first_chunk"):
                     builder.mamba_snapshot_first_chunk = first_chunk
-                if hasattr(builder, "mamba_prefill_ends"):
-                    builder.mamba_prefill_ends = prefill_ends
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
@@ -504,13 +485,3 @@ def _fill_num_accepted_kernel(
     if req_state_idx < 0:
         return
     tl.store(num_accepted_ptr + req_state_idx, num_sampled)
-
-
-def mamba_prefill_end(new_req_data: NewRequestData) -> int:
-    """The scheduler's ``max(num_prompt_tokens, num_tokens - 1)`` for a request
-    the worker receives: a resumed (preempted) request ships all of its tokens,
-    prompt and outputs, from ``prefill_token_start`` on."""
-    prompt_len = new_req_data.prompt_len
-    if new_req_data.prefill_token_ids is None:
-        return prompt_len
-    return max(prompt_len, new_req_data.prefill_len - 1)

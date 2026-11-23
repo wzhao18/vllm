@@ -328,9 +328,6 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         # Per batch row of the next build: the row is its request's first
         # scheduled chunk (V2 runner model state; mamba_internal_snapshot).
         self.mamba_snapshot_first_chunk: Sequence[bool] | None = None
-        # Per batch row: where its prefill ends, for intermediate chunks that
-        # cross a Mamba block boundary (same V2 model state, same lifetime).
-        self.mamba_prefill_ends: Sequence[int] | None = None
         # (batch_size, num_spec_decodes) of a step whose graph buffers the model
         # state's fused step prep (step_prep.py) already staged; consumed by build().
         self.prestaged: tuple[int, int] | None = None
@@ -718,15 +715,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         # by the V2 runner's model state (CacheConfig.mamba_internal_snapshot).
         first_chunk_rows = self.mamba_snapshot_first_chunk
         self.mamba_snapshot_first_chunk = None
-        prefill_end_rows = self.mamba_prefill_ends
-        self.mamba_prefill_ends = None
         checkpoint = None
         if num_prefills > 0:
             request_rows = list(range(m.num_reqs))
             if active_non_spec_mask_cpu is not None:
                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(
-                m, request_rows, first_chunk_rows, prefill_end_rows
+                m, request_rows, first_chunk_rows
             )
 
         return KimiK3KDAMetadata(

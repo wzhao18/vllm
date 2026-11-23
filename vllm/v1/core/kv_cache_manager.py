@@ -619,15 +619,6 @@ class KVCacheManager:
         for manager in self.coordinator.single_type_managers:
             if isinstance(manager, MambaManager) and manager.prefill_snapshot:
                 manager.set_first_chunk(request.request_id, first_chunk)
-                # Crossing chunks need a retention that keeps only grid points
-                # at or above the Mamba block: sparse (0) or the block itself.
-                # Finer (dense) retention publishes every chunk end.
-                manager.set_prefill_end(
-                    request.request_id,
-                    prefill_end
-                    if self.coordinator.retention_interval in (0, manager.block_size)
-                    else 0,
-                )
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
