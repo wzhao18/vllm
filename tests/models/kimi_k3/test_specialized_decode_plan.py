@@ -84,11 +84,11 @@ DL3_CAP64 = tuple(m for m in DL3 if m <= 256 and m not in (204, 228, 252))
     "dsa,tp,dcp,q,rubin,seams,why",
     [
         (True, 16, 16, 8, True, True, None),  # K3.1's decode role
-        (True, 16, 8, 8, True, True, "DSA wide steps need TP16 = DCP16"),
-        (True, 16, 2, 8, True, True, "DSA wide steps need TP16 = DCP16"),
-        (True, 16, 1, 8, True, True, "DSA wide steps need TP16 = DCP16"),
-        (True, 8, 8, 8, True, True, "DSA wide steps need TP16 = DCP16"),
-        (True, 8, 1, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 16, 8, 8, True, True, "DSA wide steps need TP = DCP (TP8 or TP16)"),
+        (True, 16, 2, 8, True, True, "DSA wide steps need TP = DCP (TP8 or TP16)"),
+        (True, 16, 1, 8, True, True, "DSA wide steps need TP = DCP (TP8 or TP16)"),
+        (True, 8, 8, 8, True, True, None),  # K3.1 TP8 = DCP8 (DFn)
+        (True, 8, 1, 8, True, True, "DSA wide steps need TP = DCP (TP8 or TP16)"),
         (True, 16, 16, 1, True, True, "no prepared providers above 64 rows"),
         (True, 16, 16, 8, False, True, "no prepared providers above 64 rows"),
         (True, 16, 16, 8, True, False, "sequence parallelism"),
@@ -102,7 +102,7 @@ DL3_CAP64 = tuple(m for m in DL3 if m <= 256 and m not in (204, 228, 252))
 )
 def test_wide_gate(dsa, tp, dcp, q, rubin, seams, why):
     """Verify graphs above 64 rows run the specialized decode on Rubin without
-    sequence parallelism; with K3.1's DSA layers only at TP16 = DCP16. Otherwise the
+    sequence parallelism; with K3.1's DSA layers only at TP = DCP (TP8 or TP16). Otherwise the
     gate names the reason the coverage log prints."""
     assert wide_gate(q, rubin=rubin, seams=seams, dsa=dsa, tp=tp, dcp=dcp) == why
 
@@ -127,7 +127,8 @@ class Built(Exception):
     [
         ((10, 7), False, True, 16, 16, True),  # K3.1's decode role
         ((10, 7), False, True, 16, 1, False),
-        ((10, 7), False, True, 8, 8, False),
+        ((10, 7), False, True, 8, 8, True),  # K3.1 TP8 = DCP8 (DFn)
+        ((10, 7), False, True, 8, 1, False),
         ((10, 3), False, True, 16, 16, False),  # GB300
         ((10, 7), True, True, 16, 16, False),
         ((10, 7), False, False, 8, 8, True),  # K3
@@ -162,19 +163,19 @@ def test_decode_reads_the_gate_from_the_deployment(
 
 @pytest.mark.parametrize("dsa", [True, False], ids=["k31-tp8", "k3-table-miss"])
 def test_coverage_names_why_wide_rows_run_stock(dsa):
-    """Captured rows above 64 that run the stock forward name the cause: K3.1's TP16 =
-    DCP16 gate, or a WIDE_ROWS miss. On the no-fallback target topology (Rubin TP16 =
-    DCP16, q > 1) the same uncovered rows refuse to start instead (NQ-NOFALLBACK)."""
+    """Captured rows above 64 that run the stock forward name the cause: K3.1's TP =
+    DCP gate (here TP8 with DCP1), or a WIDE_ROWS miss. On the no-fallback target
+    topology (Rubin TP16 = DCP16, q > 1) the same uncovered rows refuse to start instead (NQ-NOFALLBACK)."""
     decode: Any = object.__new__(SpecializedDecode)
     decode.q, decode.captured = 8, (64, 72, 256)
     decode.batches, decode.wide = (64,), ()
     decode.choices = lambda b, q: {}
-    decode.wide_off = wide_gate(8, rubin=True, seams=True, dsa=dsa, tp=8, dcp=8)
+    decode.wide_off = wide_gate(8, rubin=True, seams=True, dsa=dsa, tp=8, dcp=1)
     decode.context = Context(
         arch="rubin", tp=8, rank=0, dcp=8, sms=212, q=8, max_rows=256,
         max_context=1 << 20, bf16_state=True,
     )  # fmt: skip
-    why = "DSA wide steps need TP16 = DCP16" if dsa else "not in WIDE_ROWS"
+    why = "DSA wide steps need TP = DCP (TP8 or TP16)" if dsa else "not in WIDE_ROWS"
     assert decode.plan_coverage().reasons == {72: why, 256: why}
     decode.context = dataclasses.replace(decode.context, tp=16, dcp=16)
     with pytest.raises(Uncovered, match=rf"M72\(q8\).*whole stock forward: {why}"):

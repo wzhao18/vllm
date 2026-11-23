@@ -137,15 +137,16 @@ def wide_gate(q, *, rubin, seams, dsa, tp, dcp):
     """Why the captured verify rows above the tuned providers run the stock forward
     (None: those in ``WIDE_ROWS`` run the specialized decode). Wide steps need Rubin,
     q > 1 and every rank's full rows (no sequence parallelism: the o-projection seam),
-    and with K3.1 DSA layers (seam S2-DSA) TP16 = DCP16, where the fused wide
-    o-projection serves every such row: elsewhere they would run untested fallback
-    seams."""
+    and with K3.1 DSA layers (seam S2-DSA) DCP over every TP rank (TP16 = DCP16, TP8 =
+    DCP8: WideDsa's widened DcpBox at every wide row, the o-projection fused where
+    ``oproj.prepared.WIDE_TWOSHOT`` admits the TP, else seam S3). Other DSA layouts
+    (DCP below TP) were never run there."""
     if not (rubin and q > 1):
         return f"no prepared providers above {PREPARED_MAX} rows"
     if not seams:
         return "sequence parallelism"
-    if dsa and (tp, dcp) != (16, 16):
-        return "DSA wide steps need TP16 = DCP16"
+    if dsa and (tp not in (8, 16) or dcp != tp):
+        return "DSA wide steps need TP = DCP (TP8 or TP16)"
     return None
 
 
