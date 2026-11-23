@@ -502,6 +502,12 @@ class PreparedKda:
     def prepare_caches(self, caches):
         """Policy keys: a batch, or (requests, tokens) for verify steps; prepared
         operands: [requests * tokens, 4 * dim + 8] FP32."""
+        if caches[0].dtype != torch.bfloat16:  # BF16 conv window only
+            from ...shapes import Unsupported
+
+            raise Unsupported(
+                "kda", None, f"a {caches[0].dtype} conv state (this kernel reads BF16)"
+            )
         for key, (pitch, mode) in self.policies.items():
             requests, tokens = key if isinstance(key, tuple) else (key, 1)
             batch, meta = requests * tokens, dict(device="meta")

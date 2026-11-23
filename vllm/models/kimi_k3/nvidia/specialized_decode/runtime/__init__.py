@@ -262,6 +262,14 @@ def unsupported(vllm_config) -> str | None:
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None and kda_dtypes(vllm_config)[0] != torch.bfloat16 and not sp:
+        # The TP8 / TP16 KDA kernels (heads, wide / loop / feed verify) read the
+        # conv window as BF16: an FP32 conv state runs only on the SP topology's
+        # record cores (test_specialized_decode_kda_conv_fp32_gpu).
+        reason = (
+            "an FP32 KDA conv state outside TP4 = DCP4 sequence parallelism (the "
+            "TP8 / TP16 KDA kernels take a BF16 conv state)"
+        )
     if (
         reason is None
         and dsa
