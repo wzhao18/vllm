@@ -221,160 +221,7 @@ struct V2Sm {
   uint32_t* s_u;
   unsigned long long* pref;
   long long* dbg;
-  // cluster row body (topk_v2_redo_kernel): cn CTAs per row; rank 0 runs the row and
-  // posts its full passes in desc, ranks 1.. take a share of every posted pass
-  int cn = 1;
-  int* desc = nullptr;
 };
-
-// ---- cluster passes: the full-row passes of the complete body split over the CTAs of a
-// cluster. Every CTA walks its share of the row's groups and adds into the row CTA's
-// shared histograms (distributed shared memory atomics): integer counts, so the totals
-// are the same bits whatever the split or the order.
-enum V2PassOp : int {
-  kV2PExit = 0, kV2PCoarse = 1, kV2PWin = 2, kV2PRadKey = 3, kV2PTie = 4,
-  kV2PGt = 5,      // keys above tau (a0) -> the row CTA's s_gt
-  kV2PWrite = 6,   // chunk [a2, a2 + a3) bitmaps: keys above tau a0 / ties at a0
-  kV2PWrite3 = 7,  // as kV2PWrite, ties only with gid <= a1 (tier 3)
-};
-struct V2Pass {
-  int op, row, ga, gb, a0, a1, a2, a3;
-};
-constexpr int kV2DescWords = 8;
-constexpr int kV2Cluster = 8;  // CTAs per row in the redo kernel (portable cluster size)
-// passes over fewer groups run in the row CTA alone (two cluster barriers and the
-// helpers' flush cost more than they save on a short walk)
-constexpr int kV2ClusterMinGroups = 2048;
-
-// group g of row `row` (positions [8 g - sh, + 8)): the same values as v2_row's load_group
-struct V2RowView {
-  const uint16_t* lrow;
-  int L, sh, ng, g_lo, g_hi;
-  __device__ __forceinline__ V2RowView(const uint16_t* lr, int l, int s, int n, int lo, int hi)
-      : lrow(lr), L(l), sh(s), ng(n), g_lo(lo), g_hi(hi) {}
-  __device__ __forceinline__ V2RowView(const V2Params& p, int row) {
-    lrow = p.logits + (int64_t)row * p.lstride;
-    const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
-    const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
-    L = p.local_len[row];
-    const int head = min(L, head0);
-    sh = (8 - head) & 7;
-    ng = (L + sh + 7) >> 3;
-    g_lo = sh ? 1 : 0;
-    g_hi = (L + sh) >> 3;
-  }
-  __device__ __forceinline__ uint4 load(int g) const {
-    if (g >= g_lo && g < g_hi) return __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g);
-    if (g < 0 || g >= ng) return make_uint4(~0u, ~0u, ~0u, ~0u);
-    uint32_t w[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int a = 8 * g - sh + 2 * j, b = a + 1;
-      const uint32_t lo16 = (a >= 0 && a < L) ? lrow[a] : 0xFFFFu;
-      const uint32_t hi16 = (b >= 0 && b < L) ? lrow[b] : 0xFFFFu;
-      w[j] = lo16 | (hi16 << 16);
-    }
-    return make_uint4(w[0], w[1], w[2], w[3]);
-  }
-};
-
-// This CTA's share (cluster rank cr of cn) of pass d: groups ga + cr * blockDim + tid,
-// step cn * blockDim (cn = 1: for_keys' walk). hist / win: the row CTA's buffers.
-template <int OP>
-__device__ __forceinline__ void v2_pass_share_t(const V2Params& p, const V2Pass d, const V2RowView& v,
-                                                 uint32_t* hist, uint32_t* win, uint32_t* gt, int cr,
-                                                 int cn) {
-  const int IL = p.interleave, W = p.W;
-  const int nt = (int)blockDim.x;
-  auto gid_at = [&](int pos) -> uint32_t {
-    return (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL);
-  };
-  if constexpr (OP == kV2PGt) {
-    uint32_t c = 0;
-    for (int g = d.ga + cr * nt + (int)threadIdx.x; g < d.gb; g += cn * nt) {
-      const uint4 r = v.load(g);
-      if ((int)max_key_bound(r) <= d.a0) continue;
-      const Keys8 k8(r);
-#pragma unroll 1
-      for (int j = 0; j < 8; ++j) c += (int)k8.key(j) > d.a0;
-    }
-    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-    if ((threadIdx.x & 31) == 0 && c) atomicAdd(gt, c);
-    return;
-  }
-  if constexpr (OP == kV2PWrite || OP == kV2PWrite3) {
-    const int tau = d.a0, gs = d.a1, c0 = d.a2, n = d.a3;
-    uint32_t* bmg = hist;
-    uint32_t* bme = hist + kV2Chunk / 32;
-    for (int g = d.ga + cr * nt + (int)threadIdx.x; g < d.gb; g += cn * nt) {
-      const uint4 r = v.load(g);
-      if ((int)max_key_bound(r) < tau) continue;
-      const int pg = 8 * g - v.sh;
-      const int i0 = pg - c0;
-      const Keys8 k8(r);
-      uint32_t mg = 0, me = 0;
-#pragma unroll 1
-      for (int j = 0; j < 8; ++j) {
-        if (i0 + j < 0 || i0 + j >= n) continue;
-        const int k = (int)k8.key(j);
-        if (k > tau) mg |= 1u << j;
-        else if (k == tau && tau != 0 && (OP != kV2PWrite3 || (int)gid_at(pg + j) <= gs))
-          me |= 1u << j;
-      }
-      if (i0 >= 0) {
-        if (mg) or_bits8(bmg, i0, mg);
-        if (me) or_bits8(bme, i0, me);
-      } else {
-        for (int j = -i0; j < 8; ++j) {
-          if ((mg >> j) & 1u) atomicOr(&bmg[(i0 + j) >> 5], 1u << ((i0 + j) & 31));
-          if ((me >> j) & 1u) atomicOr(&bme[(i0 + j) >> 5], 1u << ((i0 + j) & 31));
-        }
-      }
-    }
-    return;
-  }
-  for (int g = d.ga + cr * nt + (int)threadIdx.x; g < d.gb; g += cn * nt) {
-    const uint4 r = v.load(g);
-    const int i0 = 8 * g - v.sh;
-    if constexpr (OP == kV2PWin) {
-      if ((int)max_key_bound(r) < d.a0) continue;
-    }
-    const Keys8 k8(r);
-#pragma unroll 1
-    for (int j = 0; j < 8; ++j) {
-      const uint32_t k = k8.key(j);
-      if (!k) continue;
-      if constexpr (OP == kV2PCoarse) {
-        atomicAdd(&hist[k >> 4], 1u);
-      } else if constexpr (OP == kV2PWin) {
-        const uint32_t u = k - (uint32_t)d.a0;
-        if (u < (uint32_t)kV2Win) atomicAdd(&win[u], 1u);
-      } else if constexpr (OP == kV2PRadKey) {
-        const int rd = d.a0, shb = d.a1;
-        if (rd > 0 && (k >> (shb - 16)) != (uint32_t)d.a2) continue;
-        atomicAdd(&hist[(k >> (shb - 24)) & 0xFFu], 1u);
-      } else {  // kV2PTie: the keys equal to tau by gid >> 8
-        if (k != (uint32_t)d.a0) continue;
-        atomicAdd(&hist[gid_at(i0 + j) >> 8], 1u);
-      }
-    }
-  }
-}
-// one specialized walk per pass type (the op is dispatched once, not per key)
-// (v: the row's view; the row CTA passes its own, a helper builds it from d.row)
-__device__ __noinline__ void v2_pass_share(const V2Params& p, const V2Pass d, const V2RowView v,
-                                           uint32_t* hist, uint32_t* win, uint32_t* gt, int cr, int cn) {
-  switch (d.op) {
-    case kV2PCoarse: v2_pass_share_t<kV2PCoarse>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PWin: v2_pass_share_t<kV2PWin>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PRadKey: v2_pass_share_t<kV2PRadKey>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PTie: v2_pass_share_t<kV2PTie>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PGt: v2_pass_share_t<kV2PGt>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PWrite: v2_pass_share_t<kV2PWrite>(p, d, v, hist, win, gt, cr, cn); break;
-    case kV2PWrite3: v2_pass_share_t<kV2PWrite3>(p, d, v, hist, win, gt, cr, cn); break;
-    default: break;
-  }
-}
 
 // CG rounds for rank-skewed rows (round-1 windows disjoint, or tau outside their common
 // range), out of line so the hot row body keeps its code layout. hi2 = the largest exact
@@ -658,22 +505,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     auto for_keys = [&](int ga, int gb, auto&& fn) {
       for (int g = ga + tid; g < gb; g += kV2T) fn(8 * g - sh, load_group(g));
       __syncthreads();
-    };
-    // a full pass of the complete body, over the cluster's CTAs when the row has a
-    // cluster (every thread must call it; it ends with a CTA / cluster barrier)
-    auto cpass = [&](int op, int a0, int a1, uint32_t a2, int ga = 0, int gb = -1, int a3 = 0) {
-      const V2Pass d{op, row, ga, gb < 0 ? ng : gb, a0, a1, (int)a2, a3};
-      const int pcn = d.gb - d.ga >= kV2ClusterMinGroups ? sm.cn : 1;
-      if (pcn > 1) {
-        if (tid == 0) {
-          sm.desc[0] = d.op; sm.desc[1] = d.row; sm.desc[2] = d.ga; sm.desc[3] = d.gb;
-          sm.desc[4] = d.a0; sm.desc[5] = d.a1; sm.desc[6] = d.a2; sm.desc[7] = d.a3;
-        }
-        cg::this_cluster().sync();
-      }
-      v2_pass_share(p, d, V2RowView(lrow, L, sh, ng, g_lo, g_hi), hist, win, &s_u[4], 0, pcn);
-      if (pcn > 1) cg::this_cluster().sync();
-      else __syncthreads();
     };
     // partial head / tail groups (masked, key by key), loaded while the copy lands
     const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0 && g_hi < kCap;
@@ -1146,18 +977,15 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // the q-th key, the window around it
       for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
       __syncthreads();
-      if constexpr (kFast) {  // the hot body keeps its own walk (code layout)
-        for_keys(0, ng, [&](int, const uint4& r) {
-          const Keys8 k8(r);
+      for_keys(0, ng, [&](int, const uint4& r) {
+          const uint32_t valid = 0xFFu;
+        const Keys8 k8(r);
 #pragma unroll 1
-          for (int j = 0; j < 8; ++j) {
-            const uint32_t k = k8.key(j);
-            if (k) atomicAdd(&hist[k >> 4], 1u);
-          }
-        });
-      } else {
-        cpass(kV2PCoarse, 0, 0, 0u);
-      }
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j);
+          if (((valid >> j) & 1u) && k) atomicAdd(&hist[k >> 4], 1u);
+        }
+      });
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -1181,19 +1009,16 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       if (tid == 0) { s_above = 0; s_lo = lo; }
       __syncthreads();
       if ((tid & 31) == 0 && a) atomicAdd(&s_above, a);
-      if constexpr (kFast) {
-        for_keys(0, ng, [&](int, const uint4& r) {
-          if ((int)max_key_bound(r) < lo) return;
-          const Keys8 k8(r);
+      for_keys(0, ng, [&](int, const uint4& r) {
+          const uint32_t valid = 0xFFu;
+        if ((int)max_key_bound(r) < lo) return;
+        const Keys8 k8(r);
 #pragma unroll 1
-          for (int j = 0; j < 8; ++j) {
-            const uint32_t k = k8.key(j), u = k - (uint32_t)lo;
-            if (k && u < (uint32_t)kV2Win) atomicAdd(&win[u], 1u);
-          }
-        });
-      } else {
-        cpass(kV2PWin, lo, 0, 0u);
-      }
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j), u = k - (uint32_t)lo;
+          if (((valid >> j) & 1u) && k && u < (uint32_t)kV2Win) atomicAdd(&win[u], 1u);
+        }
+      });
       }
     }
     __syncthreads();
@@ -1894,7 +1719,15 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           const uint32_t kt = (uint32_t)(pref >> (24 - shb - 8));
           if (rd == 2) {
             // the one pass: ties at tau by gid >> 8
-            cpass(kV2PTie, (int)kt, 0, 0u);
+            for_keys(0, ng, [&](int i0, const uint4& r) {
+              const Keys8 k8(r);
+#pragma unroll 1
+              for (int j = 0; j < 8; ++j) {
+                const uint32_t k = k8.key(j);
+                if (!k || k != kt) continue;
+                atomicAdd(&hist[gid_of(i0 + j) >> 8], 1u);
+              }
+            });
             // round-2 digit d = 255 - (gid >> 16): the sum of fine bins [g16 * 256, + 256)
             if (tid < 16) {
               uint32_t sum = 0;
@@ -1938,9 +1771,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             atomicAdd(&hist[(c >> shb) & 0xFFu], 1u);
           }
           __syncthreads();  // as for_keys: the histogram is complete before it is sent
-        } else if (rd < 2) {
-          // key rounds (rd 0: key bits 15..8, rd 1: 7..0 under the rd-0 prefix)
-          cpass(kV2PRadKey, rd, shb, (uint32_t)pref);
         } else
         for_keys(0, ng, [&](int i0, const uint4& r) {
           const uint32_t valid = 0xFFu;
@@ -2068,7 +1898,16 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
         if ((tid & 31) == 0 && a) atomicAdd(&s_gt, a);
       } else {
-        cpass(kV2PGt, tau, 0, 0u);  // keys above tau, into s_gt (zeroed above)
+        uint32_t c = 0;
+        for_keys(0, ng, [&](int, const uint4& r) {
+          const uint32_t valid = 0xFFu;
+          if ((int)max_key_bound(r) <= tau) return;
+          const Keys8 k8(r);
+#pragma unroll 1
+          for (int j = 0; j < 8; ++j) c += ((valid >> j) & 1u) && (int)k8.key(j) > tau;
+        });
+        for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        if ((tid & 31) == 0 && c) atomicAdd(&s_gt, c);
       }
       __syncthreads();
       const int gtt = (int)s_gt;
@@ -2091,9 +1930,29 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             else if (k == tau) atomicOr(&bme[i >> 5], 1u << (i & 31));
           }
         } else {
-          // chunk bitmaps (the group walk, split over the cluster's CTAs)
-          cpass(tier == 3 ? kV2PWrite3 : kV2PWrite, tau, gs, (uint32_t)c0,
-                max(0, (c0 + sh) >> 3), min(ng, (c0 + n + sh + 7) >> 3), n);
+          for_keys(max(0, (c0 + sh) >> 3), min(ng, (c0 + n + sh + 7) >> 3), [&](int pg, const uint4& r) {
+            if ((int)max_key_bound(r) < tau) return;
+            const int i0 = pg - c0;  // chunk-relative position of the group's first key
+            const Keys8 k8(r);
+            uint32_t mg = 0, me = 0;
+#pragma unroll 1
+            for (int j = 0; j < 8; ++j) {
+              if (i0 + j < 0 || i0 + j >= n) continue;
+              const int k = (int)k8.key(j);
+              if (k > tau) mg |= 1u << j;
+              else if (k == tau && tau != 0 && (tier != 3 || (int)gid_of(pg + j) <= gs))
+                me |= 1u << j;
+            }
+            if (i0 >= 0) {
+              if (mg) or_bits8(bmg, i0, mg);
+              if (me) or_bits8(bme, i0, me);
+            } else {
+              for (int j = -i0; j < 8; ++j) {
+                if ((mg >> j) & 1u) atomicOr(&bmg[(i0 + j) >> 5], 1u << ((i0 + j) & 31));
+                if ((me >> j) & 1u) atomicOr(&bme[(i0 + j) >> 5], 1u << ((i0 + j) & 31));
+              }
+            }
+          });
         }
         __syncthreads();
         V2DBG(23);
@@ -2183,73 +2042,14 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params 
 // exchanged words), with the complete body at the next epoch; CTAs without one exit.
 // A small grid (kV2RedoCtas): row r goes to CTA r % grid on every rank, so a CTA's rows
 // run in the same order everywhere; the flags of a CTA's rows are read at once.
-// Launched with clusters (kV2Cluster CTAs per cluster when the shape allows): cluster c
-// takes the rows of slot c; its rank-0 CTA runs each row and rank 1.. take a share of
-// the row's full passes (cpass); the rows, their order and every exchanged word are the
-// single-CTA ones.
 __global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(kV2T)
-  __shared__ int s_desc[kV2DescWords];
-  cg::cluster_group cl = cg::this_cluster();
-  const int cn = (int)cl.num_blocks(), cr = (int)cl.block_rank();
-  const int cid = (int)blockIdx.x / cn, ncl = (int)gridDim.x / cn;
   int any = 0;
-  for (int row = cid + threadIdx.x * ncl; row < p.T; row += kV2T * ncl) any |= p.redo[row];
-  if (!__syncthreads_or(any)) return;  // the same on every CTA of the cluster
-  if (cr != 0) {
-    // a helper: one share of every pass its row CTA posts, until the exit post
-    const int* ld = cl.map_shared_rank(s_desc, 0);
-    uint32_t* lh = cl.map_shared_rank(hist, 0);
-    uint32_t* lw = cl.map_shared_rank(
-        reinterpret_cast<uint32_t*>(srow) + kV2RxW + kV2Cand + kV2Msg, 0);
-    uint32_t* lgt = cl.map_shared_rank(&s_u[4], 0);
-    // a helper's share goes into its own shared buffers (fast local atomics; an all-tie
-    // row sends every key to one bin, and remote atomics to one address serialize), then
-    // the non-zero words are added (counts) or OR'd (bitmaps) into the row CTA's
-    uint32_t* const mw = reinterpret_cast<uint32_t*>(srow) + kV2RxW + kV2Cand + kV2Msg;
-    while (true) {
-      cl.sync();
-      const V2Pass d{ld[0], ld[1], ld[2], ld[3], ld[4], ld[5], ld[6], ld[7]};
-      if (d.op == kV2PExit) break;
-      const bool bits = d.op == kV2PWrite || d.op == kV2PWrite3;
-      const int nh = d.op == kV2PWin || d.op == kV2PGt ? 0
-                     : d.op == kV2PRadKey            ? 256
-                     : bits                          ? 2 * (kV2Chunk / 32)
-                                                     : kCoarseBins;
-      for (int i = threadIdx.x; i < nh; i += kV2T) hist[i] = 0;
-      if (d.op == kV2PWin)
-        for (int i = threadIdx.x; i < kV2Win; i += kV2T) mw[i] = 0;
-      if (threadIdx.x == 0) s_u[4] = 0;
-      __syncthreads();
-      v2_pass_share(p, d, V2RowView(p, d.row), hist, mw, &s_u[4], cr, cn);
-      __syncthreads();
-      for (int i = threadIdx.x; i < nh; i += kV2T) {
-        const uint32_t v = hist[i];
-        if (v) {
-          if (bits) atomicOr(&lh[i], v);
-          else atomicAdd(&lh[i], v);
-        }
-      }
-      if (d.op == kV2PWin)
-        for (int i = threadIdx.x; i < kV2Win; i += kV2T)
-          if (mw[i]) atomicAdd(&lw[i], mw[i]);
-      if (d.op == kV2PGt && threadIdx.x == 0 && s_u[4]) atomicAdd(lgt, s_u[4]);
-      cl.sync();
-    }
-    cl.sync();  // the row CTA's shared memory stays until every helper has read the exit
-    return;
-  }
-  V2Sm smc = sm;
-  smc.cn = cn;
-  smc.desc = s_desc;
-  for (int row = cid; row < p.T; row += ncl) {
+  for (int row = blockIdx.x + threadIdx.x * gridDim.x; row < p.T; row += kV2T * gridDim.x) any |= p.redo[row];
+  if (!__syncthreads_or(any)) return;
+  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = p.redo[row];
-    if (r) v2_row<false, kV2T>(p, smc, row, r == 510 ? 0 : r, bar_phase);
-  }
-  if (cn > 1) {
-    if (threadIdx.x == 0) s_desc[0] = kV2PExit;
-    cl.sync();
-    cl.sync();
+    if (r) v2_row<false, kV2T>(p, sm, row, r == 510 ? 0 : r, bar_phase);
   }
 }
 

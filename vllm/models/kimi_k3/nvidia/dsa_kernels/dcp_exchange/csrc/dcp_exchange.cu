@@ -3325,39 +3325,8 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
     return;
   }
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
-  // the wide variant leaves those rows to the redo kernel (most CTAs exit after the PDL
-  // wait). Per shape: a cluster of kV2Cluster CTAs per row slot when that many clusters
-  // are co-resident (the row's full passes split over them), else one CTA per slot.
-  const int slots = std::min(T, kV2RedoCtas);
-  static int redo_cn = 0;
-  if (!redo_cn) {
-    cudaLaunchConfig_t q = {};
-    q.gridDim = dim3((unsigned)(kV2RedoCtas * kV2Cluster), 1, 1);
-    q.blockDim = dim3(kV2T, 1, 1);
-    q.dynamicSmemBytes = kV2Dyn;
-    cudaLaunchAttribute qa[1];
-    qa[0].id = cudaLaunchAttributeClusterDimension;
-    qa[0].val.clusterDim.x = kV2Cluster;
-    qa[0].val.clusterDim.y = 1;
-    qa[0].val.clusterDim.z = 1;
-    q.attrs = qa;
-    q.numAttrs = 1;
-    int nc = 0;
-    if (cudaOccupancyMaxActiveClusters(&nc, (void*)topk_v2_redo_kernel, &q) != cudaSuccess) {
-      (void)cudaGetLastError();
-      nc = 0;
-    }
-    redo_cn = nc >= kV2RedoCtas ? kV2Cluster : 1;
-  }
-  cudaLaunchAttribute rattr[2];
-  rattr[0] = attr[0];
-  rattr[1].id = cudaLaunchAttributeClusterDimension;
-  rattr[1].val.clusterDim.x = (unsigned)redo_cn;
-  rattr[1].val.clusterDim.y = 1;
-  rattr[1].val.clusterDim.z = 1;
-  cfg.attrs = rattr;
-  cfg.numAttrs = 2;
-  cfg.gridDim = dim3((unsigned)(slots * redo_cn), 1, 1);
+  // the wide variant leaves those rows to the redo kernel (most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
   cfg.blockDim = dim3(kV2T, 1, 1);
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
