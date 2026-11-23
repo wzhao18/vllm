@@ -699,6 +699,19 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return next(iter(layouts), None)
 
     @classmethod
+    def get_reserved_device_memory(
+        cls, vllm_config: "VllmConfig", kv_cache_spec: dict[str, Any]
+    ) -> int:
+        """The sum of the wrapped connectors' reservations."""
+        assert vllm_config.kv_transfer_config is not None
+        return sum(
+            connector_cls.get_reserved_device_memory(temp_config, kv_cache_spec)
+            for connector_cls, temp_config in cls._get_connector_classes_and_configs(
+                vllm_config
+            )
+        )
+
+    @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
     ) -> KVConnectorStats | None:
