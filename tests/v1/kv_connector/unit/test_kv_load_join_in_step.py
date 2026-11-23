@@ -736,5 +736,11 @@ def test_worker_writes_a_per_step_join_record(monkeypatch, tmp_path):
     records = [json.loads(line) for line in path.read_text().splitlines()]
     jobs = [r for r in records if r[0] == "J"]
     assert [r[1] for r in jobs] == [7, 8]
+    # (PCRIT v124) The iterlog clock anchors ("A", perf_counter, wall) are
+    # written at open and close (and every 30 s): t_bind is perf_counter, so
+    # J joins the engine's S records by time, not only by step_seq.
+    anchors = [r for r in records if r[0] == "A"]
+    assert records[0][0] == "H" and len(anchors) >= 2
+    assert anchors[0][1] <= jobs[0][2] <= anchors[-1][1]
     assert jobs[0][3:] == [0.0, 0, 0]
     assert jobs[1][3] >= 0.009 and jobs[1][4:] == [1, 1]
