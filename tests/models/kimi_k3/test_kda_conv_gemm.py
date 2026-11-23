@@ -118,6 +118,8 @@ def test_kda_conv_gemm_old_column_pass():
         (1024, 1024, 16384),  # 3 cluster columns: swizzle 4 -> 3 (was an IMA)
         (3072, 1024, 16384),  # 9 cluster columns: swizzle 4 -> 3 (was an IMA)
         (6144, 7168, 8192),  # 18 cluster columns: swizzle 4 -> 3 (TP2 plane)
+        (3072, 7168, 16384),  # TP4 plane (DSA-DP PE): 9 columns, swizzle 3
+        (1536, 7168, 8192),  # TP8 plane (TP8+DCP8 PA): SHAPE_TACTICS[4608]
     ],
 )
 def test_kda_conv_gemm_deployed_tactic_shapes(part, k, m):
@@ -127,9 +129,53 @@ def test_kda_conv_gemm_deployed_tactic_shapes(part, k, m):
     epilogue's unbounded stores of the padded tiles wrote past the planes
     (illegal address at P=1024 K=1024 M=16384). shape_tactic fits the swizzle
     to the shape; output and conv state stay bitwise equal to stock."""
-    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        tactic_for,
+    )
 
-    _run([m // 3, m // 3, m - 2 * (m // 3)], m, tactic=TACTIC, part=part, k=k)
+    tactic = tactic_for(3 * part)
+    _run([m // 3, m // 3, m - 2 * (m // 3)], m, tactic=tactic, part=part, k=k)
+
+
+@pytest.mark.parametrize(
+    "seqlens,offsets,m",
+    [
+        ([2000, 3, 4100, 1], [0, 2, 2048, 1], 8192),
+    ],
+)
+def test_kda_conv_gemm_tp8_checkpoint_fixups(seqlens, offsets, m):
+    """TP8 plane (P 1536) with the per-shape tactic: block / sequence fix-ups
+    (short sequences, initial state on odd sequences) and checkpoint rows,
+    bitwise vs in_proj + qkv_conv."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        tactic_for,
+    )
+
+    _run_checkpoint(seqlens, offsets, m, tactic=tactic_for(3 * 1536), seed=5,
+              part=1536, k=7168)  # fmt: skip
+
+
+def test_tactic_for_shapes():
+    """Every deployed q|k|v width has a tactic whose clusters tile it: TP1
+    36864, TP2 18432, TP4 9216 (TACTIC) and TP8 4608 (SHAPE_TACTICS)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        TACTIC,
+        tactic_for,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        shape_tactic,
+    )
+
+    for n in (36864, 18432, 9216):
+        assert tactic_for(n) is TACTIC
+        shape_tactic(n, tactic_for(n))
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        SHAPE_TACTICS,
+    )
+
+    assert shape_tactic(4608, tactic_for(4608)) == SHAPE_TACTICS[4608]
+    with pytest.raises(ValueError):
+        shape_tactic(4608, TACTIC)
 
 
 def test_shape_tactic():
@@ -381,3 +427,61 @@ def test_kda_conv_gemm_checkpoint_prod_tactic():
 
     _run_checkpoint([2000, 1000, 5000, 192, 8000], [1984, 1000, 4096, 176, 7680],
                     16384, tactic=TACTIC, seed=7, part=12288, k=7168)  # fmt: skip
+
+
+def _fake_layer(part):
+    from types import SimpleNamespace
+
+    lin = SimpleNamespace(
+        weight=SimpleNamespace(data=torch.empty(4 * part, 7168)),
+        input_size_per_partition=7168,
+    )
+    conv = SimpleNamespace(weight=torch.empty(3 * part, 1, 4, dtype=torch.float32))
+    return SimpleNamespace(
+        in_proj_qkvgfab=lin, conv1d=conv, local_projection_size=part
+    )
+
+
+def test_missing_tactic_raises(monkeypatch):
+    """A supported layer whose q|k|v width no tactic tiles raises at load
+    (missing SHAPE_TACTICS entry), never silently keeps the stock conv; the
+    deployed widths pass."""
+    from vllm.models.kimi_k3.nvidia import mxfp8
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda c: True)
+    monkeypatch.setattr(mxfp8, "is_mxfp8_linear", lambda lin: True)
+    monkeypatch.setattr(mxfp8, "_kernel_layout", lambda lin: "nk")
+    for part in (12288, 6144, 3072, 1536):
+        assert kda_conv_in_proj.unsupported_reason(_fake_layer(part)) is None
+    with pytest.raises(ValueError, match="SHAPE_TACTICS"):
+        kda_conv_in_proj.unsupported_reason(_fake_layer(768))  # TP16 width 2304
+
+
+@pytest.mark.parametrize(
+    "decodes,spec,prefills", [(1, 0, 3), (0, 2, 3), (0, 0, 0)]
+)
+def test_fused_in_proj_declines_mixed_batches(monkeypatch, decodes, spec, prefills):
+    """kv_both prefill workers also serve mixed steps (aggregated + store): a
+    step with decode or spec-verify rows (or no prefill) keeps the stock
+    in_proj + conv, whatever its row count."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+
+    md = SimpleNamespace(
+        num_prefills=prefills, num_decodes=decodes, num_spec_decodes=spec
+    )
+    monkeypatch.setattr(
+        kda_conv_in_proj,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer.kda": md}),
+    )
+    conv = kda_conv_in_proj.PrefillKdaConvInProj.__new__(
+        kda_conv_in_proj.PrefillKdaConvInProj
+    )
+    conv.layer = SimpleNamespace(prefix="layer.kda")
+    conv._gemm = object()  # never reached
+    qa = SimpleNamespace(data=torch.empty(kda_conv_in_proj.MIN_ROWS * 4, 8))
+    assert conv.fused(qa) is None

@@ -835,7 +835,8 @@ class KimiK3MegaMoEExperts(nn.Module):
 
     def enable_fused_shared(self, hidden: int, intermediate: int) -> bool:
         """Switch this layer's wide-EP decode bucket (``RUBIN_WIDE_EP_DECODE_TOKENS``
-        tokens per rank, the D3-32 SP shard) to the refreshed GenPhase kernel with an
+        tokens per rank, the D3-32 SP shard; added below a larger GenPhase bucket,
+        the EP16 SP decode shard) to the refreshed GenPhase kernel with an
         MXFP8 E4M3 shared expert of ``(hidden, intermediate)`` fused in (its FC1 tiles
         run under the dispatch; the side-stream shared expert then has nothing left
         to overlap). Per-shape: larger buckets keep their kernel. Returns whether a
@@ -843,6 +844,29 @@ class KimiK3MegaMoEExperts(nn.Module):
         the runtime); then :meth:`warmup_fused_shared` before CUDA graph capture."""
         if self.prefill_worker:
             return False
+        first = self.buckets[0]
+        if (
+            first.variant == "genphase"
+            and first.max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS
+            and self.problem.quant_kind == "nvfp4"
+        ):
+            # A GenPhase server sized above the fused bucket (EP16 SP decode: shards
+            # of 192 / 242 tokens per rank) adds it: steps of at most
+            # RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank run the fused shared
+            # expert, larger ones keep the GenPhase bucket and the side-stream
+            # shared expert. Same kernel family and math; one more bucket (arena,
+            # workspace) in the runtime built for the fused buckets.
+            self.buckets = (
+                dataclasses.replace(first, max_tokens=RUBIN_WIDE_EP_DECODE_TOKENS),
+                *self.buckets,
+            )
+            logger.info_once(
+                "Rubin MegaMoE: EP%d GenPhase decode adds the %d-token fused-shared "
+                "bucket below its %d bucket.",
+                self.ep_size,
+                RUBIN_WIDE_EP_DECODE_TOKENS,
+                first.max_tokens,
+            )
         switched = False
         buckets = []
         for bucket in self.buckets:
@@ -861,6 +885,11 @@ class KimiK3MegaMoEExperts(nn.Module):
             buckets.append(bucket)
         self.buckets = tuple(buckets)
         self.bucket = self.buckets[-1]
+        for bucket in self.buckets:  # the kernel's admission rules (raises)
+            if bucket.shared is not None:
+                RubinMoeConfig.make(
+                    self.problem, bucket, rank=0, world_size=self.ep_size
+                )
         return switched
 
     def fused_shared(self, num_tokens: int) -> bool:

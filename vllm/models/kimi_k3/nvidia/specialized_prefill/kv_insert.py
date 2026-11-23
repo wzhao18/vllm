@@ -52,6 +52,36 @@ def _mla_fp8_insert_kernel(
     )
 
 
+def prefill_dcp_supported(
+    vllm_config, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: int
+) -> bool:
+    """Whether a FLASHINFER_MLA_SPARSE layer whose prefill MQA runs off the
+    specialized prefill sparse MLA (DCP > 1 or ShardQ: TP8+DCP8) still writes
+    its MLA KV rows here: a P/D prefill worker (KV producer) on Rubin (sm_107)
+    with the per-tensor FP8 cache and D 512 + 64. The rows are DCP-local slot
+    maps; ``insert`` skips slots < 0 (tokens another DCP rank owns), as
+    ``concat_and_cache_mla`` does."""
+    from vllm.platforms import current_platform
+
+    kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+    on = (
+        kv_transfer is not None
+        and bool(kv_transfer.is_kv_producer)
+        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        and (kv_lora_rank, rope_dim) == (512, 64)
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(107)
+    )
+    if on:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "Kimi K3.1: DCP / ShardQ prefill MLA layers write the FP8 KV cache "
+            "with the specialized insert."
+        )
+    return on
+
+
 def applicable(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
