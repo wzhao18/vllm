@@ -84,11 +84,11 @@ K = 128
 # the recurrence's dot products. KdaFlow's largest item build (flow.ITEM_BUILDS 24)
 # serves up to 212 requests at 24 heads on VR200's 212 SMs; above (213+
 # requests per DP group: rows up to 1020) KdaWide. A build whose shared memory does
-# not fit raises at make_core (no fallback). q5..q8 switch to KdaFlow from n17: there
-# KdaWide (2 x 212 CTAs) needs a second wave (24 x 17 items > 424 CTAs), a step of
-# ~+20 us per layer at q8 (n16 22.9 -> n24 42.9 us; DCRIT r122: +2.7 ms per DC k5 / k7
-# step from n16 to n20 per DP rank).
-_WIDE_Q = "1-2:split,3-16:wide,17-212:flow,213-:wide"
+# not fit raises at make_core (no fallback). q5..q8 run KdaFlow from n12: it beats
+# KdaWide at every measured n >= 12 (q8 n12 13.9 vs 21.7, n16 14.5 vs 22.9 us per
+# layer; Rhea 2026-11-22), and KdaWide steps at its second CTA wave above n16 (DCRIT
+# r122: +2.7 ms per DC k5 / k7 step). Below n12 not yet measured: KdaWide as before.
+_WIDE_Q = "1-2:split,3-11:wide,12-212:flow,213-:wide"
 RECORD_KINDS = {
     24: {
         "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
