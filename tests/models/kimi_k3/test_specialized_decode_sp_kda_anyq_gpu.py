@@ -40,8 +40,8 @@ def verify_length(monkeypatch, request):
 @pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
 def test_record_kind_per_q(verify_length):
     q = verify_length
-    # q5..q8 run KdaFlow from n18 (KdaWide's second CTA wave), q2..q4 from n21.
-    first = 18 if q > 4 else 21
+    # q4..q8 run KdaFlow from n18 (KdaWide's second CTA wave), q2 / q3 from n21.
+    first = 18 if q > 3 else 21
     assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, first - 1, first, 128, 212, 213)] == [
         "split", "split", "wide", "wide", "flow", "flow", "flow", "wide",
     ]  # fmt: skip
