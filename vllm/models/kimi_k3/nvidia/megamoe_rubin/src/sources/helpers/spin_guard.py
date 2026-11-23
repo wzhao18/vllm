@@ -13,13 +13,11 @@ computes (the waits read the same words in the same order).
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
-
-from vllm.models.kimi_k3.nvidia.guard_global import read_global_u64
 from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
 
 # 15 min: far above any legitimate wait (peers compiling or loading before their first
 # launch take minutes at most), far below a forever-hang.
-SPIN_GUARD_NS = 900 * 1000 * 1000 * 1000  # built-in default; runtime bound: guard_config.py (int64.3)
+SPIN_GUARD_NS = 900 * 1000 * 1000 * 1000
 
 
 @dsl_user_op
@@ -187,7 +185,7 @@ def _record_header(base: Int64, site: int, call: Int32, observed: Int32, target:
 def spin_guard(start_ns: cutlass.Uint64, site: int, word, target: Int32, print_flag=None, record=None) -> None:
     """Trap with a diagnostic once a spin on the Int32 ``word`` (a pointer) that started
     at ``start_ns`` exceeds ``SPIN_GUARD_NS``; ``site`` is a constant id of the wait."""
-    if globaltimer_ns() - start_ns > read_global_u64("k31_megamoe_guard_ns", SPIN_GUARD_NS):
+    if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
             observed = cute.arch.load(word, Int32, sem="relaxed", scope="sys")
             base = _record_open(record, 1)
@@ -208,7 +206,7 @@ def spin_guard_value(
 ) -> None:
     """``spin_guard`` for waits whose condition is not one Int32 word (flag sets, 64-bit tokens, polled
     planes): the caller passes the observed and target values it compares (or a count of what is missing)."""
-    if globaltimer_ns() - start_ns > read_global_u64("k31_megamoe_guard_ns", SPIN_GUARD_NS):
+    if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
             base = _record_open(record, 1)
             if base != Int64(0):
@@ -267,7 +265,7 @@ def spin_guard_ranks(
     """``spin_guard`` for a wait on one arrival per rank: on timeout, besides the count, print one line per
     rank whose bit is missing in ``arrived_mask`` (Int32 pointer, local) with its progress words read
     remotely (``progress``: this rank's local [issued, entered] pointer; the peer mapper gives the peer's)."""
-    if globaltimer_ns() - start_ns > read_global_u64("k31_megamoe_guard_ns", SPIN_GUARD_NS):
+    if globaltimer_ns() - start_ns > cutlass.Uint64(SPIN_GUARD_NS):
         if _elect_printer(site, print_flag):
             mask = cute.arch.load(arrived_mask, Int32, sem="relaxed", scope="sys")
             observed = cute.arch.load(word, Int32, sem="relaxed", scope="sys")

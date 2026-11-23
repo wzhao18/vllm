@@ -56,8 +56,6 @@ import sys
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32, Uint64
-
-from vllm.models.kimi_k3.nvidia.guard_global import read_global_u64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -65,7 +63,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 # far below a forever-hang, and below MegaMoE's 15 min guard so a stuck non-MegaMoE wait
 # reports on its own rank before healthy peers trap in MegaMoE (tests/models/kimi_k3/
 # test_k31_spin_guard_order.py). Shorter only on never-merge stall-test overlays.
-SPIN_GUARD_NS = 600 * 1000 * 1000 * 1000  # built-in default; runtime bound: guard_config.py (int64.3)
+SPIN_GUARD_NS = 600 * 1000 * 1000 * 1000
 SPIN_POLLS = 1024  # failed polls before the first clock read
 SPIN_FLUSH_NS = 1000 * 1000 * 1000  # print -> trap delay (lets every line land)
 
@@ -194,7 +192,7 @@ def _tick(n, t0, kernel: cutlass.Constexpr[str], site: cutlass.Constexpr[str], o
         # count (~430 s of 100 ns polls) must not restart it
         if t0 == Uint64(0):
             t0 = t
-        elif t - t0 > read_global_u64("k31_guard_ns", SPIN_GUARD_NS):
+        elif t - t0 > Uint64(SPIN_GUARD_NS):
             _timeout(kernel, site, observed, target, rank, size)
     return n, t0
 

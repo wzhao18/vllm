@@ -1029,7 +1029,7 @@ class _Deferred:
 
     def _resolve(self) -> Any:
         if self._obj is None:
-            self._obj = _patch_guards(_await(*self._job))
+            self._obj = _await(*self._job)
             self._job = None
         return self._obj
 
@@ -1343,21 +1343,7 @@ class _CachedCompile:
     def __call__(self, fn, *args, **kwargs):
         if not _is_k3_kernel(fn) or "trace_finalize_hooks" in kwargs:
             return self._inner(fn, *args, **kwargs)
-        compiled = _compile(self._inner, fn, args, kwargs)
-        return compiled if isinstance(compiled, _Deferred) else _patch_guards(compiled)
-
-
-def _patch_guards(compiled):
-    """Runtime spin-guard bounds (guard_patch.py): written into the kernel's module globals after every compile or
-    load, outside the trace, so a retune never re-keys the cache. A failure leaves the fixed initializer in place
-    (600 s / 900 s: the guard order still holds) and is logged."""
-    try:
-        from vllm.models.kimi_k3.nvidia import guard_patch
-
-        guard_patch.patch_compiled(compiled)
-    except Exception as e:  # noqa: BLE001 - diagnostics must not break a kernel load
-        logger.error("Kimi K3 CuTe cache: runtime spin-guard patch failed (%s): kernel keeps its built-in bound", e)
-    return compiled
+        return _compile(self._inner, fn, args, kwargs)
 
 
 def _is_k3_kernel(fn: Any) -> bool:
