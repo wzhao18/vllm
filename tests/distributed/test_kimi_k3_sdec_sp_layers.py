@@ -1868,15 +1868,15 @@ def _any_q_rows(q: int) -> tuple[int, ...]:
     return tuple(sorted(r for r in picks if r <= top))
 
 
-@pytest.mark.parametrize("q", [2, 3, 6, 8], ids=lambda q: f"q{q}")
+@pytest.mark.parametrize("q", [2, 3, 5, 6, 8], ids=lambda q: f"q{q}")
 def test_sp_dsa_block_any_q(q):
-    """The DSA A/B (MXFP4 indexer, DcpExchange, as deployed) at DSpark q2 / q3 / q6 /
-    q8 (k1 / k2 / k5 / k7) on aligned rows."""
+    """The DSA A/B (MXFP4 indexer, DcpExchange, as deployed) at DSpark q2 / q3 / q5 / q6 /
+    q8 (k1 / k2 / k4 / k5 / k7) on aligned rows."""
     pytest.importorskip("cutlass")
     _launch("dsa", "mxfp4", "exchange", _any_q_rows(q), False, q=q)
 
 
-@pytest.mark.parametrize("q", [2, 3, 6, 8], ids=lambda q: f"q{q}")
+@pytest.mark.parametrize("q", [2, 3, 5, 6, 8], ids=lambda q: f"q{q}")
 def test_sp_kda_block_any_q(q):
     """The KDA A/B (RecoverSSM records, two steps with partial acceptance) at q2 / q3
     / q6 / q8 on aligned rows: KdaFlow (q2 / q4) or KdaWide (q3, q5..q8) from n21."""
