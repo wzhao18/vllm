@@ -164,8 +164,7 @@ def test_c512_on_kimi_k3_mega_moe_is_the_sp_topology():
     [
         (4, 4, False, "deep_gemm_mega_moe"),  # TP4 without EP: no SP
         (4, 4, True, "deep_gemm"),  # SP needs MegaMoE
-        (4, 2, True, "deep_gemm_mega_moe"),  # DCP != TP
-        (4, 1, True, "deep_gemm_mega_moe"),
+        (4, 2, True, "deep_gemm_mega_moe"),  # DCP != TP (DCP1: DSA-DP, below)
         (8, 8, True, "deep_gemm_mega_moe"),  # other TP sizes keep EP refused
         (16, 16, True, "deep_gemm_mega_moe"),
     ],
@@ -177,6 +176,93 @@ def test_other_topologies_are_not_sp(tp, dcp, ep, backend):
     config = deployment(tp=tp, dcp=dcp, ep=ep, **backend)
     assert not sp_topology(config)
     assert unsupported(config) is not None
+
+
+# DSA-DP ("DSA DP, GEMM TP"): TP4 at DCP1 over the same EP MegaMoE, the DSA layers
+# data-parallel inside the TP group (ops/dsa_dp.py) on the stock owner segment.
+DD_ROWS = tuple(range(16, 385, 16))  # q4 x TP4 requests per rank, max_num_seqs 96
+
+
+def dsa_dp_deployment(**overrides):
+    """DD's decode role: TP4 DCP1 DSA-DP x DP4 EP16, the release GQA drafter, q4
+    graphs every 16 rows up to 384 (max_num_seqs 96)."""
+    config = deployment(
+        dcp=1,
+        **{
+            "compilation_config.cudagraph_capture_sizes": list(DD_ROWS),
+            "compilation_config.max_cudagraph_capture_size": 384,
+            "scheduler_config.max_num_seqs": 96,
+            **overrides,
+        },
+    )
+    config.speculative_config.draft_model_config = SimpleNamespace(
+        architectures=["K3GqaDSparkModel"]
+    )
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.model_config.hf_text_config.is_dsa_layer = lambda i: i % 4 == 3
+    return config
+
+
+def test_dsa_dp_is_the_sp_topology():
+    """TP4 DCP1 with DSA layers is the SP topology's DSA-DP variant: admitted, its
+    decode config carries DSA-DP, DCP1 and rows in whole requests per TP rank."""
+    config = dsa_dp_deployment()
+    assert sp_topology(config) and runtime.dsa_dp_topology(config)
+    assert unsupported(config) is None, unsupported(config)
+    decode = specialized_decode_config(config)
+    assert (decode.sequence_parallel, decode.dsa_dp, decode.dcp, decode.ep) == (
+        True,
+        True,
+        1,
+        16,
+    )
+    assert decode.captured == DD_ROWS
+    # C512 (DCP4) is not DSA-DP
+    assert not specialized_decode_config(deployment()).dsa_dp
+
+
+def test_dsa_dp_rows_round_like_the_runner():
+    """The runner rounds DSA-DP graphs to whole q-token requests per TP rank
+    (``row_multiple``): dd-i56b's 24 rows capture as 32; the sdec rows match."""
+    sizes = [24, 32, 48, 64, 96, 128, 144, 192, 288, 384]
+    config = dsa_dp_deployment(
+        **{"compilation_config.cudagraph_capture_sizes": sizes}
+    )
+    assert unsupported(config) is None, unsupported(config)
+    decode = specialized_decode_config(config)
+    assert decode.captured == (32, 48, 64, 96, 128, 144, 192, 288, 384)
+    assert all(r % 16 == 0 for r in decode.captured)
+
+
+def test_dsa_dp_refusals():
+    """DSA-DP refuses a largest batch without a whole-requests-per-rank graph, the
+    preview drafter and a model without DSA layers, each with its cause."""
+    reason = unsupported(dsa_dp_deployment(**{"scheduler_config.max_num_seqs": 94}))
+    assert reason is not None and "multiples of 16" in reason, reason
+    config = dsa_dp_deployment()
+    config.speculative_config.draft_model_config.architectures = ["K3DSparkModel"]
+    assert "release GQA" in unsupported(config)
+    config = dsa_dp_deployment()
+    config.model_config.hf_text_config.dsa_config = None
+    assert not sp_topology(config)
+    assert unsupported(config) is not None
+
+
+def test_dsa_dp_supported_only_on_the_sdec_dsa_dp_layout(monkeypatch):
+    """ops/dsa_dp.supported: under the specialized decode only on the SP DSA-DP
+    layout (TP8 / TP16 DCP1 keep replicated DSA KV); unchanged without it."""
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    assert dsa_dp.supported(dsa_dp_deployment())
+    tp8 = dsa_dp_deployment()
+    tp8.parallel_config.tensor_parallel_size = 8
+    assert not dsa_dp.supported(tp8)
+    tp8.additional_config = {"decode_backend": "auto"}
+    assert dsa_dp.supported(tp8)
+    c512 = dsa_dp_deployment()
+    c512.parallel_config.decode_context_parallel_size = 4
+    assert not dsa_dp.supported(c512)
 
 
 def test_moe_token_shard_is_not_sp(monkeypatch):

@@ -396,6 +396,7 @@ class SpecializedDecode:
         properties = torch.cuda.get_device_properties(self.device)
         cc = (properties.major, properties.minor)
         self.q, self.dcp = config.q, config.dcp
+        self.dsa_dp = config.dsa_dp  # (sp_attention.SpStep: stock DSA-DP layers)
         self.queries = (config.q,)
         self.captured = config.captured
         # (no tuned / wide TP8 / TP16 batches, step switch or MLA rows here)
