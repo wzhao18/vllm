@@ -257,14 +257,26 @@ def _case_body(config, rank, device, group, front=False):
                 ref_latent, ref_logits, _ = module._maybe_overlap_router_and_down_proj(x)
                 assert logits.dtype == ref_logits.dtype == torch.float32
                 assert latent.dtype == ref_latent.dtype == torch.bfloat16
-                # FP32 summation-order changes only: logits within FP32 reorder noise
-                # of the stock router's, the latent within one BF16 rounding
+                # FP32 summation-order changes only: both ours and stock within the
+                # FP32 accumulation bound of the FP64 product (K x 2^-24 x |x||W|),
+                # plus the output rounding (half an FP32 / BF16 ulp)
+                def bound_ok(got, weight, mantissa):
+                    xd, wd = x.double(), weight.double()
+                    exact = xd @ wd.t()
+                    acc = 7168 * 2.0**-24 * (xd.abs() @ wd.abs().t())
+                    top = exact.abs() + acc
+                    ulp = torch.exp2(torch.floor(torch.log2(top.clamp_min(1e-30))))
+                    limit = acc + ulp * 2.0 ** -mantissa
+                    return ((got.double() - exact).abs() <= limit * 1.001).all()
+
+                router = module.gate.weight
+                down = module.routed_expert_down_proj.weight
+                assert bound_ok(ref_logits, router, 24), f"R{r}: stock logits bound"
+                assert bound_ok(logits, router, 24), f"R{r}: logits beyond the bound"
+                assert bound_ok(ref_latent, down, 8), f"R{r}: stock latent bound"
+                assert bound_ok(latent, down, 8), f"R{r}: latent beyond the bound"
                 err = (logits - ref_logits).abs().max().item()
                 scale = ref_logits.abs().max().item()
-                assert err <= 1e-5 * scale, f"R{r}: logits {err:.3e} vs max {scale:.3e}"
-                diff = latent.float() - ref_latent.float()
-                ulp = ref_latent.float().abs() * 2.0**-7 + 1e-30
-                assert (diff.abs() <= ulp).all(), f"R{r}: latent beyond one BF16 ulp"
                 same = (latent == ref_latent).float().mean().item()
                 operands.append(f"R{r} logits {err / scale:.1e} latent bitwise {same:.4f}")
         if rank == 0:
