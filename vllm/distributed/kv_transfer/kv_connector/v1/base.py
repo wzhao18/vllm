@@ -627,16 +627,6 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
-    def join_load_in_step(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
-    ) -> bool:
-        """True: the load is in ``blocks`` before this step's forward; admit now."""
-        return False
-
-    def joined_load_tracker(self, scheduler: Any) -> Any:
-        """Scheduler-side state of join_load_in_step (None: never joins)."""
-        return None
-
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

@@ -39,9 +39,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.joined_loads import (  # noqa: E501
-    JoinedLoadTracker,
-)
 from vllm.distributed.mooncake_store import MooncakeStoreConfig
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
@@ -259,22 +256,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
-    def join_load_in_step(
-        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
-    ) -> bool:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.join_load_in_step(
-            request, blocks, num_external_tokens
-        )
-
-    def joined_load_tracker(self, scheduler: Any) -> JoinedLoadTracker | None:
-        """The scheduler's same-step admission state (joined_loads.py)."""
-        if self.connector_scheduler is None:
-            return None
-        tracker = JoinedLoadTracker(scheduler)
-        self.connector_scheduler.tracker = tracker
-        return tracker
-
     def update_state_after_alloc(
         self,
         request: Request,
@@ -431,9 +412,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return
         self.connector_worker.start_load_kv(connector_metadata)
         self._loads_issued_for = connector_metadata
-        # Joined loads (join_load_in_step) must be in their blocks before
-        # this step's forward is launched.
-        self.connector_worker.wait_joined_loads(connector_metadata)
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
