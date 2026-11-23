@@ -78,7 +78,13 @@ ATTENTION_MOE = {8: ("5-8:32", "8:32")}
 # reads. One-GPU chain (experts -> tail -> AttnRes -> the cold 46.8 MB in-projection,
 # the prefetch forked after the experts as here), us/layer: none 34.91-34.98, 8 MiB
 # 34.77, 16 MiB 34.39, 24 MiB 34.35, 32 MiB 34.58-34.61, 48 MiB 35.69-35.89.
-WIDE = {16: ("1-7:48,8:24", 96, "", ("5-7:64", "3-8:64"))}
+# TP8 (DFn on Rubin): the TP16 entries; the ~56 MiB one die keeps resident bounds
+# the next-attention cap at either TP (TP8's weights are 2x per rank, so the 48 MiB
+# reach a smaller share of them).
+WIDE = {
+    8: ("1-7:48,8:24", 96, "", ("5-7:64", "3-8:64")),
+    16: ("1-7:48,8:24", 96, "", ("5-7:64", "3-8:64")),
+}
 # Per-TP batches whose MLA-layer ``attention_moe`` prefetch (``WIDE`` devices) fetches
 # the front rows and the shared down only (9.6 of 19.7 MiB at TP16), not the shared
 # gate/up, which requests its own 11 MB slice before its PDL wait beside the

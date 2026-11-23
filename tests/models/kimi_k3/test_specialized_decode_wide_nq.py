@@ -773,3 +773,17 @@ def test_tp8_rubin_shared_down_splits():
     assert all(plain[0].get(b) == plain[1].get(b) for b in range(1, 65))
     tp16 = split_table(16, True, True)
     assert [tp16.get(b) for b in (13, 32, 64)] == [8, 8, 4]
+
+
+def test_tp8_rubin_prefetch_tables():
+    """TP8 on Rubin-class devices (DFn) takes the ``prefetch.WIDE`` entries (the
+    next-attention cap within one die's resident L2, no ``oproj_down`` prefetch);
+    prefetches move no data a kernel computes with: no precision change."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import prefetch
+
+    assert prefetch.WIDE[8] == prefetch.WIDE[16]
+    spec, grid, front, shared = prefetch.WIDE[8]
+    assert grid == 96 and front == ""
+    table = prefetch.batch_table(spec)
+    assert [table.get(b) for b in (1, 7, 8, 9)] == [48, 48, 24, None]
