@@ -589,7 +589,7 @@ def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rm
         spans.append(c[-1].time_range.end - c[0].time_range.start)
         gaps.append(sum(max(0, b.time_range.start - a.time_range.end) for a, b in zip(c, c[1:])))
         for e in c:
-            per.setdefault(e.name[:70], []).append(e.time_range.elapsed_us())
+            per.setdefault(e.name if len(e.name) <= 90 else e.name[:40] + "~" + e.name[-45:], []).append(e.time_range.elapsed_us())
     calls_n = max(1, len(calls))
     # per-call cross-rank SKEW at the main MegaMoE kernel: absolute host-clock start of every occurrence (kineto trace
     # start + relative start); exact within a node (shared host clock), cross-node only as good as the clock sync
@@ -618,7 +618,7 @@ def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rm
     elif rank == 0:
         print(f"KSKEW {mode} {variant}/{n} unavailable (base_ns={base_ns}, counts={[len(x) for x in allst]})", flush=True)
     rows = sorted(per.items(), key=lambda kv: -sum(kv[1]))
-    body = " | ".join(f"{k} x{len(v) / calls_n:.1f} {st.median(v):.1f}us" for k, v in rows[:8])
+    body = " | ".join(f"{k} x{len(v) / calls_n:.1f} {st.median(v):.1f}us" for k, v in rows[:10])
     print(f"KPROF rank={rank} {mode} {variant}/{n} calls={len(calls)} span_med={st.median(spans):.1f}us "
           f"gaps_med={st.median(gaps):.1f}us :: {body}", flush=True)
 
