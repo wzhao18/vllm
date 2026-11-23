@@ -7,7 +7,9 @@ trtllm-gen's 128 (FlashInfer sparse, per-tensor FP8 query, "proj" partials), the
 widened DSA box of the deployment's largest graph (1536 rows, partials False, as
 ``DcpBox.widened`` builds it for WideDsa).
 
-Per (q, rows) case (q4 72 / 768, q6 384, q8 128 / 1536):
+Per (q, rows) case (``CASES``: q2-q8, 65-256 across the tile edges, 384, 768 and the
+1536-row capacity anchor; requests of zero total length stand for the padded rows of
+a FULL graph):
 
 - the query: the fork mode's publish-only MlaQuery and QueryWait (every wide row
   forks at TP8 as at TP16): every rank's query rows and KV row bitwise equal to the
@@ -39,7 +41,14 @@ GATE = HEADS * V
 PITCH = 2112 + GATE + INDEX_DIM + INDEX_HEADS
 UNIT, FP8_ROW, INDEX_ROW = 64, 576, 132
 EPS = 1e-6
-CASES = ((4, 72), (4, 768), (6, 384), (8, 128), (8, 1536))
+# (q, rows): every q from 2 to 8, the first wide row past 64 (65, 66, 68, 72) and
+# both sides of the 128 / 192 / 256 tile edges (129, 130, 132, 194, 196), mid rows,
+# and the 1536-row capacity anchor (the widened box's every row).
+CASES = (
+    (2, 66), (2, 130), (2, 194), (3, 129), (4, 68), (4, 128), (4, 132), (4, 192),
+    (4, 196), (4, 256), (4, 768), (5, 65), (6, 384), (7, 196), (8, 72), (8, 256),
+    (8, 1536),
+)  # fmt: skip
 TIMEOUT = 600
 
 
@@ -221,13 +230,18 @@ def _case(box, size, rank, local, q, batch, parity):
         wait(publish[0], stream(dev))
         run_value(*args, totals, None, projected, out, w_uv_gathered)
     dist.barrier()
-    for _ in range(3):
+    for replay in range(3):
         out.zero_()
         graph.replay()
         torch.accelerator.synchronize()
         dist.barrier()
-        assert torch.equal(out, eager)
-        assert (box.q[parity, :batch, : size * HEADS].view(torch.int32) == -1).all()
+        assert torch.equal(out, eager), (q, batch, replay)
+        armed = box.q[parity, :batch, : size * HEADS].view(torch.int32) == -1
+        bad = (~armed).nonzero()
+        assert armed.all(), (q, batch, replay, rank, bad.shape[0], bad[:4].tolist())
+        # (no rank publishes the next replay's query into a mailbox still checked)
+        torch.accelerator.synchronize()
+        dist.barrier()
     del graph
 
 
