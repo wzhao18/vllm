@@ -44,13 +44,8 @@ from .symmetric_buffer import SymmetricBufferDevice
 
 
 from .token_comm import TokenBackMode, TokenBackScheduleMode, TokenCommArgs  # noqa: E402
-from ....common.spin_guard import _st_gpu_s32, _st_gpu_v4_s32, _st_sys_s32, globaltimer_ns, red_or_relaxed_sys_b32, spin_guard, spin_guard_ranks, spin_guard_value
+from ....common.spin_guard import globaltimer_ns, spin_guard
 from ...kernel_src.rubin.inference.mega.genphase_tail import GenphaseTail
-
-
-from ....common.ep_balance_layout import (  # noqa: E402
-    EPBAL_CHECKSUM_MUL, EPBAL_CHECKSUM_SALT, EPBAL_HEADER_WORDS, EPBAL_POS_ADD, EPBAL_POS_MUL_S32, EPBAL_MAX_EXPERTS, EPBAL_PERIOD, EPBAL_SHIFT, EPBAL_SLOT_WORDS, EPBAL_SLOTS,
-)
 
 
 class DedupCallTail(GenphaseTail):
@@ -68,40 +63,8 @@ class DedupCallTail(GenphaseTail):
 
     epoch_region = "nvlink.token_comm_dedup.call_epoch"
     signal_region = "nvlink.token_comm_dedup.call_done_signal"
-    # Diagnostics (MEGAMOEFIX 2026-11-22, common/spin_guard.spin_guard_ranks): this rank's [issued, entered]
-    # call ids (host / kernel entry stamps), and one bit per rank whose sizes / metadata reached this rank.
-    progress_region = "nvlink.token_comm_dedup.call_progress"
-    sizes_mask_region = "nvlink.token_comm_dedup.sizes_arrived_mask"
-    metadata_mask_region = "nvlink.token_comm_dedup.metadata_arrived_mask"
-    # One bit per guard site: the first timed-out thread of this rank that sets it prints, the rest trap
-    # silently (spin_guard._elect_printer). Never reset: a trap ends the context.
-    printed_region = "nvlink.token_comm_dedup.guard_printed"
-    # Device-accessible address of this process's host spin-record buffer (spin_record.py), written once by the
-    # host after the workspace is carved; 0 = no records (the guards then only print and trap).
-    record_region = "nvlink.token_comm_dedup.spin_record_addr"
-    # Device-accessible address of this process's EP-balance ring (megamoe_rubin/ep_balance.py), written once by
-    # the host after the workspace is carved; 0 = no logging.
-    epbal_region = "nvlink.token_comm_dedup.epbal_ring_addr"
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
-        workspace.register(
-            self.progress_region, cutlass.Int32, (2,), buffer_space="shared", byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
-        workspace.register(self.sizes_mask_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
-        workspace.register(self.metadata_mask_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
-        workspace.register(
-            self.printed_region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
-        workspace.register(
-            self.record_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
-        workspace.register(
-            self.epbal_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
         workspace.register(
             self.epoch_region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16,
             reset="zero_on_first_allocate",
@@ -608,12 +571,6 @@ class _DedupMetadataPushRouter(KernelComponent):
         self._router_lane_idx = lane_idx
         self._router_smem_base = smem_base
 
-        # Entry stamp: this call's id (1-based) in this rank's progress word, before anything can wait.
-        if (thread_idx == Int32(0)) & (linear_cta_idx == Int32(0)):
-            cute.arch.store(
-                device_workspace.ptr(self._call_tail.progress_region) + Int32(1),
-                self._call_tail.read_epoch(device_workspace) + Int32(1), sem="relaxed", scope="sys",
-            )
         # BUG-E2E-3: no remote write before every rank has finished (reset) the previous call.
         if thread_idx == Int32(0):
             previous_done = self._call_tail.previous_done_observation(device_workspace)
@@ -770,11 +727,8 @@ class _DedupMetadataPushRouter(KernelComponent):
             iket.range_push("router.wait_source_base")
             source_base_ready = self._device_workspace.ptr(self.source_base_ready_region)
             if self._router_thread_idx == Int32(0):
-                spin_start_ns = globaltimer_ns()
                 while cute.arch.load(source_base_ready, Int32, sem="acquire", scope="gpu") != Int32(1):
                     nanosleep(150)
-                    spin_guard(spin_start_ns, 23, source_base_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region))
             cute.arch.sync_threads()
             iket.range_pop()
 
@@ -814,13 +768,10 @@ class _DedupMetadataPushRouter(KernelComponent):
         histogram_done = self._device_workspace.ptr(self.router_histogram_done_region)
         iket.range_push("router.wait_histogram")
         if self._router_thread_idx == Int32(0):
-            spin_start_ns = globaltimer_ns()
             while cute.arch.load(histogram_done, Int32, sem="acquire", scope="gpu") != Int32(
                 self.router_data_cta_count
             ):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 24, histogram_done, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_threads()
         iket.range_pop()
 
@@ -866,18 +817,12 @@ class _DedupMetadataPushRouter(KernelComponent):
         sorted_metadata_ready = self._device_workspace.ptr(self.sorted_metadata_ready_region)
         push_table_ready = self._device_workspace.ptr(self.push_table_ready_region)
         if self._router_thread_idx == Int32(0):
-            spin_start_ns = globaltimer_ns()
             while cute.arch.load(sorted_metadata_ready, Int32, sem="acquire", scope="gpu") != Int32(
                 self.router_data_cta_count
             ):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 25, sorted_metadata_ready, Int32(self.router_data_cta_count), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region))
-            spin_start_ns = globaltimer_ns()
             while cute.arch.load(push_table_ready, Int32, sem="acquire", scope="gpu") != Int32(1):
                 nanosleep(150)
-                spin_guard(spin_start_ns, 26, push_table_ready, Int32(1), print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region))
         cute.arch.sync_threads()
 
         source_expert_base = self._device_workspace.tensor(self.source_expert_base_region)
@@ -961,15 +906,10 @@ class _DedupMetadataPushRouter(KernelComponent):
         # Keep notifier threads behind the leader's system fence.
         cute.arch.sync_threads()
         metadata_ready_address = self._device_workspace.ptr(self.metadata_ready_region).toint()
-        metadata_mask_address = self._device_workspace.ptr(self._call_tail.metadata_mask_region).toint()
         rank_round_count = ceil_div(self.world_size, block_thread_count)
         for rank_round in cutlass.range_constexpr(rank_round_count):
             destination_rank = Int32(rank_round * block_thread_count) + self._router_thread_idx
             if destination_rank < Int32(self.world_size):
-                red_or_relaxed_sys_b32(
-                    self._peer_rank_ptr_mapper.map(metadata_mask_address, destination_rank, Int64(0)),
-                    Int32(1) << Int32(self._router_local_rank),
-                )
                 red_add_relaxed_sys_s32(
                     self._peer_rank_ptr_mapper.map(metadata_ready_address, destination_rank, Int64(0)), Int32(1)
                 )
@@ -1008,15 +948,10 @@ class _DedupMetadataPushRouter(KernelComponent):
                 cute.arch.fence_acq_rel_sys()
             cute.arch.sync_threads()
             ready_address = self._device_workspace.ptr(self.sizes_ready_region).toint()
-            mask_address = self._device_workspace.ptr(self._call_tail.sizes_mask_region).toint()
             ready_round_count = ceil_div(self.world_size, block_thread_count)
             for ready_round in cutlass.range_constexpr(ready_round_count):
                 destination_rank = Int32(ready_round * block_thread_count) + self._router_thread_idx
                 if destination_rank < Int32(self.world_size):
-                    red_or_relaxed_sys_b32(
-                        self._peer_rank_ptr_mapper.map(mask_address, destination_rank, Int64(0)),
-                        Int32(1) << Int32(self._router_local_rank),
-                    )
                     red_add_relaxed_sys_s32(
                         self._peer_rank_ptr_mapper.map(ready_address, destination_rank, Int64(0)), Int32(1)
                     )
@@ -1045,15 +980,7 @@ class _DedupMetadataPushRouter(KernelComponent):
             spin_start_ns = globaltimer_ns()
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(150)
-                spin_guard_ranks(
-                    spin_start_ns, 20, sizes_ready, Int32(self.world_size),
-                    self._device_workspace.ptr(self._call_tail.sizes_mask_region),
-                    self._device_workspace.ptr(self._call_tail.progress_region),
-                    self._peer_rank_ptr_mapper, self.world_size,
-                    self._call_tail.read_epoch(self._device_workspace) + Int32(1),
-                    print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region),
-                )
+                spin_guard(spin_start_ns, 20, sizes_ready, Int32(self.world_size))
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         iket.range_pop()
@@ -1445,58 +1372,8 @@ class _DedupMetadataPushRouter(KernelComponent):
             spin_start_ns = globaltimer_ns()
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.world_size):
                 nanosleep(sleep_cycles)
-                spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size), print_flag=device_workspace.ptr(self._call_tail.printed_region),
-                    record=device_workspace.ptr(self._call_tail.record_region))
+                spin_guard(spin_start_ns, 21, sizes_ready, Int32(self.world_size))
         cute.arch.sync_warp()
-
-    @cute.jit
-    def log_ep_balance(self, device_workspace: DeviceWorkspace, lane_idx: Int32, warp_idx: Int32) -> None:
-        """Served EP-balance log (int64.3 item 3): on one call in EPBAL_PERIOD, ONE warp (warp ``warp_idx == 0`` of
-        CTA 0) copies the GLOBAL per-expert token counts (every rank adds its histogram into every peer's ``sizes``,
-        so after ``sizes_ready == world_size`` they are complete on every rank) into a slot of the session's
-        DEVICE-memory ring, with a %globaltimer stamp. The caller runs it after this CTA's dispatch pulls are published.
-
-        Device memory, gpu-scope stores, no fence: pinned-host stores cost ~100 us under MegaMoE load to whatever
-        next orders at system scope (a sys fence, a sys acquire, the CTA exit; MEGAMOEFIX tasks C-Gp). The host
-        copies the slot out at drain time on its own stream; word 7 carries ``epbal_checksum(call, counts)``, a
-        position-weighted sum bound to the call id, and the host takes a slot only when the call id and the
-        checksum agree (a slot copied while its stores are still landing is retried on the next drain)."""
-        linear_cta_idx, _, _ = cute.arch.block_idx()
-        # trace-time: a slot holds EPBAL_MAX_EXPERTS counts (more experts: no log); 16-byte stores need 4 | count
-        if cutlass.const_expr(self.expert_count_padded <= EPBAL_MAX_EXPERTS and self.expert_count_padded % 4 == 0):
-            if (linear_cta_idx == Int32(0)) & (warp_idx == Int32(0)):
-                ring = cute.arch.load(device_workspace.ptr(self._call_tail.epbal_region), Int64, sem="relaxed", scope="gpu")
-                call = self._call_tail.read_epoch(device_workspace) + Int32(1)
-                if (ring != Int64(0)) & ((call & Int32(EPBAL_PERIOD - 1)) == Int32(0)):
-                    base = ring + Int64((call >> Int32(EPBAL_SHIFT)) & Int32(EPBAL_SLOTS - 1)) * Int64(EPBAL_SLOT_WORDS * 4)
-                    sizes = device_workspace.tensor(self.sizes_region)
-                    total = Int32(0)
-                    for vector_round in cutlass.range_constexpr(ceil_div(self.expert_count_padded // 4, 32)):
-                        expert = (Int32(vector_round * 32) + lane_idx) * Int32(4)
-                        if expert < Int32(self.expert_count_padded):
-                            c0 = sizes[expert]
-                            c1 = sizes[expert + Int32(1)]
-                            c2 = sizes[expert + Int32(2)]
-                            c3 = sizes[expert + Int32(3)]
-                            _st_gpu_v4_s32(base + Int64(EPBAL_HEADER_WORDS * 4) + Int64(expert) * Int64(4), c0, c1, c2, c3)
-                            # position-weighted (odd weight (i * POS_MUL + POS_ADD) | 1 per expert), wrapping int32
-                            w0 = (expert * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w1 = ((expert + Int32(1)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w2 = ((expert + Int32(2)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            w3 = ((expert + Int32(3)) * Int32(EPBAL_POS_MUL_S32) + Int32(EPBAL_POS_ADD)) | Int32(1)
-                            total = total + c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3
-                    for shift in cutlass.range_constexpr(5):
-                        total = total + cute.arch.shuffle_sync_bfly(total, 16 >> shift)
-                    if lane_idx == Int32(0):
-                        t_ready = globaltimer_ns()
-                        checksum = (total ^ Int32(EPBAL_CHECKSUM_SALT)) + call * Int32(EPBAL_CHECKSUM_MUL)
-                        # words 4..7: world, experts_per_rank, 0 = global record, checksum
-                        _st_gpu_v4_s32(base + Int64(16), Int32(self.world_size), Int32(self.experts_per_rank), Int32(0), checksum)
-                        _st_gpu_s32(base + Int64(4), Int32(t_ready & cutlass.Uint64(0xFFFFFFFF)))
-                        _st_gpu_s32(base + Int64(8), Int32(t_ready >> cutlass.Uint64(32)))
-                        _st_gpu_s32(base + Int64(12), Int32(self.expert_count_padded))
-                        _st_gpu_s32(base, call)
-                    cute.arch.sync_warp()
 
     @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
@@ -1509,8 +1386,7 @@ class _DedupMetadataPushRouter(KernelComponent):
                 self.metadata_ready_target
             ):
                 nanosleep(sleep_cycles)
-                spin_guard(spin_start_ns, 22, metadata_ready, Int32(self.metadata_ready_target), print_flag=device_workspace.ptr(self._call_tail.printed_region),
-                    record=device_workspace.ptr(self._call_tail.record_region))
+                spin_guard(spin_start_ns, 22, metadata_ready, Int32(self.metadata_ready_target))
         cute.arch.sync_warp()
 
     @cute.jit
@@ -2249,8 +2125,6 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
-        # EP-balance log after this CTA's pulls are published: off the dispatch critical path (int64.3 item 3).
-        self._router.log_ep_balance(self._device_workspace, lane_idx, transfer_warp_idx)
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode == "standalone_warps"):
             # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
             cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -2490,7 +2364,6 @@ class TokenCommDedup(KernelComponent):
                 if (metadata.is_last_copy != Int32(0)) and (metadata.dst_token_cnt > Int32(1)):
                     iket.range_push("token_back.wait_fc2_warp_prefix")
                     wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
-                    spin_start_ns = globaltimer_ns()
                     while completed_expert_prefix <= local_expert:
                         prefix_base = (completed_expert_prefix // Int32(32)) * Int32(32)
                         checked_expert = prefix_base + Int32(31) - lane_idx
@@ -2507,11 +2380,6 @@ class TokenCommDedup(KernelComponent):
                         if completed_expert_prefix <= local_expert:
                             nanosleep(wait_sleep_ns)
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
-                            spin_guard_value(
-                                spin_start_ns, 27, completed_expert_prefix, local_expert + Int32(1),
-                                print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region),
-                            )
                     # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
                     cute.arch.sync_warp()
                     iket.range_pop()

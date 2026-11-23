@@ -165,10 +165,6 @@ def parse_args():
         "warpgroups (inference_dedup_wg2, reuse_dispatch_warps)",
     )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
-    p.add_argument("--epbal-percall", type=int, default=0,
-                   help="int64.3 item 3 per-call A/B of the served EP-balance log: N timed eager calls per point "
-                        "with the log on/off in alternating 64-call blocks aligned to the session call ids "
-                        "(pre-registered in MEGAMOEFIX.md 12:20); prints EPBAL_PERCALL lines and skips the timing")
     p.add_argument(
         "--active-experts",
         type=int,
@@ -524,113 +520,6 @@ def env_identity(pkg_dir):
 # ---------------------------------------------------------------------------------
 
 
-_EPBAL_VERDICTS: list = []
-
-
-def _epbal_percall(args, session, moe, hidden, ids, wts, weights, bucket, out, fused, rms, variant, n,
-                   rank, world, group):
-    """Per-call A/B of the served EP-balance log (MEGAMOEFIX.md pre-registration, MAIN 12:14). Blocks of 64 calls
-    aligned to the session call ids: the ring word is set to the ring ("on", even block) or 0 ("off") at each block
-    start, so each on-block logs exactly once (its first call, call id % 64 == 0)."""
-    import random
-    import statistics as st
-
-    ws = session.kernel._device_workspace
-    names = {r.name for r in ws.regions("local")}
-    epoch_name = next(r for r in ("nvlink.token_comm_dedup.call_epoch", "rubin.genphase_tail.epoch") if r in names)
-    ring_names = [r for r in session._EPBAL_REGIONS if r in names]
-    ring_addr = session._ep_balance_ring.address
-    lw = session.local_workspace
-
-    def set_word(on: bool) -> None:
-        for r in ring_names:
-            o = ws.offset(r)
-            lw[o : o + 8].view(torch.int64).fill_(ring_addr if on else 0)
-
-    for _ in range(8):  # warm: no timing
-        moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms)
-    torch.cuda.synchronize()
-    eo = ws.offset(epoch_name)
-    e0 = int(lw[eo : eo + 4].view(torch.int32).item())
-    N = args.epbal_percall
-    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(N)]
-    calls = []
-    for k in range(N):
-        c = e0 + 1 + k
-        if c % 64 == 0:
-            set_word((c // 64) % 2 == 0)
-        ev[k][0].record()
-        moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms)
-        ev[k][1].record()
-        calls.append(c)
-    torch.cuda.synchronize()
-    set_word(True)  # leave the log on, as served
-    mine = [ev[k][0].elapsed_time(ev[k][1]) * 1000.0 for k in range(N)]  # us
-    allr = [mine]
-    if world > 1 and group is not None:
-        allr = [None] * world
-        dist.all_gather_object(allr, mine, group=group)
-    t = [max(r[k] for r in allr) for k in range(N)]
-    if rank != 0:
-        return
-    pos = {}  # (block, position in block) -> time
-    for k in range(N):
-        pos[(calls[k] // 64, calls[k] % 64)] = t[k]
-    blocks = sorted({b for b, _ in pos})
-    rng = random.Random(7)
-
-    def sym(b, j):  # on-block b position j vs the mean of the off-blocks around it (DCRIT r73.3)
-        if (b, j) in pos and (b - 1, j) in pos and (b + 1, j) in pos:
-            return pos[(b, j)] - 0.5 * (pos[(b - 1, j)] + pos[(b + 1, j)])
-        return None
-
-    on_blocks = [b for b in blocks if b % 2 == 0]
-    d = [sym(b, 0) for b in on_blocks]
-    d2 = [sym(b, 1) for b in on_blocks]
-    pairs = [(x, y) for x, y in zip(d, d2) if x is not None and y is not None]
-    d, d2 = [x for x, _ in pairs], [y for _, y in pairs]
-    dd = [x + y for x, y in pairs]
-
-    def boot_median(xs):
-        if not xs:
-            return 0.0, 0.0, 0.0
-        bs = sorted(st.median(rng.choices(xs, k=len(xs))) for _ in range(10000))
-        return st.median(xs), bs[249], bs[9749]
-
-    med_d, lo_d, hi_d = boot_median(d)
-    med_d2, lo_d2, hi_d2 = boot_median(d2)
-    med_dd, lo_dd, hi_dd = boot_median(dd)
-    off_all = [v for (b, j), v in pos.items() if b % 2 == 1]
-    mean_off = st.mean(off_all)
-    amort = 100.0 * med_dd / (64.0 * mean_off)
-    on_nf = [v for (b, j), v in pos.items() if b % 2 == 0 and j >= 2]  # non-firing (DCRIT r73.1)
-    off_nf = [v for (b, j), v in pos.items() if b % 2 == 1 and j >= 2]
-    p99 = lambda xs: sorted(xs)[int(0.99 * (len(xs) - 1))]  # noqa: E731
-    ratios = sorted(p99(rng.choices(on_nf, k=len(on_nf))) / p99(rng.choices(off_nf, k=len(off_nf)))
-                    for _ in range(2000))
-    r_pt, r_lo, r_hi = p99(on_nf) / p99(off_nf), ratios[49], ratios[1949]
-    pass1 = hi_dd <= 2.0
-    # p99 non-inferiority (MAIN 12:18): upper bound <= 1.01 passes; a CI straddling 1.01 is INCONCLUSIVE, not PASS
-    p99_state = "PASS" if r_hi <= 1.01 else ("FAIL" if r_lo > 1.01 else "INCONCLUSIVE")
-    pass2 = amort <= 0.1 and p99_state == "PASS"
-    if pass1 and pass2:
-        state = "PASS"
-    elif pass1 and amort <= 0.1 and p99_state == "INCONCLUSIVE":
-        state = "INCONCLUSIVE"
-    else:
-        state = "FAIL"
-    verdict = state
-    need_ep16 = variant.startswith("genphase") or "gen" in str(variant)
-    need_ep16 = need_ep16 and hi_dd > 0.5
-    _EPBAL_VERDICTS.append(verdict)
-    print(f"EPBAL_PERCALL {variant}/{n} pairs={len(pairs)} d={med_d:+.3f}us[{lo_d:+.3f},{hi_d:+.3f}] "
-          f"d2={med_d2:+.3f}us[{lo_d2:+.3f},{hi_d2:+.3f}] d+d2={med_dd:+.3f}us CI95=[{lo_dd:+.3f}, {hi_dd:+.3f}] "
-          f"(PASS-1 upper<=+2us: {pass1}) | amortised={amort:+.4f}% of mean off call {mean_off:.1f}us | "
-          f"non-firing p99 on/off={r_pt:.4f} CI95=[{r_lo:.4f}, {r_hi:.4f}] width={r_hi - r_lo:.4f} "
-          f"(p99 non-inferiority upper<=1.01: {p99_state}; amortised<=0.1%: {amort <= 0.1})"
-          f"{' NEED_EP16' if need_ep16 else ''} -> {state}", flush=True)
-
-
 def main():
     args = parse_args()
     rank, world, device = init_distributed()
@@ -823,10 +712,6 @@ def main():
         out = torch.empty(
             (max(n, 1), problem.hidden), dtype=torch.bfloat16, device=device
         )
-        if args.epbal_percall:
-            _epbal_percall(args, session, moe, hidden, ids, wts, weights, bucket, out, fused, rms, variant, n,
-                           rank, world, group)
-            continue
         res = moe.forward(
             hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms
         )
@@ -1021,39 +906,6 @@ def main():
                     f.write(text + "\n")
 
     torch.cuda.synchronize()
-    # Served EP-balance ring (int64.3 item 3): every sampled call's global routes must be one point's n x world x topk
-    # (random routing: every route valid), and the per-rank loads must add up to it.
-    from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
-
-    if args.epbal_percall and rank == 0:
-        v = _EPBAL_VERDICTS
-        overall = ("PASS" if v and all(x == "PASS" for x in v) else
-                   "FAIL" if (not v or any(x == "FAIL" for x in v)) else "INCONCLUSIVE")
-        print(f"EPBAL_PERCALL_ALL {overall} shapes={len(v)} passed={sum(x == 'PASS' for x in v)} "
-              f"inconclusive={sum(x == 'INCONCLUSIVE' for x in v)}", flush=True)
-    # the served drain is asynchronous (each drain takes the copy issued by the previous one, WINDOW slots at a
-    # time): drain until two consecutive drains after a device sync bring nothing
-    recs, empty = [], 0
-    while empty < 2:
-        torch.cuda.synchronize()
-        got = ep_balance.drain_all()
-        recs += got
-        empty = 0 if got else empty + 1
-    expected = {n * world * problem.top_k for _, _, n in points}
-    glob = [r for r in recs if r["local_rank"] < 0]
-    ok = sum(1 for r in glob if r["routes"] in expected and sum(r["rank_loads"]) == r["routes"] and r["world"] == world)
-    # local (decode genphase) records: every rank logs its own experts; merge by call across ranks
-    gathered = [recs]
-    if world > 1 and group is not None:
-        gathered = [None] * world
-        dist.all_gather_object(gathered, recs, group=group)
-    merged = ep_balance.merge_local(gathered)
-    ok += sum(1 for m in merged if m["complete"] and m["routes"] in expected)
-    n_rec = len(glob) + len(merged)
-    if rank == 0:
-        mm = [round(r["max_over_mean"], 3) for r in glob + merged]
-        act = [(r["active_busiest"], round(r["active_mean"], 2)) for r in merged][:8]
-        print(f"EPBAL records={n_rec} routes_ok={ok}/{n_rec} max_over_mean={mm[:8]} active_busiest_mean={act}", flush=True)
     moe.destroy()
     if world > 1:
         dist.destroy_process_group()

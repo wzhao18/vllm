@@ -33,9 +33,6 @@ class GenphaseTail:
     done_counter_region: ClassVar[str] = "rubin.genphase_tail.done_counter"
     epoch_region: ClassVar[str] = "rubin.genphase_tail.epoch"
     signal_region: ClassVar[str] = "rubin.genphase_tail.signal"
-    # Device-accessible address of this session's served EP-balance ring (megamoe_rubin/ep_balance.py), written once
-    # by the host after the workspace is carved; 0 = no logging.
-    epbal_region: ClassVar[str] = "rubin.genphase_tail.epbal_ring_addr"
 
     def __init__(self, *, world_size: int) -> None:
         self.world_size = world_size
@@ -50,10 +47,6 @@ class GenphaseTail:
             (1,),
             buffer_space="local",
             byte_alignment=16,
-            reset="zero_on_first_allocate",
-        )
-        workspace.register(
-            self.epbal_region, cutlass.Int64, (1,), buffer_space="local", byte_alignment=16,
             reset="zero_on_first_allocate",
         )
         workspace.register(

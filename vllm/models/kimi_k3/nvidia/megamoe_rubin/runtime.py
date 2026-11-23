@@ -35,7 +35,6 @@ import torch
 import torch.distributed as dist
 
 from vllm.logger import init_logger
-from vllm.models.kimi_k3.nvidia import breadcrumb
 
 from .arch import require_sm107
 from .config import (
@@ -75,27 +74,6 @@ def _sorted_buckets(buckets: Sequence[RubinBucket]) -> list[RubinBucket]:
     return ordered
 
 
-# Device printf FIFO for the spin-guard trap lines (VENDOR.md S9). Backstop only: the primary fix is that
-# one thread per rank and guard site prints (spin_guard._elect_printer). The limit can only be raised before
-# this context's first kernel that uses printf, so a failure is logged and ignored.
-_PRINTF_FIFO_BYTES = 8 << 20
-
-
-def _raise_printf_fifo() -> None:
-    try:
-        from cuda.bindings import runtime as cudart
-
-        err, cur = cudart.cudaDeviceGetLimit(cudart.cudaLimit.cudaLimitPrintfFifoSize)
-        if err == cudart.cudaError_t.cudaSuccess and cur < _PRINTF_FIFO_BYTES:
-            (err,) = cudart.cudaDeviceSetLimit(
-                cudart.cudaLimit.cudaLimitPrintfFifoSize, _PRINTF_FIFO_BYTES
-            )
-        if err != cudart.cudaError_t.cudaSuccess:
-            logger.info("Rubin MegaMoE: printf FIFO not raised (%s)", err)
-    except Exception as e:  # noqa: BLE001 - diagnostics only
-        logger.info("Rubin MegaMoE: printf FIFO not raised (%s)", e)
-
-
 class RubinMegaMoE:
     def __init__(
         self,
@@ -105,7 +83,6 @@ class RubinMegaMoE:
     ):
         require_sm107()
         ensure_not_capturing("RubinMegaMoE construction")
-        _raise_printf_fifo()
         self.problem = problem
         self.group = group
         self.rank, self.world = _rank_world(group)
@@ -422,7 +399,6 @@ class RubinMegaMoE:
             raise ValueError(f"hidden must be (n, {self.problem.hidden}).")
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
-        breadcrumb.crumb(breadcrumb.OP_MOE_IN)
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
         if unfused_norm is not None:
@@ -448,7 +424,6 @@ class RubinMegaMoE:
                 normed = torch.empty_like(result)
                 ops.rms_norm(normed, result, unfused_norm[0], unfused_norm[1])
                 result = normed
-        breadcrumb.crumb(breadcrumb.OP_MOE_OUT)
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
