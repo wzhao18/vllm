@@ -1021,6 +1021,8 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         # worker waits for each before this step's forward.
         # (req_id, seconds the worker may wait for it before giving up).
         self.join_wait: list[tuple[str, float]] = []
+        # This engine's step index (logging: the worker's per-step J record).
+        self.step_seq = -1
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

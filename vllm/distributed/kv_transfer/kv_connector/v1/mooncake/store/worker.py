@@ -83,6 +83,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.selective_lease
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
+from vllm.v1.metrics.iterlog import ITERLOG_DIR
+from vllm.v1.metrics.iterlog import _Writer as IterLogWriter
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
@@ -2627,6 +2629,32 @@ class MooncakeStoreWorker:
             self._joined_registry().register(req_meta.req_id)
         self.recv_request_queue.put(req_meta)
 
+    def _log_join_step(
+        self,
+        metadata: MooncakeStoreConnectorMetadata,
+        t_bind: float,
+        wait_s: float,
+        n_joined: int,
+        n_timeouts: int,
+    ) -> None:
+        """Per-step J record in the iterlog dir (logging only), keyed by the
+        engine's step index, for the max bind wait over ranks per step."""
+        writer = getattr(self, "_join_iterlog", False)
+        if writer is False:
+            writer = None
+            if ITERLOG_DIR is not None:
+                writer = IterLogWriter(
+                    "mooncake-join",
+                    {"J": "step_seq t_bind wait_s n_joined n_timeouts"},
+                    {"pid": os.getpid()},
+                )
+            self._join_iterlog = writer
+        if writer is not None:
+            writer.put(
+                ("J", getattr(metadata, "step_seq", -1), t_bind, wait_s,
+                 n_joined, n_timeouts)
+            )
+
     def _join_timed_out_report(self) -> set[str]:
         if getattr(self, "_join_timed_out", None) is None:
             self._join_timed_out = set()
@@ -2657,6 +2685,7 @@ class MooncakeStoreWorker:
         step, and the request's KV is never stored.
         """
         if not getattr(metadata, "join_wait", None):
+            self._log_join_step(metadata, time.perf_counter(), 0.0, 0, 0)
             return
         start = time.perf_counter()
         timeouts = 0
@@ -2681,10 +2710,16 @@ class MooncakeStoreWorker:
             else:
                 self._increment_kv_connector_counter("join_load_failed", 1)
         waited = time.perf_counter() - start
+        self._log_join_step(metadata, start, waited, len(metadata.join_wait), timeouts)
         if getattr(self, "_load_seconds_lock", None) is not None:
             with self._load_seconds_lock:  # for the scheduler's join summary
                 self._join_waits.append(waited)
                 self._join_timeouts += timeouts
+        elif not getattr(self, "_warned_no_summary_lock", False):
+            self._warned_no_summary_lock = True
+            logger.warning(
+                "Mooncake join summary: no worker lock, bind waits not reported"
+            )
         self._record_kv_connector_operation("join_wait", waited, len(metadata.join_wait))
         self._increment_kv_connector_counter("join_loads", len(metadata.join_wait))
         if waited > 1e-3:

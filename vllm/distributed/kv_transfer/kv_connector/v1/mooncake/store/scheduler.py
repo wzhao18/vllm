@@ -229,8 +229,8 @@ def join_wait_bound_s(predicted_s: float) -> float:
 
 class JoinSummary:
     """Per-engine summary of same-step joined loads, logged every
-    ``interval_s`` and at exit (logging only): eligible loads (offered a
-    join), joined loads, joined loads given up at bind, and the bind's wait
+    ``interval_s`` and at exit (logging only): early loads issued, eligible
+    loads (offered a join), joined loads, joined loads given up at bind, and the bind's wait
     for its step's joined loads (mean, p90), for the window and in total."""
 
     def __init__(self, interval_s: float = 60.0) -> None:
@@ -238,6 +238,9 @@ class JoinSummary:
         self._last = time.monotonic()
         self._window = {"eligible": 0, "joined": 0, "timeouts": 0}
         self._total = dict(self._window)
+        # Early loads issued (the join-share denominator); incremented directly.
+        self.issued_early = 0
+        self._issued_total = 0
         self._waits: list[float] = []
         self._total_waits: list[float] = []
 
@@ -273,10 +276,14 @@ class JoinSummary:
         if len(self._total_waits) > 100_000:
             del self._total_waits[:-100_000]
         w, t = self._window, self._total
+        self._issued_total += self.issued_early
         logger.info(
-            "Mooncake joined loads (last %.0f s | total): eligible %d | %d, "
-            "joined %d | %d, join-wait timeouts %d | %d, join wait %s | %s",
+            "Mooncake joined loads (last %.0f s | total): issued_early %d | %d, "
+            "eligible %d | %d, joined %d | %d, join-wait timeouts %d | %d, "
+            "join wait %s | last 100K samples %s",
             now - self._last,
+            self.issued_early,
+            self._issued_total,
             w["eligible"],
             t["eligible"],
             w["joined"],
@@ -289,6 +296,7 @@ class JoinSummary:
         self._last = now
         self._window = {key: 0 for key in self._window}
         self._waits = []
+        self.issued_early = 0
 
 
 class LoadTimeModel:
@@ -783,6 +791,9 @@ class MooncakeStoreScheduler:
             # Worker channel not connected yet: the step's metadata carries it.
             self.load_specs[request_id] = load_spec
             return
+        summary = getattr(self, "_join_summary", None)
+        if summary is not None:
+            summary.issued_early += 1
         if hasattr(self, "_early_tokens"):
             self._early_tokens[request_id] = (
                 load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens
@@ -821,6 +832,8 @@ class MooncakeStoreScheduler:
             self._unfinished_request_ids,
             preempted_ids,
         )
+        meta.step_seq = getattr(self, "_meta_seq", 0)
+        self._meta_seq = meta.step_seq + 1
 
         # Handle new requests
         for request in scheduler_output.scheduled_new_reqs:

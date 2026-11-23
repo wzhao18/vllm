@@ -698,6 +698,7 @@ def test_join_summary_logs_window_and_total(monkeypatch):
     for outcome in ("joined", "joined", "no_headroom", "cold"):
         summary.count(outcome)
     summary.add_waits([0.001, 0.002, 0.010], 1)
+    summary.issued_early += 5
     assert not logged.info.called  # inside the interval
     summary.log(True)
     fmt, *args = logged.info.call_args.args
@@ -705,3 +706,35 @@ def test_join_summary_logs_window_and_total(monkeypatch):
     assert "eligible 4 | 4" in line and "joined 2 | 2" in line
     assert "join-wait timeouts 1 | 1" in line
     assert "mean 4.3 ms p90 10.0 ms (n=3)" in line
+    assert "issued_early 5 | 5" in line and "| last 100K samples mean" in line
+
+
+def test_worker_writes_a_per_step_join_record(monkeypatch, tmp_path):
+    # (PCRIT v123 a) One J record per bind, keyed by the engine's step index,
+    # so the max bind wait over ranks per step can be computed.
+    import json
+
+    monkeypatch.setattr(store_worker, "ITERLOG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        store_worker,
+        "IterLogWriter",
+        lambda kind, fields, meta: __import__(
+            "vllm.v1.metrics.iterlog", fromlist=["_Writer"]
+        )._Writer(kind, fields, meta, out_dir=str(tmp_path)),
+    )
+    worker = _bare_worker()
+    quiet = _meta([])
+    quiet.step_seq = 7
+    worker.wait_joined_loads(quiet)
+    worker.joined_loads.register("r")
+    stuck = _meta(["r"], bound_s=0.01)
+    stuck.step_seq = 8
+    worker.wait_joined_loads(stuck)
+    worker._join_iterlog.close()
+
+    (path,) = tmp_path.glob("mooncake-join-*.jsonl")
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    jobs = [r for r in records if r[0] == "J"]
+    assert [r[1] for r in jobs] == [7, 8]
+    assert jobs[0][3:] == [0.0, 0, 0]
+    assert jobs[1][3] >= 0.009 and jobs[1][4:] == [1, 1]
