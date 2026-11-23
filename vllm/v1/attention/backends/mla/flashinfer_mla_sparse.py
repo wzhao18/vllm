@@ -1213,6 +1213,17 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 self.qk_rope_head_dim,
             ):
                 self._prefill_sparse_mla = sparse_mla
+        # Kimi K3.1 specialized prefill FP8 MLA KV insert: with the specialized
+        # prefill sparse MLA, or on a DCP / ShardQ prefill worker (TP8+DCP8).
+        self._prefill_kv_insert = self._prefill_sparse_mla is not None
+        if not self._prefill_kv_insert and not self.use_prims_ts:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
+
+            self._prefill_kv_insert = (
+                self.dcp_world_size > 1 or self.use_shardq
+            ) and kv_insert.prefill_dcp_supported(
+                vllm_config, kv_cache_dtype, self.kv_lora_rank, self.qk_rope_head_dim
+            )
         # The DCP path's rows that the memory profile claims a working set for
         # (_reserve_trtllm_gen): MLAAttention runs a step's DCP-path MQA in
         # row chunks of at most this many rows (dense-MHA steps have more).
@@ -1237,7 +1248,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         skip_scale: bool = False,
     ) -> None:
         # Kimi K3.1 specialized prefill: the same FP8 insert at HBM rate
-        if self._prefill_sparse_mla is not None and kv_cache.numel() > 0:
+        if self._prefill_kv_insert and kv_cache.numel() > 0:
             from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
 
             k_pe2 = k_pe.squeeze(1)
