@@ -169,8 +169,11 @@ def test_tactic_for_shapes():
     for n in (36864, 18432, 9216):
         assert tactic_for(n) is TACTIC
         shape_tactic(n, tactic_for(n))
-    t8 = shape_tactic(4608, tactic_for(4608))
-    assert t8[0] == TACTIC[0] and t8[1][1] * t8[0][1] == 512 and t8[3] == 3
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        SHAPE_TACTICS,
+    )
+
+    assert shape_tactic(4608, tactic_for(4608)) == SHAPE_TACTICS[4608]
     with pytest.raises(ValueError):
         shape_tactic(4608, TACTIC)
 

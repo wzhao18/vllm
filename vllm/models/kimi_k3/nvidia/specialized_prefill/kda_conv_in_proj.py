@@ -26,9 +26,13 @@ MIN_ROWS = 2048
 TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "")
 #: Per-shape tactics, keyed by the q|k|v width N = 3 P of a TP-sharded layer,
 #: where TACTIC's cluster columns (tile N x cluster N = 1024) do not tile N.
-#: TP8 (P 1536, N 4608 = 9 x 512): 2x2 cluster, swizzle fitted to 3.
+#: TP8 (P 1536, N 4608): 4x1 cluster, "n" raster (pads M, which the epilogue
+#: bounds). Measured on VR200 (pgemm_conv_bench --mode conv, K 7168, 8 equal
+#: sequences, fused GEMM + fix-up vs cuBLASLt + qkv_conv): 32768 rows 258.5 vs
+#: 277.4 us, 16384 rows 142.9 vs 152.3 us; 2x2 "m" 268.5 / 148.6, 2x1 "m"
+#: 274.8 / 152.8, 4x1 "m" 282.9 / 158.0, 2x2 "n" 262.1 / 145.2.
 SHAPE_TACTICS = {
-    4608: ((512, 256), (2, 2), 256, 4, "m", 0, 0, ""),
+    4608: ((512, 256), (4, 1), 256, 8, "n", 0, 0, ""),
 }
 
 
