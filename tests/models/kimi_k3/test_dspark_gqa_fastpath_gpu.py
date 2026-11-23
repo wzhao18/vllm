@@ -127,7 +127,9 @@ def test_combine_normalizes_as_stock():
 # ---------------------------------------------------------------- torchrun
 
 
-@pytest.mark.parametrize("part", ["sites", "sites4", "vpmarkov", "build", "gather"])
+@pytest.mark.parametrize(
+    "part", ["sites", "sites4", "vpmarkov", "vpmarkov1", "build", "gather"]
+)
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin
     GPUs)."""
@@ -429,7 +431,7 @@ def _stock_markov(w1, w2, base, anchors, steps, sampling=None, shards=1):
     return torch.stack(out, dim=1)
 
 
-def _vp_markov_main(rank, world, device, group):
+def _vp_markov_main(rank, world, device, group, steps=3):
     """VocabParallelMarkov (the TP4 drafter's Markov sampling, here over the local
     world) against the stock loop at Markov rank 512 and the real vocabulary: the
     drafts bitwise (greedy and sampled; a fifth of the requests at temperature 0) and,
@@ -437,7 +439,7 @@ def _vp_markov_main(rank, world, device, group):
     other column written), eager and in a CUDA graph."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
 
-    vocab, rank_dim, steps = 163840, 512, 3
+    vocab, rank_dim = 163840, 512
     gen = torch.Generator(device=device).manual_seed(4242)
     w1 = torch.randn((vocab, rank_dim), generator=gen, device=device) * 0.05
     w1 = w1.bfloat16()
@@ -449,16 +451,21 @@ def _vp_markov_main(rank, world, device, group):
         torch.distributed.all_gather_into_tensor(out, x, group=group)
         return out
 
-    # The NCCL all-gather of the keys (explicit gather) and the peer mailbox.
-    variants = (
+    # The NCCL all-gather of the keys (explicit gather) and the peer mailbox; one
+    # draft position (DSpark k1) runs the gather only (GqaDraftFastPath.vp_markov:
+    # the mailbox needs >= 2 positions).
+    variants = [
         ("gather", draft.VocabParallelMarkov(w1, w2, world, rank, steps, gather)),
-        (
-            "mailbox",
-            draft.VocabParallelMarkov(
-                w1, w2, world, rank, steps, group=group, cap=128
-            ),
-        ),
-    )
+    ]
+    if steps > 1:
+        variants.append(
+            (
+                "mailbox",
+                draft.VocabParallelMarkov(
+                    w1, w2, world, rank, steps, group=group, cap=128
+                ),
+            )
+        )
     failures = 0
     for variant, markov in variants:
         lo, width = rank * markov.vocab_rank, markov.vocab_rank
@@ -809,6 +816,8 @@ def _gpu_main(parts):
         failures += _sites_main(rank, world, device, group, tp=4)
     if "vpmarkov" in parts:
         failures += _vp_markov_main(rank, world, device, group)
+    if "vpmarkov1" in parts:
+        failures += _vp_markov_main(rank, world, device, group, steps=1)
     if "build" in parts:
         failures += _build_main(rank, world, device, group)
     if "gather" in parts:

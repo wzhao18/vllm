@@ -1914,9 +1914,16 @@ class GqaDraftFastPath(DraftFastPath):
         try:
             from vllm.distributed import get_tp_group
 
+            # The polled per-position mailbox needs >= 2 draft positions: a peer
+            # reuses position 0's slots after its select of the NEXT position, which
+            # waits for this rank's keys; with one position (DSpark k1) the next is
+            # the next run's position 0, so a fast peer overwrites keys this rank has
+            # not taken yet (hang seen at k1, 2026-11-22 sdk-smk3-DCk1). k1 keeps the
+            # in-graph all-gather of the keys (same keys and selection).
+            group = get_tp_group().device_group if steps > 1 else None
             markov = VocabParallelMarkov(
                 head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps,
-                group=get_tp_group().device_group, cap=max(batches),
+                group=group, cap=max(batches),
             )  # fmt: skip
         except ValueError as error:
             fail("DSpark drafter Markov sampling", str(error))
