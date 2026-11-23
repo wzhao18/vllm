@@ -69,7 +69,9 @@ SETTLED_MARKOV = {16: "1:1"}
 # at most 8 rows, the shard read in place with an L2 evict-first policy), per TP, on
 # Rubin. 1 GPU, cold L2, 7 rows: 15.3 vs 18.5 us (torch.mm; 16-rank serving: cuBLAS
 # 18.5 + split-K reduce 3.8). An FP32 accumulation reorder of the base logits.
-FAST_LM_HEAD = {16: "1-7:1"}
+# TP8 (DFn on Rubin): the same rows on the 2x vocabulary shard (the verify LM head
+# already runs both kernels on it at every TP; test_specialized_decode_tp8_lmhead_gpu).
+FAST_LM_HEAD = {8: "1-7:1", 16: "1-7:1"}
 # Query rows whose LM-head shard GEMM runs with evict-first weight
 # loads (cutedsl.verify.lmhead.PreparedWideLmHead: the projection core without a K
 # split, BF16 logits bitwise equal to cuBLAS's unsplit kernels), per TP, on Rubin:
@@ -88,7 +90,7 @@ FAST_LM_HEAD = {16: "1-7:1"}
 # Above 64 rows cuBLAS as before. NQ-TUNE: 9-16 rows, the sweep's split-K 64.16.1.8 is
 # 14.23-14.30 us vs cuBLAS 14.55-14.60 (-2%, an FP32 K-order reorder: no K split): a
 # drafter LM head on that projection tactic is not wired.
-WIDE_LM_HEAD = {16: "17-32:1"}
+WIDE_LM_HEAD = {8: "17-32:1", 16: "17-32:1"}
 # Query rows whose LM-head shard GEMM is the die-local persistent stream-K token-wide
 # GEMM (cutedsl.gemm.wide_sk: the shard's two halves homed on the two dies, one CTA
 # pair per SM pair, all rows on the MMA's N), per TP, for the release drafter
