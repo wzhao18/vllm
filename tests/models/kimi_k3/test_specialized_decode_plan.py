@@ -5,6 +5,7 @@ the tuned rows) between the specialized providers and the stock seams, K3.1's DS
 seam (S2-DSA) included."""
 
 import dataclasses
+import re
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -178,7 +179,8 @@ def test_coverage_names_why_wide_rows_run_stock(dsa):
     why = "DSA wide steps need TP = DCP (TP8 or TP16)" if dsa else "not in WIDE_ROWS"
     assert decode.plan_coverage().reasons == {72: why, 256: why}
     decode.context = dataclasses.replace(decode.context, tp=16, dcp=16)
-    with pytest.raises(Uncovered, match=rf"M72\(q8\).*whole stock forward: {why}"):
+    match = rf"M72\(q8\).*whole stock forward: {re.escape(why)}"
+    with pytest.raises(Uncovered, match=match):
         decode.plan_coverage()
 
 
