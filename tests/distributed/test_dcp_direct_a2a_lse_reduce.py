@@ -1398,31 +1398,31 @@ class TestDeviceFaultWatch:
         import enum
         import types
 
-        class CudaError(enum.Enum):
-            cudaSuccess = 0
-            cudaErrorNotReady = 600
-            cudaErrorLaunchFailure = 719
+        class CUresult(enum.Enum):
+            CUDA_SUCCESS = 0
+            CUDA_ERROR_NOT_READY = 600
+            CUDA_ERROR_LAUNCH_FAILED = 719
 
         watch = cp_common._DeviceFaultWatch.__new__(cp_common._DeviceFaultWatch)
         watch.device_index = 3
-        watch.runtime = types.SimpleNamespace(cudaError_t=CudaError)
-        replies = iter(CudaError[name] for name in errors)
+        watch.driver = types.SimpleNamespace(CUresult=CUresult)
+        replies = iter(CUresult[name] for name in errors)
         watch.query = lambda: next(replies)  # type: ignore[method-assign]
         aborted: list[str] = []
         watch._abort = aborted.append  # type: ignore[method-assign]
         return watch, aborted
 
     def test_healthy_context_is_left_alone(self):
-        watch, aborted = self._watch(["cudaSuccess", "cudaErrorNotReady"])
+        watch, aborted = self._watch(["CUDA_SUCCESS", "CUDA_ERROR_NOT_READY"])
         assert not watch.check()
         assert not watch.check()
         assert aborted == []
 
     def test_sticky_error_aborts_with_the_error(self):
-        watch, aborted = self._watch(["cudaErrorLaunchFailure"])
+        watch, aborted = self._watch(["CUDA_ERROR_LAUNCH_FAILED"])
         assert watch.check()
         (message,) = aborted
-        assert "device 3" in message and "cudaErrorLaunchFailure" in message
+        assert "device 3" in message and "CUDA_ERROR_LAUNCH_FAILED" in message
         assert "direct DCP" in message
 
     def test_cpu_device_starts_no_watch(self, monkeypatch):
