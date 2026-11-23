@@ -75,7 +75,11 @@ SHARED = ("shared_gu", "shared_down")
 # 65-80 rows: one 80-row token tile instead of two 64-row tiles (DDSA step-up bench r2,
 # 1 GPU cold chain, us/call 64.64.2.6 / 64.80.2.5: R65 15.53 / 9.39, R72 15.98 / 9.39,
 # R80 16.06 / 9.46; same split, same max error vs FP32).
-ROUTER_LATENT = {"*": "1-40:64.32.2.9,41-64:64.64.2.6,65-80:64.80.2.5,81-96:64.96.2.5"}
+# 33-40 rows: one 64-row token tile (64.64.2.6) instead of two 32-row tiles, which
+# read the weights twice (CUPTI DC k7 B16 -> B17, n32 -> n34: +590 us of split-K per
+# step; DC k3 B40 17.731 > B44 17.675 ms, rgst-a). Same split (2), so the same split
+# summation order; the token tile only changes which CTA computes a row.
+ROUTER_LATENT = {"*": "1-32:64.32.2.9,33-64:64.64.2.6,65-80:64.80.2.5,81-96:64.96.2.5"}
 # Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
 # slice, split-K front vs prewait (fastab xy1/xy2/x96, Rhea): n32 split-K faster
