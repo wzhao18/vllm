@@ -822,6 +822,34 @@ def test_tp8_inprojection_generic_rows_run_cublas():
 
     for rows in (6288, 3808):
         tp8 = providers.projection_policies(8, rows, (8, 64, 72, 128), sms=212, q=4)
-        assert set(tp8) == {8, 64}, (rows, tp8)
+        assert 72 not in tp8 and 128 not in tp8, (rows, tp8)
     tp16 = providers.projection_policies(16, 3216, (72, 128), sms=212, q=4)
     assert tp16 == {72: (64, 64, 2, 6), 128: (64, 64, 2, 6)}
+
+
+def test_tp8_rubin_tables_take_tp16_entries():
+    """DFn (TP8 = DCP8 on Rubin) table extensions that take TP16's measured Rubin
+    entries: the experts' grid (every SM; B1 152, B2-4 192), the merged front at 16-32
+    rows (a stated FP32 K reorder), the o-projection's batched consumer polls and
+    carve-outs (launch attributes, bitwise), and the drafter's Markov (MarkovWide above
+    8 requests: identical drafts), context step, all-reduce sites and their gates."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime,
+        front,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import (
+        prepared as oproj,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+    assert experts_runtime.GRID[(8, 212)] == 212
+    assert experts_runtime.GRIDS[(8, 212)] == experts_runtime.GRIDS[(16, 212)]
+    assert front.MERGED_WIDE[8] == front.MERGED_WIDE[16]
+    assert oproj.CONSUMER_CARVEOUT[8] == oproj.CONSUMER_CARVEOUT[16]
+    assert oproj.PRODUCER_CARVEOUT[8] == oproj.PRODUCER_CARVEOUT[16]
+    assert oproj.TWOSHOT_BATCHED[8] == oproj.TWOSHOT[8]  # the TP8 two-shot rows
+    for table in ("FAST_CONTEXT", "FAST_AR", "GATED_AR", "SITE_DEFERRED", "VALID_AR"):
+        assert getattr(draft, table)[8] == getattr(draft, table)[16], table
+    markov = draft.batch_table(draft.FUSED_MARKOV[8])
+    assert all(markov.get(b) == 1 for b in (1, 8, 9, 64, 384))

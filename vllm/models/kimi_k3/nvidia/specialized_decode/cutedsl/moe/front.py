@@ -569,7 +569,7 @@ MERGED = {8: "41-64:1", 16: "33-64:1"}
 # -0.68..-1.26, M32 -1.20..-1.43 (q8) / -1.56 (q4); with the rows 4 us late M16-32
 # +0.03..-0.31. The front's K split changes (a stated FP32 reorder of the logits and
 # the latent rows); top-16 ids identical on the test routes.
-MERGED_WIDE = {16: "16-32:1"}
+MERGED_WIDE = {8: "16-32:1", 16: "16-32:1"}
 # Devices with more SMs than GB300's 152 (Rubin), by packed front rows: ``MERGED``
 # batches whose merged front + gate/up kernel is ``MoeFrontTmem64`` (128-row tiles
 # split over K in clusters of 8, the weights staged in tensor memory before the PDL
