@@ -114,8 +114,9 @@ RING_HEAD = {16: "1-:1"}
 # B17-B192); NQ-TUNE: the 16-rank in-graph step vs the stock forward at q4 M1024 /
 # M1536 / M2048 and q8 M1024 / M2048 (a point that loses leaves this table).
 WIDE_ROWS = {"*": "65-:1"}
-# 9-64 rows too (TP16NV LHF; the dense ring box holds PREPARED_MAX rows).
-RING_DENSE = {16: "1-64:1"}
+# (9-64 rows: not a table edit, the ring split-K GEMM's tiles hold one fragment per
+# epilogue thread only at 1-8 rows; ``RingSplitKGemm`` asserts.)
+RING_DENSE = {16: "1-8:1"}
 
 
 def head_batches(attention, q):
