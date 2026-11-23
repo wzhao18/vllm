@@ -147,3 +147,35 @@ def test_kdaflow_fold_bitwise_vs_kdawide(verify_length, monkeypatch):
                        checkpoints["flow"][single], checkpoints["wide"][single])  # fmt: skip
     torch.testing.assert_close(checkpoints["flow"], checkpoints["wide"], rtol=1e-5,
                                atol=1e-7, msg=f"q{q} folded checkpoints (>= 2 pending)")  # fmt: skip
+
+
+@pytest.fixture
+def conv32(monkeypatch):
+    """FP32 KDA conv state (the stock-precision rule: --mamba-cache-dtype float32):
+    every helper's caches() returns the conv window in FP32."""
+    real = kda.caches
+
+    def caches(slots, seed=1):
+        conv, state = real(slots, seed)
+        return conv.float(), state
+
+    monkeypatch.setattr(kda, "caches", caches)
+    return True
+
+
+# n33 (every core kind's middle) and each q's largest KdaFlow build at the SP row cap;
+# at FP32 conv the q4 20/24-item and q7 / q8 builds run one conv window buffer.
+CAP_N32 = {**CAP_N, 4: 200}
+
+
+@pytest.mark.parametrize("n", ["n33", "cap"])
+@pytest.mark.parametrize("verify_length", [2, 3, 4, 5, 6, 7, 8], indirect=True,
+                         ids=lambda q: f"q{q}")  # fmt: skip
+def test_deferred_serving_path_fp32_conv(verify_length, n, conv32):
+    requests = 33 if n == "n33" else CAP_N32[verify_length]
+    path.test_deferred_serving_path_matches_stock(requests, True, False)
+
+
+@pytest.mark.parametrize("verify_length", [4, 8], indirect=True, ids=lambda q: f"q{q}")
+def test_fold_then_verify_fp32_conv(verify_length, conv32):
+    fold.test_fold_matches_stock_commit_then_verify(33, True)
