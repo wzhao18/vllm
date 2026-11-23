@@ -39,6 +39,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.attention.ops.cp_common import request_arrival_barrier
 from vllm.v1.hisparse.binding import release_hisparse_profiling_cache
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -473,6 +474,9 @@ class CudaGraphManager:
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for size_index, desc in enumerate(descs):
                     _k31_breadcrumb_size(size_index)
+                    # Ranks re-align on the host before this size's first
+                    # direct CP collective (start-up skew, e.g. a JIT build).
+                    request_arrival_barrier()
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 

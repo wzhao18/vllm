@@ -4,10 +4,15 @@
 
 from __future__ import annotations
 
+import atexit
 import functools
+import os
+import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
@@ -87,6 +92,130 @@ def direct_cp_multicast_enabled(
     ) and _symm_mem_spans_group(group)
 
 
+# Startup arrival barrier.
+#
+# The direct CP collectives wait for their peers on the device with a bounded
+# spin, and nothing on the host orders the ranks before a launch. During startup
+# one rank can lag its peers by minutes (a JIT build or a cubin load under a
+# cross-node file lock at a kernel's first use), long enough to exhaust the
+# peers' device wait. So the first direct collective of each workspace after
+# ``request_arrival_barrier()`` (start-up, then once per CUDA graph capture size)
+# first waits for every rank of its group on a host barrier. In steady state the
+# generation never changes: one integer compare per eager call and nothing in a
+# graph replay.
+_arrival_generation = 1
+
+
+def request_arrival_barrier() -> None:
+    """Make the next direct CP collective of every workspace start with a host
+    barrier on its group. Call it collectively (every rank, same point), e.g.
+    before warming up each CUDA graph capture size."""
+    global _arrival_generation
+    _arrival_generation += 1
+
+
+def _cpu_group_of(device_group: ProcessGroup) -> ProcessGroup | None:
+    """The CPU (gloo) group of the vLLM GroupCoordinator owning ``device_group``."""
+    from vllm.distributed import parallel_state
+
+    for ref in list(parallel_state._groups.values()):
+        coordinator = ref()
+        if coordinator is not None and coordinator.device_group is device_group:
+            return coordinator.cpu_group
+    return None
+
+
+# Device fault watch.
+#
+# A direct CP collective whose device wait expires prints "direct DCP ...
+# timeout source=<rank> ..." and traps. The trap faults this rank's CUDA context,
+# but the host only learns of it at its next CUDA call, and a host already
+# blocked in a CPU collective (graph-capture bookkeeping) never makes one, while
+# the peers spin forever in collectives that wait for the dead rank: the engine
+# hangs instead of failing (DCRIT r148). A watcher thread polls the context
+# state with a stream query on a private, empty stream (its thread uses relaxed
+# capture mode, so a concurrent graph capture is unaffected) and aborts the
+# worker on a sticky error, which the executor turns into an engine failure.
+DEVICE_FAULT_EXIT_CODE = 87
+
+
+class _DeviceFaultWatch:
+    POLL_S = 1.0
+
+    def __init__(self, device_index: int) -> None:
+        from cuda.bindings import runtime
+
+        self.runtime = runtime
+        self.device_index = device_index
+        self.stream = torch.cuda.Stream(device=device_index)
+        self.stream_handle = self.stream.cuda_stream
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name="direct-cp-fault-watch", daemon=True
+        )
+        self._thread.start()
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5.0)
+
+    def query(self) -> Any:
+        """cudaSuccess while the context is healthy, else its sticky error."""
+        (error,) = self.runtime.cudaStreamQuery(
+            self.runtime.cudaStream_t(self.stream_handle)
+        )
+        return error
+
+    def check(self) -> bool:
+        error = self.query()
+        if error in (
+            self.runtime.cudaError_t.cudaSuccess,
+            self.runtime.cudaError_t.cudaErrorNotReady,
+        ):
+            return False
+        self._abort(
+            f"CUDA context of this worker (device {self.device_index}) faulted: "
+            f"{error.name}. A device trap or fault, e.g. a direct DCP collective "
+            "spin timeout ('direct DCP ... timeout source=<rank>' on stdout names "
+            "the late source rank). Aborting the worker so the engine fails "
+            "instead of hanging."
+        )
+        return True
+
+    def _abort(self, message: str) -> None:
+        logger.critical("%s", message)
+        print(message, file=sys.stderr, flush=True)
+        os._exit(DEVICE_FAULT_EXIT_CODE)
+
+    def _watch(self) -> None:
+        runtime = self.runtime
+        runtime.cudaSetDevice(self.device_index)
+        runtime.cudaThreadExchangeStreamCaptureMode(
+            runtime.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+        )
+        while not self._stop.wait(self.POLL_S):
+            if self.check():
+                return
+
+
+_device_fault_watches: dict[int, _DeviceFaultWatch] = {}
+_device_fault_lock = threading.Lock()
+
+
+def watch_device_faults(device: torch.device) -> None:
+    """Abort this process when the CUDA context of ``device`` faults (once per
+    device; no-op off CUDA)."""
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device() if device.index is None else device.index
+    with _device_fault_lock:
+        if index not in _device_fault_watches:
+            _device_fault_watches[index] = _DeviceFaultWatch(index)
+
+
 class DirectCPWorkspace:
     def __init__(
         self,
@@ -101,6 +230,18 @@ class DirectCPWorkspace:
         self.num_ubatches = num_ubatches
         self.epoch = torch.zeros(num_ubatches, dtype=torch.int64, device=self.device)
         self._allocations: list[tuple[torch.Tensor, Any, list[torch.Tensor]]] = []
+        # Host barrier group for arrive(); None skips the barrier (a standalone
+        # group outside vLLM's parallel state). Tests may assign a gloo group.
+        self.arrival_group = _cpu_group_of(group)
+        self._arrived_generation = 0
+
+    def arrive(self) -> None:
+        """Start-up arrival barrier: call before launching a spin collective."""
+        if self._arrived_generation == _arrival_generation:
+            return
+        self._arrived_generation = _arrival_generation
+        if self.arrival_group is not None and self.world_size > 1:
+            dist.barrier(group=self.arrival_group)
 
     def _allocate(
         self, shape: tuple[int, ...], dtype: torch.dtype
