@@ -604,6 +604,12 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if self.vllm_config.kernel_config.enable_jit_warmup:
+            # Time every kernel compile from here on (model build, warmup,
+            # CUDA graph capture); activate() logs the startup summary.
+            from vllm.utils.jit_monitor import install_timing_hooks
+
+            install_timing_hooks()
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),

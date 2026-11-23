@@ -322,6 +322,7 @@ class CompilerManager:
                     str(compile_range),
                     elapsed,
                 )
+                _report_compile_time(compile_range, elapsed)
             return compiled_graph
 
         # no compiler cached the graph, or the cache is disabled,
@@ -428,8 +429,18 @@ class CompilerManager:
                 str(compile_range),
                 elapsed,
             )
+            _report_compile_time(compile_range, elapsed)
 
         return compiled_graph
+
+
+def _report_compile_time(compile_range: Range, seconds: float) -> None:
+    """Duration of the graph(s) ``report_compile`` counted for this range."""
+    from vllm.utils import jit_monitor
+
+    jit_monitor.report_compile_time(
+        "torch.compile", f"graph for compile range {compile_range}", seconds
+    )
 
 
 class StopCompiling(BaseException):

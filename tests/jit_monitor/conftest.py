@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+
 import pytest
 
 from vllm.utils import jit_monitor
@@ -23,6 +25,11 @@ def _reset_monitor():
         jit_monitor._cutedsl_hook_installed = False
         jit_monitor._tilelang_hook_installed = False
         jit_monitor._tilelang_jitimpl_compile_depth = 0
+        jit_monitor._flashinfer_hook_installed = False
+        jit_monitor._timing_installed = False
+        jit_monitor._triton_autotune_listener_installed = False
+        jit_monitor._compile_stats = {"startup": {}, "serving": {}}
+        jit_monitor._tls = threading.local()
 
     reset()
     yield
