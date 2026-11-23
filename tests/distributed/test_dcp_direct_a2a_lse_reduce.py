@@ -121,11 +121,13 @@ def _distributed_run(fn, world_size: int, extra_env: dict[str, str]) -> None:
     for process in processes:
         process.join(timeout=120)
 
+    # Reap every rank before asserting: a failed rank must not leave its peers
+    # running (spinning on the GPU) after the test returns.
     for process in processes:
         if process.is_alive():
             process.kill()
             process.join()
-        assert process.exitcode == 0
+    assert [process.exitcode for process in processes] == [0] * len(processes)
 
 
 class _FakeGroupCoordinator:
