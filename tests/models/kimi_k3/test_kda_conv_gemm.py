@@ -485,3 +485,54 @@ def test_fused_in_proj_declines_mixed_batches(monkeypatch, decodes, spec, prefil
     conv._gemm = object()  # never reached
     qa = SimpleNamespace(data=torch.empty(kda_conv_in_proj.MIN_ROWS * 4, 8))
     assert conv.fused(qa) is None
+
+
+def test_fused_in_proj_drops_tp_padding_rows(monkeypatch):
+    """TP8 KDA in_proj rows end in in_proj_padding (g|f_a|beta 1536+128+12 =
+    1676, padded to 1680): fused() returns only the g|f_a|beta columns, so the
+    caller's split [P, head_dim, heads] holds (TP8+DCP8 prefill crashed on the
+    padded block before e1d3b62e0d)."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+
+    part, hd, heads, pad, rows = 1536, 128, 12, 4, kda_conv_in_proj.MIN_ROWS
+    md = SimpleNamespace(
+        num_prefills=1, num_decodes=0, num_spec_decodes=0, checkpoint=None,
+        non_spec_query_start_loc=torch.tensor([0, rows], dtype=torch.int32),
+        non_spec_state_indices_tensor=torch.zeros(1, dtype=torch.int32),
+        has_initial_state=torch.zeros(1, dtype=torch.bool),
+    )  # fmt: skip
+    monkeypatch.setattr(
+        kda_conv_in_proj,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"kda": md}),
+    )
+    rest_rows = part + hd + heads + pad
+    monkeypatch.setattr(
+        torch, "_scaled_mm",
+        lambda a, b, **kw: torch.arange(a.shape[0] * b.shape[1], dtype=torch.float32)
+        .view(a.shape[0], b.shape[1]),
+    )  # fmt: skip
+    conv = kda_conv_in_proj.PrefillKdaConvInProj.__new__(
+        kda_conv_in_proj.PrefillKdaConvInProj
+    )
+    conv.layer = SimpleNamespace(
+        prefix="kda", local_projection_size=part, head_dim=hd, local_num_heads=heads,
+        kv_cache=[torch.zeros(1, 3 * part, 3, dtype=torch.float32)],
+    )  # fmt: skip
+    conv.p = part
+    conv.rest_cols = part + hd + heads
+    conv.w_rest = torch.zeros(rest_rows, 64)
+    conv.s_rest = torch.zeros(rest_rows * 2, dtype=torch.uint8)
+    conv._gemm = lambda *a, **kw: (torch.zeros(3, rows, part), None)
+    conv._gemm.supports_checkpoint_halo = True
+    qa = SimpleNamespace(
+        data=torch.zeros(rows, 64), scale=torch.zeros(rows * 2, dtype=torch.uint8)
+    )
+    _, rest, _ = conv.fused(qa)
+    assert rest.shape == (rows, part + hd + heads)
+    g, f_a, beta = rest.split([part, hd, heads], dim=-1)
+    assert beta.shape == (rows, heads)
+    # the kept columns are the GEMM's first columns (padding dropped at the end)
+    assert torch.equal(rest[1], torch.arange(rest_rows, 2 * rest_rows)[: rest.shape[1]].float())
