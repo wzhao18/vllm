@@ -87,7 +87,8 @@ def test_bin_pins_cover_and_match_linear():
         lin = lt_pin.pinned(w, rows, strict=True)
         assert lin is not None and set(lin.kernels) >= set(rows) - set(
             lt_pin.pins_for((n, k))
-        ), (n, k)
+        ) - lt_pin.default_rows((n, k)), (n, k)
+        rows = [r for r in rows if r in lin.kernels]
         for r in rows:
             x = torch.randn((r, k), device="cuda", generator=gen).bfloat16()
             out = lin.run(x, x.new_empty((r, n)))
@@ -140,9 +141,10 @@ def test_exact_pins_match_linear():
     gen = torch.Generator(device="cuda").manual_seed(2)
     for (n, k), rows in sorted(table.items()):
         w = (torch.randn((n, k), device="cuda", generator=gen) / k**0.5).bfloat16()
-        lin = lt_pin.pinned(w, sorted(rows), strict=True)
+        rows = sorted(set(rows) - lt_pin.default_rows((n, k)))
+        lin = lt_pin.pinned(w, rows, strict=True)
         assert lin is not None and set(lin.kernels) == set(rows), (n, k)
-        for r in sorted(rows):
+        for r in rows:
             x = torch.randn((r, k), device="cuda", generator=gen).bfloat16()
             out = lin.run(x, x.new_empty((r, n)))
             ref = x.float() @ w.float().t()
@@ -152,3 +154,20 @@ def test_exact_pins_match_linear():
             stock_err = (stock.float() - ref).abs().max().item() / scale
             assert err <= max(2 * stock_err, 4e-3), ((n, k), r, err, stock_err)
         del w
+
+
+def test_default_rows_are_unpinned_and_labelled():
+    """DEFAULT_ROWS (measured: no pinned algorithm beats F.linear): never pinned, by
+    an exact pin or a bin, and labelled as a measured default in the coverage log."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode import lt_pin
+
+    table = lt_pin.DEFAULT_ROWS.get(lt_pin.version(), {})
+    if not table:
+        pytest.skip(f"no default rows for cuBLASLt {lt_pin.version()}")
+    for shape, rows in table.items():
+        for r in rows:
+            assert r not in lt_pin.pins_for(shape) and lt_pin.bin_pin(shape, r) is None
+        labels = lt_pin.pin_labels(shape, sorted(rows))
+        assert all(v.startswith("measured cuBLAS default") for v in labels.values())
+        w = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+        assert lt_pin.pinned(w, sorted(rows), strict=True) is None

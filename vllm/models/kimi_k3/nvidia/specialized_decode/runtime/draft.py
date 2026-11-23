@@ -1313,15 +1313,16 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0, strict=
     pinned_rows: dict[tuple, dict[int, str]] = {}
 
     def account(weight, rows, prepared):
-        from ..lt_pin import pin_labels
+        from ..lt_pin import default_rows, pin_labels
 
         shape = tuple(weight.shape)
         served = set(prepared.kernels) if prepared is not None else set()
-        stock.setdefault(shape, set()).update(r for r in rows if r not in served)
-        pins = getattr(prepared, "pins", None)
-        if pins is not None:
-            labels = pin_labels(weight.shape, sorted(pins.kernels))
-            pinned_rows.setdefault(shape, {}).update(labels)
+        rest = [r for r in rows if r not in served]
+        measured = {r for r in rest if r in default_rows(shape)}
+        stock.setdefault(shape, set()).update(r for r in rest if r not in measured)
+        covered = sorted(measured | set(getattr(getattr(prepared, "pins", None), "kernels", ())))
+        if covered:
+            pinned_rows.setdefault(shape, {}).update(pin_labels(shape, covered))
 
     for linear, rows in linears:
         if getattr(linear, "bias", None) is not None:

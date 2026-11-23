@@ -614,6 +614,19 @@ EXACT_PINS[130801] = {
 }
 
 
+# Rows whose measured best is the F.linear default itself (DCRIT r120 no-worse check,
+# per-call validation on hecate0223: interleaved default / pin, 14 rounds each, the pin
+# slower beyond the interquartile ranges): no pin; the drafter runs F.linear there, a
+# measured choice logged as such (never 'stock cuBLAS'), and no bin covers them.
+DEFAULT_ROWS: dict[int, dict[tuple[int, int], frozenset]] = {}
+DEFAULT_ROWS[130801] = {
+    (2048, 7168): frozenset([66, 72, 78, 105, 114, 117, 120, 126]),
+    (2560, 7168): frozenset([72, 76, 80, 88, 92, 96, 104, 108, 112, 120, 124, 128, 140, 144]),
+    (7168, 1536): frozenset([33, 36, 42, 45, 48]),
+    (7168, 3584): frozenset([258, 273, 285, 288]),
+}
+
+
 BIN_PINS: dict[int, dict[tuple[int, int], tuple[tuple[int, int, str, str], ...]]] = {}
 # Row-bin pins (SDECK, 2026-11-22; DCRIT r110 / r111 #5, MAIN option (a)): the TP4 drafter
 # linears (the SP decode roles DC / DB) at every DSpark k1-k7 row above the split-K
@@ -866,7 +879,13 @@ def pins_for(shape) -> dict[int, str]:
     out.update(
         {r: h for r, (_, h) in EXACT_PINS.get(version(), {}).get(shape, {}).items()}
     )
-    return out
+    keep = default_rows(shape)
+    return {r: h for r, h in out.items() if r not in keep}
+
+
+def default_rows(shape) -> frozenset:
+    """Rows of (N, K) where the measured best is F.linear's default (DEFAULT_ROWS)."""
+    return DEFAULT_ROWS.get(version(), {}).get(tuple(shape), frozenset())
 
 
 class PinnedLinear:
@@ -909,6 +928,8 @@ class PinnedLinear:
 
 def bin_pin(shape, rows: int) -> "tuple[int, int, str, str] | None":
     """The BIN_PINS bin (lo, hi, label, descriptor) of (N, K) covering ``rows``."""
+    if rows in default_rows(shape):
+        return None
     for lo, hi, label, hexstr in BIN_PINS.get(version(), {}).get(tuple(shape), ()):
         if lo <= rows <= hi:
             return lo, hi, label, hexstr
@@ -921,8 +942,11 @@ def pin_labels(shape, rows) -> dict[int, str]:
     shape = tuple(shape)
     table, out = pins_for(shape), {}
     exact = EXACT_PINS.get(version(), {}).get(shape, {})
+    keep = default_rows(shape)
     for r in rows:
-        if r in exact:
+        if r in keep:
+            out[r] = "measured cuBLAS default (no pinned algorithm beats it)"
+        elif r in exact:
             out[r] = f"pinned cuBLASLt {exact[r][0]} (exact row)"
         elif r in table:
             out[r] = "pinned cuBLASLt (exact row)"
