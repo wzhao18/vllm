@@ -27,6 +27,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    register_poll_helper,
+    spin_start,
+    spin_tick,
+)
+
 from ..common.primitives import asm
 
 VALID_SENT = 0x80000000
@@ -135,8 +141,10 @@ def try_wait_valid(barrier, phase):
 def wait_valid(barrier, phase):
     """Wait for ``phase`` of a layout::v1 barrier; nonzero if a chunk was armed."""
     done, armed = try_wait_valid(barrier, phase)
+    sgn, sgt = spin_start()
     while done == 0:
         done, armed = try_wait_valid(barrier, phase)
+        sgn, sgt = spin_tick(sgn, sgt, observed=done, target=0)
     return armed
 
 
@@ -152,3 +160,7 @@ def poll_valid(barrier, phase, nbytes: cutlass.Constexpr[int], issue):
         armed = wait_valid(barrier, phase)
         phase = phase ^ 1
     return phase
+
+
+# spin timeouts name the caller of these shared polls
+register_poll_helper(__file__, "wait_valid")

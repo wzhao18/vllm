@@ -22,6 +22,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
@@ -249,5 +251,7 @@ class QueryWait:
             loads = [load_volatile(source, count=4) for source in sources]
             for i in cutlass.range_constexpr(n):  # the loads above are in flight
                 words = loads[i]
+                sgn, sgt = spin_start()
                 while not published(words, sentinel=Q_SENT):
                     words = load_volatile(sources[i], count=4)
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)

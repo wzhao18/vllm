@@ -74,6 +74,27 @@ def _sorted_buckets(buckets: Sequence[RubinBucket]) -> list[RubinBucket]:
     return ordered
 
 
+# Device printf FIFO for the spin-guard trap lines (VENDOR.md S9). Backstop only: the primary fix is that
+# one thread per rank and guard site prints (spin_guard._elect_printer). The limit can only be raised before
+# this context's first kernel that uses printf, so a failure is logged and ignored.
+_PRINTF_FIFO_BYTES = 8 << 20
+
+
+def _raise_printf_fifo() -> None:
+    try:
+        from cuda.bindings import runtime as cudart
+
+        err, cur = cudart.cudaDeviceGetLimit(cudart.cudaLimit.cudaLimitPrintfFifoSize)
+        if err == cudart.cudaError_t.cudaSuccess and cur < _PRINTF_FIFO_BYTES:
+            (err,) = cudart.cudaDeviceSetLimit(
+                cudart.cudaLimit.cudaLimitPrintfFifoSize, _PRINTF_FIFO_BYTES
+            )
+        if err != cudart.cudaError_t.cudaSuccess:
+            logger.info("Rubin MegaMoE: printf FIFO not raised (%s)", err)
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        logger.info("Rubin MegaMoE: printf FIFO not raised (%s)", e)
+
+
 class RubinMegaMoE:
     def __init__(
         self,
@@ -83,6 +104,7 @@ class RubinMegaMoE:
     ):
         require_sm107()
         ensure_not_capturing("RubinMegaMoE construction")
+        _raise_printf_fifo()
         self.problem = problem
         self.group = group
         self.rank, self.world = _rank_world(group)

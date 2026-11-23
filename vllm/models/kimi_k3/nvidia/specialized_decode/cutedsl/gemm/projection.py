@@ -16,7 +16,13 @@ from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
 from ..common.host import architecture, prepare_shared_carveout, tensor_maps, to_cute
 from ..common.host import stream as current_stream
-from .splitk import CTA_K, SplitKGemm, SplitKTactic
+from .splitk import (
+    CTA_K,
+    SplitKGemm,
+    SplitKTactic,
+    splitk_smem_bytes,
+    splitk_smem_capacity,
+)
 
 
 def matrix_view(tensor, *, output=False):
@@ -130,6 +136,15 @@ class PreparedProjection:
                         raise ValueError(
                             f"split-K tactic {tactic} for K = {k}: K must be a "
                             f"multiple of {CTA_K} x split ({CTA_K * tactic[2]})"
+                        )
+                    # A ring that does not fit the launch's dynamic shared memory
+                    # compiles with only a warning and faults at run (illegal
+                    # address, step-up bench r1): refuse it here.
+                    need, cap = splitk_smem_bytes(tactic), splitk_smem_capacity()
+                    if need > cap:
+                        raise ValueError(
+                            f"split-K tactic {tactic}: {need} B shared memory > "
+                            f"{cap} B the kernel launches with"
                         )
                     code = compile_projection(tactic, dtype, arch)
                 self.kernels[batch] = code

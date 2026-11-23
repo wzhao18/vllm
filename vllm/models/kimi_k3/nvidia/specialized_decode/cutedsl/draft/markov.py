@@ -65,6 +65,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64  # noqa: F401
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.gumbel import (
     DRAFT_NOISE_SALT,
     drafted_value,
@@ -482,6 +484,7 @@ class MarkovGreedy:
                 if c < self.chunks:
                     pending |= Uint32(1 << j)
             spins = Int32(0)
+            sgn, sgt = spin_start()
             while pending != Uint32(0):
                 spins += 1
                 if cutlass.const_expr(self.spin_limit > 0):  # noqa: SIM102
@@ -507,6 +510,10 @@ class MarkovGreedy:
                             ready &= values[k] != Uint32(0)
                         if ready:
                             pending &= ~Uint32(1 << j)
+                sgn, sgt = spin_tick(
+                    sgn, sgt, observed=pending,
+                    target=0, rank=rank, size=self.tp
+                )
             self.stamp(stats, cta, tid, 8 + 6 * i)
             if cutlass.const_expr(self.settle):
                 cute.arch.sync_threads()
@@ -607,6 +614,7 @@ class MarkovGreedy:
         values = load_words(pointer, count=4, volatile=True)
         ready = (values[0] != Uint32(0)) & (values[1] != Uint32(0))
         ready = ready & (values[2] != Uint32(0)) & (values[3] != Uint32(0))
+        sgn, sgt = spin_start()
         while not ready:
             spins += 1
             values = load_words(pointer, count=4, volatile=True)
@@ -615,6 +623,7 @@ class MarkovGreedy:
             if cutlass.const_expr(self.spin_limit > 0):  # noqa: SIM102
                 if spins > self.spin_limit:
                     ready = True
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
 
 
 class MarkovBox:

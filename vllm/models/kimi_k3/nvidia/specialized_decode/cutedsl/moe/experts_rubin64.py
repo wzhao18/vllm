@@ -21,6 +21,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.primitives import (
     alloc,
     asm,
@@ -1068,12 +1070,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     source += ((Int64(group) * slots + peer) * 1024 + row) * 4
                     words = cute.make_rmem_tensor(self.width, Uint32)
                     ready = False
+                    sgn, sgt = spin_start()
                     while not ready:
                         bad = False
                         for t in cutlass.range_constexpr(self.width):
                             words[t] = load_volatile(source + t * 512)[0]
                             bad |= words[t] == Uint32(4294967295)
                         ready = cute.arch.vote_all_sync(not bad)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                     for t in cutlass.range_constexpr(self.width):
                         values[t] += bits_float(words[t])
                         store_words(source + t * 512, (Uint32(4294967295),))
@@ -1108,6 +1112,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 place = cute.crd2idx((rslot, token, chunk - owner * width), recv.layout)
                 target = Int64(peers[owner]) + Int64(place) * 2
             ready = False
+            sgn, sgt = spin_start()
             while not ready:
                 bad = False
                 for slot in cutlass.range_constexpr(16):
@@ -1116,6 +1121,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 ready = cute.arch.vote_all_sync(not bad)
                 if not ready:
                     sleep_ns(64)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             low, high = Float32(0), Float32(0)
             for slot in cutlass.range_constexpr(16):
                 store_words(source + slot * 7168, (Uint32(4294967295),))

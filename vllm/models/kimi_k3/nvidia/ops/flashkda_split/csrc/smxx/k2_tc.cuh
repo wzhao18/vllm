@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include "utils.cuh"
+#include "k31_spin_guard.cuh"  // bounded mbarrier waits
 
 namespace k2tc {
 
@@ -71,17 +72,8 @@ __device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
                : "memory");
 }
 
-__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
-  asm volatile(
-      "{\n .reg .pred P1;\n"
-      "WAIT_%=:\n"
-      " mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-      " @P1 bra DONE_%=;\n"
-      " bra WAIT_%=;\n"
-      "DONE_%=:\n}" ::"r"(bar),
-      "r"(parity)
-      : "memory");
-}
+// bounded (k31_spin_guard.cuh): site = the wait's line
+#define mbar_wait(bar, parity) k31sg::mbar_wait((bar), (parity), "flashkda_k2_tc", __LINE__)
 
 __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
   asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(bar)
@@ -258,6 +250,7 @@ __global__ void __launch_bounds__(kThreads, 2) k2_tc_kernel(
     cutlass::bfloat16_t const* __restrict__ ws_inv,
     cutlass::bfloat16_t const* __restrict__ ws_mqk, int flags,
     unsigned const* __restrict__ tile_flags) {
+  k31sg::begin_call((long long)(T_total));  // timeout lines: call index and size
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   extern __shared__ __align__(1024) unsigned char smem[];
   const int warp = threadIdx.x >> 5;

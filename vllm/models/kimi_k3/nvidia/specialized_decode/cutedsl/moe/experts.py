@@ -9,6 +9,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import (
+    spin_start,
+    spin_tick,
+)
+
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -700,6 +705,7 @@ class ExpertsKernel(ExpertsGeometry):
         if valid_bytes < 4:
             mask = (Uint32(1) << 8 * valid_bytes) - 1
         ready = False
+        sgn, sgt = spin_start()
         while not ready:
             bad = False
             for v in cutlass.range_constexpr(chunks):
@@ -715,6 +721,7 @@ class ExpertsKernel(ExpertsGeometry):
             if valid_bytes > 0:
                 bad |= has_ff_byte(scale & mask)
             ready = cute.arch.vote_all_sync(not bad)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         image = sm.iterator + self.off_h + buffer * self.h_image_bytes
         for v in cutlass.range_constexpr(chunks):
             words = tuple(values[v, w] for w in range(4))
@@ -1255,6 +1262,7 @@ class ExpertsKernel(ExpertsGeometry):
                     source += ((Int64(group) * slots + peer) * 1024 + row) * 4
                     words = cute.make_rmem_tensor(self.width, Uint32)
                     ready = False
+                    sgn, sgt = spin_start()
                     while not ready:
                         bad = False
                         for t in cutlass.range_constexpr(self.width):
@@ -1263,6 +1271,7 @@ class ExpertsKernel(ExpertsGeometry):
                                 words[t] = load_volatile(source + t * 512)[0]
                                 bad |= words[t] == Uint32(4294967295)
                         ready = cute.arch.vote_all_sync(not bad)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                     for t in cutlass.range_constexpr(self.width):
                         if t < live:
                             values[t] += bits_float(words[t])
@@ -1368,12 +1377,14 @@ class ExpertsKernel(ExpertsGeometry):
             source += (Int64(token) * 16 * 1792 + column // 2 + lane) * 4
             words = cute.make_rmem_tensor(16, Uint32)
             ready = False
+            sgn, sgt = spin_start()
             while not ready:
                 bad = False
                 for slot in cutlass.range_constexpr(16):
                     words[slot] = load_volatile(source + slot * 7168)[0]
                     bad |= words[slot] == Uint32(4294967295)
                 ready = cute.arch.vote_all_sync(not bad)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             low, high = Float32(0), Float32(0)
             for slot in cutlass.range_constexpr(16):
                 store_words(source + slot * 7168, (Uint32(4294967295),))

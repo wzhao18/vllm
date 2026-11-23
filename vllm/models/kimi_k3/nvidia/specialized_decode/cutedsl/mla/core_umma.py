@@ -29,6 +29,8 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.host import fake
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -531,8 +533,10 @@ class DcpCoreUmma:
                 ready = self.query_ready(qwords)
             else:
                 ready = self.load_query(qwords, query, b, tid)
+            sgn, sgt = spin_start()
             while not ready:
                 ready = self.load_query(qwords, query, b, tid)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             w = 0
             for kb in cutlass.range_constexpr(5):
                 chunks = 8 if kb < 4 else 4

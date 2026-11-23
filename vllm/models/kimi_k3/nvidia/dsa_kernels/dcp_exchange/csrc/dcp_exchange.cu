@@ -95,6 +95,7 @@ constexpr int kPPTile = 16384;   // pre-pass keys per CTA tile (kThreads x 8 x 8
 constexpr int kPPList = 4096;    // pre-pass candidates kept per row
 constexpr int kPPCand = 2;       // candidate bound: this many coarse bins below the centre
 
+static __device__ unsigned int g_spin_printed;  // one timeout line per process and GPU
 __device__ __forceinline__ void spin_fail(int* err, int code) {
   atomicCAS(err, 0, code);
   __threadfence_system();
@@ -102,6 +103,14 @@ __device__ __forceinline__ void spin_fail(int* err, int code) {
   // debug builds: record the code (python check() raises) and continue (no trap)
   printf("k31dcpx error %d block (%d,%d) thread %d\n", code, blockIdx.x, blockIdx.y, threadIdx.x);
 #else
+  // the trap ends the context before the host can read err: name the kernel family,
+  // the code (the wait site) and the SM first (K31_SPIN_TIMEOUT, as k31_spin_guard.cuh)
+  if (atomicCAS(&g_spin_printed, 0u, 1u) == 0u) {
+    unsigned sm;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+    printf("K31_SPIN_TIMEOUT kernel=k31_dcp_exchange site=%d smid=%u block=%d,%d thread=%d\n", code,
+           sm, (int)blockIdx.x, (int)blockIdx.y, (int)threadIdx.x);
+  }
   __trap();
 #endif
 }

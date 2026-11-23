@@ -26,7 +26,13 @@ import torch
 
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
-from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
+from vllm.models.kimi_k3.nvidia.ops.stable_build import (
+    SPIN_GUARD,
+    spin_guard_bytes,
+    spin_rank,
+    spin_record_ptr,
+    stable_copy,
+)
 from vllm.platforms import current_platform
 
 HIDDEN = 7168
@@ -50,6 +56,7 @@ def _module(chunk_depth: int = 2):
             h = hashlib.sha256()
             with open(_SRC, "rb") as fh:
                 h.update(fh.read())
+            h.update(spin_guard_bytes())
             h.update(f"{torch.__version__} {torch.version.cuda} {chunk_depth}".encode())
             tag = h.hexdigest()[:16]
             build = os.path.join(
@@ -57,7 +64,7 @@ def _module(chunk_depth: int = 2):
             )
             os.makedirs(build, exist_ok=True)
             name = os.path.basename(_SRC)
-            src = stable_copy(build, os.path.dirname(_SRC), [name])
+            src = stable_copy(build, os.path.dirname(_SRC), [name], extra=[SPIN_GUARD])
             # Same flags as the native kernel (CMakeLists.txt KIMI_K3_ATTN_RES).
             mod = load(
                 name=f"k31pf_attn_res_mxfp8_{tag}",
@@ -80,6 +87,8 @@ def _module(chunk_depth: int = 2):
                 build_directory=build,
                 verbose=False,
             )
+            # k31_spin_guard.cuh
+            mod.set_spin_rank(spin_rank(), spin_record_ptr())
             _mods[chunk_depth] = mod
     return mod
 

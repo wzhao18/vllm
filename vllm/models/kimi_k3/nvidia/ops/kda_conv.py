@@ -56,7 +56,13 @@ import threading
 import torch
 
 from vllm.logger import init_logger
-from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
+from vllm.models.kimi_k3.nvidia.ops.stable_build import (
+    SPIN_GUARD,
+    spin_guard_bytes,
+    spin_rank,
+    spin_record_ptr,
+    stable_copy,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -759,13 +765,14 @@ def _load_qkv_conv() -> None:
         h = hashlib.sha256()
         with open(_QKV_SRC, "rb") as fh:
             h.update(fh.read())
+        h.update(spin_guard_bytes())
         h.update(f"{torch.__version__} {torch.version.cuda}".encode())
         build = os.path.join(
             envs.VLLM_CACHE_ROOT, "k3_kda_conv", h.hexdigest()[:16] + "-s"
         )
         os.makedirs(build, exist_ok=True)
         name = os.path.basename(_QKV_SRC)
-        src = stable_copy(build, os.path.dirname(_QKV_SRC), [name])
+        src = stable_copy(build, os.path.dirname(_QKV_SRC), [name], extra=[SPIN_GUARD])
         load(
             name="k3_kda_conv",
             sources=[os.path.join(src, name)],
@@ -775,6 +782,8 @@ def _load_qkv_conv() -> None:
             is_python_module=False,
             verbose=False,
         )
+        # k31_spin_guard.cuh
+        torch.ops.k3_kda_conv.set_spin_rank(spin_rank(), spin_record_ptr())
         _qkv_loaded = True
 
 

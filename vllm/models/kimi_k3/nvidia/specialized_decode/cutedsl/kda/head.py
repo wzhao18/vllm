@@ -43,6 +43,7 @@ from cutlass.cute.arch import store_async_dsmem
 from cutlass.cute.nvgpu import tcgen05
 
 from vllm.logger import init_logger
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ..attn_res.kernel import BESIDE_SMEM
 from ..common.host import architecture, layout, stream, to_cute
@@ -568,8 +569,10 @@ class KdaHead(SplitKGemm):
             if target > 0:  # every CTA, so the last reader re-arms after the producer
                 if lane == 0:
                     seen = Int32(_acquire_load(counter))
+                    sgn, sgt = spin_start()
                     while seen < target:
                         seen = Int32(_acquire_load(counter))
+                        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
                 cute.arch.sync_warp()
             cute.arch.griddepcontrol_launch_dependents()
             ar = [
@@ -698,6 +701,7 @@ class KdaHead(SplitKGemm):
         state = Int32(2)
         if target > 0:
             state = Int32(0)
+        sgn, sgt = spin_start()
         while state == 0:
             bad = False
             for c in cutlass.range_constexpr(8):
@@ -716,6 +720,7 @@ class KdaHead(SplitKGemm):
                     done = Int32(Int32(_acquire_load(counter)) >= target)
                 if cute.arch.shuffle_sync(done, 0) != 0:
                     state = Int32(2)
+            sgn, sgt = spin_tick(sgn, sgt, observed=state, target=0)
         if state == 2:
             for c in cutlass.range_constexpr(8):
                 source = at(fa_beta, token, 16 * c + 4 * quarter)
@@ -738,8 +743,10 @@ class KdaHead(SplitKGemm):
                 if cutlass.const_expr(self.fa_poll):
                     # readers may have seen F_A's rows before its counter adds landed
                     seen = Int32(_acquire_load(counter))
+                    sgn, sgt = spin_start()
                     while seen < target:
                         seen = Int32(_acquire_load(counter))
+                        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
                 _store_zero(counter)
                 _store_zero(counter + 4)
         if cutlass.const_expr(self.fa_poll):

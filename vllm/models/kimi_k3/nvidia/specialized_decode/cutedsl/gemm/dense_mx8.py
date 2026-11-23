@@ -47,6 +47,8 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.dies import global_time, smid
 from ..common.primitives import asm, copy_bulk, push_float, wait
 from ..mla.qvalid import spin_ns
@@ -855,8 +857,10 @@ class DenseMx8:
                 cute.arch.mbarrier_init_fence()
                 st_release_gpu(mine, gen)
                 if cutlass.const_expr(not self.debug & 2048):
+                    sgn, sgt = spin_start()
                     while ld_acquire_gpu(peer) < gen:
                         pass
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 self._stamp(part_ptr, bidx, 3)
                 fence_proxy_async_global()
                 for j in cutlass.range_constexpr(2):
@@ -918,8 +922,10 @@ class DenseMx8:
                     cute.arch.mbarrier_init(xbar + 1, 1)
                     cute.arch.mbarrier_init_fence()
                     if cutlass.const_expr(not self.debug & 2048):
+                        sgn, sgt = spin_start()
                         while ld_acquire_gpu(flag_a) < gen:
                             pass
+                            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                     fence_proxy_async_global()
                     cute.arch.mbarrier_arrive_and_expect_tx(xbar, chunk)
                     copy_bulk(sa_s, src0, xbar.toint(), chunk)

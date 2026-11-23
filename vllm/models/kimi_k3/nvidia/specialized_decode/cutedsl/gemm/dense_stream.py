@@ -51,6 +51,8 @@ import numpy as np
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common.dies import smid
 from ..common.primitives import asm
 from .wide import (
@@ -62,12 +64,11 @@ from .wide import (
     _ld_acquire,
     _ld_v4,
     _lds_v4,
-    _round_bf16,
-    _st_bf16,
-    _st_relaxed,
-    _st_v4,
     _now,
+    _round_bf16,
+    _st_relaxed,
     _st_u64,
+    _st_v4,
     _tmem_ld16,
     _tmem_wait16,
 )
@@ -568,8 +569,10 @@ class DenseStream:
                 j = Int32(0)
                 for p in cutlass.range(r + 1, last + 1, unroll=1):
                     if (p * units // sd < (p + 1) * units // sd) & (j < nst):
+                        sgn, sgt = spin_start()
                         while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
                             pass
+                            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                         _fence_proxy_global()  # the bulk copy (async proxy) reads them
                         src = ws + Int64(slot_base + p) * part
                         for o in cutlass.range_constexpr(-(-part // BULK)):
@@ -579,8 +582,10 @@ class DenseStream:
                         j += 1
             for p in cutlass.range(r + 1, last + 1, unroll=1):  # acquire every partial
                 if p * units // sd < (p + 1) * units // sd:
+                    sgn, sgt = spin_start()
                     while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
                         pass
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             if nst > 0:
                 cute.arch.mbarrier_wait(staged, 0)
             if tid == 0:

@@ -401,6 +401,7 @@ class RubinMegaMoeSession:
         self.local_workspace = torch.zeros(
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
+        self._write_spin_record_address()
         # Per-launch scratch of the refreshed inference kernel (src_gp; any content
         # at launch, nothing survives it). The caching allocator aligns to 512 B.
         self.tmp_buffer = (
@@ -680,9 +681,56 @@ class RubinMegaMoeSession:
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
+        self._stamp_issued()
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
+    # Host "issued" stamp (MEGAMOEFIX 2026-11-22, VENDOR.md S9): this rank's count of launches of this session,
+    # written into its [issued, entered] progress word in the symmetric arena by a 4-byte H2D copy on a side
+    # stream (copy engine: needs no SM and no sync, so it lands even when this GPU is stuck in an earlier
+    # kernel). A peer's spin guard reads it over NVLink on timeout to tell a host that never issued the call (H1)
+    # from a GPU that never started it (H2). Eager launches only: during CUDA graph capture the host does not
+    # issue per launch, so graph replays leave it behind (the trap line reports raw ids).
+    _PROGRESS_REGION = "nvlink.token_comm_dedup.call_progress"
+
+    _RECORD_REGION = "nvlink.token_comm_dedup.spin_record_addr"
+
+    def _write_spin_record_address(self) -> None:
+        """Point this session's guards at the process's host spin-record buffer (spin_record.py): a trap's
+        diagnostic then survives the context loss (printf alone is lost when the host never synchronizes)."""
+        ws = self.kernel._device_workspace
+        if self._RECORD_REGION not in {r.name for r in ws.regions("local")}:
+            return
+        from vllm.models.kimi_k3.nvidia import spin_record
+
+        records = spin_record.get(self.cfg.rank)
+        off = ws.offset(self._RECORD_REGION)
+        self.local_workspace[off : off + 8].view(torch.int64).fill_(records.address)
+
+    def _stamp_issued(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        view = getattr(self, "_issued_view", None)
+        if view is None:
+            ws = self.kernel._device_workspace
+            names = {r.name for r in ws.regions("shared")}
+            if self._PROGRESS_REGION not in names:
+                self._issued_view = False  # this kernel variant has no progress word
+                return
+            off = ws.offset(self._PROGRESS_REGION)
+            view = self.shared_workspace[off : off + 4].view(torch.int32)
+            self._issued_view = view
+            self._issued = 0
+            self._issued_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            self._issued_stream = torch.cuda.Stream(device=self.device)
+        elif view is False:
+            return
+        self._issued += 1
+        self._issued_host[0] = self._issued
+        with torch.cuda.stream(self._issued_stream):
+            view.copy_(self._issued_host, non_blocking=True)
+
     def release(self) -> None:
+        self._issued_view = None  # the progress word lives in the arena being released
         self._bound.clear()
         self._out_bound.clear()
         self._norm_bound.clear()

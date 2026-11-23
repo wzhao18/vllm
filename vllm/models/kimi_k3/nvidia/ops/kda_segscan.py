@@ -63,7 +63,13 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
+from vllm.models.kimi_k3.nvidia.ops.stable_build import (
+    SPIN_GUARD,
+    spin_guard_bytes,
+    spin_rank,
+    spin_record_ptr,
+    stable_copy,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
@@ -142,6 +148,7 @@ def load_extension() -> None:
                 h.update(fh.read())
         with open(os.path.join(cutlass, "cutlass", "version.h"), "rb") as fh:
             h.update(fh.read())
+        h.update(spin_guard_bytes())
         h.update(f"{torch.__version__} {torch.version.cuda}".encode())
         build = os.path.join(
             envs.VLLM_CACHE_ROOT, "k3_flashkda_split", h.hexdigest()[:16] + "-s"
@@ -167,7 +174,8 @@ def load_extension() -> None:
             "--threads",
             "8",
         ]
-        csrc = os.path.join(stable_copy(build, _SRC), "csrc")
+        root = stable_copy(build, _SRC, extra=[SPIN_GUARD])
+        csrc = os.path.join(root, "csrc")
         load(
             name="k3_flashkda_split",
             sources=[
@@ -180,13 +188,15 @@ def load_extension() -> None:
                 os.path.join(csrc, "smxx", "prep64.cu"),
                 os.path.join(csrc, "smxx", "prep64_tc.cu"),
             ],
-            extra_include_paths=[csrc, cutlass],
+            extra_include_paths=[csrc, root, cutlass],
             extra_cflags=flags,
             extra_cuda_cflags=cuda,
             build_directory=build,
             is_python_module=False,
             verbose=False,
         )
+        # k31_spin_guard.cuh
+        torch.ops.k3_flashkda_split.set_spin_rank(spin_rank(), spin_record_ptr())
         _loaded = True
 
 

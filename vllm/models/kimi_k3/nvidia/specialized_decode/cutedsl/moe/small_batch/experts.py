@@ -11,6 +11,8 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.arch import store_async_dsmem
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ...common.primitives import (
     acquire_tensormap_asm,
     alloc,
@@ -252,11 +254,13 @@ class ClusterExpertsTP16(_ClusterExperts):
             for t in cutlass.range_constexpr(self.batch):
                 pointer = x.iterator + t * 3584 + 1792 * half + 256 * n + lane * 8
                 ready = False
+                sgn, sgt = spin_start()
                 while not ready:
                     words = load_volatile(pointer, count=4)
                     ready = published(words)
                     for k in cutlass.range_constexpr(4):
                         packed[t, k] = words[k]
+                    sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             block, k = lane // 4, lane % 4
             kc, kb = 16 * n + 2 * block + k // 2, 8 * n + block
             for t in cutlass.range_constexpr(self.batch):

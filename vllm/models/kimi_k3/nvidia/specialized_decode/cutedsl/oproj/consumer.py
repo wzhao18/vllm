@@ -10,6 +10,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..attn_res.kernel import arm_exchanges, rstd
 from ..common.mailbox import rearm
 from ..common.primitives import (
@@ -262,6 +264,7 @@ class OprojConsumer:
             for rank in cutlass.range_constexpr(n):
                 if rank < count:
                     ready &= published(raw[rank, j] for j in range(4))
+            sgn, sgt = spin_start()
             while not cute.arch.vote_all_sync(ready):
                 for rank in cutlass.range_constexpr(n):
                     if rank < count:
@@ -270,10 +273,12 @@ class OprojConsumer:
                 for rank in cutlass.range_constexpr(n):
                     if rank < count:
                         ready &= published(raw[rank, j] for j in range(4))
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         for rank in cutlass.range_constexpr(n):
             if rank < count:  # noqa: SIM102
                 if not published(raw[rank, j] for j in range(4)):
                     pending |= 1 << rank
+        sgn, sgt = spin_start()
         while pending != 0:
             for rank in cutlass.range_constexpr(n):
                 if (pending & (1 << rank)) != 0:
@@ -282,6 +287,7 @@ class OprojConsumer:
                 if (pending & (1 << rank)) != 0:  # noqa: SIM102
                     if published(raw[rank, j] for j in range(4)):
                         pending &= ~(1 << rank)
+            sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
         values = cute.make_rmem_tensor(8, Float32)
         for j in cutlass.range_constexpr(4):
             pair = unpack_bf16(raw[0, j])

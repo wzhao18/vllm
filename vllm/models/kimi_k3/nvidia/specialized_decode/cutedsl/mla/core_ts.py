@@ -74,6 +74,8 @@ from tokenspeed_mla.mla_helpers import (  # noqa: F401
     create_mla_static_tile_scheduler,
 )
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ..common import tensormap
 from ..common.primitives import (
     asm,
@@ -432,8 +434,10 @@ def polled_core(
                     if t == 0:
                         flag = self.ts_flag(table, block)
                         word = load_words(flag, count=1, scope="gpu")[0]
+                        sgn, sgt = spin_start()
                         while word != Uint32(1):
                             word = load_words(flag, count=1, scope="gpu")[0]
+                            sgn, sgt = spin_tick(sgn, sgt, observed=word, target=0)
                         cute.arch.fence_acq_rel_gpu()
                         store_words(flag, (Uint32(0),), scope="gpu")
                     self.ts_push_bar.arrive_and_wait()
@@ -498,8 +502,13 @@ def polled_core(
                                 loads = [poll_b32x8(p) for p in ptrs]
                                 for i in cutlass.range_constexpr(n):
                                     words = loads[i]
+                                    sgn, sgt = spin_start()
                                     while not published(words, sentinel=Q_SENT):
                                         words = poll_b32x8(ptrs[i])
+                                        sgn, sgt = spin_tick(
+                                            sgn, sgt, observed=0,
+                                            target=0
+                                        )
                     self.ts_q_bar.arrive()
 
         @cute.jit
@@ -530,6 +539,7 @@ def polled_core(
                     spin_ns(self.ts_valid_delay)
                 phase = Int32(0)
                 armed = Int32(1)
+                sgn, sgt = spin_start()
                 while armed != 0:
                     expect_valid(barrier, nbytes)
                     copy_valid(q_latent, base, head, barrier)
@@ -537,6 +547,7 @@ def polled_core(
                         copy_valid(q_rope, base + Int64(head), nbytes - head, barrier)
                     armed = wait_valid(barrier, phase)
                     phase = phase ^ 1
+                    sgn, sgt = spin_tick(sgn, sgt, observed=armed, target=0)
                 invalidate_barrier(barrier)
 
         @cute.jit
@@ -567,6 +578,7 @@ def polled_core(
                 spin_ns(self.ts_valid_delay)
             phase = Int32(0)
             armed = Int32(1)
+            sgn, sgt = spin_start()
             while armed != 0:
                 expect_valid(barrier, half_rows * 576)
                 for kb in cutlass.range_constexpr(4):
@@ -577,6 +589,7 @@ def polled_core(
                 phase = phase ^ 1
                 if cutlass.const_expr(not POLL_Q):
                     armed = Int32(0)
+                sgn, sgt = spin_tick(sgn, sgt, observed=armed, target=0)
             invalidate_barrier(barrier)
             rank = cute.arch.block_idx_in_cluster()
             signal_word(barrier + 16, full, rank - rank % 2)
@@ -597,6 +610,7 @@ def polled_core(
             for i in cutlass.range_constexpr(n):
                 if not published((raw[i, e] for e in range(8)), sentinel=Q_SENT):
                     pending |= 1 << i
+            sgn, sgt = spin_start()
             while pending != 0:
                 for i in cutlass.range_constexpr(n):
                     if (pending & (1 << i)) != 0:
@@ -607,6 +621,7 @@ def polled_core(
                     if (pending & (1 << i)) != 0:  # noqa: SIM102
                         if published((raw[i, e] for e in range(8)), sentinel=Q_SENT):
                             pending &= ~(1 << i)
+                sgn, sgt = spin_tick(sgn, sgt, observed=pending, target=0)
 
         @cute.jit
         def ts_arm_x(self, table, lane):

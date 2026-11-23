@@ -7,6 +7,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
 
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
+
 from ...common.primitives import (
     alloc,
     bf16,
@@ -123,10 +125,12 @@ class MoeSharedTP8:
             column = 2 * tid
             gate = up = (Uint32(0), Uint32(0))
             valid = False
+            sgn, sgt = spin_start()
             while not valid:
                 gate = mailbox_load(hg.iterator + par * 2 * 1536 + column, count=2)
                 up = mailbox_load(hg.iterator + par * 2 * 1536 + 768 + column, count=2)
                 valid = ((gate[0] & gate[1] & up[0] & up[1]) & Uint32(1)) != 0
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             ga0 = table_load(tables.iterator + (gate[0] >> 16))
             ua0 = table_load(tables.iterator + 65536 + (up[0] >> 16))
             ga1 = table_load(tables.iterator + (gate[1] >> 16))
@@ -267,8 +271,10 @@ class MoeFrontTP8:
             if cta == 0:
                 mailbox_store(epoch.iterator + (par ^ 1) * 32, (Uint32(0),))
             observed = mailbox_load(epoch.iterator + par * 32)[0]
+            sgn, sgt = spin_start()
             while observed < 28:
                 observed = mailbox_load(epoch.iterator + par * 32)[0]
+                sgn, sgt = spin_tick(sgn, sgt, observed=observed, target=0, rank=rank)
         else:
             for i in range(tid - 1, 2 * router_rows, 511):
                 token, row = i // router_rows, i % router_rows
@@ -344,9 +350,11 @@ class MoeFrontTP8:
                     pointer = latent.iterator + par * 8 * 3584 + vector * 8
                     words = mailbox_load(pointer, count=4, scope="sys")
                     ready = published(words)
+                    sgn, sgt = spin_start()
                     while not ready:
                         words = mailbox_load(pointer, count=4, scope="sys")
                         ready = published(words)
+                        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0, rank=rank)
                     mailbox_store(latent_out.iterator + vector * 8, words)
                     store_relaxed(pointer, (Uint32(0x80000000),) * 4)
             cute.arch.griddepcontrol_wait()
