@@ -60,11 +60,7 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     # 6.38, R384 6.75 / 6.69
     (7168, 3072): (
         (1, 128, ((128, 64), (1, 1), False, 128), 4),
-        # R129-256 (C576 SP serving, 176-224 rows): 6 of the 24 weight k-blocks issued
-        # before griddepcontrol.wait instead of 4 (PBIND D-GEMM kda_out arm B; the math
-        # and tactic are unchanged, only how much of the weight stream overlaps the
-        # KDA core's tail)
-        (129, 256, ((256, 128), (2, 1), False, 256), 6),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
         (257, 512, ((128, 128), (1, 1), False, 128), 4),
     ),
 }
