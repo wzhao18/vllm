@@ -34,6 +34,7 @@ from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
     direct_cp_enabled,
     direct_cp_multicast_enabled,
+    watch_device_faults,
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -1168,6 +1169,7 @@ class DirectDCPA2AWorkspace(DirectCPWorkspace):
         self.heads_per_rank = heads_per_rank
         self.head_dim = head_dim
         self.dtype = dtype
+        watch_device_faults(self.device)
 
         output_shape = (
             num_ubatches,
@@ -1252,6 +1254,7 @@ class DirectDCPA2AWorkspace(DirectCPWorkspace):
             self.max_num_tokens,
             is_lse_base_on_e,
         )
+        self.arrive()
         if self.cutedsl_lse_reduce is None:
             torch.ops._C.direct_dcp_a2a_lse_reduce(*args)
         else:
@@ -1343,6 +1346,7 @@ class DirectDCPQGatherWorkspace(DirectCPWorkspace):
         super().__init__(group, device, num_ubatches)
         if self.world_size <= 1:
             raise ValueError("Direct DCP q-gather requires at least two ranks")
+        watch_device_faults(self.device)
         self.max_num_tokens = max_num_tokens
         self.heads_per_rank = heads_per_rank
         self.gathered_num_heads = gathered_num_heads
@@ -1402,6 +1406,7 @@ class DirectDCPQGatherWorkspace(DirectCPWorkspace):
             ),
         )
         query_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
+        self.arrive()
         torch.ops._C.direct_dcp_q_gather(
             local_query,
             output,
@@ -1497,6 +1502,7 @@ class DirectDCPKVGatherWorkspace(DirectCPWorkspace):
                 "Direct DCP kv-gather capacity must divide evenly across "
                 f"ranks: {max_gathered_tokens} % {self.world_size} != 0"
             )
+        watch_device_faults(self.device)
         self.max_gathered_tokens = max_gathered_tokens
 
         kv_shape = (num_ubatches, 2, max_gathered_tokens, token_dim)
@@ -1522,6 +1528,7 @@ class DirectDCPKVGatherWorkspace(DirectCPWorkspace):
                 f"DCP kv-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
             )
         kv_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
+        self.arrive()
         torch.ops._C.direct_dcp_kv_gather(
             local_kv,
             self.received_kv[ubatch],

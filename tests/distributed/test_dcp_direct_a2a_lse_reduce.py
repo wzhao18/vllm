@@ -3,6 +3,8 @@
 """Tests for direct symmetric-memory DCP collectives."""
 
 import functools
+import os
+import time
 from unittest.mock import MagicMock
 
 import multiprocess as mp
@@ -1326,6 +1328,134 @@ def test_cutedsl_a2a_rejects_mismatched_shapes():
     assert not ranks.counters[0].any()
 
 
+class TestStartupArrivalBarrier:
+    """Host arrival barrier before the first direct CP collective per
+    generation (start-up, then each CUDA graph capture size)."""
+
+    @staticmethod
+    def _workspace(monkeypatch, world_size: int = 2):
+        workspace = cp_common.DirectCPWorkspace.__new__(cp_common.DirectCPWorkspace)
+        workspace.world_size = world_size
+        workspace.arrival_group = object()
+        workspace._arrived_generation = 0
+        calls: list[object] = []
+        monkeypatch.setattr(
+            cp_common.dist, "barrier", lambda group: calls.append(group)
+        )
+        return workspace, calls
+
+    def test_one_barrier_per_generation(self, monkeypatch):
+        workspace, calls = self._workspace(monkeypatch)
+        # The first collective ever (start-up) waits for every rank once.
+        workspace.arrive()
+        workspace.arrive()
+        assert calls == [workspace.arrival_group]
+        # Each capture size requests one more barrier.
+        cp_common.request_arrival_barrier()
+        workspace.arrive()
+        assert len(calls) == 2
+        # Steady state: no generation change, no barrier.
+        for _ in range(100):
+            workspace.arrive()
+        assert len(calls) == 2
+
+    def test_workspaces_arrive_independently(self, monkeypatch):
+        first, calls = self._workspace(monkeypatch)
+        second = cp_common.DirectCPWorkspace.__new__(cp_common.DirectCPWorkspace)
+        second.world_size = 2
+        second.arrival_group = object()
+        second._arrived_generation = 0
+        cp_common.request_arrival_barrier()
+        first.arrive()
+        second.arrive()
+        first.arrive()
+        assert calls == [first.arrival_group, second.arrival_group]
+
+    def test_no_barrier_without_group_or_peers(self, monkeypatch):
+        workspace, calls = self._workspace(monkeypatch)
+        workspace.arrival_group = None
+        cp_common.request_arrival_barrier()
+        workspace.arrive()
+        single, _ = self._workspace(monkeypatch, world_size=1)
+        single.arrive()
+        assert calls == []
+
+    def test_arrival_group_is_the_coordinators_cpu_group(self, monkeypatch):
+        from vllm.distributed import parallel_state
+
+        device_group, cpu_group = object(), object()
+        coordinator = MagicMock(device_group=device_group, cpu_group=cpu_group)
+        monkeypatch.setitem(parallel_state._groups, "dcp_test", lambda: coordinator)
+        assert cp_common._cpu_group_of(device_group) is cpu_group
+        assert cp_common._cpu_group_of(object()) is None
+
+
+class TestDeviceFaultWatch:
+    """A faulted CUDA context turns into a worker abort, not a hang."""
+
+    @staticmethod
+    def _watch(errors: list[str]):
+        import enum
+        import types
+
+        class CudaError(enum.Enum):
+            cudaSuccess = 0
+            cudaErrorNotReady = 600
+            cudaErrorLaunchFailure = 719
+
+        watch = cp_common._DeviceFaultWatch.__new__(cp_common._DeviceFaultWatch)
+        watch.device_index = 3
+        watch.runtime = types.SimpleNamespace(cudaError_t=CudaError)
+        replies = iter(CudaError[name] for name in errors)
+        watch.query = lambda: next(replies)  # type: ignore[method-assign]
+        aborted: list[str] = []
+        watch._abort = aborted.append  # type: ignore[method-assign]
+        return watch, aborted
+
+    def test_healthy_context_is_left_alone(self):
+        watch, aborted = self._watch(["cudaSuccess", "cudaErrorNotReady"])
+        assert not watch.check()
+        assert not watch.check()
+        assert aborted == []
+
+    def test_sticky_error_aborts_with_the_error(self):
+        watch, aborted = self._watch(["cudaErrorLaunchFailure"])
+        assert watch.check()
+        (message,) = aborted
+        assert "device 3" in message and "cudaErrorLaunchFailure" in message
+        assert "direct DCP" in message
+
+    def test_cpu_device_starts_no_watch(self, monkeypatch):
+        monkeypatch.setattr(cp_common, "_device_fault_watches", {})
+        cp_common.watch_device_faults(torch.device("cpu"))
+        assert cp_common._device_fault_watches == {}
+
+
+def _device_fault_worker(stderr_path: str) -> None:
+    """Fault the context (device-side assert), then block on the host with no
+    CUDA call, as a rank waiting in a CPU collective does."""
+    stderr = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(stderr, 2)
+    cp_common.watch_device_faults(torch.device("cuda:0"))
+    values = torch.zeros(4, device="cuda")
+    values[torch.tensor([64], device="cuda")] = 1.0  # out of bounds: trap
+    time.sleep(60)
+    os._exit(0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need a GPU.")
+def test_device_fault_aborts_blocked_host(tmp_path):
+    stderr = tmp_path / "worker.stderr"
+    process = mp.Process(target=_device_fault_worker, args=(str(stderr),))
+    process.start()
+    process.join(timeout=50)
+    if process.is_alive():
+        process.kill()
+        process.join()
+    assert process.exitcode == cp_common.DEVICE_FAULT_EXIT_CODE, process.exitcode
+    assert "faulted" in stderr.read_text()
+
+
 def _distributed_direct_a2a_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
     local_rank = int(env["LOCAL_RANK"])
@@ -1666,6 +1796,155 @@ def test_distributed_direct_a2a_matches_reference(
             "TEST_IMPL": impl,
         },
     )
+
+
+def _a2a_skew_workspace(device: torch.device):
+    # The CUDA op serves every DCP size (the CuTe kernels only up to 8 ranks).
+    dcp.dbo_current_ubatch_id = lambda: 0
+    workspace = dcp.DirectDCPA2AWorkspace(
+        dist.group.WORLD, device, 16, 6, 512, torch.bfloat16
+    )
+    workspace.cutedsl_lse_reduce = None
+    return workspace
+
+
+def _a2a_skew_inputs(rank: int, world_size: int, device: torch.device):
+    generator = torch.Generator(device=device)
+    generator.manual_seed(99 + rank)
+    partial_output = torch.randn(
+        4,
+        6 * world_size,
+        512,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    partial_lse = torch.randn(
+        4, 6 * world_size, device=device, dtype=torch.float32, generator=generator
+    )
+    return partial_output, partial_lse
+
+
+def _arrival_barrier_worker(env: dict[str, str]) -> None:
+    """A late rank (a JIT build at a kernel's first use) holds its peers on the
+    host before they launch the first spin collective of a generation."""
+    update_environment_variables(env)
+    rank = int(env["LOCAL_RANK"])
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(backend="nccl")
+    try:
+        from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+
+        world_size = dist.get_world_size()
+        workspace = _a2a_skew_workspace(device)
+        workspace.arrival_group = dist.new_group(backend="gloo")
+        partial_output, partial_lse = _a2a_skew_inputs(rank, world_size, device)
+        delay = float(env["TEST_DELAY_S"])
+        dist.barrier(group=workspace.arrival_group)
+
+        # A new capture size: rank 1 is late on the host.
+        cp_common.request_arrival_barrier()
+        if rank == 1:
+            time.sleep(delay)
+        start = time.monotonic()
+        actual = workspace.lse_reduce(partial_output, partial_lse, False)
+        launch_s = time.monotonic() - start
+        if rank == 0:
+            # The launch waited on the host for rank 1 instead of spinning.
+            assert launch_s >= delay - 0.5, launch_s
+        torch.accelerator.synchronize()
+
+        head_slice = slice(rank * 6, (rank + 1) * 6)
+        gathered_output = [torch.empty_like(partial_output) for _ in range(world_size)]
+        gathered_lse = [torch.empty_like(partial_lse) for _ in range(world_size)]
+        dist.all_gather(gathered_output, partial_output)
+        dist.all_gather(gathered_lse, partial_lse)
+        expected = _lse_weighted_combine(
+            torch.stack([value[:, head_slice, :] for value in gathered_output]).float(),
+            torch.stack([value[:, head_slice] for value in gathered_lse]),
+            is_lse_base_on_e=False,
+        )
+        _assert_close(actual, expected, torch.bfloat16)
+
+        # Same generation (steady state): no host barrier, a short skew is
+        # absorbed by the device wait.
+        dist.barrier(group=workspace.arrival_group)
+        if rank == 1:
+            time.sleep(1.0)
+        start = time.monotonic()
+        again = workspace.lse_reduce(partial_output, partial_lse, False)
+        launch_s = time.monotonic() - start
+        if rank == 0:
+            assert launch_s < 0.5, launch_s
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(again, actual, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Need 2 GPUs.")
+def test_distributed_arrival_barrier_absorbs_startup_skew():
+    _distributed_run(
+        _arrival_barrier_worker, world_size=2, extra_env={"TEST_DELAY_S": "5"}
+    )
+
+
+def _spin_timeout_abort_worker(env: dict[str, str]) -> None:
+    """Rank 1 never joins the A2A. Rank 0's combine times out and traps while
+    its host waits in a CPU collective (the r148 hang shape); the watcher must
+    abort rank 0 with the report instead of leaving it hung."""
+    update_environment_variables(env)
+    rank = int(env["LOCAL_RANK"])
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(backend="nccl")
+    gloo = dist.new_group(backend="gloo")
+    workspace = _a2a_skew_workspace(device)
+    partial_output, partial_lse = _a2a_skew_inputs(rank, dist.get_world_size(), device)
+    torch.accelerator.synchronize()
+    dist.barrier(group=gloo)
+    if rank == 0:
+        stderr = os.open(env["TEST_STDERR"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        os.dup2(stderr, 2)
+        workspace.lse_reduce(partial_output, partial_lse, False)
+        # Never completes: rank 1 does not arrive. Only the abort ends rank 0.
+        dist.barrier(group=gloo)
+        os._exit(0)
+    time.sleep(float(env["TEST_WAIT_S"]))
+    os._exit(0)
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Need 2 GPUs.")
+def test_distributed_spin_timeout_aborts_instead_of_hanging(tmp_path):
+    stderr = tmp_path / "rank0.stderr"
+    wait_s = 105
+    port = str(get_open_port())
+    processes = []
+    for rank in range(2):
+        env = {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": "2",
+            "LOCAL_WORLD_SIZE": "2",
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": port,
+            "TEST_STDERR": str(stderr),
+            "TEST_WAIT_S": str(wait_s),
+        }
+        process = mp.Process(target=_spin_timeout_abort_worker, args=(env,))
+        process.start()
+        processes.append(process)
+    try:
+        processes[0].join(timeout=wait_s)
+        exitcode = processes[0].exitcode
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+            process.join()
+    assert exitcode == cp_common.DEVICE_FAULT_EXIT_CODE, exitcode
+    assert "faulted" in stderr.read_text()
 
 
 if __name__ == "__main__":
