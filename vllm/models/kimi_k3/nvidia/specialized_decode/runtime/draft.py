@@ -59,7 +59,7 @@ logger = init_logger(__name__)
 # slices: the same drafts.) Markov rank 512 (128 rows per CTA, markov.CTA_ROWS) takes
 # the rank-256 choices. NQ-TUNE: rank 512 gate / staged / settle per batch
 # (scripts/dsdraft/markov_test.py at B1-B8) and B65-B192 launches vs the stock loop.
-FUSED_MARKOV = {8: "1-8:1,9-:1", 16: "1-2:2,3-8:3,9-:1"}
+FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-:1"}
 # FUSED_MARKOV requests whose kernel waits at a CTA barrier between each position's key
 # poll and its shuffle maxima (cutedsl.draft.markov ``settle``), per TP. 16 ranks, real
 # DSpark weights, us: B1 31.19 -> 30.65 (31.37 -> 30.73), B2 / B8 flat; drafts
