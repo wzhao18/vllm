@@ -868,7 +868,8 @@ class SpStep:
         """A stock DSA-DP layer's attention half on this rank's shard, as the stock
         decoder's ``_dsa_scatter`` FULL-graph path runs it: the pre-AttnRes, the
         owner-segment exchange and attention (``ops.dsa_dp.run_segment``; under an
-        eager-runner capture the layer's owned-row exchange), the post-AttnRes. Returns (the MLP input, the prefix sum, the saved blocks)."""
+        eager-runner capture the layer's owned-row exchange), the post-AttnRes.
+        Returns (the MLP input, the prefix sum, the saved blocks)."""
         from ...ops import dsa_dp
 
         x, prefix_sum, residual = layer._pre_attn_norm(hidden, residual, prefix_sum)
