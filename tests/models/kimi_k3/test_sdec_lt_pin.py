@@ -110,3 +110,45 @@ def test_bin_pins_cover_and_match_linear():
             lt_pin.pinned(w, [lo], strict=True)
     finally:
         table[(7168, 1536)] = saved
+
+
+def test_strict_refuses_pins_of_another_cublaslt(monkeypatch):
+    """Pins are cuBLASLt-version specific: a strict build on a cuBLASLt the pins were
+    not searched with raises (no silent heuristic fallback)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode import lt_pin
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Uncovered
+
+    if not lt_pin.BIN_PINS.get(lt_pin.version()):
+        pytest.skip(f"no row-bin pins for cuBLASLt {lt_pin.version()}")
+    w = torch.zeros((7168, 1536), device="cuda", dtype=torch.bfloat16)
+    real = lt_pin.version()
+    monkeypatch.setattr(lt_pin, "version", lambda: real + 1)
+    with pytest.raises(Uncovered, match="not portable"):
+        lt_pin.pinned(w, [66], strict=True)
+    assert lt_pin.pinned(w, [66]) is None  # non-strict: unpinned, logged by the caller
+
+
+def test_exact_pins_match_linear():
+    """EXACT_PINS (DCRIT r120: every captured drafter M, the searched best or the
+    cuBLASLt heuristic's own algorithm): each pin passes the algorithm check under
+    strict and computes F.linear's product at its row."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode import lt_pin
+
+    table = lt_pin.EXACT_PINS.get(lt_pin.version(), {})
+    if not table:
+        pytest.skip(f"no exact pins for cuBLASLt {lt_pin.version()}")
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    for (n, k), rows in sorted(table.items()):
+        w = (torch.randn((n, k), device="cuda", generator=gen) / k**0.5).bfloat16()
+        lin = lt_pin.pinned(w, sorted(rows), strict=True)
+        assert lin is not None and set(lin.kernels) == set(rows), (n, k)
+        for r in sorted(rows):
+            x = torch.randn((r, k), device="cuda", generator=gen).bfloat16()
+            out = lin.run(x, x.new_empty((r, n)))
+            ref = x.float() @ w.float().t()
+            stock = torch.nn.functional.linear(x, w)
+            scale = ref.abs().max().item()
+            err = (out.float() - ref).abs().max().item() / scale
+            stock_err = (stock.float() - ref).abs().max().item() / scale
+            assert err <= max(2 * stock_err, 4e-3), ((n, k), r, err, stock_err)
+        del w

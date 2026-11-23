@@ -1878,9 +1878,12 @@ class GqaDraftFastPath(DraftFastPath):
             rank,
             "draft LM head",
             f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, die-local stream-K "
-            f"GEMM rows {sk_lm}, {pinned_lm or 'no pinned cuBLASLt rows'}, stock "
-            f"cuBLAS shard GEMM rows {stock_lm} (GQA_WIDE_LM_HEAD: measured choices, "
-            "as the preview drafter's)",
+            f"GEMM rows {sk_lm}, {pinned_lm or 'no pinned cuBLASLt rows'}"
+            + (
+                f", stock cuBLAS shard GEMM rows {stock_lm}"
+                if stock_lm
+                else " (every drafter row on a specialized or pinned GEMM)"
+            ),
         )
         return fast
 
