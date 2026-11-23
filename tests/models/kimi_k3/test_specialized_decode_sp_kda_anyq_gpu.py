@@ -16,6 +16,7 @@ KdaFlow's chunk order)."""
 import sys
 
 import pytest
+import torch
 
 from tests.models.kimi_k3 import test_specialized_decode_sp_kda_deferred_path_gpu as path
 from tests.models.kimi_k3 import test_specialized_decode_sp_kda_fold_gpu as fold
@@ -77,3 +78,65 @@ def test_kdaflow_builds_at_every_q(verify_length):
     q = verify_length
     assert q in flow.FLOW_TOKENS
     assert 9 not in flow.FLOW_TOKENS
+
+
+@pytest.mark.parametrize("verify_length", [2, 3, 5, 6, 7, 8], indirect=True,
+                         ids=lambda q: f"q{q}")  # fmt: skip
+def test_kdaflow_fold_bitwise_vs_kdawide(verify_length, monkeypatch):
+    """The deferred fold (recorded-key norms, suffix decays, the commit's FMA chain)
+    is KdaWide's bit for bit at every q: the same pending records (0..q tokens per
+    request) folded by a KdaFlow and a KdaWide core give identical checkpoints. At q5..q8
+    the norms come from KdaFlow's 32-value block-sum rounds (DCRIT r124 d). The
+    verify (outputs, new corrections) differs in FP32 order and is not compared."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import sp
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.sp import SpKdaCore
+
+    q, n = verify_length, 33
+    rows, slots = q * n, 2 * n + 2
+    kv0 = kda.caches(slots)
+    projected, metadata = kda.step(n, slots)
+    record_rows = torch.randperm(kda.MAX_REQS, generator=torch.Generator().manual_seed(4))
+    record_rows = record_rows[:n].to(torch.int32).to(kda.DEVICE)
+    g = torch.Generator().manual_seed(5)
+    pending = torch.zeros(kda.MAX_REQS, dtype=torch.int32)
+    pending[record_rows.cpu().long()] = torch.randint(0, q + 1, (n,), generator=g,
+                                                       dtype=torch.int32)  # fmt: skip
+    pending = pending.to(kda.DEVICE)
+    records = None
+
+    def no_flush():
+        raise AssertionError("a folding core flushed")
+
+    checkpoints = {}
+    for kind in ("wide", "flow"):
+        monkeypatch.setitem(sp.RECORD_KINDS, kda.HEADS, {"*": f"1-:{kind}"})
+        layer = kda.layer()
+        layer.deferred_recoverssm = True
+        mine = layer.recoverssm_records
+        if records is None:  # one random set of pending records for both cores
+            gd = torch.Generator(device=kda.DEVICE).manual_seed(6)
+            records = (
+                torch.randn(mine.key_gate.shape, generator=gd, device=kda.DEVICE)
+                .to(mine.key_gate.dtype),
+                torch.randn(mine.correction.shape, generator=gd, device=kda.DEVICE)
+                * 0.1,
+            )
+        mine.key_gate.copy_(records[0])
+        mine.correction.copy_(records[1])
+        kv = tuple(t.clone() for t in kv0)
+        core = SpKdaCore(layer, (rows,), records="deferred", ctx=kda.context())
+        assert core.kinds[rows] == kind
+        core.prepare_caches(list(kv))
+        deferred = kda.Module(
+            **vars(metadata),
+            recoverssm_deferred=kda.Module(
+                record_rows=record_rows, pending=pending, flush=no_flush
+            ),
+        )
+        out = torch.empty(rows, kda.DIM, dtype=torch.bfloat16, device=kda.DEVICE)
+        core.run(projected, out, caches=list(kv), metadata=deferred)
+        torch.cuda.synchronize()
+        checkpoints[kind] = kv[1].clone()
+    assert int(pending.sum()) > 0
+    kda.assert_bitwise(f"q{q} folded checkpoints KdaFlow vs KdaWide",
+                       checkpoints["flow"], checkpoints["wide"])  # fmt: skip
