@@ -113,6 +113,16 @@ GQA_WINDOW = {
     (4, 3): ((2, (16, 4, 2, 8)), (8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (52, (2, 0, 6, 2)),
              (96, (1, 0, 6, 2)), (106, (1, 0, 6, 0)), (0, (1, 2, 3, 0))),
 }  # fmt: skip
+# TP4 (the SP decode roles DC / DB) at DSpark k1, k2, k4, k5, k6: the measured shapes of
+# the nearest measured draft length, per (request, KV head) row tiling (GROUP x k query
+# rows): k1 / k2 / k4 / k5 (6-30 rows, within GqaWindowUmma's 32: group x q <= 32)
+# take k3's, k6 (36 rows, above it: no GqaWindowUmma shape) takes k7's; as (1, 5) does
+# for TP16 k5. Every shape is checked against stock per q (test_dspark_gqa_attention_int
+# test_window_tp4_any_q). NQ-TUNE: --shape sweeps at TP4 k1 / k2 / k4 / k5 / k6.
+for _k in (1, 2, 4, 5):
+    GQA_WINDOW[(4, _k)] = GQA_WINDOW[(4, 3)]
+GQA_WINDOW[(4, 6)] = GQA_WINDOW[(4, 7)]
+del _k
 
 
 def window_options():

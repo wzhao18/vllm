@@ -37,7 +37,7 @@ REQUESTS = [
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", REQUESTS)
 def test_fold_matches_stock_commit_then_verify(n, graph):
-    assert record_kind(HEADS, n) in FOLDS, n
+    assert record_kind(HEADS, n, Q) in FOLDS, n
     rows, slots = Q * n, 2 * n + 2
     stock, ours = kda.layer(), kda.layer()  # the same weights, their own records
     ours.deferred_recoverssm = True
@@ -97,7 +97,7 @@ def test_fold_matches_stock_commit_then_verify(n, graph):
                  ("corrections", got.correction[index], want.correction[:n])]  # fmt: skip
         kda.assert_bitwise(f"{where} conv window", kv[0], ref_kv[0])
         for name, a, b in pairs:
-            if record_kind(HEADS, n) != "flow":
+            if record_kind(HEADS, n, Q) != "flow":
                 kda.assert_bitwise(f"{where} {name}", a, b)
                 continue
             # KdaFlow's chunk-form verify sums the FP32 dot products in another
