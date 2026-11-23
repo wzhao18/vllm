@@ -171,8 +171,9 @@ def test_tp8_every_captured_row_is_wide(q):
 def test_tp8_families_choose_every_wide_row(q):
     """Each family's ``choose`` at every TP8 = DCP8 wide row (Rubin, FP32 and BF16 KDA
     state): DSA runs WideDsa, KDA its TP8 verify kernels (gate mode 1), AttnRes as at
-    TP16; the o-projection takes seam S3 and the MXFP4 MoE layer seam S4 (no TP8
-    entry in WIDE_TWOSHOT / WIDE_TAIL), both specialized steps; nothing raises."""
+    TP16; the o-projection takes seam S3 (no TP8 entry in WIDE_TWOSHOT) and the MXFP4
+    MoE layer the wide tail behind the stock routed experts (no TP8 wide engine);
+    nothing raises."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
         choose as attn_res_choose,
     )
@@ -197,7 +198,8 @@ def test_tp8_families_choose_every_wide_row(q):
             dsa = dsa_choose(shape, ctx)
             assert dsa is not None and dsa.tactic == "wide", m
             assert oproj_choose(shape, ctx) is None, m  # S3
-            assert moe_choose(shape, ctx) is None, m  # S4 (MXFP4)
+            moe = moe_choose(shape, ctx)  # the wide tail behind the stock experts
+            assert moe.path is Path.GENERIC and "no TP8 wide engine" in moe.note, m
             expect = Path.STOCK if m >= 384 else Path.GENERIC
             assert attn_res_choose(shape, ctx).path is expect, m
             kda = kda_choose(shape, ctx)
@@ -661,7 +663,7 @@ def test_decode_feeds_front_rows_single_launch_batches():
         if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "wide_engines"
     ]
     assert ast.unparse(engines) == (
-        "tuple((b for b in wide_moe if wide_experts_batch(b)))"
+        "tuple((b for b in wide_moe if wide_experts_batch(b, tp)))"
     )
     guards = [
         ast.unparse(n.test)
@@ -743,6 +745,8 @@ def test_wide_experts_single_launch_only():
     for rows in (68, 256, 512, WIDE_MAX):
         assert prepared.wide_experts_batch(rows), rows
         assert "wide experts" in prepared.choose(Shape(rows, 4), ctx).note, rows
+    for rows in (68, 256, 512, WIDE_MAX):  # TP8: no wide engine at any row
+        assert not prepared.wide_experts_batch(rows, 8), rows
     for rows in (WIDE_MAX + 4, 1024, 2048):
         assert not prepared.wide_experts_batch(rows), rows
         note = prepared.choose(Shape(rows, 4), ctx).note

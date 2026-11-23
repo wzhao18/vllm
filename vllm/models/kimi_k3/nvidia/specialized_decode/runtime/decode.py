@@ -271,8 +271,8 @@ class SpecializedDecode:
         # NQ-NOFALLBACK beyond the target topology: a K3.1 DSA deployment with wide
         # steps (TP8 = DCP8) runs every captured verify row specialized or refuses to
         # start, and its DSA / KDA layers never take the whole stock seams (S2-DSA,
-        # S1) there; the o-projection (S3) and MXFP4 MoE layer (S4) seams stay logged
-        # choices inside the specialized step (``check_wide``).
+        # S1) there; the o-projection seam (S3) stays a logged choice inside the
+        # specialized step (``check_wide``).
         self.strict_wide = dsa and self.wide_off is None and q > 1
         self.batches = tuple(sorted({*self.tuned, *self.wide}))
         self.capacity = self.batches[-1]  # rows of every decode buffer
@@ -495,7 +495,7 @@ class SpecializedDecode:
         wide_moe = tuple(b for b in moe_batches if b > PREPARED_MAX)
         # (the wide batches whose routed experts run on the wide engines, behind
         # FrontRows; the others run the stock router and experts into the wide tail)
-        wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
+        wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b, tp))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
             MoeTailBox(*owner) if packed else None,
@@ -626,8 +626,8 @@ class SpecializedDecode:
         admits every wide row there today, and a table edit that stops admitting one
         fails the startup instead of rerouting the shape. A K3.1 DSA deployment with
         wide steps off the target (``strict_wide``: TP8 = DCP8) refuses S1 and S2-DSA
-        the same way; its S3 / S4 seams (no TP8 entry in WIDE_TWOSHOT / WIDE_TAIL) are
-        logged choices inside the specialized step. Elsewhere (out of scope) the seams
+        the same way; its S3 seam (no TP8 entry in WIDE_TWOSHOT) is a logged choice
+        inside the specialized step. Elsewhere (out of scope) the seams
         stay logged coverage choices."""
         target = self.context.target
         if not (target or self.strict_wide):
@@ -645,7 +645,7 @@ class SpecializedDecode:
                     refuse("MLA attention", "seam S2, mla.prepared.choose", shape)
                 if target and m not in attention.oproj_wide:
                     refuse("o-projection", "seam S3, oproj WIDE_TWOSHOT", shape)
-            if moe and self.context.target and m not in self.moe_batches:
+            if moe and m not in self.moe_batches:
                 refuse("MoE layer", "seam S4, moe.prepared.WIDE_TAIL", shape)
 
     def prepare_kv(self):
