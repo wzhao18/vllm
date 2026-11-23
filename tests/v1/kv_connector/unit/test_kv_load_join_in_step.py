@@ -654,7 +654,11 @@ def test_tracker_on_real_async_scheduler_park_fail_free_readmit():
     assert request.status == RequestStatus.PREEMPTED
     assert scheduler._joined.parked("r")
     assert all(b.ref_cnt == 1 for b in old_blocks)
-    filler = _request("f", max_tokens=4)
+    # A different prompt: the filler's cached blocks are no local hit for r.
+    filler = create_requests(
+        num_requests=2, num_tokens=4 * BS, max_tokens=4, block_size=BS,
+        req_ids=["unused", "f"],
+    )[1]
     scheduler.add_request(filler)
     step2 = scheduler.schedule()
     assert "r" not in step2.num_scheduled_tokens
