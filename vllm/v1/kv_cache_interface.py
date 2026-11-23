@@ -1652,8 +1652,10 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
-    prefix_cache_retention_interval: int | None = None
-    """Resolved retention policy for local prefix-cache checkpoints."""
+    prefix_cache_retention_interval: int | str | None = None
+    """Retention policy for prefix-cache checkpoints: the engine core resolves
+    ``"auto"`` (see ``resolve_prefix_cache_retention_interval``) before any
+    scheduler, connector or worker reads it."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
     hash_block_size: int | None = None

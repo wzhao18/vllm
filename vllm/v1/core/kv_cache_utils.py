@@ -841,6 +841,84 @@ def eagle_proof_margin(
     return block_size
 
 
+# KV connectors that persist prefix-cache state across requests and engines and
+# take Mamba boundary states through ``boundary_state_offloads``.
+_PREFIX_STORE_CONNECTORS = frozenset(
+    {"MooncakeStoreConnector", "OffloadingConnector", "UMBPConnector"}
+)
+
+
+def has_prefix_store_connector(kv_transfer_config: Any) -> bool:
+    """Whether ``kv_transfer_config`` includes a prefix-store connector, directly
+    or inside a ``MultiConnector``."""
+    if kv_transfer_config is None:
+        return False
+
+    def names(cfg: Any) -> Iterator[str]:
+        get = cfg.get if isinstance(cfg, dict) else lambda k, d=None: getattr(cfg, k, d)
+        name = get("kv_connector")
+        if name:
+            yield name
+        extra = get("kv_connector_extra_config") or {}
+        for sub in extra.get("connectors", ()) if isinstance(extra, dict) else ():
+            yield from names(sub)
+
+    return any(n in _PREFIX_STORE_CONNECTORS for n in names(kv_transfer_config))
+
+
+def resolve_prefix_cache_retention_interval(
+    retention_interval: int | str | None,
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+    scheduler_block_size: int,
+    enable_prefix_caching: bool,
+    has_prefix_store: bool,
+) -> int | None:
+    """Resolve ``CacheConfig.prefix_cache_retention_interval``.
+
+    ``"auto"`` retains a checkpoint at every scheduler block boundary when
+    prefix caching is on, a Mamba group runs in "align" mode and a prefix-store
+    KV connector persists the states (``has_prefix_store_connector``): a later
+    request sharing only part of a prompt on any engine then resumes at the
+    last block boundary of the shared prefix. Otherwise ``"auto"`` is ``0``
+    (semantic checkpoints only). Explicit values pass through.
+    """
+    if retention_interval != "auto":
+        assert retention_interval is None or isinstance(retention_interval, int)
+        return retention_interval
+    if enable_prefix_caching and has_prefix_store and any(
+        isinstance(g.kv_cache_spec, MambaSpec)
+        and g.kv_cache_spec.mamba_cache_mode == "align"
+        for g in kv_cache_groups
+    ):
+        return scheduler_block_size
+    return 0
+
+
+def apply_prefix_cache_retention_interval(
+    vllm_config: VllmConfig,
+    kv_cache_configs: Iterable[KVCacheConfig],
+    scheduler_kv_cache_config: KVCacheConfig,
+    scheduler_block_size: int,
+) -> int | None:
+    """Resolve the retention interval once and write it into the CacheConfig,
+    the scheduler's KVCacheConfig and every worker's, so the scheduler, the KV
+    connector's scheduler and worker sides all read the same integer."""
+    cache_config = vllm_config.cache_config
+    retention_interval = resolve_prefix_cache_retention_interval(
+        cache_config.prefix_cache_retention_interval,
+        scheduler_kv_cache_config.kv_cache_groups,
+        scheduler_block_size,
+        bool(cache_config.enable_prefix_caching),
+        has_prefix_store_connector(vllm_config.kv_transfer_config),
+    )
+    cache_config.prefix_cache_retention_interval = retention_interval
+    for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+        kv_cache_config.prefix_cache_retention_interval = retention_interval
+    if retention_interval != 0:
+        logger.info_once("prefix-cache retention interval %s", retention_interval)
+    return retention_interval
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
