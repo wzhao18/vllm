@@ -685,6 +685,6 @@ def test_tracker_on_real_async_scheduler_park_fail_free_readmit():
         step3, create_model_runner_output([request, filler])
     )
     assert all(entry[1] is not old_blocks for entry in scheduler.deferred_frees)
-    new_blocks = set(scheduler.kv_cache_manager.get_blocks("r").blocks[0])
+    new_ids = {b.block_id for b in scheduler.kv_cache_manager.get_blocks("r").blocks[0]}
     # Returned to the pool (or reused for its own recompute), never leaked.
-    assert all(b.ref_cnt == 0 or b in new_blocks for b in old_blocks)
+    assert all(b.ref_cnt == 0 or b.block_id in new_ids for b in old_blocks)
