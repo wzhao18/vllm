@@ -424,3 +424,61 @@ def test_kda_conv_gemm_checkpoint_prod_tactic():
 
     _run_checkpoint([2000, 1000, 5000, 192, 8000], [1984, 1000, 4096, 176, 7680],
                     16384, tactic=TACTIC, seed=7, part=12288, k=7168)  # fmt: skip
+
+
+def _fake_layer(part):
+    from types import SimpleNamespace
+
+    lin = SimpleNamespace(
+        weight=SimpleNamespace(data=torch.empty(4 * part, 7168)),
+        input_size_per_partition=7168,
+    )
+    conv = SimpleNamespace(weight=torch.empty(3 * part, 1, 4, dtype=torch.float32))
+    return SimpleNamespace(
+        in_proj_qkvgfab=lin, conv1d=conv, local_projection_size=part
+    )
+
+
+def test_missing_tactic_raises(monkeypatch):
+    """A supported layer whose q|k|v width no tactic tiles raises at load
+    (missing SHAPE_TACTICS entry), never silently keeps the stock conv; the
+    deployed widths pass."""
+    from vllm.models.kimi_k3.nvidia import mxfp8
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda c: True)
+    monkeypatch.setattr(mxfp8, "is_mxfp8_linear", lambda lin: True)
+    monkeypatch.setattr(mxfp8, "_kernel_layout", lambda lin: "nk")
+    for part in (12288, 6144, 3072, 1536):
+        assert kda_conv_in_proj.unsupported_reason(_fake_layer(part)) is None
+    with pytest.raises(ValueError, match="SHAPE_TACTICS"):
+        kda_conv_in_proj.unsupported_reason(_fake_layer(768))  # TP16 width 2304
+
+
+@pytest.mark.parametrize(
+    "decodes,spec,prefills", [(1, 0, 3), (0, 2, 3), (0, 0, 0)]
+)
+def test_fused_in_proj_declines_mixed_batches(monkeypatch, decodes, spec, prefills):
+    """kv_both prefill workers also serve mixed steps (aggregated + store): a
+    step with decode or spec-verify rows (or no prefill) keeps the stock
+    in_proj + conv, whatever its row count."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+
+    md = SimpleNamespace(
+        num_prefills=prefills, num_decodes=decodes, num_spec_decodes=spec
+    )
+    monkeypatch.setattr(
+        kda_conv_in_proj,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer.kda": md}),
+    )
+    conv = kda_conv_in_proj.PrefillKdaConvInProj.__new__(
+        kda_conv_in_proj.PrefillKdaConvInProj
+    )
+    conv.layer = SimpleNamespace(prefix="layer.kda")
+    conv._gemm = object()  # never reached
+    qa = SimpleNamespace(data=torch.empty(kda_conv_in_proj.MIN_ROWS * 4, 8))
+    assert conv.fused(qa) is None

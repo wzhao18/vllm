@@ -860,6 +860,13 @@ class KimiK3MegaMoEExperts(nn.Module):
                 dataclasses.replace(first, max_tokens=RUBIN_WIDE_EP_DECODE_TOKENS),
                 *self.buckets,
             )
+            logger.info_once(
+                "Rubin MegaMoE: EP%d GenPhase decode adds the %d-token fused-shared "
+                "bucket below its %d bucket.",
+                self.ep_size,
+                RUBIN_WIDE_EP_DECODE_TOKENS,
+                first.max_tokens,
+            )
         switched = False
         buckets = []
         for bucket in self.buckets:

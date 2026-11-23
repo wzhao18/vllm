@@ -49,7 +49,8 @@ def unsupported_reason(layer) -> str | None:
     """None when the layer can run the fused GEMM: SM107, online-MXFP8 in_proj
     with K-major [N, K] rows (either kernel layout), FP32 width-4 conv
     weights, 256-multiple planes that the shape's tactic (``tactic_for``)
-    clusters tile exactly (``kda_conv_gemm.shape_tactic``); else why not."""
+    clusters tile exactly (``kda_conv_gemm.shape_tactic``); else why not.
+    Raises ValueError when only the tactic is missing for the shape."""
     from vllm.platforms import current_platform
 
     if not current_platform.is_device_capability((10, 7)):
@@ -68,11 +69,17 @@ def unsupported_reason(layer) -> str | None:
         return "plane / K size"
     from .sm107_gemm.kda_conv_gemm import shape_tactic
 
+    # A supported layer whose q|k|v width no tactic tiles is a missing
+    # SHAPE_TACTICS entry, not a capability limit: raise at load (no silent
+    # fallback to the stock in_proj + conv).
+    n = 3 * layer.local_projection_size
     try:
-        n = 3 * layer.local_projection_size
         shape_tactic(n, tactic_for(n))
     except ValueError as e:
-        return str(e)
+        raise ValueError(
+            f"prefill KDA conv GEMM: no tactic tiles q|k|v width {n} "
+            f"(add a SHAPE_TACTICS entry): {e}"
+        ) from e
     return None
 
 

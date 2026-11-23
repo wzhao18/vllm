@@ -60,18 +60,20 @@ def test_kv_insert_scope():
     )
 
 
+@pytest.mark.parametrize("block_size", [64, 2048])
 @pytest.mark.parametrize("dcp_rank", [0, 3, 7])
-def test_kv_insert_dcp_local_slots_bitwise(dcp_rank):
+def test_kv_insert_dcp_local_slots_bitwise(dcp_rank, block_size):
     """TP8+DCP8 prefill worker (PFLHF P4): the DCP-local slot map (interleave 1)
     holds -1 for every token another DCP rank owns; the insert writes exactly
-    the rows stock concat_and_cache_mla writes."""
+    the rows stock concat_and_cache_mla writes (skip_scale per-tensor FP8),
+    including the 2048-token pool blocks of the TP8 slot-packed KV groups."""
     from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
 
-    dcp, num_tokens, block_size = 8, 4096, 64
-    kv_c, k_pe, _, cache = _inputs(num_tokens, 128, block_size, dcp_rank)
+    dcp, num_tokens = 8, 4096
+    kv_c, k_pe, _, cache = _inputs(num_tokens, 8192 // block_size, block_size, dcp_rank)
     t = torch.arange(num_tokens, device="cuda")
     local = t // dcp  # this rank's position of its owned tokens
-    slots = torch.where(t % dcp == dcp_rank, 3 * block_size + local, -1)
+    slots = torch.where(t % dcp == dcp_rank, 3 * 64 + local, -1)
     slots = slots.to(torch.int64).contiguous()
     ref = cache.clone()
     scale = torch.ones(1, dtype=torch.float32, device="cuda")

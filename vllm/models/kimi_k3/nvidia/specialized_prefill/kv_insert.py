@@ -64,7 +64,7 @@ def prefill_dcp_supported(
     from vllm.platforms import current_platform
 
     kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
-    return (
+    on = (
         kv_transfer is not None
         and bool(kv_transfer.is_kv_producer)
         and kv_cache_dtype in ("fp8", "fp8_e4m3")
@@ -72,6 +72,14 @@ def prefill_dcp_supported(
         and current_platform.is_cuda()
         and current_platform.is_device_capability(107)
     )
+    if on:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "Kimi K3.1: DCP / ShardQ prefill MLA layers write the FP8 KV cache "
+            "with the specialized insert."
+        )
+    return on
 
 
 def applicable(
