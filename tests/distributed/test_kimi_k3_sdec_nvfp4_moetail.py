@@ -53,8 +53,6 @@ def _rel(a, b):
 
 
 def test_nvfp4_moetail_matches_stock():
-    from test_kimi_k3_sdec_nvfp4_moe import _vllm_config
-
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
@@ -64,6 +62,8 @@ def test_nvfp4_moetail_matches_stock():
     )
     from vllm.platforms import current_platform
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    from .test_kimi_k3_sdec_nvfp4_moe import _vllm_config
 
     rank, local = int(os.environ["RANK"]), int(os.environ.get("LOCAL_RANK", "0"))
     torch.accelerator.set_device_index(local)
@@ -89,8 +89,6 @@ def test_nvfp4_moetail_matches_stock():
 
 
 def _run(config, rank, device, group):
-    from test_kimi_k3_sdec_nvfp4_moe import _stock_layer
-
     from vllm.forward_context import set_forward_context
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
         tail_runtime,
@@ -111,6 +109,8 @@ def _run(config, rank, device, group):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         pack_front,
     )
+
+    from .test_kimi_k3_sdec_nvfp4_moe import _stock_layer
 
     module = _stock_layer(config, rank, device)
     module.experts.moe_config.defer_moe_finalize(DEFER_ROWS)
