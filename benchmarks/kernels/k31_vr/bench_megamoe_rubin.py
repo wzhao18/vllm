@@ -135,7 +135,9 @@ def init_distributed():
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--quant-kind", choices=("nvfp4", "mxfp4_mxfp8"), default="nvfp4")
+    p.add_argument(
+        "--quant-kind", choices=("nvfp4", "mxfp4_mxfp8", "mxfp4"), default="nvfp4"
+    )
     p.add_argument("--variant", choices=("inference", "genphase"), default="inference")
     p.add_argument("--tokens", default="5925", help="live tokens per rank, comma list")
     p.add_argument(

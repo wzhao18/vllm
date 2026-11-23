@@ -30,6 +30,7 @@ from .weights import (
     e4m3_to_f32,
     e8m0_to_f32,
     from_blocked,
+    quantize_mxfp4_block32,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
     unpack_fp4_to_f32,
@@ -61,9 +62,10 @@ def stage_inputs_torch(
     topk = topk_ids.shape[1]
     dev = hidden_states.device
     nvfp4 = quant_kind == "nvfp4"
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
     vec = NV_BLOCK if nvfp4 else MX_BLOCK
     x = torch.zeros(
-        (capacity, hidden // 2 if nvfp4 else hidden), dtype=torch.uint8, device=dev
+        (capacity, hidden // 2 if fp4 else hidden), dtype=torch.uint8, device=dev
     )
     x_sf = torch.zeros((capacity, sf_cols), dtype=torch.uint8, device=dev)
     idx = torch.full((capacity, topk), -1, dtype=torch.int32, device=dev)
@@ -73,6 +75,8 @@ def stage_inputs_torch(
             q, sf = quantize_nvfp4_block16(
                 hidden_states.float(), norm_const=input_norm_const
             )
+        elif fp4:
+            q, sf = quantize_mxfp4_block32(hidden_states.float())
         else:
             q, sf = quantize_mxfp8_block32(hidden_states.float())
         x[:n] = q.view(torch.uint8)
@@ -95,7 +99,10 @@ def _dequant_activation(quant_kind, x_data, x_sf, hidden):
         data = unpack_fp4_to_f32(x_data)[:, :hidden]
         sf = e4m3_to_f32(x_sf[:, : hidden // NV_BLOCK])
         return data * sf.repeat_interleave(NV_BLOCK, dim=1)
-    data = x_data.view(torch.float8_e4m3fn)[:, :hidden].float()
+    if quant_kind == "mxfp4":
+        data = unpack_fp4_to_f32(x_data)[:, :hidden]
+    else:
+        data = x_data.view(torch.float8_e4m3fn)[:, :hidden].float()
     sf = e8m0_to_f32(x_sf[:, : hidden // MX_BLOCK])
     return data * sf.repeat_interleave(MX_BLOCK, dim=1)
 
@@ -152,6 +159,11 @@ def megamoe_oracle(
             q, sf = quantize_nvfp4_block16(act, norm)
             act = unpack_fp4_to_f32(q) * e4m3_to_f32(sf).repeat_interleave(
                 NV_BLOCK, dim=1
+            )
+        elif quant_kind == "mxfp4":
+            q, sf = quantize_mxfp4_block32(act)
+            act = unpack_fp4_to_f32(q) * e8m0_to_f32(sf).repeat_interleave(
+                MX_BLOCK, dim=1
             )
         else:
             q, sf = quantize_mxfp8_block32(act)

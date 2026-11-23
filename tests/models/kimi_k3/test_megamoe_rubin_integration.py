@@ -3,8 +3,9 @@
 """moe_backend="kimi_k3_mega_moe" wiring for Kimi K3, CPU only:
 
 - the backend value: accepted, normalized, a native MegaMoE backend, Kimi K3 only;
-- the automatic format policy (MXFP8 x MXFP4 up to 512 tokens/rank, else NVFP4) and
-  the kernel variant / shipped knob record of the server's bucket;
+- the automatic format policy (MXFP8 x MXFP4 up to 512 tokens/rank, else NVFP4), the
+  ``megamoe_quant`` override (incl. W4A4 MXFP4) and the kernel variant / shipped knob
+  record of the server's bucket;
 - ``KimiK3MegaMoEExperts`` registers DeepGEMM MegaMoE's parameter names, shapes and
   dtypes at the K3.1 shapes, loads checkpoint shards as stored, converts to the
   kernel layout (raising on non-representable NVFP4 weights on every rank), exposes
@@ -155,6 +156,23 @@ def test_format_policy(tokens, kind, variant):
     assert X.RUBIN_MX_MAX_TOKENS_PER_RANK == 512
     assert X.rubin_quant_kind(tokens) == kind
     assert X.rubin_kernel_variant(tokens) == variant
+
+
+@pytest.mark.parametrize(
+    ("requested", "kind"),
+    [("nvfp4", "nvfp4"), ("mxfp4_mxfp8", "mxfp4_mxfp8"), ("mxfp4_mxfp4", "mxfp4")],
+)
+def test_format_policy_override(requested, kind):
+    """additional_config megamoe_quant overrides the automatic policy at any size."""
+    for tokens in (1, 8192):
+        assert X.rubin_quant_kind(tokens, requested=requested) == kind
+    C.RubinMoeProblem(quant_kind=kind)
+
+
+def test_format_policy_override_rejects_unknown():
+    for bad in ("mxfp4", "mxfp8", "w4a4"):
+        with pytest.raises(ValueError, match="megamoe_quant"):
+            X.rubin_quant_kind(8192, requested=bad)
 
 
 def test_format_policy_rejects_empty_server():

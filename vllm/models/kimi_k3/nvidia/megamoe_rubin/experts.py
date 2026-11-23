@@ -197,18 +197,40 @@ def rubin_bucket_capacities(
 RUBIN_SHARED_OVERLAP_MAX_SMS = 148
 
 
+# additional_config["megamoe_quant"] -> quant kind (FlashInfer's kind names).
+_MEGAMOE_QUANT: dict[str, QuantKind] = {
+    "nvfp4": "nvfp4",
+    "mxfp4_mxfp8": "mxfp4_mxfp8",
+    "mxfp4_mxfp4": "mxfp4",
+}
+
+
 def rubin_quant_kind(
-    max_tokens_per_rank: int, weight_format: MegaMoEWeightFormat = MEGA_MOE_MXFP4
+    max_tokens_per_rank: int,
+    weight_format: MegaMoEWeightFormat = MEGA_MOE_MXFP4,
+    requested: str = "auto",
 ) -> QuantKind:
     """Routed-expert precision of a server whose layer sees at most
-    ``max_tokens_per_rank`` tokens per forward (automatic, no flag). An NVFP4
-    checkpoint runs the NVFP4 kernel at every size (it has no exact MXFP4 form)."""
+    ``max_tokens_per_rank`` tokens per forward: automatic unless ``requested``
+    (``additional_config["megamoe_quant"]``: ``auto`` | ``nvfp4`` | ``mxfp4_mxfp8``
+    | ``mxfp4_mxfp4``; the exact NVFP4 conversion, or the MXFP4 weights as in the
+    checkpoint with MXFP8 or MXFP4 activations). An NVFP4 checkpoint runs the NVFP4
+    kernel at every size (it has no exact MXFP4 form)."""
     if max_tokens_per_rank <= 0:
         raise ValueError(f"max_tokens_per_rank must be positive: {max_tokens_per_rank}")
     if weight_format is MEGA_MOE_NVFP4:
+        if requested not in ("auto", "nvfp4"):
+            raise ValueError(f"megamoe_quant {requested!r} needs MXFP4 weights.")
         return "nvfp4"
     if weight_format is not MEGA_MOE_MXFP4:
         raise ValueError(f"no Rubin MegaMoE kernel for {weight_format.name!r} weights.")
+    if requested != "auto":
+        if requested not in _MEGAMOE_QUANT:
+            raise ValueError(
+                f"megamoe_quant must be auto or one of {tuple(_MEGAMOE_QUANT)}, got "
+                f"{requested!r}."
+            )
+        return _MEGAMOE_QUANT[requested]
     if max_tokens_per_rank <= RUBIN_MX_MAX_TOKENS_PER_RANK:
         return "mxfp4_mxfp8"
     return "nvfp4"
@@ -464,7 +486,14 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.shared_spec = None
         self.eplb_state = EplbLayerState()
         self.ep_size = ep_size
-        self.quant_kind = rubin_quant_kind(self.max_num_tokens, weight_format)
+        additional_config = getattr(vllm_config, "additional_config", None)
+        self.quant_kind = rubin_quant_kind(
+            self.max_num_tokens,
+            weight_format,
+            additional_config.get("megamoe_quant", "auto")
+            if isinstance(additional_config, dict)
+            else "auto",
+        )
         self.problem = RubinMoeProblem(
             num_experts=num_experts,
             top_k=top_k,

@@ -1,7 +1,7 @@
 {
  "version": 2,
- "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs. Plus two S2 records (EP16 nvfp4 inference i4096 and i8192: tile N=256), measured on the vendored S2 kernel at real EP16 (4 nodes) with bench_mmpf kernel_eager, the native_events protocol: $W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i{4096,8192}.json. Plus the pf-c256-moe prefill records (EP8 C256 i2048, EP4 1-node bench i8192; its EP16 i8192 record is superseded by S2's). EP28/EP32 inference records: FlashInfer a368c5f66 default_knobs as measured in moe_ep32.",
- "source_files": 74,
+ "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs. Plus two S2 records (EP16 nvfp4 inference i4096 and i8192: tile N=256), measured on the vendored S2 kernel at real EP16 (4 nodes) with bench_mmpf kernel_eager, the native_events protocol: $W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i{4096,8192}.json. Plus the pf-c256-moe prefill records (EP8 C256 i2048, EP4 1-node bench i8192; its EP16 i8192 record is superseded by S2's). EP28/EP32 inference records: FlashInfer a368c5f66 default_knobs as measured in moe_ep32. Plus untuned mxfp4 (MXFP4 x MXFP4) inference records: copies of the nvfp4 inference records' knobs, for megamoe_quant mxfp4_mxfp4.",
+ "source_files": 99,
  "entries": [
   {
    "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
@@ -4602,6 +4602,1604 @@
     "cuda_version": "13.4",
     "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
    }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 6144,
+   "live_tokens": 5925,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:22:06",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_nvfp4_t5925.json (mxfp4 untuned copy)",
+    "sha256": "f7afc3e485cc06413427835e8bb21f579be39dbdedc0ac5f19485e66188fec67",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 9728,
+   "live_tokens": 9600,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:24:42",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_nvfp4_t9600.json (mxfp4 untuned copy)",
+    "sha256": "cf128da2ba619f28ab02c883e5ca6b9a068efe782bee99e56563defbd13ee6db",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:18:06",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8b_nvfp4_t720.json (mxfp4 untuned copy)",
+    "sha256": "a961f755abe4b5031305d89b4cef9ccdc8e5d215f8b696b48556f54aff968a68",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 5760,
+   "live_tokens": 5760,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:23:47",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8w_nvfp4_t5760.json (mxfp4 untuned copy)",
+    "sha256": "6b9edfbcd39e7bc5ce86e76df1b2775a97c8a6d76ee573deb1cf2f9f6e686332",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 4,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:09:36",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_smoke_nvfp4.json (mxfp4 untuned copy)",
+    "sha256": "161462ec4f8de0432dfc115ac298a3fb11c9954edc7ea892b15dd47548239d4e",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T12:28:43",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_w16c_nvfp4_i2048.json (mxfp4 untuned copy)",
+    "sha256": "6f4ec0c57e0ce2aae5acafc8edbf8bc0c5cc0f141becbea66cfe92ce80b2d612",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T12:29:39",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_w16c_nvfp4_i4096.json (mxfp4 untuned copy)",
+    "sha256": "5d55db529ca07d11ec3f38e59b6f4eb45b4b6373415ea58e7cca6bd5aa56b4ab",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 6144,
+   "live_tokens": 5925,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T12:30:37",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_w16c_nvfp4_i5925.json (mxfp4 untuned copy)",
+    "sha256": "3098ca860f4550efe0294975eafa8396ebd212456c93afa0cf148027599e45f4",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:39:05",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i1024.json (mxfp4 untuned copy)",
+    "sha256": "0c25e0980f90c52a219db91632561b7f3097efaaf906a13793f9ad852978c308",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:40:23",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i2048.json (mxfp4 untuned copy)",
+    "sha256": "a49ee0c75a9092ce7af65bca4c5784a8b8ff385e8532120882f23048fe87dcf6",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:41:43",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i4096.json (mxfp4 untuned copy)",
+    "sha256": "fb020a98f9960667a1064520a6bfdb533beadbcac34bc27c5436e4e3f2e842bd",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:37:12",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i1024.json (mxfp4 untuned copy)",
+    "sha256": "1222875edc5b41d60aea95d6bc51b01c498062dc2fbfc9f2306a80eaf432942f",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1440,
+   "live_tokens": 1440,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:38:24",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i1440.json (mxfp4 untuned copy)",
+    "sha256": "b9b2c59357417ab298eec0f0cc56fcd5d13137d5f44fe89b891d69c73dfef416",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:39:38",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2048.json (mxfp4 untuned copy)",
+    "sha256": "d22b966dcef105a075b26d27424da1693d754f040c6a542be5c84cef0ec49918",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2880,
+   "live_tokens": 2880,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-09T11:40:54",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2880.json (mxfp4 untuned copy)",
+    "sha256": "fd947cdbb980e73b597eb51f69495e41f70267caad335a98ea769b0983a29883",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "world_size": 8,
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-11T15:20:00",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: pf-c256-moe: C256 prefill per-rank shape (112 experts x 2048 tokens/rank, top-16) emulated on EP4 (448 experts); deployed grouped record 590.1 us on the same bench",
+   "provenance": {
+    "file": "$W/hti/p2/pf-c256-moe/knobs_src/knobs_pfc256_ep8_nvfp4_i2048.json (mxfp4 untuned copy)",
+    "sha256": "93572907a1f4188c4a0849f9b288325388e9c6761d00affb54a4d479477880cf",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "world_size": 4,
+   "max_tokens": 8192,
+   "live_tokens": 4350,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-11T15:20:00",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: pf-c256-moe: 1-node TP4 prefill bench shape (224 experts/rank, 4350 tokens/rank, cap 8192); smoke grouped i2048 record 1132.9 us on the same bench",
+   "provenance": {
+    "file": "$W/hti/p2/pf-c256-moe/knobs_src/knobs_pfc256_ep4_nvfp4_i8192.json (mxfp4 untuned copy)",
+    "sha256": "aeed739707172f2c2540738ead75c6e28cb93eb5f584631df9b219347d9b1618",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 8192,
+   "live_tokens": 8192,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-11T17:37:29",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i8192.json (mxfp4 untuned copy)",
+    "sha256": "b445ca168d03c8361a4d19f76a6ff5a33bf8177f8a66b3d4137e5018b6cf2451",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "tuned_at": "2026-11-11T17:41:09",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i4096.json (mxfp4 untuned copy)",
+    "sha256": "6ff736615e6dfe0104c0ebc424f47cf2c36b6dd43f22eb2b9356e59c7a30b1cb",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 28,
+   "max_tokens": 128,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep28-i128 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 28,
+   "max_tokens": 256,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep28-i256 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 28,
+   "max_tokens": 512,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep28-i512 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 32,
+   "max_tokens": 128,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep32-i128 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 32,
+   "max_tokens": 256,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep32-i256 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "kernel_variant": "inference",
+   "dtype": "mxfp4",
+   "world_size": 32,
+   "max_tokens": 512,
+   "live_tokens": null,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     64
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": null,
+   "source": "untuned-copy-of-nvfp4",
+   "measurement_policy": {
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
+   },
+   "profiling_policy": {
+    "cuda_graph_profile_replays": 10,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "perf-model/microbench/results/moe_ep32/rows.json#nvfp4-ep32-i512 (mxfp4 untuned copy)",
+    "flashinfer_version": "a368c5f66 (tag wzhao/kimi-k3-megamoe-sm107-ep32-20261118)",
+    "cuda_version": "13.4",
+    "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
+   },
+   "comment": "UNTUNED: the knobs of the nvfp4 record at the same variant / EP / capacity (MXFP4 x MXFP4 uses the same packed-FP4 tiles, kind::mxf4 instead of mxf4nvf4), so megamoe_quant mxfp4_mxfp4 resolves; replace with tuner winners after the GPU A/B. Copied from: sm107-block-scaled-1667b47a-runtime-options-v1"
   }
  ]
 }

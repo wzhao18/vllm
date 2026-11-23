@@ -4,10 +4,10 @@
 
 ``RubinMoeConfig`` ports every admission rule of FlashInfer's
 ``Sm107BlockScaledMoeConfig.__post_init__`` (shim/block_scaled.py, hash in VENDOR.md)
-for the two quant kinds this backend runs (``nvfp4``, ``mxfp4_mxfp8``) with BF16
-combine, SiTU and separate top-k reduction. The knob reader consumes FlashInfer's v2
-knob-cache JSON (``knobs/k31_vr.json`` ships the VR tuner winners) with FlashInfer's
-lookup order; a miss raises, there is no silent default.
+for the quant kinds this backend runs (``nvfp4``, ``mxfp4_mxfp8``, ``mxfp4``) with
+BF16 combine, SiTU and separate top-k reduction. The knob reader consumes FlashInfer's
+v2 knob-cache JSON (``knobs/k31_vr.json`` ships the VR tuner winners) with
+FlashInfer's lookup order; a miss raises, there is no silent default.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import torch
 
 from .weights import MX_BLOCK, NV_BLOCK, fp4_storage_dtype, is_power_of_two
 
-QuantKind = Literal["mxfp4_mxfp8", "nvfp4"]
+QuantKind = Literal["mxfp4_mxfp8", "nvfp4", "mxfp4"]
 Variant = Literal["inference", "genphase", "inference_dedup", "inference_dedup_wg2"]
 # "inference_dedup": the refreshed inference kernel (src_gp, FlashInfer main) with the
 # deduplicated combine: the owner rank pre-reduces a token's local expert rows (FP32,
@@ -38,6 +38,7 @@ DEDUP_VARIANTS = ("inference_dedup", "inference_dedup_wg2")  # prefill only
 _KIND_TABLE: dict[str, tuple[Any, torch.dtype, int, int]] = {
     "nvfp4": (None, torch.float8_e4m3fn, NV_BLOCK, 128),
     "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, MX_BLOCK, 64),
+    "mxfp4": (None, torch.float8_e8m0fnu, MX_BLOCK, 128),
 }
 
 KNOB_KEYS = (
@@ -104,7 +105,7 @@ class RubinMoeProblem:
         for name in ("input_norm_const", "fc1_norm_const"):
             if not is_power_of_two(getattr(self, name)):
                 raise ValueError(f"{name} must be a positive power of two.")
-        if self.quant_kind == "mxfp4_mxfp8" and (
+        if self.quant_kind != "nvfp4" and (
             self.input_norm_const != 1.0 or self.fc1_norm_const != 1.0
         ):
             raise ValueError(
@@ -326,8 +327,10 @@ class RubinMoeConfig:
                 f"intermediate ({self.intermediate}) must be a multiple of "
                 f"{max(2 * vec, 32)} for {self.quant_kind}."
             )
-        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
-            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
+        if self.quant_kind in ("mxfp4", "mxfp4_mxfp8") and self.intermediate % 128:
+            raise ValueError(
+                f"{self.quant_kind} intermediate must be a multiple of 128."
+            )
         tiler = self.mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3 or any(type(d) is not int or d <= 0 for d in tiler):
@@ -526,7 +529,8 @@ class RubinMoeConfig:
 
     @property
     def activation_row_bytes(self) -> int:
-        return self.hidden // 2 if self.quant_kind == "nvfp4" else self.hidden
+        packed_fp4 = _KIND_TABLE[self.quant_kind][0] is None
+        return self.hidden // 2 if packed_fp4 else self.hidden
 
 
 # --------------------------------------------------------------------------------------

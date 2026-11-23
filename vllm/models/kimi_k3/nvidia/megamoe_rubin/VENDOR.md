@@ -279,6 +279,16 @@ bb51648766e34e7cbc9d581106ca8a913fb46180eb059114719097b375663135  shim/dependenc
 779b509737ad45d6aefb84b3a7d245c8a36f9b7031b4ec12e6456482521a492a  shim/correctness.py    -> reference.py (sampled oracle, output_error)
 ```
 
+W4A4 MXFP4 (quant kind `mxfp4`, `additional_config["megamoe_quant"] = "mxfp4_mxfp4"`):
+the vendored kernel already supports it (`quant_def.QuantKind.mxfp4`: packed E2M1
+activations with per-32 E8M0 scales, `kind::mxf4` MMA, 2x-mode instruction K 128; the
+FC1 epilogue requantizes to MXFP4 through the paired-amax path). FlashInfer enabled it in
+the shim only, in PR #7944 (`5438e036`, 2026-11-01, no change under `src/`): `_KIND_TABLE`
+entry, `intermediate % 128`, the MXFP4 weight layout of `mxfp4_mxfp8` (FlashInfer's
+`mxfp4_mxfp4_bf16_cutedsl/weights.py` re-exports it), `quantize_mxfp4_block32` input
+staging and the FC1->FC2 wire of the reference. Ported into config.py, weights.py,
+staging.py (Triton) and reference.py; no vendored byte changes.
+
 Also ported: `core/tuning.py` `select_token_entries` / `live_buckets` (config.py) and
 `flashinfer/cute_dsl/availability.py` `_dsl_captured_arch` (arch.py). Not taken: the
 autotuner (`shim/autotune.py`, `tune.py`), NVSHMEM bootstrap (`core/runtime`,

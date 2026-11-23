@@ -640,6 +640,9 @@ def route_stage_cause(mlp) -> str | None:
         return "router correction bias"
     if not (experts.top_k <= 32 and experts.top_k <= logits <= 1024 and logits % 4 == 0):
         return f"top-{experts.top_k} of {logits}"
+    if experts.problem.quant_kind == "mxfp4":
+        # (stages NVFP4 or MXFP8 activations; MXFP4 ones only on the stock stager)
+        return "MXFP4 activations (megamoe_quant mxfp4_mxfp4)"
     return None
 
 

@@ -17,6 +17,9 @@ Rows ``< n``:
 - NVFP4: per 16 elements ``s = e4m3_rne(min(amax * (n_in/6), 448))``,
   ``q = e2m1_rne_satfinite(v * (n_in / s))`` (0 where ``s == 0``), even element in
   the low nibble (FlashInfer ``quantize_nvfp4_block16``).
+- MXFP4 (``mxfp4``): per 32 elements ``e = ceil_log2(amax * (1/6))`` clamped to
+  [-126, 127], ``q = e2m1_rne_satfinite(v / 2^e)`` packed as NVFP4, SF byte
+  ``e + 127`` (FlashInfer ``quantize_mxfp4_block32``).
 - SF columns beyond ``hidden / vec`` (kernel row padding) are zeroed.
 - ``topk_idx = id`` for ``0 <= id < E``, -1 for ``id == -1`` (masked route) or for
   every route of a row with ``is_padding[row]`` set (when given: the caller's
@@ -149,6 +152,7 @@ def _stage_kernel(
     H: tl.constexpr,
     CH: tl.constexpr,
     VEC: tl.constexpr,
+    FP4: tl.constexpr,
     NVFP4: tl.constexpr,
     SF_COLS: tl.constexpr,
     SF_PAD_P2: tl.constexpr,
@@ -226,8 +230,8 @@ def _stage_kernel(
                     tl.zeros([ROWS, SF_PAD_P2], dtype=tl.uint8),
                     mask=rm[:, None] & (p[None, :] < SF_COLS - H // VEC),
                 )
-        if NVFP4:
-            # One 16-element block per row of a [blocks, 8] tile of bf16 pairs read
+        if FP4:
+            # One scale block per row of a [blocks, VEC / 2] tile of bf16 pairs read
             # as 32-bit words: the block amax and the packed E2M1 bytes stay inside
             # a thread (no reshape / split relayout); bf16 -> fp32 is exact.
             NB: tl.constexpr = ROWS * (CH // VEC)
@@ -247,20 +251,34 @@ def _stage_kernel(
             lo = (words << 16).to(tl.float32, bitcast=True)
             hi = (words & 0xFFFF0000).to(tl.float32, bitcast=True)
             amax = tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi), axis=1))
-            s = tl.minimum(amax * scale_mult, 448.0)
-            s8 = s.to(tl.float8e4nv)
-            srt = s8.to(tl.float32)
-            # IEEE division (Triton's "/" is approximate): norm_const / scale.
-            acc = tl.where(
-                srt > 0.0,
-                tl.math.div_rn(
-                    tl.zeros_like(srt) + norm_const,
-                    tl.maximum(srt, 1.1754943508222875e-38),
-                ),
-                0.0,
-            )
-            y_lo = lo * acc[:, None]
-            y_hi = hi * acc[:, None]
+            if NVFP4:
+                s = tl.minimum(amax * scale_mult, 448.0)
+                s8 = s.to(tl.float8e4nv)
+                srt = s8.to(tl.float32)
+                # IEEE division (Triton's "/" is approximate): norm_const / scale.
+                acc = tl.where(
+                    srt > 0.0,
+                    tl.math.div_rn(
+                        tl.zeros_like(srt) + norm_const,
+                        tl.maximum(srt, 1.1754943508222875e-38),
+                    ),
+                    0.0,
+                )
+                y_lo = lo * acc[:, None]
+                y_hi = hi * acc[:, None]
+                sf_byte = s8.to(tl.uint8, bitcast=True)
+            else:
+                t = amax * (1.0 / 6.0)
+                t = tl.where((t == t) & (t < float("inf")), t, 0.0)
+                t = tl.maximum(t, 1.1754943508222875e-38)
+                bits = t.to(tl.int32, bitcast=True)
+                e = ((bits >> 23) & 0xFF) - 127
+                e += ((bits & 0x7FFFFF) != 0).to(tl.int32)
+                e = tl.minimum(tl.maximum(e, -126), 127)
+                scale = ((e + 127) << 23).to(tl.float32, bitcast=True)[:, None]
+                y_lo = tl.math.div_rn(lo, tl.broadcast_to(scale, lo.shape))
+                y_hi = tl.math.div_rn(hi, tl.broadcast_to(scale, hi.shape))
+                sf_byte = (e + 127).to(tl.uint8)
             # Hardware E2M1 (grid 0, .5, 1, 1.5, 2, 3, 4, 6): round to nearest, ties
             # to the even code, |y| > 6 and inf saturate to 6. As FlashInfer's
             # quantize_nvfp4_block16: NaN -> 0 and a nibble that rounds to zero is +0.
@@ -276,11 +294,7 @@ def _stage_kernel(
                 packed,
                 mask=bm[:, None],
             )
-            tl.store(
-                sf_ptr + brow * sf_stride + bcol,
-                s8.to(tl.uint8, bitcast=True),
-                mask=bm,
-            )
+            tl.store(sf_ptr + brow * sf_stride + bcol, sf_byte, mask=bm)
         else:
             offs = chunk * CH + tl.arange(0, CH)
             v = tl.load(
@@ -362,14 +376,15 @@ def stage_inputs(
     n, hidden = hidden_states.shape
     capacity, topk = topk_idx.shape
     nvfp4 = quant_kind == "nvfp4"
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
     vec = 16 if nvfp4 else 32
     if n > capacity:
         raise ValueError(f"{n} tokens exceed the bucket capacity {capacity}.")
     if hidden_states.dtype != torch.bfloat16 or hidden_states.stride(-1) != 1:
         raise ValueError("hidden_states must be BF16 with unit inner stride.")
-    if nvfp4 and n and (hidden_states.stride(0) % 2 or hidden_states.data_ptr() % 4):
+    if fp4 and n and (hidden_states.stride(0) % 2 or hidden_states.data_ptr() % 4):
         raise ValueError(
-            "NVFP4 staging reads BF16 pairs as 32-bit words: hidden_states needs an "
+            "FP4 staging reads BF16 pairs as 32-bit words: hidden_states needs an "
             "even row stride and 4-byte alignment."
         )
     if topk_ids.shape != (n, topk) or topk_weights.shape != (n, topk):
@@ -456,6 +471,7 @@ def stage_inputs(
         H=hidden,
         CH=ch,
         VEC=vec,
+        FP4=fp4,
         NVFP4=nvfp4,
         SF_COLS=sf_cols,
         SF_PAD_P2=max(1, triton.next_power_of_2(max(pad, 1))),

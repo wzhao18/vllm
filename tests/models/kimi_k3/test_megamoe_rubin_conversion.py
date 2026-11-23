@@ -9,7 +9,8 @@
 - detection of non-representable weights (spread 18, NaN scale byte, byte-0 scale on
   live codes) with the offending (expert, leg) named;
 - the MXFP4 (``mxfp4_mxfp8``) kernel layout equals FlashInfer's
-  ``preprocess_prequantized_block_scaled_weights`` byte for byte;
+  ``preprocess_prequantized_block_scaled_weights`` byte for byte, and the W4A4 MXFP4
+  kind (``mxfp4``) uses the same weight bytes with its own admission rules;
 - the knob reader on the shipped VR knob file, the knob merge (record count per
   source file) and the bench capacity selection;
 - checkpoint expert-key parsing (``weight_packed`` / ``weight_scale``);
@@ -383,6 +384,66 @@ def test_mxfp4_mxfp8_layout_matches_flashinfer():
         ours, quant_kind="mxfp4_mxfp8", experts=E, hidden=H, intermediate=intermediate
     )
     assert ours.fc1_alpha is None and ours.report is None
+
+
+def test_mxfp4_weights_reuse_the_mxfp4_mxfp8_layout():
+    """W4A4 MXFP4 (``mxfp4``) takes the checkpoint weights in the same kernel layout as
+    MXFP8 activations (FlashInfer's mxfp4_mxfp4 backend reuses those weights), tagged
+    with its own kind so a session of the other kind refuses them."""
+    intermediate = 128
+    w13, s13, w2, s2 = _random_layer(12, intermediate, kmax=-4, spread=40)
+    args = (w13, s13.view(torch.float8_e8m0fnu), w2, s2)
+    dims = dict(hidden=H, intermediate=intermediate)
+    mx8 = W.prepare_weights("mxfp4_mxfp8", *args, **dims)
+    mx4 = W.prepare_weights("mxfp4", *args, **dims)
+    assert mx4.quant_kind == "mxfp4" and mx4.fc1_alpha is None and mx4.report is None
+    for a, b in zip((*mx8.fc1, *mx8.fc2), (*mx4.fc1, *mx4.fc2)):
+        assert a.dtype == b.dtype and a.shape == b.shape and a.stride() == b.stride()
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    W.validate_kernel_weights(mx4, quant_kind="mxfp4", experts=E, **dims)
+    with pytest.raises(ValueError, match="prepared for"):
+        W.validate_kernel_weights(mx4, quant_kind="mxfp4_mxfp8", experts=E, **dims)
+    with pytest.raises(ValueError, match="MXFP4-weight"):
+        W.prepare_mxfp4_mxfp8_weights(*args, **dims, quant_kind="nvfp4")
+
+
+def test_mxfp4_admission_rules():
+    """Ported FlashInfer rules for W4A4 MXFP4: packed FP4 activations with per-32 E8M0
+    scales, 2x-mode instruction K 128 (tile K 256 or 512), intermediate % 128, no
+    NVFP4 norm constants."""
+    C = _load("config")
+    problem = C.RubinMoeProblem(quant_kind="mxfp4")
+    with pytest.raises(ValueError, match="norm constants"):
+        C.RubinMoeProblem(quant_kind="mxfp4", input_norm_const=2.0)
+    knobs = dict(
+        cluster_shape_mn=(2, 1),
+        fallback_cluster_shape_mn=None,
+        schedule_policy=("grouped", None),
+        work_id_mode="grid_stride",
+        fc2_use_bulk=True,
+        fc2_tma_stages=2,
+        epi_flag_batches=(1, 4),
+        token_in_flag_batch=1,
+        token_back_mode="epi_warps",
+        reduce_topk_in_kernel=False,
+    )
+
+    def make(tiler, p=problem):
+        bucket = C.RubinBucket(
+            "inference", 8192, C.RubinKnobs.from_dict(dict(knobs, mma_tiler_mnk=tiler))
+        )
+        return C.RubinMoeConfig.make(p, bucket, rank=0, world_size=4)
+
+    for tiler in ((256, 128, 256), (256, 256, 256), (256, 128, 512), (256, 256, 512)):
+        cfg = make(tiler)
+    assert (cfg.sf_vec_size, cfg.instruction_k) == (32, 128)
+    assert cfg.torch_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.torch_act_data_dtype == W.fp4_storage_dtype()
+    assert cfg.activation_row_bytes == problem.hidden // 2
+    with pytest.raises(ValueError, match="tile K"):
+        make((256, 128, 128))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        make((256, 128, 256), C.RubinMoeProblem(quant_kind="mxfp4", intermediate=3136))
 
 
 def _offenders(exc):

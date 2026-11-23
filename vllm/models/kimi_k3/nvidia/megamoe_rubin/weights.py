@@ -10,12 +10,12 @@ Input contract (canonical, one layer, this rank's local experts ``[r*E_l, (r+1)*
 - ``w13_scale`` ``(E_l, 2I, H/32)`` UE8M0 bytes (``2^(b-127)``, 255 = NaN)
 - ``w2``        ``(E_l, H, I/2)``,  ``w2_scale`` ``(E_l, H, I/32)``
 
-Two kernel quant kinds:
+Kernel quant kinds:
 
-- ``mxfp4_mxfp8``: the MXFP4 weights as they are (port of FlashInfer
-  ``preprocess_prequantized_block_scaled_weights``): 16-row gate/up interleave of data
-  and scales, 32x4x4 scale-atom swizzle, K-major data handed over as the logical
-  ``(E, K/2, N)`` view.
+- ``mxfp4_mxfp8`` and ``mxfp4`` (MXFP8 or MXFP4 activations): the MXFP4 weights as
+  they are (port of FlashInfer ``preprocess_prequantized_block_scaled_weights``, one
+  layout for both): 16-row gate/up interleave of data and scales, 32x4x4 scale-atom
+  swizzle, K-major data handed over as the logical ``(E, K/2, N)`` view.
 - ``nvfp4``: an EXACT MXFP4 -> NVFP4 conversion. The E2M1 codes are unchanged; every
   per-32 UE8M0 scale ``2^k`` becomes two per-16 E4M3 scales ``2^(k-c)`` against one FP32
   global scale ``2^c`` per (expert, GEMM), ``c = max(kmax - 8, -126)``. The dequantized
@@ -53,7 +53,7 @@ E4M3_MAX = 448.0
 E2M1_MAX = 6.0
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
-QUANT_KINDS = ("mxfp4_mxfp8", "nvfp4")
+QUANT_KINDS = ("mxfp4_mxfp8", "nvfp4", "mxfp4")
 
 # E4M3 window for exact power-of-two scales: 2^-9 (subnormal 0x01) .. 2^8 (0x78).
 _M_MIN = -9
@@ -686,15 +686,18 @@ def prepare_mxfp4_mxfp8_weights(
     *,
     hidden: int,
     intermediate: int,
+    quant_kind: str = "mxfp4_mxfp8",
 ) -> RubinMoeWeights:
     """MXFP4 weights as they are (FlashInfer
-    ``preprocess_prequantized_block_scaled_weights`` for
-    ``quant_kind="mxfp4_mxfp8"``, byte-identical)."""
+    ``preprocess_prequantized_block_scaled_weights`` for ``quant_kind``
+    ``"mxfp4_mxfp8"`` or ``"mxfp4"``, byte-identical)."""
+    if quant_kind not in ("mxfp4_mxfp8", "mxfp4"):
+        raise ValueError(f"not an MXFP4-weight quant kind: {quant_kind!r}.")
     check_canonical_mxfp4(
         w13, w13_scale, w2, w2_scale, hidden=hidden, intermediate=intermediate
     )
     if intermediate % (4 * MX_BLOCK):
-        raise ValueError("mxfp4_mxfp8 needs intermediate % 128 == 0.")
+        raise ValueError(f"{quant_kind} needs intermediate % 128 == 0.")
     d13 = interleave_gate_up_16(_u8(w13), intermediate_size=intermediate)
     s13 = interleave_gate_up_16(_u8(w13_scale), intermediate_size=intermediate)
     fc1 = (
@@ -705,7 +708,7 @@ def prepare_mxfp4_mxfp8_weights(
         _aligned_k_major_view(_u8(w2)),
         to_blocked_batched(_u8(w2_scale).contiguous()).view(torch.float8_e8m0fnu),
     )
-    return RubinMoeWeights("mxfp4_mxfp8", fc1, fc2)
+    return RubinMoeWeights(quant_kind, fc1, fc2)
 
 
 def deinterleave_gate_up_cols_16(y: torch.Tensor) -> torch.Tensor:
@@ -988,9 +991,15 @@ def prepare_weights(
     layer_id: int | None = None,
     expert_offset: int = 0,
 ) -> RubinMoeWeights:
-    if quant_kind == "mxfp4_mxfp8":
+    if quant_kind in ("mxfp4_mxfp8", "mxfp4"):
         return prepare_mxfp4_mxfp8_weights(
-            w13, w13_scale, w2, w2_scale, hidden=hidden, intermediate=intermediate
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            hidden=hidden,
+            intermediate=intermediate,
+            quant_kind=quant_kind,
         )
     if quant_kind == "nvfp4":
         return prepare_nvfp4_weights(
@@ -1076,4 +1085,6 @@ def validate_kernel_weights(
                     "fc1_norm_const on the backend device."
                 )
     elif any(t is not None for t in scalars):
-        raise ValueError("mxfp4_mxfp8 takes no fc1_alpha / fc2_alpha / fc1_norm_const.")
+        raise ValueError(
+            f"{quant_kind} takes no fc1_alpha / fc2_alpha / fc1_norm_const."
+        )
