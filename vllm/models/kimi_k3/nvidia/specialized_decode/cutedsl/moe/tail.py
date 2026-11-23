@@ -106,19 +106,9 @@ class MoeTail:
 
     def __init__(
         self, tp: int, batch: int, *, mode="front", trigger=2, poll_ns=None, gate=False,
-        reload=False, permuted=False,
+        reload=False,
     ):  # fmt: skip
         self.tp, self.batch, self.mode, self.trigger = tp, batch, mode, trigger
-        # ``permuted`` (front mode): the routed rows arrive as the stock experts'
-        # deferred output (``UnfinalizedMoEOutput``: permuted unweighted rows
-        # [P, 3584], routing weights [B, 16] BF16, permute map [B, 16] int32, -1 =
-        # not local; the NVFP4 layers' TRT-LLM-Gen experts) instead of route-major
-        # rows [B * 16, 3584]: route (t, k) reads permuted row map[t, k] (row 0 with
-        # weight 0 where -1, as ``tail_rows.LatentRows``). The same FP32 FMAs in k
-        # order and the same rounding as the route-major finalize.
-        self.permuted = permuted
-        if permuted and mode != "front":
-            raise ValueError("A permuted MoeTail input is a front-mode schedule")
         # ``reload`` (Rubin, ``tail_runtime.RUBIN_TAIL_RELOAD``): the latent poll and
         # the two-shot settle reload every source each pass instead of only the
         # pending ones (see ``poll``). Same words in the same order, bitwise.
@@ -226,7 +216,7 @@ class MoeTail:
         return tuple(t.shape[0] // 3 for t in io[2:5])
 
     @cute.jit
-    def front(self, io, latent_mc, par, rank, capacity, block, warp, lane, index=None):
+    def front(self, io, latent_mc, par, rank, capacity, block, warp, lane):
         _, _, g, weights, s, peers = io
         if cutlass.const_expr(self.mode == "front"):
             cute.arch.griddepcontrol_wait()
@@ -239,11 +229,6 @@ class MoeTail:
                 wp = weights.iterator + par * ws + token * 16
                 w = cute.make_rmem_tensor(8, Uint32)
                 rows = cute.make_rmem_tensor(16, Uint32)
-                local = cute.make_rmem_tensor(16, Int32)
-                if cutlass.const_expr(self.permuted):
-                    src = g.iterator + 64 * line + 2 * lane
-                    for j in cutlass.range_constexpr(16):
-                        local[j] = index[token * 16 + j]
                 dirty = Int32(1)
                 sgn, sgt = spin_start()
                 while dirty != 0:
@@ -251,11 +236,7 @@ class MoeTail:
                         for k, v in enumerate(load_volatile(wp + 8 * h, count=4)):
                             w[4 * h + k] = v
                     for j in cutlass.range_constexpr(16):
-                        if cutlass.const_expr(self.permuted):
-                            row = max(local[j], Int32(0))
-                            rows[j] = load_volatile(src + row * 3584)[0]
-                        else:
-                            rows[j] = load_volatile(src + j * 3584)[0]
+                        rows[j] = load_volatile(src + j * 3584)[0]
                     if cutlass.const_expr(self.mode == "front_poll"):
                         words = [w[k] for k in range(8)] + [rows[j] for j in range(16)]
                         bad = reduce(or_, map(front_dirty, words))
@@ -271,8 +252,6 @@ class MoeTail:
                 a0, a1 = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(16):
                     weight = bf16(w[j // 2], j % 2)
-                    if cutlass.const_expr(self.permuted):
-                        weight = cutlass.select_(local[j] >= 0, weight, Float32(0))
                     a0 = fma(bf16(rows[j]), weight, a0)
                     a1 = fma(bf16(rows[j], True), weight, a1)
                 word = pack_pair(a0, a1, policy="latent")
@@ -377,8 +356,7 @@ class MoeTail:
             load_tma3(sw.iterator, weight_map.iterator, bar, 2 * q, row0)
         cute.arch.cluster_arrive_relaxed()
         io = (latent, shared, gemm2, weights, shared_output, peers)
-        index = args[17] if cutlass.const_expr(self.permuted) else None
-        self.front(io, latent_mc, par, rank, capacity, block, warp, lane, index)
+        self.front(io, latent_mc, par, rank, capacity, block, warp, lane)
         if cutlass.const_expr(self.gate):
             slot0 = par * self.tp * capacity + token0
             self.gate_poll(latent, shared, slot0, capacity, q, row0)

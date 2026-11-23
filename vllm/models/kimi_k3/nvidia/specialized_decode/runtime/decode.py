@@ -43,12 +43,7 @@ from ..cutedsl.moe.experts_runtime import (
 )
 from ..cutedsl.moe.front import SharedFront
 from ..cutedsl.moe.front_rows import FrontRows
-from ..cutedsl.moe.nvfp4 import (
-    Nvfp4Front,
-    Nvfp4MoE,
-    is_nvfp4_moe,
-    mxfp8_shared_cause,
-)
+from ..cutedsl.moe.nvfp4 import Nvfp4MoE, is_nvfp4_moe, mxfp8_shared_cause
 from ..cutedsl.moe.prepared import (
     WIDE_FRONT,
     MoEScratch,
@@ -60,7 +55,7 @@ from ..cutedsl.moe.prepared import (
 from ..cutedsl.moe.prepared import choose as moe_choose
 from ..cutedsl.moe.small_batch import chain as small_batch_chain
 from ..cutedsl.moe.tail_rows import PreparedTailRows
-from ..cutedsl.moe.tail_runtime import MoeTailBox, MoeTailWeights, PreparedTail
+from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from ..cutedsl.oproj.prepared import choose as oproj_choose
 from ..shapes import (
@@ -369,9 +364,7 @@ class SpecializedDecode:
                 if moe.rows is not None:  # wide batches: the wide tail's output ring
                     consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
-            elif isinstance(moe, Nvfp4MoE):  # the MoE tail's ring, the wide tail's
-                if moe.tail is not None:
-                    consumer.bind_ring(moe.tail_box.out.buffer)
+            elif isinstance(moe, Nvfp4MoE):  # every batch: the wide tail's ring
                 consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
             elif layer.layer_idx in self.dense_rings:
@@ -472,13 +465,6 @@ class SpecializedDecode:
             if d.is_moe_layer and d.layer_idx not in nvfp4
         }
         self.nvfp4_layers = frozenset(nvfp4)
-        # NVFP4 layers' tuned front (``moe.nvfp4.Nvfp4Front``, <= 64 rows): the same
-        # packed [router; latent-down] shard rows as the MXFP4 layers' front
-        nv_packed = {
-            d.layer_idx: pack_front(d.mlp, rank, tp)
-            for d in layers
-            if d.layer_idx in nvfp4
-        }
         for d in layers:  # before the prefetch tables take the weight addresses
             if attention_kind(d.self_attn) == "dsa":
                 pack_dsa_projection(d.self_attn)
@@ -507,7 +493,7 @@ class SpecializedDecode:
         wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
-            MoeTailBox(*owner) if packed or nvfp4 else None,
+            MoeTailBox(*owner) if packed else None,
             [d.layer_idx for d in layers if d.is_moe_layer],
         )
         twoshot = TwoShot(*owner)
@@ -546,25 +532,9 @@ class SpecializedDecode:
                     sharded=(self.sharded, self.shard_box),
                     deferred=deferred_rows(module, moe_batches),
                 )  # fmt: skip
-                fronted = [b for b in moe_batches if b <= Nvfp4Front.MAX]
-                front = tail = None
-                if fronted:
-                    front = Nvfp4Front(module, nv_packed[index], front_box, fronted)
-                    # the tuned MoE tail (front-mode MoeTail over the experts'
-                    # deferred rows) at the same rows: the next AttnRes polls the
-                    # tail box's ring up to its CAP rows, the wide ring above
-                    norm = module.routed_expert_norm
-                    up = module.routed_expert_up_proj.weight
-                    local_up = up.narrow(0, rank * (7168 // tp), 7168 // tp)
-                    weights = MoeTailWeights(
-                        tp, local_up, norm.weight, norm.variance_epsilon,
-                        moe_layers.index(index), len(moe_layers), fronted,
-                        permuted=True,
-                    )  # fmt: skip
-                    tail = weights, tail_box
                 self.feed_forward[index] = Nvfp4MoE(
                     module, state, rows, moe_batches, prefetch=prefetch,
-                    layer_idx=index, front=front, tail=tail,
+                    layer_idx=index,
                 )  # fmt: skip
                 continue
             args = (module, packed[index], front_box, state.front, tuned_moe, beta)

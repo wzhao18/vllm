@@ -56,14 +56,7 @@ class RouteSitu:
     def __init__(
         self, batch, shared, renorm, early, roles, polled, plan=False, lean=None,
         rcp=False, halves=False, signal=False, sync_copy=False, early_ids=False,
-        logits_only=False,
     ):  # fmt: skip
-        # logits_only (polled, route + copy): the route role only gathers the token's
-        # 896 FP32 router logits from the front box into ``logits`` (re-armed) and
-        # ranks nothing: the NVFP4 layers' stock experts route from those logits
-        # themselves (``nvfp4.Nvfp4Front``).
-        self.logits_only = logits_only
-        assert not logits_only or (polled and not plan and not signal)
         # Lean (B>8 by default): few registers, so routing CTAs co-reside with the front
         # and the fused shared expert, polled logits skip the front's completion wait,
         # and 8 threads rank each candidate.
@@ -124,9 +117,7 @@ class RouteSitu:
             cute.arch.griddepcontrol_launch_dependents()
         for r in c.range_constexpr(len(self.roles)):
             if role == r:
-                if c.const_expr(self.roles[r] == "route" and self.logits_only):
-                    self.store_logits(logits, token, tid, mailbox)
-                elif c.const_expr(self.roles[r] == "route"):
+                if c.const_expr(self.roles[r] == "route"):
                     work = (logits, bias, ids, weights, scale, token, tid, mailbox)
                     self.route(*work, signal)
                 elif c.const_expr(self.roles[r] == "copy"):
@@ -260,18 +251,6 @@ class RouteSitu:
 
     def expert(self, tid, i):
         return tid * 4 + i if self.polled else tid + i * 256
-
-    @cute.jit
-    def store_logits(self, logits, token, tid, mailbox):
-        """``logits_only``: thread t < 224 polls the token's logits [4 t, 4 t + 4)
-        (FP32 words in front-box columns [3584, 5376), as ``route`` polls them),
-        re-arms the cell and stores the words unchanged into ``logits``."""
-        if tid < 224:
-            cell = mailbox.iterator + token * mailbox.shape[2] + 3584 + tid * 8
-            got = poll(cell, 0, 1)
-            rearm(cell)
-            dst = logits.iterator + token * self.experts + tid * 4
-            store_words(dst, [got[0, k] for k in range(4)])
 
     @cute.jit
     def copy_cell(self, mailbox, token, tid):
@@ -640,15 +619,14 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None, wide=False)
 def compile_route(
     batch, shared, renorm, roles, device, polled=False, plan=False, lean=None,
     early=None, rcp=False, halves=False, signal=False, sync_copy=False,
-    early_ids=False, box_rows=64, logits_only=False,
+    early_ids=False, box_rows=64,
 ):  # fmt: skip
     """``box_rows``: the front mailbox's rows (``FrontRows``: its capacity); above 64
-    tokens the plan is 64-row blocks of PLAN_BYTES. ``logits_only``: see
-    ``RouteSitu``."""
+    tokens the plan is 64-row blocks of PLAN_BYTES."""
     early = batch <= 2 if early is None else early
     kernel = RouteSitu(
         batch, shared, renorm, early, roles, polled, plan, lean, rcp, halves, signal,
-        sync_copy, early_ids, logits_only,
+        sync_copy, early_ids,
     )  # fmt: skip
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
