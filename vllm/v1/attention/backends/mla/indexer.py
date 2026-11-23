@@ -1018,6 +1018,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             and not self.indexer_uses_fp4
             and self.vllm_config.model_config.hf_text_config.model_type == "kimi_linear"
         )
+        # The chunker budgets M * N FP32 logits (4 bytes each). Without context
+        # parallelism a chunk's logits may fill the whole profiled reservation:
+        # 3x more of them when the top-k ranks SM100's BF16 logits in place.
+        self.max_prefill_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB << 20
+        if self.dcp_world_size == 1 and not self.use_pcp:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                prefill_logits_budget_elems,
+            )
+
+            self.max_prefill_logits_bytes = 4 * prefill_logits_budget_elems(
+                self.vllm_config.kernel_config.sparse_indexer_topk_backend
+            )
 
         next_n = self.get_decode_threshold(self.vllm_config)
         self.decode_threshold = next_n
@@ -1511,7 +1523,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
-            max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            max_logits_bytes = self.max_prefill_logits_bytes
             if self._rowshard_dcp_prefill:
                 # Each rank scores only its query rows. The scorer still tiles
                 # within the original per-rank workspace budget.

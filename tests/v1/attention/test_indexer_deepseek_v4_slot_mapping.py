@@ -837,6 +837,70 @@ def test_indexer_prefill_budget_matches_compressed_workspace(compress_ratio):
         assert int(compressed_seq_lens[req_slice].sum()) <= workspace_rows
 
 
+@pytest.mark.parametrize(
+    "topk_backend,logits_dtype,bytes_per_logit",
+    [
+        # Ranks the BF16 logits in place: the reservation holds 3x the budget.
+        ("trtllm_gvr2", torch.bfloat16, 2),
+        # Ranks an FP32 copy of the BF16 logits.
+        ("auto", torch.bfloat16, 2 + 4),
+        # Off SM100 the logits are FP32.
+        ("trtllm_gvr2", torch.float32, 4),
+    ],
+)
+def test_indexer_prefill_chunks_fill_logits_reservation(
+    monkeypatch, topk_backend, logits_dtype, bytes_per_logit
+):
+    """Each prefill chunk's logits (with the top-k's FP32 copy, if it takes
+    one) fit the reservation the memory profile made for one chunk, and with
+    a top-k that ranks 16-bit logits in place the chunks use all of it."""
+    from vllm import envs
+    from vllm.model_executor.layers import sparse_attn_indexer
+
+    monkeypatch.setattr(
+        sparse_attn_indexer, "_prefill_logits_dtype", lambda: (logits_dtype, 384)
+    )
+    monkeypatch.setattr(sparse_attn_indexer, "trtllm_gvr2_host", lambda: object())
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config.kernel_config.sparse_indexer_topk_backend = topk_backend
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        block_table_width=get_block_table_width(max_num_blocks, 64),
+    )
+    reserved = sparse_attn_indexer.prefill_logits_reserved_bytes()
+    budget_elems = builder.max_prefill_logits_bytes // 4
+    assert budget_elems == reserved // bytes_per_logit
+    if (topk_backend, logits_dtype) == ("auto", torch.bfloat16):
+        # The FP32-copy path keeps today's budget.
+        assert builder.max_prefill_logits_bytes == (
+            envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB << 20
+        )
+
+    # A long prompt split by rows, then short requests packed together.
+    seq_lens = torch.tensor([234_368, 9_975, 1_689, 16_384, 40_000])
+    query_lens = torch.tensor([5_564, 3_200, 1_689, 6_409, 3])
+    chunks = builder._split_indexer_prefill_chunks(
+        seq_lens, query_lens, 10**12, builder.max_prefill_logits_bytes
+    )
+    covered = 0
+    for req_slice, query_slice in chunks:
+        rows = query_slice.stop - query_slice.start
+        width = int(seq_lens[req_slice].max())
+        assert rows * width * bytes_per_logit <= reserved
+        covered += rows
+    assert covered == int(query_lens.sum())
+    # The largest chunk is one row short of overflowing the reservation.
+    rows_per_chunk = chunks[0][1].stop - chunks[0][1].start
+    assert (rows_per_chunk + 1) * 234_368 * bytes_per_logit > reserved
+
+
 def test_indexer_expanded_block_table_sized_by_decode_tokens():
     """Allocated after the memory profile, so it must not scale with the token
     budget: only decode tokens (one per request without drafts) are expanded."""
