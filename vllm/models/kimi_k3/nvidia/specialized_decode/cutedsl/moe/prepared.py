@@ -134,7 +134,7 @@ class PreparedMoE:
         self.sms = torch.cuda.get_device_properties(state.device).multi_processor_count
         for b, sms in front.split.items():  # the split's down CTAs take the SMs left
             experts.grids[b] = min(experts.grid_for(b), self.sms - sms)
-        if self.sms > 152 and state.tp == 16:
+        if self.sms > 152 and state.tp in (8, 16):
             # Rubin-class TP16 B3-8: routing releases the experts at entry (their
             # launch and prologue overlap it). The shared expert drains first (B5-8,
             # grid = SMs) or its down GEMM runs on the SMs the 192-CTA grid leaves

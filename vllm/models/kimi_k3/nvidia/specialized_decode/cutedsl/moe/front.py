@@ -544,7 +544,7 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # 40-56); on 8 SMs, us/layer over 3-8 real-route layers (79-300 distinct): M16
 # -1.2..-8.9, M24 -2.4..-5.6, M32 -5.4..-16.1, M40-56 -17.1..-30.4 (6 SMs within
 # 0.5 of 8; M64 stays at 4: 6 / 8 within -1.1..+0.6).
-SPLITS_WIDE = {16: ("", "13-63:8,64:4")}
+SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
