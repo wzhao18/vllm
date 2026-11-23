@@ -848,7 +848,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _dispatch_pull_retries(self) -> None:
         """Re-post parked requests whose peer is fresh again; fail those that
-        could not re-post within ``pull_retry_window_s``."""
+        could not re-post within half the KV lease (``kv_lease_duration``)."""
         if not self._pull_retry_disconnect or not self._pull_retry_pending:
             return
         now = time.perf_counter()
