@@ -148,7 +148,8 @@ KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
 # decay formulas);
 # the q4 fold (KdaSplit's math, before) paid nothing at step level (b801dda -> 5ec8564
 # q4 M32 -1.8), so q4 keeps the plain KdaSplitStock.
-KDA_FOLD64_FP32: dict[int, str] = {16: "64:1"}
+# q6 B8 (48 rows, TP16NV LHF): the same stock-math fold (rows 40 / 48 bitwise).
+KDA_FOLD64_FP32: dict[int, str] = {16: "48:1,64:1"}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 bins 16-64, by rows:
 # SplitKTmemGemm64 (128, 64, split, x's slots, 14): the weights of each 128-row tile's K
 # slice staged in tensor memory (and shared memory) before the PDL wait, clusters of

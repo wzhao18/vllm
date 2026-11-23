@@ -1252,7 +1252,8 @@ GQA_TWO_SHOT_SILU = dict(TWO_SHOT_SILU)
 GQA_TWO_SHOT_EARLY = dict(TWO_SHOT_EARLY)
 # The context step on a side stream joined before the first attention core: none
 # until measured on the GQA chain at 16 ranks (NQ-TUNE: the preview's 1-63 rows).
-GQA_CONTEXT_OVERLAP: dict[int, str] = {}
+# TP16: the preview drafter's measured rows (CONTEXT_OVERLAP; TP16NV LHF).
+GQA_CONTEXT_OVERLAP: dict[int, str] = {16: "1-63:1"}
 # Requests per drafter graph whose Markov sampling runs ``VocabParallelMarkov`` (one
 # set of launches per draft position, no co-resident CTAs), per TP: TP4 (C512's SP
 # decode role), where the fused kernels' 320 CTAs per rank (Markov rank 512) exceed

@@ -43,7 +43,12 @@ from ..cutedsl.moe.experts_runtime import (
 )
 from ..cutedsl.moe.front import SharedFront
 from ..cutedsl.moe.front_rows import FrontRows
-from ..cutedsl.moe.nvfp4 import Nvfp4MoE, is_nvfp4_moe, mxfp8_shared_cause
+from ..cutedsl.moe.nvfp4 import (
+    Nvfp4Front,
+    Nvfp4MoE,
+    is_nvfp4_moe,
+    mxfp8_shared_cause,
+)
 from ..cutedsl.moe.prepared import (
     WIDE_FRONT,
     MoEScratch,
@@ -55,7 +60,7 @@ from ..cutedsl.moe.prepared import (
 from ..cutedsl.moe.prepared import choose as moe_choose
 from ..cutedsl.moe.small_batch import chain as small_batch_chain
 from ..cutedsl.moe.tail_rows import PreparedTailRows
-from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
+from ..cutedsl.moe.tail_runtime import MoeTailBox, MoeTailWeights, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from ..cutedsl.oproj.prepared import choose as oproj_choose
 from ..shapes import (
@@ -96,7 +101,8 @@ logger = init_logger(__name__)
 # 65-256 rows too (axhb-sw3, 16 ranks, mirrored, 93 layers, 32k, us/step: B9 -11, B17
 # -19, B24 -14, B28 -37, B32 -5): the stock embedding + FlashInfer two-shot all-reduce
 # (~36 us at 256 rows) leave the step head.
-RING_HEAD = {16: "1-256:1"}
+# Above 256 rows too (TP16NV LHF; the head box grows to the largest ring batch).
+RING_HEAD = {16: "1-:1"}
 # Rubin verify graphs above the tuned rows (token rows by q, "*": any) that run the
 # specialized decode (generic kernels and stock seams, ``wide``); others run the stock
 # forward. A point leaves this table when its in-graph step measures slower than the
@@ -108,6 +114,8 @@ RING_HEAD = {16: "1-256:1"}
 # B17-B192); NQ-TUNE: the 16-rank in-graph step vs the stock forward at q4 M1024 /
 # M1536 / M2048 and q8 M1024 / M2048 (a point that loses leaves this table).
 WIDE_ROWS = {"*": "65-:1"}
+# (9-64 rows: not a table edit, the ring split-K GEMM's tiles hold one fragment per
+# epilogue thread only at 1-8 rows; ``RingSplitKGemm`` asserts.)
 RING_DENSE = {16: "1-8:1"}
 
 
@@ -361,7 +369,9 @@ class SpecializedDecode:
                 if moe.rows is not None:  # wide batches: the wide tail's output ring
                     consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
-            elif isinstance(moe, Nvfp4MoE):  # every batch: the wide tail's ring
+            elif isinstance(moe, Nvfp4MoE):  # the MoE tail's ring, the wide tail's
+                if moe.tail is not None:
+                    consumer.bind_ring(moe.tail_box.out.buffer)
                 consumer.bind_ring_rows(moe.state.rows.out.buffer)
                 self.fused_before[layer.layer_idx] = consumer
             elif layer.layer_idx in self.dense_rings:
@@ -462,6 +472,13 @@ class SpecializedDecode:
             if d.is_moe_layer and d.layer_idx not in nvfp4
         }
         self.nvfp4_layers = frozenset(nvfp4)
+        # NVFP4 layers' tuned front (``moe.nvfp4.Nvfp4Front``, <= 64 rows): the same
+        # packed [router; latent-down] shard rows as the MXFP4 layers' front
+        nv_packed = {
+            d.layer_idx: pack_front(d.mlp, rank, tp)
+            for d in layers
+            if d.layer_idx in nvfp4
+        }
         for d in layers:  # before the prefetch tables take the weight addresses
             if attention_kind(d.self_attn) == "dsa":
                 pack_dsa_projection(d.self_attn)
@@ -490,7 +507,7 @@ class SpecializedDecode:
         wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
-            MoeTailBox(*owner) if packed else None,
+            MoeTailBox(*owner) if packed or nvfp4 else None,
             [d.layer_idx for d in layers if d.is_moe_layer],
         )
         twoshot = TwoShot(*owner)
@@ -529,9 +546,25 @@ class SpecializedDecode:
                     sharded=(self.sharded, self.shard_box),
                     deferred=deferred_rows(module, moe_batches),
                 )  # fmt: skip
+                fronted = [b for b in moe_batches if b <= Nvfp4Front.MAX]
+                front = tail = None
+                if fronted:
+                    front = Nvfp4Front(module, nv_packed[index], front_box, fronted)
+                    # the tuned MoE tail (front-mode MoeTail over the experts'
+                    # deferred rows) at the same rows: the next AttnRes polls the
+                    # tail box's ring up to its CAP rows, the wide ring above
+                    norm = module.routed_expert_norm
+                    up = module.routed_expert_up_proj.weight
+                    local_up = up.narrow(0, rank * (7168 // tp), 7168 // tp)
+                    weights = MoeTailWeights(
+                        tp, local_up, norm.weight, norm.variance_epsilon,
+                        moe_layers.index(index), len(moe_layers), fronted,
+                        permuted=True,
+                    )  # fmt: skip
+                    tail = weights, tail_box
                 self.feed_forward[index] = Nvfp4MoE(
                     module, state, rows, moe_batches, prefetch=prefetch,
-                    layer_idx=index,
+                    layer_idx=index, front=front, tail=tail,
                 )  # fmt: skip
                 continue
             args = (module, packed[index], front_box, state.front, tuned_moe, beta)

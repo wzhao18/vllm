@@ -19,6 +19,8 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import (
     check_registers,
+    dynamic_fake,
+    dynamic_view,
     fake,
     prepare_shared_carveout,
     stream,
@@ -349,7 +351,8 @@ class MoeTailBox:
 
 @cache
 def compile_tail(
-    tp, batch, device, mode="front", trigger=2, early=False, umma=False, head=False
+    tp, batch, device, mode="front", trigger=2, early=False, umma=False, head=False,
+    permuted=False,
 ):  # fmt: skip
     """front: rows complete at the PDL wait; front_poll: three 0xffff-armed G/W/S parity
     slots polled per row and re-armed after use; publish (``published``): WaveMoeTail
@@ -362,7 +365,10 @@ def compile_tail(
     tensors: tuple = (vec(latent), vec(3 * tp * CAP * (7168 // tp)))
     weights = vec(7168 // tp * 3584) if m8 and not umma else vec(128, Uint8, 64)
     tensors += (weights, vec(3584))
-    tensors += (vec(slots * 16 * 3584), vec(slots * 16), vec(slots * 7168))
+    # (``permuted``: the stock experts' permuted rows [P, 3584], P their padded row
+    # count, flat; the permute map follows the scalars)
+    gemm2 = dynamic_fake(1) if permuted else vec(slots * 16 * 3584)
+    tensors += (gemm2, vec(slots * 16), vec(slots * 7168))
     tensors += (vec(tp, Int64), vec(CAP * 7168))
     scalars: tuple = (Int64(0), Int64(0), Int32(0), Int32(0), Int32(CAP), Float32(1e-6))
     scalars += (Int32(2), Int32(CAP))
@@ -394,8 +400,9 @@ def compile_tail(
         gate = front and bool(batch_table(RUBIN_GATE.get(tp, "")).get(batch, 0))
         kernel = MoeTail(
             tp, batch, mode=mode, trigger=trigger, poll_ns=poll_ns, gate=gate,
-            reload=tail_reload(tp, batch, device),
+            reload=tail_reload(tp, batch, device), permuted=permuted,
         )  # fmt: skip
+        scalars += (vec(batch * 16, Int32),) if permuted else ()
     options = "" if m8 else "--ptxas-options=--maxrregcount=120"
     with torch.accelerator.device_index(device):
         args = (*tensors, *scalars, make_fake_stream())
@@ -420,8 +427,14 @@ def compile_push(batch, device, tp=8):
 class MoeTailWeights:
     """One layer's up-projection shard [7168/TP, 3584], RMS weight and TMA map."""
 
-    def __init__(self, tp, weight, gamma, eps, ordinal, count, batches, twoshots=()):
-        self.weight, self.gamma = weight, gamma
+    def __init__(
+        self, tp, weight, gamma, eps, ordinal, count, batches, twoshots=(), *,
+        permuted=False,
+    ):  # fmt: skip
+        """``permuted``: every batch on the front-mode MoeTail over the stock experts'
+        deferred output (``MoeTail(permuted=True)``, ``run(..., index=)``: the NVFP4
+        layers, ``nvfp4.Nvfp4MoE``)."""
+        self.weight, self.gamma, self.permuted = weight, gamma, permuted
         # Three parities rotate over the model's MoE layers; each launch re-arms the
         # previous MoE layer's slots of its batch (wrapping across decode steps, where
         # the first layer re-arms the largest batch the last layer may have published).
@@ -451,16 +464,21 @@ class MoeTailWeights:
             self.umma_map = tensor_maps([spec], weight.device)
             self.umma_views = (to_cute(self.umma_map, 64), self.views[1])
         for b in batches:  # WaveMoeTail reads the shard directly, not by TMA
-            twoshot = b in twoshots
-            publish = published(tp, b, device)
+            twoshot = b in twoshots and not permuted
+            publish = published(tp, b, device) and not permuted
             mode = "twoshot" if twoshot else "publish" if publish else "front"
             views = self.views if mode == "front" else (flat(weight), self.views[1])
             on = mode != "front" and b in umma
             views = self.umma_views if on else views
-            self.compiles[b] = (tp, b, device, mode), dict(early=b in early, umma=on)
+            options = dict(early=b in early and mode != "front", umma=on)
+            if permuted:
+                options["permuted"] = True
+            self.compiles[b] = (tp, b, device, mode), options
             code = compile_tail(*self.compiles[b][0], **self.compiles[b][1])
             self.codes[b] = code, views, shares(tp, b, twoshot, device), twoshot
-        shared = any(shares(tp, b, b in twoshots, device) for b in batches)
+        shared = not permuted and any(
+            shares(tp, b, b in twoshots, device) for b in batches
+        )
         if shared and resident_clusters(device) < 7:
             raise RuntimeError("WaveMoeTail needs seven co-resident 16-CTA clusters")
 
@@ -473,19 +491,27 @@ class MoeTailWeights:
                 code = compile_tail(*args, **options, head=True)
                 self.codes[b] = (code, *self.codes[b][1:])
 
-    def run(self, box, expanded, weights, shared, code=None, batch=None):
+    def run(self, box, expanded, weights, shared, code=None, batch=None, index=None):
+        """``index`` (``permuted``): the permute map [B, 16] int32; ``expanded`` is
+        then the experts' permuted rows [P, 3584]."""
         batch = batch or weights.shape[0]
         if code is None:
             code, views, share, twoshot = self.codes[batch]
         else:
             views, share, twoshot = self.views, 0, False
+        if (index is not None) != self.permuted:
+            raise RuntimeError("MoE tail: a permute map iff the tail is permuted")
         args, tail = box.args, box.tail
         if twoshot:
             args, tail = box.twoshot_args, box.twoshot_tail
-        rows = (flat(expanded), flat(weights), flat(shared), *tail, self.parity)
+        rows = expanded.reshape(-1)
+        rows = dynamic_view(rows) if self.permuted else flat(rows)
+        rows = (rows, flat(weights), flat(shared), *tail, self.parity)
         rows += (Int32(box.rank), *self.scalars, Int32(self.wrap or batch))
         if share:
             rows += (flat(box.twoshot.gather if twoshot else box.reduced),)
+        if index is not None:
+            rows += (flat(index),)
         code(*args, *views, *rows, stream(expanded.device))
 
 

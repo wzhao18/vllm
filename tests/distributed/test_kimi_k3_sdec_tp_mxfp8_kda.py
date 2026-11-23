@@ -312,11 +312,16 @@ def _worker(env: dict[str, str]) -> None:
                     tol = want.float().abs().amax(dim=1, keepdim=True) * 2.0**-7
                     diff = (got.float() - want.float()).abs()
                     assert (diff <= tol + 1e-3).all(), f"in-projection R{r}"
-            # the TP16 shards (in [3216, 7168], o [7168, 768]) run stock's kernel
+            # the TP16 shards (in [3216, 7168], o [7168, 768]) run stock's kernel,
+            # except the in-projection's measured 17-128 rows (MX_TUNED "pre": the
+            # prewait fi_cute, test_specialized_decode_tp16nv_gpu.py)
             for n, kk in ((3216, HIDDEN), (HIDDEN, 768)):
-                rows = (*IN_ROWS, 1024, 1536, 2048)
+                rows = (*IN_ROWS, 24, 1024, 1536, 2048)
                 tactics = mxfp8_tactics(n, kk, rows)
-                assert all(tactics[r] == stock_kind(n, kk, r) for r in rows)
+                for r in rows:
+                    pre = n == 3216 and 17 <= r <= 128
+                    want = "pre" if pre else stock_kind(n, kk, r)
+                    assert tactics[r] == want, (n, kk, r, tactics[r])
             _say(rank, "W1 in-projection vs stock ok at", IN_ROWS)
 
             # W2: the MXFP8 o-projection + exchange + AttnRes vs stock

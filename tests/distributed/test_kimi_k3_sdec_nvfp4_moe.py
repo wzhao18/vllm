@@ -180,7 +180,28 @@ def _read_ring(box, rows, group):
     return out
 
 
-def _case(config, rank, device, group):
+_LAYERS: dict = {}
+
+
+def _case(config, rank, device, group, fused_up=False, front=False):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import tail_rows
+
+    # ``fused_up``: the wide tail's up projection fused with the output ring
+    # (``tail_rows.UP_ROWS``, ``up_tmem.UpTmem64``) at every row, as TP16 runs the
+    # NVFP4 layers' 1-80 and 129- rows; else cuBLAS + OutRows (this TP has no entry).
+    saved = dict(tail_rows.UP_ROWS)
+    if fused_up:
+        tail_rows.UP_ROWS[WORLD] = "1-:1"
+    else:
+        tail_rows.UP_ROWS.pop(WORLD, None)
+    try:
+        _case_body(config, rank, device, group, front)
+    finally:
+        tail_rows.UP_ROWS.clear()
+        tail_rows.UP_ROWS.update(saved)
+
+
+def _case_body(config, rank, device, group, front=False):
     from vllm.forward_context import set_forward_context
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.nvfp4 import (
         Nvfp4MoE,
@@ -193,7 +214,14 @@ def _case(config, rank, device, group):
         PreparedTailRows,
     )
 
-    module = _stock_layer(config, rank, device)
+    # one stock layer per process (its experts register their name once)
+    module = _LAYERS.get(rank)
+    if module is None:
+        module = _LAYERS[rank] = _stock_layer(config, rank, device)
+    # (each case starts finalizing; its second half asks the layer to defer)
+    moe_config = module.experts.moe_config
+    moe_config._defer_moe_finalize = False
+    moe_config.defer_moe_finalize_max_num_tokens = -1
     assert nvfp4_moe_cause(module) is None, nvfp4_moe_cause(module)
     owner = (group, device, WORLD, rank)
     state = MoEScratch(WORLD, device, ROWS, owner=owner, tuned=False, rows=True)
@@ -202,7 +230,58 @@ def _case(config, rank, device, group):
         WORLD, rank, module.routed_expert_up_proj.weight, norm.weight,
         norm.variance_epsilon, ROWS, state.rows, 0,
     )  # fmt: skip
-    ours = Nvfp4MoE(module, state, rows, ROWS)
+    tuned = None
+    if front:
+        # ``Nvfp4Front``: the MXFP4 layers' front GEMM + the logits / latent gather
+        # (<= 64 rows) in place of the stock router + latent down projection
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.nvfp4 import (
+            Nvfp4Front,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.prepared import (  # noqa: E501
+            OprojMailbox,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
+            pack_front,
+        )
+
+        box = OprojMailbox(group, device, WORLD, rank, (1, 64, 3584 + 2 * 896))
+        packed = pack_front(module, rank, WORLD)
+        tuned = Nvfp4Front(module, packed, box, ROWS)
+        operands = []
+        with torch.inference_mode():
+            for r in sorted(tuned.batches):
+                gen = torch.Generator(device=device).manual_seed(100 + r)
+                x = torch.randn(r, 7168, generator=gen, device=device).bfloat16()
+                latent, logits = (t.clone() for t in tuned.route(x))
+                torch.cuda.synchronize()
+                ref_latent, ref_logits, _ = module._maybe_overlap_router_and_down_proj(x)
+                assert logits.dtype == ref_logits.dtype == torch.float32
+                assert latent.dtype == ref_latent.dtype == torch.bfloat16
+                # FP32 summation-order changes only: both ours and stock within the
+                # FP32 accumulation bound of the FP64 product (K x 2^-24 x |x||W|),
+                # plus the output rounding (half an FP32 / BF16 ulp)
+                def bound_ok(got, weight, mantissa):
+                    xd, wd = x.double(), weight.double()
+                    exact = xd @ wd.t()
+                    acc = 7168 * 2.0**-24 * (xd.abs() @ wd.abs().t())
+                    top = exact.abs() + acc
+                    ulp = torch.exp2(torch.floor(torch.log2(top.clamp_min(1e-30))))
+                    limit = acc + ulp * 2.0 ** -mantissa
+                    return ((got.double() - exact).abs() <= limit * 1.001).all()
+
+                router = module.gate.weight
+                down = module.routed_expert_down_proj.weight
+                assert bound_ok(ref_logits, router, 24), f"R{r}: stock logits bound"
+                assert bound_ok(logits, router, 24), f"R{r}: logits beyond the bound"
+                assert bound_ok(ref_latent, down, 8), f"R{r}: stock latent bound"
+                assert bound_ok(latent, down, 8), f"R{r}: latent beyond the bound"
+                err = (logits - ref_logits).abs().max().item()
+                scale = ref_logits.abs().max().item()
+                same = (latent == ref_latent).float().mean().item()
+                operands.append(f"R{r} logits {err / scale:.1e} latent bitwise {same:.4f}")
+        if rank == 0:
+            print("NVFP4 front vs stock router / latent down:", "; ".join(operands))
+    ours = Nvfp4MoE(module, state, rows, ROWS, front=tuned)
     report, refs = [], {}
     with torch.inference_mode(), set_forward_context(None, config):
         for r in ROWS:
@@ -251,7 +330,7 @@ def _case(config, rank, device, group):
         WORLD, rank, module.routed_expert_up_proj.weight, norm.weight,
         norm.variance_epsilon, ROWS, state.rows, 1, deferred=late,
     )  # fmt: skip
-    ours = Nvfp4MoE(module, state, rows, ROWS)
+    ours = Nvfp4MoE(module, state, rows, ROWS, front=tuned)
     deferred = []
     with torch.inference_mode(), set_forward_context(None, config):
         for r in ROWS:
@@ -298,6 +377,8 @@ def _worker(rank: int, port: int) -> None:
         init_workspace_manager(device)
         try:
             _case(config, rank, device, group)
+            _case(config, rank, device, group, fused_up=True)
+            _case(config, rank, device, group, fused_up=True, front=True)
         finally:
             torch.accelerator.synchronize()
             reset_workspace_manager()
