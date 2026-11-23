@@ -180,7 +180,25 @@ def _read_ring(box, rows, group):
     return out
 
 
-def _case(config, rank, device, group):
+def _case(config, rank, device, group, fused_up=False):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import tail_rows
+
+    # ``fused_up``: the wide tail's up projection fused with the output ring
+    # (``tail_rows.UP_ROWS``, ``up_tmem.UpTmem64``) at every row, as TP16 runs the
+    # NVFP4 layers' 1-80 and 129- rows; else cuBLAS + OutRows (this TP has no entry).
+    saved = dict(tail_rows.UP_ROWS)
+    if fused_up:
+        tail_rows.UP_ROWS[WORLD] = "1-:1"
+    else:
+        tail_rows.UP_ROWS.pop(WORLD, None)
+    try:
+        _case_body(config, rank, device, group)
+    finally:
+        tail_rows.UP_ROWS.clear()
+        tail_rows.UP_ROWS.update(saved)
+
+
+def _case_body(config, rank, device, group):
     from vllm.forward_context import set_forward_context
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.nvfp4 import (
         Nvfp4MoE,
@@ -298,6 +316,7 @@ def _worker(rank: int, port: int) -> None:
         init_workspace_manager(device)
         try:
             _case(config, rank, device, group)
+            _case(config, rank, device, group, fused_up=True)
         finally:
             torch.accelerator.synchronize()
             reset_workspace_manager()
