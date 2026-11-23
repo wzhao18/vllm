@@ -99,7 +99,6 @@ def _assert_q_gather_matches_reference(
     # combine after the attention orders that; here, a barrier does. Without it
     # a faster rank's next gather overwrites rows a slower rank still reads
     # (the slow rank's check fails and its peers then time out waiting for it).
-    dist.barrier()
 
     storage_num_heads = padded_num_heads or world_size * local_query.shape[1]
     remaining_storage_bytes = (
