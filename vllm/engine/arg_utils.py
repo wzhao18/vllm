@@ -181,13 +181,6 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
     return _optional_type
 
 
-def int_or_auto(val: str) -> int | str:
-    """An integer, or the string ``auto``."""
-    if val.strip().lower() == "auto":
-        return "auto"
-    return int(val)
-
-
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
@@ -393,8 +386,6 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
         elif contains_type(type_hints, bool):
             # Creates --no-<name> and --<name> flags
             kwargs[name]["action"] = argparse.BooleanOptionalAction
-        elif name == "prefix_cache_retention_interval":
-            kwargs[name]["type"] = int_or_auto
         elif contains_type(type_hints, Literal):
             kwargs[name].update(literal_to_kwargs(type_hints))
         elif contains_type(type_hints, tuple):
@@ -612,7 +603,7 @@ class EngineArgs:
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
-    prefix_cache_retention_interval: int | Literal["auto"] | None = get_field(
+    prefix_cache_retention_interval: int | None = get_field(
         CacheConfig, "prefix_cache_retention_interval"
     )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window

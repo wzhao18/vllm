@@ -274,24 +274,13 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
-    prefix_cache_retention_interval: int | Literal["auto"] | None = 0
+    prefix_cache_retention_interval: int | None = Field(default=0, ge=0)
     """Token interval between retained sliding-window and Mamba prefix-cache
     checkpoints. ``0`` retains only semantic checkpoints, including the latest
     replay boundary and shared-prefix junctions. Positive values additionally
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
-    Applies only to sliding-window and Mamba cache groups.
-
-    ``"auto"`` resolves, once the KV cache groups are known, to the
-    scheduler block size when prefix caching is on, a Mamba group runs in
-    "align" mode and a prefix-store KV connector (Mooncake store, offloading,
-    UMBP) persists boundary states: every block-boundary state a prefill
-    computes is retained and offloaded, so a later request sharing only part of
-    the prompt -- a forked subagent, a sibling, a reset conversation -- resumes
-    at the last block boundary of the shared prefix on any engine instead of
-    recomputing it. Those states exist anyway (align-mode chunks end on block
-    boundaries), so this costs no compute. Otherwise it resolves to ``0``.
-    Model wiring may select it (Kimi K3 does, with a prefix-store connector)."""
+    Applies only to sliding-window and Mamba cache groups."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -521,17 +510,6 @@ class CacheConfig:
 
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
-
-    @field_validator("prefix_cache_retention_interval", mode="after")
-    @classmethod
-    def _validate_prefix_cache_retention_interval(
-        cls, value: int | str | None
-    ) -> int | str | None:
-        if isinstance(value, int) and value < 0:
-            raise ValueError(
-                f"prefix_cache_retention_interval must be >= 0, got {value}"
-            )
-        return value
 
     @field_validator("block_size", mode="wrap")
     @classmethod

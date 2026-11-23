@@ -13,7 +13,6 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     eagle_proof_margin,
     partial_hash_hits_enabled,
-    resolve_prefix_cache_retention_interval,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -240,15 +239,7 @@ class KVCacheCoordinator(ABC):
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
-        self.retention_interval = resolve_prefix_cache_retention_interval(
-            kv_cache_config.prefix_cache_retention_interval,
-            kv_cache_config.kv_cache_groups,
-            self.scheduler_block_size,
-            enable_caching,
-            # Built outside the engine core (tests, tools): no connector is known,
-            # so "auto" keeps the semantic checkpoints only.
-            has_prefix_store=False,
-        )
+        self.retention_interval = kv_cache_config.prefix_cache_retention_interval
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )

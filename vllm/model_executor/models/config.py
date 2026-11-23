@@ -596,30 +596,9 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
 
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Retain the KDA states at every block boundary when a prefix-store
-        connector persists them (prefix-cache retention ``"auto"``), and default
-        the kv-cache dtype when the text backbone carries DSA: per-tensor fp8
-        for FLASHINFER_MLA_SPARSE, the default on SM10x, and "fp8_ds_mla"
-        otherwise."""
-        from vllm.v1.core.kv_cache_utils import has_prefix_store_connector
-
-        cache_config = vllm_config.cache_config
-        # Agentic traffic forks prompts (subagents, siblings, resets) mid-prompt,
-        # where the only resumable KDA state is a block-boundary one; with a
-        # prefix store, keep those states so any engine can resume at the last
-        # boundary of a shared prefix. The engine core resolves "auto" once the
-        # groups are known (block size, align-mode Mamba).
-        if (
-            getattr(cache_config, "prefix_cache_retention_interval", None) == 0
-            and getattr(cache_config, "enable_prefix_caching", False)
-            and has_prefix_store_connector(
-                getattr(vllm_config, "kv_transfer_config", None)
-            )
-        ):
-            cache_config.prefix_cache_retention_interval = "auto"
-            logger.info(
-                "Kimi K3: prefix-cache retention 'auto' (prefix-store connector)"
-            )
+        """Default the kv-cache dtype when the text backbone carries DSA:
+        per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
+        "fp8_ds_mla" otherwise."""
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.
@@ -629,6 +608,7 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         from vllm.platforms import current_platform
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        cache_config = vllm_config.cache_config
         backend = vllm_config.attention_config.backend
         if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE or (
             backend is None

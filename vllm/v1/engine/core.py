@@ -63,7 +63,6 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    apply_prefix_cache_retention_interval,
     generate_scheduler_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
@@ -420,9 +419,6 @@ class EngineCore:
         for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
             kv_cache_config.hash_block_size = hash_block_size
             kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
-        apply_prefix_cache_retention_interval(
-            vllm_config, kv_cache_configs, scheduler_kv_cache_config, scheduler_block_size
-        )
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         kv_transfer_config = vllm_config.kv_transfer_config
