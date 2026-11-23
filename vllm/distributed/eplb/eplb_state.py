@@ -25,6 +25,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import collections
 import threading
 import time
 from collections.abc import Sequence
@@ -76,6 +77,49 @@ def _compute_eplb_load_stats(
     avg_tokens = num_tokens_per_rank.mean(dim=1).sum()
     max_tokens = num_tokens_per_rank.max(dim=1).values.sum()
     return avg_tokens, max_tokens
+
+
+class BalancednessLog:
+    """The EPLB balancedness log lines of EP rank 0, read back without a host sync:
+    ``submit`` copies a step's ``[avg_tokens, max_tokens]`` into pinned memory
+    (non-blocking) behind an event, ``flush`` logs every submitted line whose copy
+    has landed, in order (a later step's, or a forced one at shutdown)."""
+
+    def __init__(self) -> None:
+        self._pending: collections.deque = collections.deque()
+
+    def submit(self, stats: torch.Tensor, args: tuple) -> None:
+        if stats.is_cuda:
+            host = torch.empty(stats.shape, dtype=stats.dtype, pin_memory=True)
+            host.copy_(stats, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+        else:
+            host, event = stats.clone(), None
+        self._pending.append((event, host, args))
+
+    def flush(self, force: bool = False) -> None:
+        pending = self._pending
+        while pending:
+            event = pending[0][0]
+            if event is not None and not event.query():
+                if not force:
+                    return
+                event.synchronize()
+            _, host, (step, model_name, steps_left) = pending.popleft()
+            avg_tokens, max_tokens = host.tolist()
+            balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+            logger.info(
+                "EPLB step: %d for model %s: avg_tokens=%.2f, "
+                "max_tokens=%d, balancedness=%.4f, "
+                "steps until the next rearrangement: %d",
+                step,
+                model_name,
+                avg_tokens,
+                max_tokens,
+                balancedness,
+                steps_left,
+            )
 
 
 @dataclass
@@ -245,6 +289,7 @@ class EplbState:
         self.parallel_config = parallel_config
         self.device = device
         self.model_states: dict[str, EplbModelState] = {}
+        self.balancedness_log = BalancednessLog()
         self.policy: type[AbstractEplbPolicy] = DefaultEplbPolicy
         """
         Selected EPLB algorithm class
@@ -634,27 +679,20 @@ class EplbState:
                     num_tokens_per_rank
                 )
 
-                # This gpu/cpu sync only happens with expert stat logging enabled.
-                with gpu_sync_allowed():
-                    tokens_tensors: list[float] = torch.stack(
-                        [avg_tokens_tensor, max_tokens_tensor]
-                    ).tolist()
-                avg_tokens, max_tokens = tokens_tensors
-                balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
-
+                # Only rank 0 logs, from a non-blocking copy read back on a
+                # later step: no host sync stalls the step loop.
                 if ep_group.rank() == 0:
-                    logger.info(
-                        "EPLB step: %d for model %s: avg_tokens=%.2f, "
-                        "max_tokens=%d, balancedness=%.4f, "
-                        "steps until the next rearrangement: %d",
-                        self.expert_rearrangement_step,
-                        eplb_model_state.model_name,
-                        avg_tokens,
-                        max_tokens,
-                        balancedness,
-                        self.expert_rearrangement_step_interval
-                        - self.expert_rearrangement_step,
+                    self.balancedness_log.submit(
+                        torch.stack([avg_tokens_tensor, max_tokens_tensor]),
+                        (
+                            self.expert_rearrangement_step,
+                            eplb_model_state.model_name,
+                            self.expert_rearrangement_step_interval
+                            - self.expert_rearrangement_step,
+                        ),
                     )
+        if log_stats:
+            self.balancedness_log.flush()
 
         # Update the expert load sliding window
         if not is_dummy:
