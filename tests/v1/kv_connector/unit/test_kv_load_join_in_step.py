@@ -628,3 +628,59 @@ def test_late_failure_of_a_given_up_load_frees_parked_blocks(recompute):
     else:
         assert request.status == RequestStatus.FINISHED_ERROR
         assert "r" not in scheduler.requests
+
+
+def test_tracker_on_real_async_scheduler_park_fail_free_readmit():
+    # (PCRIT v114) The tracker drives scheduler internals (_preempt_request,
+    # _free_request_blocks, deferred_frees, block_pool, sched_step_seq): run
+    # the whole park -> late failure -> deferred free -> re-admit sequence on
+    # the real async scheduler with deferred block frees, as on P.
+    scheduler = _scheduler(async_scheduling=True, kv_role="kv_consumer")
+    assert scheduler.defer_block_free and scheduler._joined is not None
+    scheduler.recompute_kv_load_failures = True
+    request = _request(max_tokens=4)
+    scheduler.add_request(request)
+
+    step1 = scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    old_blocks = list(scheduler.kv_cache_manager.get_blocks("r").blocks[0])
+    assert old_blocks
+
+    # The bind gave up: failed report, transfer still running -> preempted,
+    # blocks parked (still referenced), not re-admitted.
+    scheduler.update_from_output(
+        step1, create_model_runner_output([request], failed_recving={"r"})
+    )
+    assert request.status == RequestStatus.PREEMPTED
+    assert scheduler._joined.parked("r")
+    assert all(b.ref_cnt == 1 for b in old_blocks)
+    filler = _request("f", max_tokens=4)
+    scheduler.add_request(filler)
+    step2 = scheduler.schedule()
+    assert "r" not in step2.num_scheduled_tokens
+    assert "f" in step2.num_scheduled_tokens
+
+    # The transfer then fails late (store error): failed + finished. The
+    # parked blocks go to deferred_frees behind the steps in flight.
+    deferred_before = len(scheduler.deferred_frees)
+    scheduler.update_from_output(
+        step2,
+        create_model_runner_output(
+            [filler], failed_recving={"r"}, finished_recving={"r", "f"}
+        ),
+    )
+    assert not scheduler._joined.parked("r") and not scheduler._joined.active()
+    assert len(scheduler.deferred_frees) == deferred_before + 1
+    assert scheduler.deferred_frees[-1][1] == old_blocks
+    assert all(b.ref_cnt == 1 for b in old_blocks)
+
+    # Re-admitted on the next schedule; the next processed step frees them.
+    step3 = scheduler.schedule()
+    assert "r" in step3.num_scheduled_tokens
+    scheduler.update_from_output(
+        step3, create_model_runner_output([request, filler])
+    )
+    assert all(entry[1] is not old_blocks for entry in scheduler.deferred_frees)
+    new_blocks = set(scheduler.kv_cache_manager.get_blocks("r").blocks[0])
+    # Returned to the pool (or reused for its own recompute), never leaked.
+    assert all(b.ref_cnt == 0 or b in new_blocks for b in old_blocks)
