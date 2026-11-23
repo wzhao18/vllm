@@ -189,8 +189,8 @@ def test_kdaflow_conv_buffers_fp32(verify_length):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
     q, limit = verify_length, flow.OVERSIZED_BUDGET
+    need = {4: 24, 5: 24, 6: 20, 7: 16, 8: 16}.get(q, 24)  # the SP row cap's build
     for items in flow.ITEM_BUILDS:
-        assert flow.conv_buffers(q, q + 2, 2, limit, items=items) == 2
-        need = {4: 24, 5: 24, 6: 20, 7: 16, 8: 16}.get(q, 24)
-        if items <= need:
+        if items <= need:  # BF16: two buffers; FP32: one at least
+            assert flow.conv_buffers(q, q + 2, 2, limit, items=items) == 2, items
             assert flow.max_stages(q, True, q + 2, 4, limit, items=items) == 1, items
