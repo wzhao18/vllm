@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "coreai_cserve_dev-k31e2e.agx-r8-k3-c512-f19-ev",
+  "total_nodes": 8,
+  "heterogeneous": false,
+  "frontend_node_index": 0,
+  "client_node_index": 0,
+  "frontend_port": 8000,
+  "served_model_name": "moonshotai/Kimi-K3",
+  "benchmark_type": "custom",
+  "frontend_type": "dynamo",
+  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/agx-r8-k3-c512-f19-ev/render/sbatch_script.sh"
+}

@@ -138,6 +138,8 @@ _SHARED_REGION_GROUP_ID = -1
 # invalidated, eg due to a persistent RDMA fault.
 _INVALID_PEER_MIN_BACKOFF_S = 1.0
 _INVALID_PEER_MAX_BACKOFF_S = 60.0
+# Interval of the per-worker "NIXL pull-retry summary" log line (logging only).
+_PULL_RETRY_SUMMARY_S = 60.0
 _MAX_HYBRID_BLOCK_SPLIT = 128
 
 
@@ -151,6 +153,36 @@ def _is_pow2_ratio(ratio: int) -> bool:
     """Whether a D/P DCP ratio is a power of two of at least 2 (the ratios
     the staged DCP pair exchange serves)."""
     return ratio >= 2 and ratio & (ratio - 1) == 0
+
+
+@dataclass
+class _PullRetryStats:
+    """Pull-mode retry counters of one worker (logging only; cumulative).
+
+    Read by the serving health checks (xferwatch / pd_guard) from the periodic
+    'NIXL pull-retry summary' line and the per-event 'NIXL pull-retry:' lines.
+    """
+
+    pulls: int = 0  # requests whose KV this worker pulled (first posts only)
+    retried: int = 0  # pulls parked for a retry after a remote disconnect
+    reconnects: int = 0  # parked pulls re-posted after the peer re-handshook
+    gave_up: int = 0  # parked pulls failed: peer not back within the window
+    latency_sum_s: float = 0.0  # parked -> re-posted, summed over reconnects
+    latency_max_s: float = 0.0
+    engines: Counter = field(default_factory=Counter)  # retries per remote engine
+    logged: tuple = ()  # counters at the last summary line
+
+    def key(self) -> tuple:
+        return (self.pulls, self.retried, self.reconnects, self.gave_up)
+
+    def summary(self) -> str:
+        return (
+            f"pulls={self.pulls} retried={self.retried} "
+            f"reconnects={self.reconnects} gave_up={self.gave_up} "
+            f"retry_latency_ms_sum={self.latency_sum_s * 1e3:.1f} "
+            f"retry_latency_ms_max={self.latency_max_s * 1e3:.1f} "
+            f"engines={dict(self.engines)}"
+        )
 
 
 @dataclass
@@ -324,6 +356,8 @@ class NixlBaseConnectorWorker:
     # bookkeeping is touched only with retry on.
     _pull_max_blocks_per_xfer: int = 0
     _pull_retry_disconnect: bool = False
+    _pull_retry_stats: "_PullRetryStats | None" = None
+    _pull_retry_summary_at: float = 0.0
     _pull_retry_window_s: float = 10.0
 
     # DCP pair exchange opt-in (see _is_dcp_pair_peer), and the first peer
@@ -1140,6 +1174,9 @@ class NixlBaseConnectorWorker:
         self._pull_retry_attempted: set[ReqId] = set()
         # Request -> (scheduled at, engine generation at the failure).
         self._pull_retry_pending: dict[ReqId, tuple[float, int]] = {}
+        # Logging only: retry counters, summarized every _PULL_RETRY_SUMMARY_S.
+        self._pull_retry_stats = _PullRetryStats()
+        self._pull_retry_summary_at = time.perf_counter()
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -4849,6 +4886,7 @@ class NixlBaseConnectorWorker:
         """
         self._raise_peer_config_mismatch()
         assert self.transfer_topo is not None
+        self._log_pull_retry_summary()
         done_sending = self._get_new_notifs()
         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
         if newly_failed:
@@ -5673,6 +5711,14 @@ class NixlBaseConnectorWorker:
         self._pull_retry_attempted.add(req_id)
         self._pending_recv_notifs.pop(req_id, None)
         self._pull_retry_pending[req_id] = (time.perf_counter(), generation)
+        if (stats := self._pull_retry_stats) is not None:
+            stats.retried += 1
+            stats.engines[meta.remote.engine_id] += 1
+        logger.info(
+            "NIXL pull-retry: event=scheduled req=%s engine=%s",
+            req_id,
+            meta.remote.engine_id,
+        )
         logger.warning(
             "NIXL pull for request %s from remote engine %s failed after a "
             "remote disconnect; re-posting its reads once the peer is "
@@ -5680,6 +5726,21 @@ class NixlBaseConnectorWorker:
             req_id,
             meta.remote.engine_id,
         )
+
+    def _log_pull_retry_summary(self, force: bool = False) -> None:
+        """Every _PULL_RETRY_SUMMARY_S (or on force), log this worker's
+        cumulative pull/retry counters if they changed. Logging only."""
+        stats = self._pull_retry_stats
+        if stats is None or stats.pulls == 0:
+            return
+        now = time.perf_counter()
+        if not force and now - self._pull_retry_summary_at < _PULL_RETRY_SUMMARY_S:
+            return
+        self._pull_retry_summary_at = now
+        if stats.key() == stats.logged:
+            return
+        stats.logged = stats.key()
+        logger.info("NIXL pull-retry summary: %s", stats.summary())
 
     def _pull_retry_ready(self, engine_id: EngineId, generation: int) -> bool:
         """The peer's failed endpoints are gone: released (the next read

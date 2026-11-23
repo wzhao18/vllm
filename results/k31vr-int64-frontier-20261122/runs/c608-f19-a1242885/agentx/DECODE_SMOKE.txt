@@ -1,0 +1,10 @@
+DECODE_SMOKE agx-x8-k3-c608-f19 run a1242885-agx-x8-k3-c608-f19-1122104139 checked 2026-11-22 10:50:53
+1 PASS no OOM / init failure; engine inits 4 (4 DP engines)
+2b REPORT graph mode 'FULL_AND_PIECEWISE ' (render FULL_AND_PIECEWISE), FULL captured '/ 2/2 ' (need 160/160) -- REPORT-ONLY: FULL progress lines are not complete in the w0 log at capture end (false FAIL killed c608 10:39)
+2 PASS graphs PIECEWISE / 160/160  (160 sizes = 4..640), finished on 16 workers, eager-fallback lines 0
+3 PASS KV tokens/engine 27292513 (equal across engines) vs 0.93 ref 27292513 = 0.00% lower
+4 PASS min free decode GPU memory after capture 119549 MiB (>= ~1.5 GiB)
+5 PASS sdec built on 16 decode workers; overlay /ov/g-15c281dc32:/k31ov (g-818860ffdd = int63.1rcf; g-b5ceb707a7 = int64 cand = rcf + b′)
+BLOCKING VERDICT: PASS
+6 xferwatch / pd_guard: (report-only, appended after 20 min)
+7 listener Send-Q (burstmon): (report-only, appended after the burst)

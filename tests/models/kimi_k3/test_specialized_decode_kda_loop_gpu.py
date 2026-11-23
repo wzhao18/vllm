@@ -89,6 +89,8 @@ STOCK_SHAPES = [
 ]  # fmt: skip
 
 
+CONV_DTYPE = torch.bfloat16  # the KDA conv state (--mamba-cache-dtype): BF16 or FP32
+
 def pitch_of(heads):
     """The packed in-projection row: Q | K | V | gate | F_A 128 | betas | pad to 16."""
     return -(-(4 * 128 * heads + 128 + heads) // 16) * 16
@@ -124,7 +126,7 @@ def caches(slots, q, seed=1, heads=HEADS):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * 128 * heads, q + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, heads, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(torch.bfloat16), state
+    return conv.bfloat16().to(CONV_DTYPE), state  # the window holds BF16 in-proj inputs
 
 
 def spec_inputs(requests, q, slots, seed=2):

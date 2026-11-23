@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "captured_at": "2026-11-22T16:24:21Z",
+  "job_id": "110790",
+  "tool": {
+    "srtctl_version": "2.59.1.post0+gae3d6877c.d20261121",
+    "srtctl_commit": "ae3d6877c46f"
+  },
+  "hardware": {
+    "architecture": "aarch64",
+    "cpu_model": "ARM CPU implementer 0x4e part 0x010 (architecture 8, variant 0x0, revision 0)",
+    "host_logical_cpus": 352
+  },
+  "nodes": {
+    "count": 8,
+    "names": [
+      "rhea0019",
+      "rhea0020",
+      "rhea0021",
+      "rhea0022",
+      "rhea0024",
+      "rhea0025",
+      "rhea0026",
+      "rhea0027"
+    ]
+  },
+  "gpus": {
+    "type": "vrnvl72",
+    "configured_per_node": 4,
+    "configured_total": 32,
+    "backend_total": 32
+  },
+  "cpus": {
+    "allocated_total": null,
+    "allocated_per_node": [],
+    "current_node_allocated": 352,
+    "process_affinity_count": 352,
+    "process_affinity_list": "0-351",
+    "effective_for_check": null,
+    "backend_node_allocations": []
+  },
+  "slurm_environment": {
+    "SLURM_CPUS_ON_NODE": "352"
+  },
+  "cpu_check": {
+    "status": "unknown",
+    "gpu_count_basis": 32,
+    "minimum_cpu_count": 32,
+    "available_cpu_count": null,
+    "available_cpu_source": "unknown",
+    "node": null,
+    "message": "Could not determine effective CPU capacity from SLURM or process affinity."
+  }
+}

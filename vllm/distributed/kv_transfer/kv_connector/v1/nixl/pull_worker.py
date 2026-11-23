@@ -80,6 +80,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Aborted cleanup requests have already been removed from the scheduler.
             if meta.awaiting_kvs or any(meta.local_block_ids):
                 self._recving_metadata[req_id] = meta
+                if (stats := self._pull_retry_stats) is not None:
+                    stats.pulls += 1
             self._read_blocks_for_req(req_id, meta)
 
         # Re-post the reads of requests parked after a remote disconnect, once
@@ -864,14 +866,30 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             engine_id = meta.remote.engine_id
             if self._pull_retry_ready(engine_id, generation):
                 del self._pull_retry_pending[req_id]
+                waited = now - scheduled_at
+                if (stats := self._pull_retry_stats) is not None:
+                    stats.reconnects += 1
+                    stats.latency_sum_s += waited
+                    stats.latency_max_s = max(stats.latency_max_s, waited)
                 logger.info(
                     "Re-posting NIXL reads for request %s from remote engine %s.",
                     req_id,
                     engine_id,
                 )
+                logger.info(
+                    "NIXL pull-retry: event=reposted req=%s engine=%s latency_ms=%.1f",
+                    req_id,
+                    engine_id,
+                    waited * 1e3,
+                )
                 self._read_blocks_for_req(req_id, meta)
             elif now - scheduled_at > self._pull_retry_window_s:
                 del self._pull_retry_pending[req_id]
+                if (stats := self._pull_retry_stats) is not None:
+                    stats.gave_up += 1
+                logger.info(
+                    "NIXL pull-retry: event=gave_up req=%s engine=%s", req_id, engine_id
+                )
                 logger.warning(
                     "NIXL pull retry for request %s gave up: remote engine %s was "
                     "not re-handshaken within %.0fs.",

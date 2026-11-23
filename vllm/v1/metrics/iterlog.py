@@ -68,6 +68,24 @@ WORKER_FIELDS = {
 }
 
 
+# Extra worker-side record sources (e.g. Kimi K3 MegaMoE EP balance): callables returning ready-made record
+# tuples, drained once per step on the worker thread after the step's own record.
+_WORKER_SOURCES: list = []
+EP_BALANCE_FIELDS = ["E", "session", "call", "layer", "local_rank", "t_ready_ns", "routes", "max_over_mean",
+                     "expert_max", "lost", "rank_loads", "active_per_rank"]
+EP_BALANCE_META = {"expert_placement": "contiguous per rank (static; dynamic EPLB off)",
+                   "layer": "(call - 1) % moe_layers",
+                   "local_rank": "-1: global counts (prefill dedup router); >= 0: this rank's experts only (decode "
+                                 "genphase), merge all ranks' E lines by (session, call); needs VLLM_ITERLOG_ALL_RANKS=1",
+                   "active_per_rank": "experts with >= 1 token per EP rank (local line: [this rank]); the decode "
+                                      "MegaMoE cost variable (weight streaming), busiest / mean over the merged ranks"}
+
+
+def register_worker_source(fn) -> None:
+    if fn not in _WORKER_SOURCES:
+        _WORKER_SOURCES.append(fn)
+
+
 class _Writer:
     """Buffered JSONL writer: ``put`` is the only hot-path call."""
 
@@ -341,7 +359,8 @@ class WorkerIterLog:
         self._torch = torch
         self._level = level
         self._w = _Writer(f"worker-r{_global_rank()}", WORKER_FIELDS,
-                          {"gpu_level": level, "rank": _global_rank()})
+                          {"gpu_level": level, "rank": _global_rank(),
+                           "E_fields": EP_BALANCE_FIELDS, "E_meta": EP_BALANCE_META})
         self._put = self._w.put
         n_ev = 6 if level >= 2 else (2 if level == 1 else 0)
         self._ring = [
@@ -403,6 +422,9 @@ class WorkerIterLog:
             self._emit(cur, (-1.0,) * 6)
         else:
             self._inflight.append(cur)
+        for source in _WORKER_SOURCES:
+            for rec in source():
+                self._put(rec)
 
     def _emit(self, cur: list, gpu: tuple) -> None:
         self._put(("W", cur[0], *cur[2], *cur[3], *gpu))

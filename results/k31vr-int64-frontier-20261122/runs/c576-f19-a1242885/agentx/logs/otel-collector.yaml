@@ -1,0 +1,35 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  file/traces:
+    path: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c576-f19-1122085528/logs/otel/traces.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+  file/logs:
+    path: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c576-f19-1122085528/logs/otel/logs.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers:
+      - otlp
+      processors: []
+      exporters:
+      - file/traces
+    logs:
+      receivers:
+      - otlp
+      processors: []
+      exporters:
+      - file/logs

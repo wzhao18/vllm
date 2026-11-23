@@ -1704,6 +1704,12 @@ class PreparedKdaHead:
 
     def prepare_caches(self, caches):
         arch = architecture(self.device)
+        if caches[0].dtype != torch.bfloat16:  # BF16 conv window only
+            from ...shapes import Unsupported
+
+            raise Unsupported(
+                "kda", None, f"a {caches[0].dtype} conv state (this kernel reads BF16)"
+            )
         bf16_state = caches[1].dtype == torch.bfloat16
         meta = dict(device="meta")
         with torch.accelerator.device_index(self.device.index):

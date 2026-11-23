@@ -1,0 +1,4 @@
+2026-11-22T08:55:54 [pd_guard 1242885 agx-x8-k3-c576-f19] outputs /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c576-f19-1122085528
+2026-11-22T09:07:00 [pd_guard 1242885 agx-x8-k3-c576-f19] first successful transfers (81)
+2026-11-22T09:07:30 [pd_guard 1242885 agx-x8-k3-c576-f19] client started
+2026-11-22T09:27:06 [pd_guard 1242885 agx-x8-k3-c576-f19] VERDICT PASS: 52936 successful, 0 failed transfers, 0 handshake failures (20 min after the first transfer)

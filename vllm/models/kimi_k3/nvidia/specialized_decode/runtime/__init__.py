@@ -103,6 +103,13 @@ def sp_topology(vllm_config) -> bool:
     return not use_moe_token_shard(vllm_config)
 
 
+def conv_dtypes():
+    """KDA conv-state dtypes the specialized decode serves."""
+    import torch
+
+    return (torch.bfloat16, torch.float32)
+
+
 def kda_dtypes(vllm_config):
     """(conv, recurrent) KDA state dtypes the deployment's cache config selects."""
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -208,13 +215,17 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 (Rubin: or BF16) recurrent
-        # state in place; it maintains neither other cache dtypes nor ReplaySSM /
-        # RecoverSSM records (the SP topology's KDA core writes the records).
+        # The KDA cores keep a BF16 or FP32 conv state (``--mamba-cache-dtype``; the
+        # cores read and write it at its own dtype, the window holds the BF16
+        # in-projection inputs either way) and an FP32 (Rubin: or BF16) recurrent
+        # state in place; no other cache dtypes, nor ReplaySSM / RecoverSSM records
+        # outside SP (the SP topology's KDA core writes the records).
         (
-            kda_dtypes(vllm_config) not in [(torch.bfloat16, s) for s in states],
-            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
-            "state (mamba cache dtype; a BF16 recurrent state on Rubin only)",
+            kda_dtypes(vllm_config)
+            not in [(c, s) for c in conv_dtypes() for s in states],
+            "KDA cache dtypes other than a BF16 / FP32 conv state and an FP32 "
+            "recurrent state (mamba cache dtype; a BF16 recurrent state on Rubin "
+            "only)",
         ),
         (
             (
@@ -251,6 +262,14 @@ def unsupported(vllm_config) -> str | None:
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None and kda_dtypes(vllm_config)[0] != torch.bfloat16 and not sp:
+        # The TP8 / TP16 KDA kernels (heads, wide / loop / feed verify) read the
+        # conv window as BF16: an FP32 conv state runs only on the SP topology's
+        # record cores (test_specialized_decode_kda_conv_fp32_gpu).
+        reason = (
+            "an FP32 KDA conv state outside TP4 = DCP4 sequence parallelism (the "
+            "TP8 / TP16 KDA kernels take a BF16 conv state)"
+        )
     if (
         reason is None
         and dsa
@@ -347,8 +366,9 @@ def sp_unsupported(vllm_config) -> str | None:
             "flashinfer_sparse_mla_kernel=trtllm)",
         ),
         (
-            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
-            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent state",
+            kda_dtypes(vllm_config) not in [(c, torch.float32) for c in conv_dtypes()],
+            "KDA cache dtypes other than a BF16 / FP32 conv state and an FP32 "
+            "recurrent state",
         ),
         (
             spec is None

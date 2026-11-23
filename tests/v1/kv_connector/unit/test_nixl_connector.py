@@ -3979,6 +3979,16 @@ class TestPullRetryAndChunking:
         assert not self.worker._pull_retry_pending
         assert not self.worker._pull_retry_attempted
         assert not self.worker._pending_recv_notifs
+        # Logging-only counters.
+        stats = self.worker._pull_retry_stats
+        assert (stats.pulls, stats.retried, stats.reconnects, stats.gave_up) == (
+            1,
+            1,
+            1,
+            0,
+        )
+        assert stats.engines == {"old": 1}
+        assert 0 <= stats.latency_max_s <= stats.latency_sum_s
 
     def test_second_disconnect_fails_without_notifying(self):
         self.transport.transfer.side_effect = _remote_disconnect()
@@ -4013,6 +4023,8 @@ class TestPullRetryAndChunking:
         result = self.worker.get_transfer_results()
         assert result.finished_recving == result.failed_recving == {"old-req"}
         self.transport.remove_remote_agent.assert_not_called()
+        stats = self.worker._pull_retry_stats
+        assert (stats.retried, stats.reconnects, stats.gave_up) == (1, 0, 1)
 
     def test_request_arriving_at_invalid_peer_is_parked_then_read(self):
         self.worker._recving_metadata.update(self._request(req_id="slow").reqs_to_recv)
@@ -4054,6 +4066,29 @@ class TestPullRetryAndChunking:
         assert not result.finished_recving and not result.failed_recving
         assert "old-req" in self.worker._pull_retry_pending
         assert self._xfer_notifs() == [None]
+
+    def test_retry_summary_is_logged_on_change_only(self, monkeypatch):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+
+        lines = []
+        monkeypatch.setattr(
+            bw.logger, "info", lambda msg, *a: lines.append(msg % a if a else msg)
+        )
+        stats = self.worker._pull_retry_stats
+        self.worker._log_pull_retry_summary(force=True)
+        assert not lines  # nothing pulled yet
+        stats.pulls, stats.retried, stats.reconnects = 4, 1, 1
+        stats.latency_sum_s = stats.latency_max_s = 0.25
+        stats.engines["old"] += 1
+        self.worker._log_pull_retry_summary()  # inside the interval
+        assert not lines
+        self.worker._log_pull_retry_summary(force=True)
+        assert lines == [
+            "NIXL pull-retry summary: pulls=4 retried=1 reconnects=1 gave_up=0 "
+            "retry_latency_ms_sum=250.0 retry_latency_ms_max=250.0 engines={'old': 1}"
+        ]
+        self.worker._log_pull_retry_summary(force=True)  # unchanged: not repeated
+        assert len(lines) == 1
 
     @pytest.mark.parametrize(
         ("extra", "window"),
