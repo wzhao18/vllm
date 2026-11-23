@@ -5,8 +5,8 @@ not only C512's q4: the deferred serving path (records, fold, accepted counts, a
 request replaced mid-chain) and the fold-then-verify chain against the stock Triton
 verify / commit, re-run from the q4 tests at another q.
 
-Record cores per q (``cutedsl.kda.sp.RECORD_KINDS``): KdaSplit at n1-2, KdaWide at
-n3-20, KdaFlow from n21 at every q (q3 with padded scan vectors; q5..q8 with block-sum
+Record cores per q (``cutedsl.kda.sp.RECORD_KINDS``): KdaSplit at n1-2, KdaWide from
+n3, KdaFlow from n21 (q2..q4) / n17 (q5..q8) at every q (q3 with padded scan vectors; q5..q8 with block-sum
 rounds, the two-half scan and the two-slot page ring).
 The request counts pick one core each: n1 split, n9 wide, n33 / n64 flow; plus each
 q's largest KdaFlow item build at the SP row cap (q5 n192: 24 items per CTA, q6
@@ -39,9 +39,10 @@ def verify_length(monkeypatch, request):
 @pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
 def test_record_kind_per_q(verify_length):
     q = verify_length
-    flow = "flow"
-    assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, 20, 21, 128, 212, 213)] == [
-        "split", "split", "wide", "wide", flow, flow, flow, "wide",
+    # q5..q8 leave KdaWide at its second CTA wave (n17), q2..q4 at n21.
+    first = 17 if q > 4 else 21
+    assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, 16, first - 1, first, 128, 212, 213)] == [
+        "split", "split", "wide", "wide", "wide", "flow", "flow", "flow", "wide",
     ]  # fmt: skip
 
 
