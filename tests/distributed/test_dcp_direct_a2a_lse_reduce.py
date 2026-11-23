@@ -81,11 +81,25 @@ def _assert_q_gather_matches_reference(
     padded_num_heads: int | None,
 ) -> None:
     expected = _q_gather_reference(local_query, world_size, padded_num_heads)
+    if (
+        os.environ.get("TEST_SLOW_CONSUMER") == "1"
+        and dist.get_rank() == world_size - 1
+    ):
+        # One rank reads its gathered rows late (a slow attention kernel).
+        torch.accelerator.synchronize()
+        time.sleep(0.5)
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
     assert actual.is_contiguous()
     assert actual.stride() == expected.stride()
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    # The gather writes every rank's final query buffer directly and keeps one
+    # buffer per ubatch, so the next gather on the same ubatch may start only
+    # after every rank has consumed these rows. In the model the DCP output
+    # combine after the attention orders that; here, a barrier does. Without it
+    # a faster rank's next gather overwrites rows a slower rank still reads
+    # (the slow rank's check fails and its peers then time out waiting for it).
+    dist.barrier()
 
     storage_num_heads = padded_num_heads or world_size * local_query.shape[1]
     remaining_storage_bytes = (
@@ -748,11 +762,16 @@ def _distributed_direct_q_gather_worker(env: dict[str, str]) -> None:
         ),
     ],
 )
-def test_distributed_direct_q_gather_cuda_graph_replay(world_size: int):
+@pytest.mark.parametrize("slow_consumer", ["0", "1"])
+def test_distributed_direct_q_gather_cuda_graph_replay(
+    world_size: int, slow_consumer: str
+):
+    """Graph replays and eager gathers back to back on one ubatch; with a slow
+    consumer, the last rank reads every result 0.5 s late."""
     _distributed_run(
         _distributed_direct_q_gather_worker,
         world_size=world_size,
-        extra_env={"TEST_CUDA_GRAPH": "1"},
+        extra_env={"TEST_CUDA_GRAPH": "1", "TEST_SLOW_CONSUMER": slow_consumer},
     )
 
 
