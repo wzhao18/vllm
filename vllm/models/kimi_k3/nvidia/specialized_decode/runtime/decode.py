@@ -96,7 +96,9 @@ logger = init_logger(__name__)
 # 65-256 rows too (axhb-sw3, 16 ranks, mirrored, 93 layers, 32k, us/step: B9 -11, B17
 # -19, B24 -14, B28 -37, B32 -5): the stock embedding + FlashInfer two-shot all-reduce
 # (~36 us at 256 rows) leave the step head.
-RING_HEAD = {16: "1-256:1"}
+# TP8 (DFn on Rubin): the same rows (the gather is shard-agnostic: one owner rank per
+# token row, the others publish nothing; test_kimi_k3_sdec_tp8_lhf).
+RING_HEAD = {8: "1-256:1", 16: "1-256:1"}
 # Rubin verify graphs above the tuned rows (token rows by q, "*": any) that run the
 # specialized decode (generic kernels and stock seams, ``wide``); others run the stock
 # forward. A point leaves this table when its in-graph step measures slower than the
