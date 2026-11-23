@@ -74,8 +74,30 @@ from .stream import KdaStream
 from .wide import KdaWide
 
 K = 128
-# Record core per request count n, by heads per rank (items = heads x n, see above).
-RECORD_KINDS = {24: "1-2:split,3-20:wide,21-:flow"}
+# Record core per request count n, by heads per rank (items = heads x n, see above),
+# then by verify length q (exact q first, then "*"). KdaFlow serves q2 and q4 only
+# (``flow.FLOW_TOKENS``: at q5..8 its block sums, 2q + q^2 + q > 32, and shared memory
+# do not fit; at q3 its outputs are wrong: test_specialized_decode_sp_kda_anyq_gpu
+# q3-n33, output max abs error 9.8 with correct checkpoints / corrections), so at q3
+# and q5..q8 (DSpark k2, k4..k7) KdaWide serves every n >= 3: the same deferred fold (FOLDS,
+# the stock Triton commit's math bit for bit) and the same verify math (FP32 state and
+# recurrence, BF16 roundings), another FP32 reduction order of the recurrence's dot
+# products only, as between any two record cores. Cost at q4 sizes (deferred, us per
+# layer, docstring): n24 24.5 vs KdaFlow 20.2, n64 51.7 vs 38.9, n128 95.2 vs 71.0.
+# NQ-TUNE: KdaFlow at q5..8 (a kernel rewrite: block sums, page ring vs group blocks).
+# KdaFlow's largest item build (flow.ITEM_BUILDS 24) serves up to 212 requests at 24
+# heads on VR200's 212 SMs; above (q2 / q4 at 213+ requests per DP group: rows up
+# to 1020) KdaWide.
+RECORD_KINDS = {
+    24: {
+        "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
+        3: "1-2:split,3-:wide",
+        5: "1-2:split,3-:wide",
+        6: "1-2:split,3-:wide",
+        7: "1-2:split,3-:wide",
+        8: "1-2:split,3-:wide",
+    }
+}
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
 # by n; empty: the batch defaults (eight-CTA clusters at n1, then four; 16 lanes).
 SP_SPEC_SCHEDULE = {24: ""}
@@ -92,9 +114,12 @@ FOLDS = ("fused", "fused_ws", "wide", "flow")
 MODES = ("deferred", "triton", "none")
 
 
-def record_kind(heads, requests):
-    """The record core at ``requests`` (RECORD_KINDS), or None."""
-    return batch_table(RECORD_KINDS.get(heads, "")).get(requests)
+def record_kind(heads, requests, q):
+    """The record core at ``requests`` of q tokens (RECORD_KINDS), or None."""
+    entry = RECORD_KINDS.get(heads, "")
+    if isinstance(entry, dict):  # by q: the exact q, then "*"
+        entry = entry.get(q, entry.get("*", ""))
+    return batch_table(entry).get(requests)
 
 
 def replays(heads, requests):
@@ -182,8 +207,8 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
     if kind == "flow":
-        if not record or not 2 <= tokens <= 4:
-            cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
+        if not record or tokens not in flow.FLOW_TOKENS:
+            cause = f"KdaFlow runs RecoverSSM record steps of {flow.FLOW_TOKENS} tokens only"
             raise Unsupported("kda", shape, cause)
         budget = flow.smem_budget(device)
         # The smallest item-capacity build that serves this shape (flow.ITEM_BUILDS:
@@ -324,7 +349,7 @@ class SpKdaCore:
             if records == "triton" and n > slots:
                 raise Unsupported("kda", shape, f"{n} requests > {slots} record rows")
             replay = records == "deferred" and replays(heads, n)
-            kind = "fused_ws" if replay else record_kind(heads, n)
+            kind = "fused_ws" if replay else record_kind(heads, n, self.q)
             if kind is None:
                 raise Unsupported("kda", shape, f"no record core at {heads} heads")
             self.kinds[r] = kind

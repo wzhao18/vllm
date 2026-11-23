@@ -24,6 +24,8 @@ tests/distributed/test_kimi_k3_sdec_sp_*.py)."""
 
 import contextlib
 import itertools
+import math
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -185,7 +187,7 @@ class Fakes:
         class Mlp:
             def __init__(self, mlp, rows, ctx, index):
                 assert mlp.use_mega_moe and ctx.sequence_parallel
-                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                assert tuple(rows) == tuple(sorted({r // TP for r in ROWS})), rows  # n = R / 4
                 gaps = fakes.gaps.get("moe_dense", ())
                 self.providers = {}
                 for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
@@ -202,7 +204,7 @@ class Fakes:
 
             def __init__(self, mlp, rows, device, index):
                 assert index == 0 and not mlp.use_mega_moe, index
-                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                assert tuple(rows) == tuple(sorted({r // TP for r in ROWS})), rows  # n = R / 4
                 super().__init__(rows, fakes.gaps.get("dense", ()))
 
             def serves(self, n):
@@ -744,3 +746,29 @@ def test_specialized_decode_delegates_to_the_sp_step(sp_decode, monkeypatch):
     assert plan.q == Q and len(plan.metadata) == len(KINDS)
     with pytest.raises(shapes.Unsupported, match="outside the captured rows"):
         built.plan(capture(monkeypatch, step, 520), None)
+
+
+@pytest.mark.parametrize("q", [2, 3, 5, 6, 7, 8])
+def test_any_q_on_aligned_rows(fakes, monkeypatch, q):
+    """DSpark k = 1..7 (q2..q8): the SP step over rows every lcm(q, 4) (whole q
+    requests split evenly over TP4) up to 512 is fully specialized and plans every
+    captured R from uniform q verify metadata; an unaligned R raises at build."""
+    step_rows = math.lcm(q, TP)
+    rows = tuple(range(step_rows, 512 + 1, step_rows))
+    monkeypatch.setattr(sys.modules[__name__], "Q", q)
+    monkeypatch.setattr(sys.modules[__name__], "ROWS", rows)
+    fakes()
+    step = sp_attention.SpStep(runtime(rows=rows, ctx=context(q=q)))
+    assert step.q == q and step.rows == rows
+    assert step.shard_cap == rows[-1] // TP
+    table = step.coverage()
+    table.assert_complete(rows)
+    for r in rows:
+        assert set(table.plan[r]) == SPECIALIZED | DECLARED, r
+        plan = step.plan(capture(monkeypatch, step, r), None)
+        assert plan.q == q and len(plan.metadata) == len(KINDS), r
+    assert table.lines()[0].startswith(f"M{rows[0]}(q{q}): ")
+    bad = rows + (rows[-1] + q,) if (rows[-1] + q) % TP else None
+    if bad is not None:
+        with pytest.raises(shapes.Unsupported, match="do not split over TP4"):
+            sp_attention.SpStep(runtime(rows=bad, ctx=context(q=q)))

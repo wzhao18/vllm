@@ -103,6 +103,13 @@ def sp_topology(vllm_config) -> bool:
     return not use_moe_token_shard(vllm_config)
 
 
+def conv_dtypes():
+    """KDA conv-state dtypes the specialized decode serves."""
+    import torch
+
+    return (torch.bfloat16, torch.float32)
+
+
 def kda_dtypes(vllm_config):
     """(conv, recurrent) KDA state dtypes the deployment's cache config selects."""
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -208,13 +215,17 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 (Rubin: or BF16) recurrent
-        # state in place; it maintains neither other cache dtypes nor ReplaySSM /
-        # RecoverSSM records (the SP topology's KDA core writes the records).
+        # The KDA cores keep a BF16 or FP32 conv state (``--mamba-cache-dtype``; the
+        # cores read and write it at its own dtype, the window holds the BF16
+        # in-projection inputs either way) and an FP32 (Rubin: or BF16) recurrent
+        # state in place; no other cache dtypes, nor ReplaySSM / RecoverSSM records
+        # outside SP (the SP topology's KDA core writes the records).
         (
-            kda_dtypes(vllm_config) not in [(torch.bfloat16, s) for s in states],
-            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
-            "state (mamba cache dtype; a BF16 recurrent state on Rubin only)",
+            kda_dtypes(vllm_config)
+            not in [(c, s) for c in conv_dtypes() for s in states],
+            "KDA cache dtypes other than a BF16 / FP32 conv state and an FP32 "
+            "recurrent state (mamba cache dtype; a BF16 recurrent state on Rubin "
+            "only)",
         ),
         (
             (
@@ -251,6 +262,14 @@ def unsupported(vllm_config) -> str | None:
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None and kda_dtypes(vllm_config)[0] != torch.bfloat16 and not sp:
+        # The TP8 / TP16 KDA kernels (heads, wide / loop / feed verify) read the
+        # conv window as BF16: an FP32 conv state runs only on the SP topology's
+        # record cores (test_specialized_decode_kda_conv_fp32_gpu).
+        reason = (
+            "an FP32 KDA conv state outside TP4 = DCP4 sequence parallelism (the "
+            "TP8 / TP16 KDA kernels take a BF16 conv state)"
+        )
     if (
         reason is None
         and dsa
@@ -309,7 +328,8 @@ def sp_unsupported(vllm_config) -> str | None:
     """Why the SP topology (``sp_topology``) is not C512's decode role, the one the
     SP specialized decode covers: Rubin, K3.1 DSA layers on a per-tensor FP8 KV cache
     under FlashInfer sparse's trtllm-gen kernel, a BF16 conv / FP32 recurrent KDA
-    state, DSpark q4, at most SP_MAX_ROWS verify rows and DCP = TP. (The stock unfused
+    state, DSpark q2..q8 on captured rows that are multiples of lcm(q, TP), at most
+    SP_MAX_ROWS verify rows and DCP = TP. (The stock unfused
     reduce-scatter o_proj it also needs is a model policy, checked per layer at
     build: ``sp_attention.sp_layer``.)"""
     import torch
@@ -346,12 +366,15 @@ def sp_unsupported(vllm_config) -> str | None:
             "flashinfer_sparse_mla_kernel=trtllm)",
         ),
         (
-            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
-            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent state",
+            kda_dtypes(vllm_config) not in [(c, torch.float32) for c in conv_dtypes()],
+            "KDA cache dtypes other than a BF16 / FP32 conv state and an FP32 "
+            "recurrent state",
         ),
         (
-            spec is None or spec.method != "dspark" or spec.num_speculative_tokens != 3,
-            "speculation other than DSpark with 3 draft tokens (q4)",
+            spec is None
+            or spec.method != "dspark"
+            or not 1 <= spec.num_speculative_tokens <= 7,
+            "speculation other than DSpark with 1..7 draft tokens (q2..q8)",
         ),
         (
             vllm_config.scheduler_config.max_num_seqs * q > SP_MAX_ROWS,
@@ -363,7 +386,64 @@ def sp_unsupported(vllm_config) -> str | None:
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None:
+        reason = sp_unaligned(vllm_config, q, parallel.tensor_parallel_size)
     return None if reason is None else f"sequence parallelism on {reason}"
+
+
+def sp_aligned_rows(q: int, tp: int, top: int) -> tuple[int, ...]:
+    """The verify row counts the SP decode can capture up to ``top``: multiples of
+    lcm(q, TP) (whole q-token requests that split evenly over the TP ranks)."""
+    import math
+
+    step = math.lcm(q, tp)
+    return tuple(range(step, top + 1, step))
+
+
+def sp_unaligned(vllm_config, q: int, tp: int) -> str | None:
+    """Why the deployment's FULL decode graphs do not suit the SP decode: it shards
+    every captured R = B x q verify rows evenly over the TP ranks (rank r owns rows
+    [r R / TP, (r + 1) R / TP)), so every R must be a multiple of lcm(q, TP). Batches
+    between two captured sizes run the next captured graph with the runner's padded
+    requests (their rows are discarded). Where the deployment captures its largest
+    batch (max_num_seqs x q within the largest capture size), that batch needs an
+    aligned graph too, else it would run the stock forward. None when aligned."""
+    import math
+
+    from ..shapes import captured_rows
+
+    compilation = vllm_config.compilation_config
+    sizes = tuple(compilation.cudagraph_capture_sizes or ())
+    seqs = vllm_config.scheduler_config.max_num_seqs
+    limit = min(seqs * q, compilation.max_cudagraph_capture_size or max(sizes, default=0))
+    rows = captured_rows(sizes, q, limit)
+    step = math.lcm(q, tp)
+    bad = [r for r in rows if r % step]
+    top = seqs * q
+    # An unaligned largest batch within the capture range has no FULL graph at any
+    # capture list. (A batch above the largest capture size, or one whose aligned
+    # size the list skips, runs eager by the deployment's own choice at any q, k3
+    # included: counted by StockSteps, not this check's concern.)
+    cap = compilation.max_cudagraph_capture_size or max(sizes, default=0)
+    top_ok = top > cap or top % step == 0
+    if not bad and top_ok:
+        return None
+    want = sp_aligned_rows(q, tp, limit - limit % step)
+    hint = (
+        f"capture sizes {list(want[:3])} .. {want[-1] if want else step} (every "
+        f"{step} rows) and max_num_seqs a multiple of {step // q}"
+    )
+    if bad:
+        return (
+            f"captured q{q} decode rows {bad[:6]}{' ...' if len(bad) > 6 else ''} "
+            f"that do not split over TP{tp} (rows must be multiples of lcm(q, TP) = "
+            f"{step}; use {hint})"
+        )
+    return (
+        f"max_num_seqs {seqs} x q{q} = {top} rows without an aligned FULL decode "
+        f"graph (rows must be multiples of lcm(q, TP) = {step}, the largest batch "
+        f"captured; use {hint})"
+    )
 
 
 def _stock_prims_ts(vllm_config) -> bool:

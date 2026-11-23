@@ -587,6 +587,14 @@ def test_window_matches_stock(tp, q, layout):
         print(f"  B{B:4d}  {eo:.2e}  {es:.2e}  {rel:.2e}")
 
 
+@pytest.mark.parametrize("q", [1, 2, 4, 5, 6])
+def test_window_tp4_any_q(q):
+    """TP4 (the SP decode roles) at DSpark k1 / k2 / k4 / k5 / k6: every GQA_WINDOW
+    shape of the draft length (GqaWindow and GqaWindowUmma bins) matches stock, as
+    test_window_matches_stock does at k3 / k7."""
+    test_window_matches_stock(4, q, "slots")
+
+
 def test_window_umma_redo(monkeypatch):
     """GqaWindowUmma's moved-metadata path (its speculated first loads drained and
     reissued, those ring slots' phases offset; forced on unmoved metadata): the

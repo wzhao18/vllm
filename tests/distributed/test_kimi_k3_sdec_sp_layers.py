@@ -902,15 +902,16 @@ def _dsa_selected_reference(attn, x, selections, caches, rank, n, chunk=16):
 # --------------------------------------------------------------------------- launch
 
 
-def _launch(case: str, *args) -> None:
-    """``case`` on 4 spawned ranks (one per GPU); every rank must exit cleanly within
-    one deadline (a hung mailbox fails the test, never CI)."""
+def _launch(case: str, *args, q: int = 4) -> None:
+    """``case`` on 4 spawned ranks (one per GPU) at DSpark verify length ``q`` (C512:
+    q4); every rank must exit cleanly within one deadline (a hung mailbox fails the
+    test, never CI)."""
     import torch.multiprocessing as mp
 
     port = get_open_port()
     context = mp.get_context("spawn")
     processes = [
-        context.Process(target=_worker, args=(rank, port, case, args))
+        context.Process(target=_worker, args=(rank, port, case, args, q))
         for rank in range(WORLD)
     ]
     for process in processes:
@@ -927,9 +928,13 @@ def _launch(case: str, *args) -> None:
     assert [p.exitcode for p in processes] == [0] * WORLD, case
 
 
-def _worker(rank: int, port: int, case: str, args: tuple) -> None:
+def _worker(rank: int, port: int, case: str, args: tuple, q: int = 4) -> None:
     """One TP4 = DCP4 rank: the vLLM groups (and their symmetric memory), the
-    workspace and the DCP top-k merge's buffers, then ``case``."""
+    workspace and the DCP top-k merge's buffers, then ``case`` at verify length
+    ``q`` (the spawned module's Q)."""
+    global Q, CAP
+    Q = q
+    CAP = 512 - 512 % math.lcm(q, WORLD)  # the largest aligned captured row
     os.environ.update(DEPLOYED_ENV)
     torch.accelerator.set_device_index(rank)
     device = torch.device("cuda", rank)
@@ -1845,3 +1850,36 @@ def test_sp_kda_block_matches_stock_layer_all_rows():
     """The KDA A/B at every captured R (4..512)."""
     pytest.importorskip("cutlass")
     _launch("kda", ALL_ROWS, 2, False, False)
+
+
+# --------------------------------------------------------------------- any DSpark k
+
+
+def _any_q_rows(q: int) -> tuple[int, ...]:
+    """Captured rows at verify length ``q``: multiples of lcm(q, 4) (whole requests
+    over TP4) from the smallest to the largest within CAP, spanning the policy seams
+    (16 / 64 / 128 / 256 rows: front vs fork query, local query, sparse core)."""
+    step = math.lcm(q, WORLD)
+    top = CAP - CAP % step
+    picks = {step, 2 * step}
+    for seam in (16, 64, 68, 128, 256, 260):
+        picks.add(-(-seam // step) * step)
+    picks.add(top)
+    return tuple(sorted(r for r in picks if r <= top))
+
+
+@pytest.mark.parametrize("q", [2, 3, 6, 8], ids=lambda q: f"q{q}")
+def test_sp_dsa_block_any_q(q):
+    """The DSA A/B (MXFP4 indexer, DcpExchange, as deployed) at DSpark q2 / q3 / q6 /
+    q8 (k1 / k2 / k5 / k7) on aligned rows."""
+    pytest.importorskip("cutlass")
+    _launch("dsa", "mxfp4", "exchange", _any_q_rows(q), False, q=q)
+
+
+@pytest.mark.parametrize("q", [2, 3, 6, 8], ids=lambda q: f"q{q}")
+def test_sp_kda_block_any_q(q):
+    """The KDA A/B (RecoverSSM records, two steps with partial acceptance) at q2 / q3
+    / q6 / q8 on aligned rows: KdaFlow (q2 / q4) or KdaWide (q3, q5..q8) from n21."""
+    pytest.importorskip("cutlass")
+    _launch("kda", _any_q_rows(q), 2, False, False, q=q)
+

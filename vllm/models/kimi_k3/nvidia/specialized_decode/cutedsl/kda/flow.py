@@ -133,6 +133,10 @@ PACKED = True
 FOLD_FENCE = 1
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms (<= 32).
 SUMS = 32
+# Verify lengths KdaFlow serves: q4 (C512) and q2, both checked against the stock
+# Triton verify / commit (test_specialized_decode_sp_kda_anyq_gpu). q3 compiles but
+# its outputs are wrong (checkpoints and corrections right); q5..8 do not fit SUMS.
+FLOW_TOKENS = (2, 4)
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -304,7 +308,7 @@ class KdaFlow(KdaWS):
         mx=False,
         items=MAX_ITEMS,
     ):
-        assert 2 <= tokens <= 4 and stages == 1 and conv_dim_first
+        assert tokens in FLOW_TOKENS and stages == 1 and conv_dim_first
         assert items in ITEM_BUILDS and items % 2 == 0, items
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas

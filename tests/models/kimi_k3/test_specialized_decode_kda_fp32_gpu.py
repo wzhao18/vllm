@@ -57,6 +57,8 @@ DTYPE_IDS = ["fp32", "bf16-control"]
 Module = SimpleNamespace
 
 
+CONV_DTYPE = torch.bfloat16  # the KDA conv state (--mamba-cache-dtype): BF16 or FP32
+
 def kda_attention(seed=0):
     """The fields ``PreparedKda`` reads from a TP16 KDA layer (stock dtypes: FP32
     conv weight, A_log, dt bias and norm weight; BF16 F_B projection)."""
@@ -82,7 +84,7 @@ def caches(state_dtype, slots, tokens, seed=1):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * DIM, tokens + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, HEADS, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(torch.bfloat16), state.to(state_dtype)
+    return conv.bfloat16().to(CONV_DTYPE), state.to(state_dtype)  # BF16-valued window
 
 
 def clone(pair):
