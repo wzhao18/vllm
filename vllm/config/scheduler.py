@@ -76,6 +76,14 @@ class SchedulerConfig:
     be ``<= max_num_seqs``. ``None`` (default) keeps current behavior.
     """
 
+    max_async_kv_loads_per_step: int | None = Field(default=None, ge=1)
+    """Maximum number of P/D KV pulls (requests with ``do_remote_prefill``)
+    that start in one scheduling step. Each start allocates KV blocks for the
+    whole prompt on the main thread, and with data parallelism every rank waits
+    for the slowest step. Pulls past the limit start on later steps; other
+    waiting requests are not held back. ``None`` (default) means no limit.
+    """
+
     long_prefill_token_threshold: int = Field(default=0, ge=0)
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default).

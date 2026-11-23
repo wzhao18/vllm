@@ -598,7 +598,14 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Default the kv-cache dtype when the text backbone carries DSA:
         per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
-        "fp8_ds_mla" otherwise."""
+        "fp8_ds_mla" otherwise. With a KV connector (P/D), start at most 2 KV
+        pulls per scheduling step."""
+        scheduler_config = vllm_config.scheduler_config
+        if (
+            vllm_config.kv_transfer_config is not None
+            and scheduler_config.max_async_kv_loads_per_step is None
+        ):
+            scheduler_config.max_async_kv_loads_per_step = 2
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.

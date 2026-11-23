@@ -1398,6 +1398,8 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
+            num_kv_pulls = 0
+            max_kv_pulls = self.scheduler_config.max_async_kv_loads_per_step
             owner_decodes = self._dsa_owner_decodes()
             load_ahead = False
             load_ahead_left = LOAD_AHEAD_MAX_REQS - len(self._load_ahead)
@@ -1474,6 +1476,19 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    skip_request(request_queue)
+                    continue
+
+                pulls_remote_kv = request.num_computed_tokens == 0 and bool(
+                    (request.kv_transfer_params or {}).get("do_remote_prefill")
+                )
+                if (
+                    pulls_remote_kv
+                    and max_kv_pulls is not None
+                    and num_kv_pulls >= max_kv_pulls
+                ):
+                    # Past --max-async-kv-loads-per-step: start this P/D pull
+                    # on a later step; local requests behind it still run.
                     skip_request(request_queue)
                     continue
 
@@ -1979,6 +1994,8 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if pulls_remote_kv:
+                        num_kv_pulls += 1
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.

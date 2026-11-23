@@ -161,6 +161,36 @@ def test_basic_lifecycle():
     assert_scheduler_empty(scheduler)
 
 
+def test_max_async_kv_loads_per_step():
+    """--max-async-kv-loads-per-step defers P/D pulls past the limit to later
+    steps without holding back the local request queued behind them."""
+    vllm_config = create_vllm_config(max_num_seqs=16)
+    vllm_config.scheduler_config.max_async_kv_loads_per_step = 2
+    scheduler = create_scheduler(vllm_config)
+    block_size = vllm_config.cache_config.block_size
+    remote = [
+        create_request(
+            request_id=i,
+            block_size=block_size,
+            num_tokens=block_size * 3,
+            do_remote_prefill=True,
+        )
+        for i in range(5)
+    ]
+    local = create_request(request_id=5, block_size=block_size, num_tokens=8)
+    for request in (*remote, local):
+        scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    assert local.request_id in scheduler_output.num_scheduled_tokens
+    for num_loading in (2, 4, 5):
+        if num_loading > 2:
+            scheduler.schedule()
+        assert [r.status for r in remote] == [
+            RequestStatus.WAITING_FOR_REMOTE_KVS
+        ] * num_loading + [RequestStatus.WAITING] * (5 - num_loading)
+
+
 def test_interleaved_lifecycle():
     """Test Remote Prefills Work Well With Other Requests."""
     vllm_config = create_vllm_config()
