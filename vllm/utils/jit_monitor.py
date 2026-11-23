@@ -983,7 +983,7 @@ def _setup_cpp_extension_hook() -> None:
         return
     for attr in ("load", "load_inline"):
         original = getattr(cpp_extension, attr, None)
-        if original is None or getattr(original, "_vllm_monitored", False):
+        if original is None or getattr(original, "_vllm_monitored", False) is True:
             continue
 
         def _make(original=original, attr=attr):
