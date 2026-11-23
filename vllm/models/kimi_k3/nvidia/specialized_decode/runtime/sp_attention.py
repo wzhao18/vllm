@@ -717,11 +717,17 @@ class SpStep:
         if self.stock_dsa:
             from ...ops import dsa_dp
 
-            if dsa_dp.graph_mode() != CUDAGraphMode.FULL:
+            # FULL: the runner's FULL decode capture (its DEP order, run_segment).
+            # NONE with this step's owned rows: a capture over the eager runner
+            # (``vllm bench forward``), where the stock layer runs its owned-row
+            # exchange (``_dsa_scatter_rows``) as the stock forward would.
+            mode = dsa_dp.graph_mode()
+            eager_rows = mode == CUDAGraphMode.NONE and dsa_dp.STEP.num_tokens >= 0
+            if mode != CUDAGraphMode.FULL and not eager_rows:
                 raise Unsupported(
                     "dsa_dp", shape,
-                    f"a FULL capture whose DSA-DP mode is {dsa_dp.graph_mode()} "
-                    "(the runner's DEP order is not set)",
+                    f"a FULL capture whose DSA-DP mode is {mode} without the step's "
+                    "DEP order or owned rows",
                 )  # fmt: skip
         # The stock DSA-DP layers read the owner segment's metadata themselves.
         metadata = [
@@ -861,12 +867,15 @@ class SpStep:
     def run_dsa_dp(self, layer, step, hidden, prefix_sum, residual):
         """A stock DSA-DP layer's attention half on this rank's shard, as the stock
         decoder's ``_dsa_scatter`` FULL-graph path runs it: the pre-AttnRes, the
-        owner-segment exchange and attention (``ops.dsa_dp.run_segment``), the
-        post-AttnRes. Returns (the MLP input, the prefix sum, the saved blocks)."""
+        owner-segment exchange and attention (``ops.dsa_dp.run_segment``; under an
+        eager-runner capture the layer's owned-row exchange), the post-AttnRes. Returns (the MLP input, the prefix sum, the saved blocks)."""
         from ...ops import dsa_dp
 
         x, prefix_sum, residual = layer._pre_attn_norm(hidden, residual, prefix_sum)
-        x = dsa_dp.run_segment(layer.self_attn, step.positions, x)
+        if dsa_dp.graph_mode() == CUDAGraphMode.FULL:
+            x = dsa_dp.run_segment(layer.self_attn, step.positions, x)
+        else:  # (plan: an eager-runner capture with this step's owned rows)
+            x = layer._dsa_scatter_rows(step.positions, x)
         return layer._post_attn_norm(x, residual, prefix_sum)
 
     def prepare_kv(self):

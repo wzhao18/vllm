@@ -170,9 +170,18 @@ def test_dsa_dp_plan_skips_the_stock_dsa_metadata(monkeypatch):
 
 
 def test_dsa_dp_plan_raises_without_the_dep_order(monkeypatch):
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
     step = dsa_dp_planner(monkeypatch, CUDAGraphMode.PIECEWISE)
     with pytest.raises(shapes.Unsupported, match="dsa_dp"):
         step.plan(positions(16), None)
+    # An eager-runner capture (bench forward): only with the step's owned rows.
+    step = dsa_dp_planner(monkeypatch, CUDAGraphMode.NONE)
+    monkeypatch.setattr(dsa_dp.STEP, "num_tokens", -1)
+    with pytest.raises(shapes.Unsupported, match="owned rows"):
+        step.plan(positions(16), None)
+    monkeypatch.setattr(dsa_dp.STEP, "num_tokens", 16)
+    assert step.plan(positions(16), None).metadata == ["md", None]
 
 
 def test_dsa_dp_coverage_declares_the_stock_dsa(monkeypatch):
