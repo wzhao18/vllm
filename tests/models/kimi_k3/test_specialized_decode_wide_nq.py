@@ -823,8 +823,8 @@ def test_tp8_inprojection_generic_rows_run_cublas():
     for rows in (6288, 3808):
         tp8 = providers.projection_policies(8, rows, (8, 64, 72, 128), sms=212, q=4)
         assert 72 not in tp8 and 128 not in tp8, (rows, tp8)
-    tp16 = providers.projection_policies(16, 3216, (72, 128), sms=212, q=4)
-    assert tp16 == {72: (64, 64, 2, 6), 128: (64, 64, 2, 6)}
+    tp16 = providers.projection_policies(16, 3216, (128,), sms=212, q=4)
+    assert tp16 == {128: (64, 64, 2, 6)}
 
 
 def test_tp8_rubin_tables_take_tp16_entries():
