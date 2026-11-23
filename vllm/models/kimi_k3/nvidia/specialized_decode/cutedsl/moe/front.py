@@ -544,7 +544,7 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # 40-56); on 8 SMs, us/layer over 3-8 real-route layers (79-300 distinct): M16
 # -1.2..-8.9, M24 -2.4..-5.6, M32 -5.4..-16.1, M40-56 -17.1..-30.4 (6 SMs within
 # 0.5 of 8; M64 stays at 4: 6 / 8 within -1.1..+0.6).
-SPLITS_WIDE = {16: ("", "13-63:8,64:4")}
+SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
@@ -556,7 +556,7 @@ MERGED = {8: "41-64:1", 16: "33-64:1"}
 # -0.68..-1.26, M32 -1.20..-1.43 (q8) / -1.56 (q4); with the rows 4 us late M16-32
 # +0.03..-0.31. The front's K split changes (a stated FP32 reorder of the logits and
 # the latent rows); top-16 ids identical on the test routes.
-MERGED_WIDE = {16: "16-32:1"}
+MERGED_WIDE = {8: "16-32:1", 16: "16-32:1"}
 # Devices with more SMs than GB300's 152 (Rubin), by packed front rows: ``MERGED``
 # batches whose merged front + gate/up kernel is ``MoeFrontTmem64`` (128-row tiles
 # split over K in clusters of 8, the weights staged in tensor memory before the PDL
