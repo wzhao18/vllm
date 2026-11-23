@@ -423,10 +423,10 @@ def test_dsa_partials_automatic():
     # by verify length: BF16 only on the rows the DSA sparse core serves at that q
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import ROWS, VARIANT
 
-    for q in (1, 4, 8):
+    for q in (1, 2, 4, 6, 8):
         expect = f"1-{ROWS}:bf16,{ROWS + 1}-:proj" if q in VARIANT else "proj"
         assert r1.dsa_partials(None, fp8=True, q=q) == expect
-    assert r1.dsa_partials(None, fp8=True, q=4) == "proj"
+    assert r1.dsa_partials(None, fp8=True, q=1) == "proj"
     assert r1.dsa_partials(None, fp8=False, q=4) == "bf16"
     assert r1.dsa_partials("proj") == "proj"
     for bad in ("fp8", "1-64:int8", "1-64"):
@@ -811,3 +811,17 @@ def test_plain_lm_head_methods():
     linear._gemm_impl = lambda *args: None  # another linear backend
     assert not plain_lm_head(linear)
     assert not plain_lm_head(object())
+
+
+def test_tp8_inprojection_generic_rows_run_cublas():
+    """``PROJECTION_GENERIC`` is keyed by TP: TP8's 65-128 rows (KDA 6288, DSA 3808
+    per rank) run cuBLAS, where split-K 64.64.2.6 measured ~10 / ~6 us slower per
+    call; TP16 keeps its split-K there. The tuned bins are unchanged."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import providers
+
+    for rows in (6288, 3808):
+        tp8 = providers.projection_policies(8, rows, (8, 64, 72, 128), sms=212, q=4)
+        assert set(tp8) == {8, 64}, (rows, tp8)
+    tp16 = providers.projection_policies(16, 3216, (72, 128), sms=212, q=4)
+    assert tp16 == {72: (64, 64, 2, 6), 128: (64, 64, 2, 6)}

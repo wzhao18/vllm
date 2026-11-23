@@ -206,7 +206,14 @@ BINS = (8, 16, 32, 64)
 # GEMM): 1 GPU, cold weights, us per call, 64.64.2.6 vs cuBLAS, KDA (3216 x 7168) /
 # MLA (2880 x 7168): M128 8.73 / 8.47 vs 9.30 / 10.51; M256 17.1 / 16.8 vs 9.82 /
 # 9.76; M512 33.7 / 32.2 vs 13.06 / 12.92.
-PROJECTION_GENERIC = {"*": "65-128:64.64.2.6"}
+# Keyed by TP: TP8 (DFn, KDA 6288 / DSA 3808 x 7168 per rank) runs cuBLAS there:
+# VR200, 1 GPU, cold weights, us per call 64.64.2.6 / cuBLAS / cuBLASLt (TP8INPROJ):
+# 6288 M68-128 27.2-28.2 / 17.6-18.0 / 17.6-20.3, M132-192 37.1-37.8 / 26.3-27.0 /
+# 24.5-27.5; 3808 M68-128 22.2-22.9 / 15.8-17.0 / 16.1-17.1 (cuBLASLt not bitwise
+# cuBLAS at 3808 M68-80: kept cuBLAS).
+PROJECTION_GENERIC = {16: {"*": "65-128:64.64.2.6"}}
+# The TP8 in-projection pitches' measured cuBLAS choice above the bins (inproj_note).
+TP8_INPROJ = {6288, 3808}
 # The most rows the generic split-K tactics serve (dense layer included); above, the
 # projections run cuBLAS.
 GENERIC_ROWS = 128
@@ -241,6 +248,8 @@ def inproj_note(attention, b):
     pitch = attention.weight.shape[0]
     if pitch in INPROJ_LT:
         why = "split-K loses above 128 rows: M256 17.1 vs 9.8 us"
+    elif pitch in TP8_INPROJ:
+        why = "TP8: split-K 64.64.2.6 loses at 65-192 rows: 6288 M128 28.2 vs 18.0 us"
     else:  # the K3.1 DSA rows (3040): no measurement of either choice
         why = f"{pitch}-row projection unmeasured vs split-K / cuBLASLt: NQ-TUNE"
     return f"inproj stock {library} ({why})"
@@ -259,7 +268,7 @@ def projection_policies(tp, rows, batches, sms=152, q=1):
             continue
         if n is None:
             shape = Shape(batch, q)
-            tactic = rows_policy(PROJECTION_GENERIC, shape, default=None)
+            tactic = rows_policy(PROJECTION_GENERIC.get(tp, {}), shape, default=None)
             if tactic is not None:  # else cuBLAS (``Attention.project``)
                 policies[batch] = tactic
             continue
