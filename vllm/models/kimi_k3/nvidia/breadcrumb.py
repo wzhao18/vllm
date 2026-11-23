@@ -101,10 +101,7 @@ class _Crumbs:
             gpu = self.gpu_word()
             if gpu != gpu_prev:
                 gpu_prev, gpu_t = gpu, now
-            # Only inside an eager forward: serving steps replay CUDA graphs and write no crumb, so outside a forward
-            # a GPU word behind the last host code is stale, not stuck (K31_BREADCRUMB false positives at serve time,
-            # REGRESS 2026-11-23: 'gpu_stuck 675s gpu_at=size#6/layer92/capture_size' on healthy prefill workers).
-            if self.in_forward and gpu != self.host_code and now - gpu_t >= STALL_S:
+            if gpu != self.host_code and now - gpu_t >= STALL_S:
                 key = ("gpu", gpu, self.host_code)
                 if key != reported:
                     reported = key

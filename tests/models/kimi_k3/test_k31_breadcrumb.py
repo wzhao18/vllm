@@ -228,9 +228,3 @@ def test_capture_loop_end_resyncs_host_and_gpu_words():
     B.capture_size(None)
     assert c.host_code == c.gpu_word() and not c.in_forward
 
-
-def test_watcher_reports_gpu_stuck_only_inside_a_forward():
-    from vllm.models.kimi_k3.nvidia import breadcrumb as B
-
-    src = open(B.__file__).read()
-    assert "if self.in_forward and gpu != self.host_code and now - gpu_t >= STALL_S:" in src
