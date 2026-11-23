@@ -372,6 +372,11 @@ class WorkerIterLog:
         self._cur: list | None = None
         self._inflight: deque = deque()
         self._last_end = None
+        # REGRESS diag (DDSA w-f19-cudaprof hook, ported; never merge): CUDA-activity torch-profiler window on request.
+        self._rank = _global_rank()
+        self._prof = None
+        self._prof_left = 0
+        self._prof_done: set[str] = set()
 
     @classmethod
     def maybe_create(cls) -> "WorkerIterLog | None":
@@ -397,6 +402,45 @@ class WorkerIterLog:
         h = [h_entry, time.perf_counter(), 0.0, 0.0, 0.0, 0.0, 0.0]
         self._cur = [self._seq, ev, h, meta]
         self._seq += 1
+        self._maybe_profile()
+
+    def _maybe_profile(self) -> None:
+        """``<ITERLOG_DIR>/PROFILE.<tag>`` holding "<steps> [role]" starts one CUDA-activity-only torch-profiler
+        window (kernels and memcpy/memset on ALL streams of this process, graph nodes included) of that many steps;
+        the trace goes to ``trace-<tag>-r<rank>.json.gz``. role (prefill / decode) matches DDSA_PROF_ROLE."""
+        if self._prof is not None:
+            self._prof_left -= 1
+            if self._prof_left <= 0:
+                prof, self._prof = self._prof, None
+                prof.stop()
+                prof.export_chrome_trace(
+                    os.path.join(ITERLOG_DIR, f"trace-{self._prof_tag}-r{self._rank}.json.gz")
+                )
+            return
+        if self._seq % 16:
+            return
+        import glob
+
+        for path in glob.glob(os.path.join(ITERLOG_DIR, "PROFILE.*")):
+            tag = path.rsplit(".", 1)[1]
+            if tag in self._prof_done:
+                continue
+            self._prof_done.add(tag)
+            try:
+                parts = (open(path).read().split() or ["100"])
+                steps = int(parts[0])
+                role = parts[1] if len(parts) > 1 else ""
+            except (OSError, ValueError):
+                steps, role = 100, ""
+            if role and role != os.environ.get("DDSA_PROF_ROLE", ""):
+                continue
+            from torch.profiler import ProfilerActivity, profile
+
+            self._prof_tag = tag
+            self._prof_left = steps
+            self._prof = profile(activities=[ProfilerActivity.CUDA])
+            self._prof.start()
+            break
 
     def mark(self, i: int) -> None:
         """1: before the forward, 2: after it, 3: sample_tokens entry,
