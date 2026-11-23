@@ -143,7 +143,7 @@ FAST_DCP = {4: "1-:1", 8: "1-64:1", 16: "1-:1"}
 # replicated context_proj GEMM (514 MB of weights per rank).
 # (hb192: to 768 context rows, DL3 B192; open above: cutedsl.draft.context keeps the
 # rows its per-row gather CTAs can hold at once.) NQ-TUNE: above 768 context rows.
-FAST_CONTEXT = {8: "1-:1", 16: "1-:1"}
+FAST_CONTEXT = {8: "1-64:1", 16: "1-:1"}
 # Query rows whose forward runs the all-reduce + residual + RMSNorm sites as Lamport
 # kernels (cutedsl.draft.allreduce): 1 one-shot, 2 two-shot (common.twoshot), per TP,
 # on Rubin. 16 ranks, us/site one-shot / two-shot (scripts/dsdraft/ar_test.py, chain
