@@ -44,6 +44,8 @@ def assert_twin(name, fp32, bf16):
     if fp32.dtype == FP32 and bf16.dtype == BF16:  # the conv window
         tp_loop.assert_bitwise(f"{name} (fp32 vs bf16.float())", fp32, bf16.float())
         assert_bf16_valued(name, fp32)  # the invariant (FP32 windows only)
+    elif not fp32.is_floating_point():  # indices / counts
+        assert torch.equal(fp32, bf16), name
     else:
         assert fp32.dtype == bf16.dtype, (name, fp32.dtype, bf16.dtype)
         tp_loop.assert_bitwise(name, fp32, bf16)
