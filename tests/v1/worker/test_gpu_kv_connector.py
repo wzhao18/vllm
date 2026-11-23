@@ -108,14 +108,30 @@ def test_deferred_finalize_collects_results_before_saving(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """With a drafter, the transfer results are collected right after the
-    target forward, and the saves and metadata are finalized after the
-    drafter writes its KV."""
+    target forward; the async loads start, and the saves and metadata are
+    finalized, after the drafter is launched (posting loads can take many ms of
+    host time, which must not delay the drafter or the next step)."""
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
     connector.pre_forward(_scheduler_output(False))
 
     connector.post_forward(set(), defer_finalize=True)
-    assert events == ["handle", "bind", "start", "results"]
+    assert events == ["handle", "bind", "results"]
 
+    connector.finalize_step()
+    assert events == ["handle", "bind", "results", "start", "wait", "clear"]
+    # Started once: a later finalize has no pending load.
+    connector.finalize_step()
+    assert events.count("start") == 1
+
+
+def test_deferred_finalize_keeps_sync_loads_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Sync loads still start before the forward; finalize does not restart them."""
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+    connector.pre_forward(_scheduler_output(True))
+    connector.post_forward(set(), defer_finalize=True)
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]

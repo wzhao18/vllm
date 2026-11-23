@@ -147,7 +147,9 @@ class ActiveKVConnector(KVConnector):
         if self._disabled:
             return None
 
-        if self._pending_load_kwargs is not None:
+        # With defer_finalize the async loads start in finalize_step, once the
+        # step's drafter is launched: posting them can take many ms on the host.
+        if self._pending_load_kwargs is not None and not defer_finalize:
             self._start_load_kv()
 
         output = KVConnectorOutput()
@@ -170,6 +172,8 @@ class ActiveKVConnector(KVConnector):
     def finalize_step(self) -> None:
         if self._disabled:
             return
+        if self._pending_load_kwargs is not None:
+            self._start_load_kv()
         self.kv_connector.wait_for_save()
         self.kv_connector.clear_connector_metadata()
 
