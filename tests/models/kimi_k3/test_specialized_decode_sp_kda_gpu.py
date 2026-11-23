@@ -51,6 +51,7 @@ from vllm.third_party.flash_linear_attention.ops.kda import (  # noqa: E402
 
 DEVICE = torch.device("cuda", 0)
 HEADS, DIM, Q = 24, 3072, 4  # C512: 96 KDA heads over TP4, DSpark q4
+CONV_DTYPE = torch.bfloat16  # the KDA conv state (--mamba-cache-dtype): BF16 or FP32
 PITCH = 4 * DIM + 128 + HEADS + 8  # Q | K | V | gate | F_A | beta | pad (16)
 MAX_REQS = 216  # requests per DP group up to 212 / rank (24-item KdaFlow) + the raise check; C512 used 128
 LOWER_BOUND = -5.0
@@ -108,7 +109,7 @@ def layer(seed=0):
         in_proj_qkvgfab=Module(weight=torch.empty(PITCH, 8, device="meta")),
         o_norm=norm,
         gate_lower_bound=LOWER_BOUND,
-        get_state_dtype=lambda: (torch.bfloat16, torch.float32),
+        get_state_dtype=lambda: (CONV_DTYPE, torch.float32),
         recoverssm_backend="triton",
         recoverssm_verify=None,
         recoverssm_records=KDARecoverSSMRecords.allocate(
@@ -122,7 +123,7 @@ def caches(slots, seed=1):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * DIM, Q + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, HEADS, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(torch.bfloat16), state
+    return conv.to(CONV_DTYPE), state
 
 
 def step(n, slots, seed=2):
