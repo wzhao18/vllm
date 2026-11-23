@@ -84,11 +84,11 @@ def captured(q, top=2048):
     return captured_rows(range(1, top + 1), q, top)
 
 
-def context(q, max_rows=2048, sms=212, bf16_state=False):
+def context(q, max_rows=2048, sms=212, bf16_state=False, tp=16):
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Context
 
     return Context(
-        arch="rubin", tp=16, rank=0, dcp=16, sms=sms, q=q, max_rows=max_rows,
+        arch="rubin", tp=tp, rank=0, dcp=tp, sms=sms, q=q, max_rows=max_rows,
         max_context=1 << 20, bf16_state=bf16_state,
     )  # fmt: skip
 
@@ -145,6 +145,63 @@ def test_families_choose_every_wide_row(q):
             expect = Path.STOCK if m >= 384 else Path.GENERIC
             assert attn_res_choose(shape, ctx).path is expect, m
             assert kda_choose(shape, ctx) is not None, m
+
+
+TP8_Q_ROWS = {4: range(68, 1537, 4), 6: range(66, 1537, 6), 8: range(72, 1537, 8)}
+
+
+@pytest.mark.parametrize("q", [4, 6, 8])
+def test_tp8_every_captured_row_is_wide(q):
+    """TP8 = DCP8 (DFn): K3.1's DSA layers take every captured verify row above 64
+    (up to its 1536-row capacity anchor) as a wide row of the specialized decode, not
+    the whole-step stock forward; the target-topology refusal stays TP16-only."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (
+        wide_gate,
+        wide_rows,
+    )
+
+    assert wide_gate(q, rubin=True, seams=True, dsa=True, tp=8, dcp=8) is None
+    rows = captured(q, 1536)
+    assert wide_rows(rows, q) == tuple(m for m in rows if m > 64)
+    assert wide_rows(rows, q) == tuple(TP8_Q_ROWS[q])
+    assert not context(q, tp=8).target
+
+
+@pytest.mark.parametrize("q", [4, 6, 8])
+def test_tp8_families_choose_every_wide_row(q):
+    """Each family's ``choose`` at every TP8 = DCP8 wide row (Rubin, FP32 and BF16 KDA
+    state): DSA runs WideDsa, KDA its TP8 verify kernels (gate mode 1), AttnRes as at
+    TP16; the o-projection takes seam S3 and the MXFP4 MoE layer seam S4 (no TP8
+    entry in WIDE_TWOSHOT / WIDE_TAIL), both specialized steps; nothing raises."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
+        choose as attn_res_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        choose as dsa_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.prepared import (
+        choose as kda_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (
+        choose as moe_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.prepared import (  # noqa: E501
+        choose as oproj_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Path, Shape
+
+    for bf16_state in (False, True):
+        ctx = context(q, max_rows=1536, bf16_state=bf16_state, tp=8)
+        for m in TP8_Q_ROWS[q]:
+            shape = Shape(m, q)
+            dsa = dsa_choose(shape, ctx)
+            assert dsa is not None and dsa.tactic == "wide", m
+            assert oproj_choose(shape, ctx) is None, m  # S3
+            assert moe_choose(shape, ctx) is None, m  # S4 (MXFP4)
+            expect = Path.STOCK if m >= 384 else Path.GENERIC
+            assert attn_res_choose(shape, ctx).path is expect, m
+            kda = kda_choose(shape, ctx)
+            assert kda.path is Path.GENERIC, m
 
 
 class Built(Exception):
