@@ -101,14 +101,22 @@ def test_bin_pins_cover_and_match_linear():
         del w
     # A rejected pin raises under strict (a descriptor of another shape's tile).
     w = torch.zeros((7168, 1536), device="cuda", dtype=torch.bfloat16)
-    lo, hi, label, _ = table[(7168, 1536)][0]
-    bad = list(table[(7168, 1536)])
-    bad[0] = (lo, hi, label, "ff" * 64)
-    saved = table[(7168, 1536)]
-    table[(7168, 1536)] = tuple(bad)
+    shape = (7168, 1536)
+    taken = set(lt_pin.pins_for(shape)) | lt_pin.default_rows(shape)
+    i, row = next(
+        (i, r)
+        for i, (lo, hi, _, _) in enumerate(table[shape])
+        for r in range(lo, hi + 1)
+        if r not in taken
+    )  # a row only the bin serves
+    lo, hi, label, _ = table[shape][i]
+    bad = list(table[shape])
+    bad[i] = (lo, hi, label, "ff" * 64)
+    saved = table[shape]
+    table[shape] = tuple(bad)
     try:
         with pytest.raises(Uncovered, match="pinned cuBLASLt"):
-            lt_pin.pinned(w, [lo], strict=True)
+            lt_pin.pinned(w, [row], strict=True)
     finally:
         table[(7168, 1536)] = saved
 
