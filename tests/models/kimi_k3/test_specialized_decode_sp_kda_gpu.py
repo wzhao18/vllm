@@ -123,7 +123,7 @@ def caches(slots, seed=1):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * DIM, Q + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, HEADS, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(CONV_DTYPE), state
+    return conv.bfloat16().to(CONV_DTYPE), state  # the window holds BF16 in-proj inputs
 
 
 def step(n, slots, seed=2):

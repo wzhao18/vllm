@@ -84,7 +84,7 @@ def caches(state_dtype, slots, tokens, seed=1):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * DIM, tokens + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, HEADS, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.to(CONV_DTYPE), state.to(state_dtype)
+    return conv.bfloat16().to(CONV_DTYPE), state.to(state_dtype)  # BF16-valued window
 
 
 def clone(pair):
