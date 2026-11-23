@@ -67,7 +67,8 @@ def _variant_edges(tmp_path, next_n: int) -> list[int]:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("next_n", [1, 4])
+# next_n: the served verify lengths q = k + 1 (k1 / k3 / k5 / k7) and q1.
+@pytest.mark.parametrize("next_n", [1, 2, 4, 6, 8])
 def test_row_counts_reach_every_installed_metadata_variant(tmp_path, next_n):
     from vllm.utils.import_utils import has_deep_gemm
 
