@@ -72,10 +72,18 @@ class _Inputs:
         self.dt_bias = 0.1 * torch.randn(H, D, dtype=torch.float32, device=DEVICE)
 
 
-def _conv_cache() -> torch.Tensor:
+# The conv cache dtype follows --mamba-cache-dtype: bf16 by default, fp32 under
+# `--mamba-cache-dtype float32` (only the conv state changes; the recurrent
+# state is always fp32).
+CONV_DTYPES = pytest.mark.parametrize(
+    "conv_dtype", [torch.bfloat16, torch.float32], ids=["conv_bf16", "conv_fp32"]
+)
+
+
+def _conv_cache(conv_dtype: torch.dtype) -> torch.Tensor:
     # The serving "DS" layout: (dim, width - 1) per slot.
     return torch.zeros(
-        NUM_SLOTS, CONV_DIM, CONV_WIDTH - 1, dtype=torch.bfloat16, device=DEVICE
+        NUM_SLOTS, CONV_DIM, CONV_WIDTH - 1, dtype=conv_dtype, device=DEVICE
     )
 
 
@@ -151,9 +159,11 @@ def _forward(
     recurrent_state[slot] = final_state[0]
 
 
-def _from_scratch(inputs: _Inputs, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _from_scratch(
+    inputs: _Inputs, end: int, conv_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Recurrent and conv state a fresh prefill of ``[0, end)`` leaves."""
-    conv_state = _conv_cache()
+    conv_state = _conv_cache(conv_dtype)
     recurrent_state = torch.zeros(
         NUM_SLOTS, H, D, D, dtype=STATE_DTYPE, device=DEVICE
     )
@@ -179,8 +189,11 @@ def _from_scratch(inputs: _Inputs, end: int) -> tuple[torch.Tensor, torch.Tensor
         3 * MAMBA_BLOCK + 300,
     ],
 )
+@CONV_DTYPES
 @torch.inference_mode()
-def test_mid_block_resume_exports_from_scratch_checkpoint(prompt_len: int):
+def test_mid_block_resume_exports_from_scratch_checkpoint(
+    prompt_len: int, conv_dtype: torch.dtype
+):
     if not is_flashkda_supported(D, torch.bfloat16, STATE_DTYPE, LOWER_BOUND):
         pytest.skip("FlashKDA prefill is not supported on this platform")
     import vllm._flashkda_C  # noqa: F401
@@ -222,7 +235,7 @@ def test_mid_block_resume_exports_from_scratch_checkpoint(prompt_len: int):
     assert checkpoint.state_indices.tolist() == [K_SLOT]
 
     # Column K holds the hit's state@s (the CoW copy of a partial hit).
-    conv_state = _conv_cache()
+    conv_state = _conv_cache(conv_dtype)
     recurrent_state = torch.zeros(
         NUM_SLOTS, H, D, D, dtype=STATE_DTYPE, device=DEVICE
     )
@@ -240,16 +253,22 @@ def test_mid_block_resume_exports_from_scratch_checkpoint(prompt_len: int):
         inputs, start, prompt_len, conv_state, recurrent_state, R_SLOT, True, checkpoint
     )
 
-    expected_recurrent, expected_conv = _from_scratch(inputs, checkpoint_position)
+    expected_recurrent, expected_conv = _from_scratch(
+        inputs, checkpoint_position, conv_dtype
+    )
     max_diff = (recurrent_state[K_SLOT] - expected_recurrent).abs().max().item()
     assert torch.equal(recurrent_state[K_SLOT], expected_recurrent), (
         f"checkpoint recurrent state differs from a prefill to "
         f"{checkpoint_position} (max abs diff {max_diff})"
     )
+    # The checkpoint's conv window is stored in the live conv cache's dtype
+    # (fp32 under --mamba-cache-dtype float32), bit-identical to a prefill.
+    assert conv_state[K_SLOT].dtype == conv_state[R_SLOT].dtype == conv_dtype
+    assert expected_conv.dtype == conv_dtype
     assert torch.equal(conv_state[K_SLOT], expected_conv)
 
     # The running slot finishes the prompt; no other slot is written.
-    final_recurrent, final_conv = _from_scratch(inputs, prompt_len)
+    final_recurrent, final_conv = _from_scratch(inputs, prompt_len, conv_dtype)
     torch.testing.assert_close(recurrent_state[R_SLOT], final_recurrent)
     assert torch.equal(conv_state[R_SLOT], final_conv)
     assert torch.equal(recurrent_state[untouched], others[0])
@@ -271,8 +290,11 @@ STALE_SLOT, SNAPSHOT_SLOT = 6, 7
         (2 * MAMBA_BLOCK, 2 * MAMBA_BLOCK + 700),
     ],
 )
+@CONV_DTYPES
 @torch.inference_mode()
-def test_running_snapshot_matches_the_split(start: int, prompt_len: int):
+def test_running_snapshot_matches_the_split(
+    start: int, prompt_len: int, conv_dtype: torch.dtype
+):
     """A running request's last chunk ending in its block: the scheduler
     rewrites the snapshot column below the initial state (the worker's
     append-only row held a stale block id there), and the one pass exports the
@@ -306,7 +328,7 @@ def test_running_snapshot_matches_the_split(start: int, prompt_len: int):
     assert offsets == [checkpoint_position - start] and cols == [snapshot_col]
 
     def prefix_state() -> tuple[torch.Tensor, torch.Tensor]:
-        conv_state = _conv_cache()
+        conv_state = _conv_cache(conv_dtype)
         recurrent_state = torch.zeros(
             NUM_SLOTS, H, D, D, dtype=STATE_DTYPE, device=DEVICE
         )
@@ -359,6 +381,9 @@ def test_running_snapshot_matches_the_split(start: int, prompt_len: int):
     )
 
     assert torch.equal(recurrent_state[SNAPSHOT_SLOT], at_checkpoint[0])
+    # The checkpoint's conv window is stored in the live conv cache's dtype.
+    assert conv_state[SNAPSHOT_SLOT].dtype == conv_state[slot].dtype == conv_dtype
+    assert at_checkpoint[1].dtype == conv_dtype
     assert torch.equal(conv_state[SNAPSHOT_SLOT], at_checkpoint[1])
     max_diff = (recurrent_state[slot] - split_recurrent[K_SLOT]).abs().max().item()
     assert torch.equal(recurrent_state[slot], split_recurrent[K_SLOT]), (
