@@ -44,7 +44,7 @@ def core_of(kind, attention, rows, records, caches, mx_out=False):
 
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("n", [3, 33, 96, 128, 141, 144, 160, 176, 177, 192, 208, 212])
+@pytest.mark.parametrize("n", [3, 18, 20, 33, 96, 128, 141, 144, 160, 176, 177, 192, 208, 212])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
     monkeypatch.setattr(flow, "max_stages", lambda *args, **kwargs: stages)
     sp.executable.cache_clear()
