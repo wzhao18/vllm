@@ -204,6 +204,25 @@ def _rocm_aiter_gemm_warmup(worker: "Worker") -> None:
     )
 
 
+def _warmup_dsa_indexer_metadata(worker: "Worker") -> None:
+    """DeepGEMM paged MQA logits metadata at every row-count class (see
+    ``dsa_indexer_metadata_warmup``); the builders call it on CUDA with
+    DeepGEMM, the same condition as here."""
+    from vllm.utils.import_utils import has_deep_gemm
+
+    if not (current_platform.is_cuda() and has_deep_gemm()):
+        return
+    from vllm.model_executor.warmup.dsa_indexer_metadata_warmup import (
+        warmup_paged_mqa_logits_metadata,
+    )
+
+    runner = worker.model_runner
+    attn_groups = list(getattr(runner, "attn_groups", None) or [])
+    speculator = getattr(runner, "speculator", None) or getattr(runner, "drafter", None)
+    attn_groups += list(getattr(speculator, "attn_groups", None) or [])
+    warmup_paged_mqa_logits_metadata(attn_groups, worker.vllm_config)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.step5_dsa_warmup import step5_dsa_warmup
 
@@ -278,6 +297,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
     step5_dsa_warmup(worker)
+    _warmup_dsa_indexer_metadata(worker)
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (

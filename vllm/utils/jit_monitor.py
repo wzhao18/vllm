@@ -13,17 +13,29 @@ additional runtime details. Verbose logging is intentionally opt-in because it
 can emit many logs and add overhead.
 
 Currently monitors:
-- CuTeDSL cute.compile calls
-- Triton ``@triton.autotune`` cache misses (via ``knobs.autotuning.print``)
+- CuTeDSL ``cute.compile`` and ``cute.experimental.compile`` calls (a call
+  that a compile cache in between serves from disk is tagged "cache load")
+- Triton ``@triton.autotune`` cache misses (via ``knobs.autotuning.print``
+  and, where Triton has it, ``knobs.autotuning.listener``)
 - Triton ``@triton.jit`` first-time compilations
   (via ``knobs.runtime.jit_post_compile_hook``)
 - TileLang ``@tilelang.jit`` first-time compilations
+- FlashInfer JIT module builds and cubin loads (downloads)
+- torch.compile graphs (``report_compile`` / ``report_compile_time``)
+
+Every monitored compile logs its wall-clock duration: one ``JIT_COMPILE``
+INFO line during startup (once ``install_timing_hooks`` ran), the
+``JIT_AFTER_WARMUP`` line after ready. ``activate()`` logs a per-worker
+``JIT_COMPILE_SUMMARY`` of the startup compiles (count and seconds by
+backend). Timing is logging only: it never changes what compiles or raises.
 """
 
 import contextlib
 import functools
 import importlib
 import os
+import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from typing import Any, Literal, cast
@@ -45,6 +57,20 @@ _tilelang_hook_installed: bool = False
 # (see ``record_jit_events``).
 _recorded_events: list[str] | None = None
 _tilelang_jitimpl_compile_depth: int = 0
+_flashinfer_hook_installed: bool = False
+# ``install_timing_hooks()`` ran: startup compiles log their duration.
+_timing_installed: bool = False
+_triton_autotune_listener_installed: bool = False
+_cpp_extension_hook_installed: bool = False
+_deepgemm_watch: "_DeepGemmCacheWatch | None" = None
+
+# Compile time by phase ("startup" before ``activate()``, "serving" after)
+# and backend: [compiles, seconds, slowest (seconds, name)].
+_stats_lock = threading.Lock()
+_compile_stats: dict[str, dict[str, list[Any]]] = {"startup": {}, "serving": {}}
+# Per thread: open CuTe compile frames (nested wrappers) and Triton compile
+# start times (``jit_cache_hook`` -> ``jit_post_compile_hook``).
+_tls = threading.local()
 
 
 def is_active() -> bool:
@@ -71,12 +97,13 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
         return
     if mode not in ("warn", "error"):
         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
+    _setup_triton_autotuning_print()
+    _install_jit_hooks()
+    # Before _active flips: the startup totals are final here.
+    log_compile_summary("startup")
     _active = True
     _mode = mode
     _verbose = verbose
-
-    _setup_triton_autotuning_print()
-    _install_jit_hooks()
 
     logger.info(
         "Kernel JIT monitor activated; monitored JIT compilations during "
@@ -85,10 +112,23 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     )
 
 
+def install_timing_hooks() -> None:
+    """Install the compile hooks at worker start, so startup compiles (model
+    build, warmup, CUDA graph capture) log their duration and add to the
+    ``JIT_COMPILE_SUMMARY`` that ``activate()`` logs. Logging only."""
+    global _timing_installed
+    _timing_installed = True
+    _install_jit_hooks()
+
+
 def _install_jit_hooks() -> None:
     """Install the compile hooks (idempotent; they report via _handle_jit_event)."""
     _setup_triton_jit_hook()
+    _setup_triton_autotune_listener()
     _setup_cutedsl_jit_hook()
+    _setup_flashinfer_jit_hook()
+    _setup_cpp_extension_hook()
+    _setup_deepgemm_watch()
 
     # Refer to #51159. tilelang ships broken symbols
     # on rocm.
@@ -180,31 +220,105 @@ def _setup_triton_autotuning_print() -> None:
 # ------------------------------------------------------------------
 
 
+def _account(backend: str, fn_name: str, seconds: float | None, count: int = 1):
+    """Add one compile (``count``) of ``seconds`` to this phase's totals."""
+    phase = "serving" if _active else "startup"
+    with _stats_lock:
+        entry = _compile_stats[phase].setdefault(backend, [0, 0.0, (0.0, "")])
+        entry[0] += count
+        entry[1] += seconds or 0.0
+        if seconds is not None and seconds > entry[2][0]:
+            entry[2] = (seconds, fn_name)
+
+
+def compile_stats(phase: str = "startup") -> dict[str, tuple[int, float]]:
+    """{backend: (compiles, seconds)} of ``phase`` ("startup" or "serving")."""
+    with _stats_lock:
+        return {b: (e[0], e[1]) for b, e in _compile_stats[phase].items()}
+
+
+def log_compile_summary(phase: str = "startup") -> None:
+    """One INFO line: compiles and seconds of ``phase`` in total and by backend
+    (with each backend's slowest compile)."""
+    with _stats_lock:
+        rows = sorted(_compile_stats[phase].items(), key=lambda kv: -kv[1][1])
+        rows = [(b, e[0], e[1], e[2]) for b, e in rows]
+    count = sum(r[1] for r in rows)
+    seconds = sum(r[2] for r in rows)
+    by_backend = ", ".join(
+        f"{b} {n}x {t:.1f} s" + (f" (slowest {s[1]} {s[0]:.1f} s)" if s[1] else "")
+        for b, n, t, s in rows
+    )
+    logger.info(
+        "JIT_COMPILE_SUMMARY %s: %d compiles, %.1f s%s",
+        phase,
+        count,
+        seconds,
+        f"; {by_backend}" if by_backend else "",
+    )
+
+
+def _seconds_suffix(seconds: float | None) -> str:
+    return "" if seconds is None else f" [{seconds:.3f} s]"
+
+
+def _gates_now() -> bool:
+    """Whether a gated event raised before its compile would: error mode."""
+    return _active and _mode == "error" and _recorded_events is None
+
+
 def _handle_jit_event(
     *,
     backend: str,
     event: str,
     fn_name: str,
     detail: str | None = None,
+    seconds: float | None = None,
+    gate: bool = True,
+    count: int = 1,
 ) -> None:
-    if _recorded_events is not None:
+    """Report one monitored compile. ``seconds``: its wall-clock duration
+    (None when the hook cannot time it). ``gate=False``: logging only (a
+    backend whose events neither fail the startup verification nor raise in
+    error mode)."""
+    _account(backend, fn_name, seconds, count)
+    if count == 0:  # the duration of a compile reported before it ran
+        logger.info(
+            "JIT_COMPILE_TIME %s: %s%s", backend, fn_name, _seconds_suffix(seconds)
+        )
+        return
+    if _recorded_events is not None and gate:
         _recorded_events.append(
-            f"{backend}: {fn_name}" + (f" ({detail})" if detail else "")
+            f"{backend}: {fn_name}"
+            + (f" ({detail})" if detail else "")
+            + _seconds_suffix(seconds)
         )
         return
     if not _active:
-        # Hooks installed by record_jit_events() before activate(): startup
-        # compiles (warmup, CUDA graph capture) are expected.
+        # Startup compiles (warmup, CUDA graph capture) are expected: log
+        # their duration only (hooks run from ``install_timing_hooks``).
+        # Per-kernel lines for compiles only: a build loads thousands of
+        # cached kernels (counted in the summary).
+        if _timing_installed and not backend.endswith(
+            (" (cache load)", " (deferred to peer)")
+        ):
+            logger.info(
+                "JIT_COMPILE %s %s: %s%s",
+                backend,
+                event,
+                fn_name,
+                (f" ({detail})" if detail else "") + _seconds_suffix(seconds),
+            )
         return
     message = (
         "%s %s during inference: %s%s. "
         "This causes a latency spike; consider extending warmup "
         "to cover this shape/config."
     )
-    detail_suffix = f" ({detail})" if detail else ""
+    detail_suffix = (f" ({detail})" if detail else "") + _seconds_suffix(seconds)
     args = (backend, event, fn_name, detail_suffix)
 
-    if _mode == "error":
+    if _mode == "error" and gate:
         raise RuntimeError(message % args)
 
     # Every post-warmup compile is an ERROR line with a fixed tag that the e2e
@@ -219,6 +333,19 @@ def report_compile(backend: str, fn_name: str, detail: str | None = None) -> Non
     ``activate()``, ignored during startup."""
     _handle_jit_event(
         backend=backend, event="compilation", fn_name=fn_name, detail=detail
+    )
+
+
+def report_compile_time(backend: str, fn_name: str, seconds: float) -> None:
+    """Log the duration of a compile already counted by ``report_compile``
+    (logging only: adds seconds, not a compile, and never raises)."""
+    _handle_jit_event(
+        backend=backend,
+        event="compilation time",
+        fn_name=fn_name,
+        seconds=seconds,
+        gate=False,
+        count=0,
     )
 
 
@@ -307,7 +434,7 @@ def _format_verbose_triton_compile_details(kwargs: Mapping[str, object]) -> str:
     )
 
 
-def _log_triton_jit_compile(fn_name: str, kwargs) -> None:
+def _log_triton_jit_compile(fn_name: str, kwargs, seconds: float | None = None) -> None:
     detail = (
         _format_verbose_triton_compile_details(kwargs)
         if _verbose or _recorded_events is not None
@@ -318,7 +445,19 @@ def _log_triton_jit_compile(fn_name: str, kwargs) -> None:
         event="kernel JIT compilation",
         fn_name=fn_name,
         detail=detail,
+        seconds=seconds,
     )
+
+
+def _triton_compile_starts() -> dict[tuple[int, str], float]:
+    starts = getattr(_tls, "triton_starts", None)
+    if starts is None:
+        starts = _tls.triton_starts = {}
+    return starts
+
+
+def _triton_compile_id(kwargs: Mapping[str, object]) -> tuple[int, str]:
+    return id(kwargs.get("fn")), _safe_repr(kwargs.get("key"), max_len=4096)
 
 
 def _setup_triton_jit_hook() -> None:
@@ -354,13 +493,62 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
-        _log_triton_jit_compile(fn_name, kwargs)
+        started = _triton_compile_starts().pop(_triton_compile_id(kwargs), None)
+        seconds = None if started is None else time.perf_counter() - started
+        _log_triton_jit_compile(fn_name, kwargs, seconds)
         if existing_hook is not None:
             return existing_hook(**kwargs)
         return None
 
     knobs.runtime.jit_post_compile_hook = _on_jit_compile
+    # `jit_cache_hook` runs before each compile (same kwargs): it only stamps
+    # the start for the duration and returns what a pre-existing hook returns
+    # (a truthy value skips the compile, as before).
+    if hasattr(knobs.runtime, "jit_cache_hook"):
+        existing_cache_hook = knobs.runtime.jit_cache_hook
+
+        def _on_jit_compile_start(**kwargs):
+            _triton_compile_starts()[_triton_compile_id(kwargs)] = time.perf_counter()
+            if existing_cache_hook is not None:
+                return existing_cache_hook(**kwargs)
+            return None
+
+        knobs.runtime.jit_cache_hook = _on_jit_compile_start
     _triton_hook_installed = True
+
+
+def _setup_triton_autotune_listener() -> None:
+    """Log each Triton autotune benchmark with its duration (where Triton
+    has ``knobs.autotuning.listener``). Logging only: an autotune also
+    compiles its configs, which the JIT hook gates."""
+    global _triton_autotune_listener_installed
+    if not HAS_TRITON or _triton_autotune_listener_installed:
+        return
+    from triton import knobs
+
+    autotuning = getattr(knobs, "autotuning", None)
+    if autotuning is None or not hasattr(autotuning, "listener"):
+        return
+    existing = autotuning.listener
+
+    def _on_autotune(**kwargs):
+        if not kwargs.get("cache_hit"):
+            fn = kwargs.get("fn")
+            _handle_jit_event(
+                backend="Triton autotune",
+                event="autotuning",
+                fn_name=getattr(fn, "__name__", None)
+                or getattr(fn, "name", "<unknown>"),
+                detail=f"key={_safe_repr(kwargs.get('key'))}",
+                seconds=kwargs.get("duration"),
+                gate=False,
+            )
+        if existing is not None:
+            return existing(**kwargs)
+        return None
+
+    autotuning.listener = _on_autotune
+    _triton_autotune_listener_installed = True
 
 
 # ------------------------------------------------------------------
@@ -368,39 +556,105 @@ def _setup_triton_jit_hook() -> None:
 # ------------------------------------------------------------------
 
 
-def _log_cutedsl_jit_compile(fn_name: str) -> None:
-    _handle_jit_event(
-        backend="CuTeDSL",
-        event="JIT compilation",
-        fn_name=fn_name,
-    )
-
-
 class _MonitoredCuteCompile:
-    """Logs JIT compilations; a plain function would break ``cute.compile[opts]``."""
+    """Times and reports CuTe DSL compiles; a plain function would break
+    ``cute.compile[opts]``. Other attributes pass through to the wrapped
+    compile (e.g. a compile cache's markers and options).
 
-    def __init__(self, inner):
+    A compile cache can sit on either side: wrapped by this (every call is a
+    new kernel variant; one the cache serves from disk is reported as a
+    "cache load") or wrapping this (only its misses reach this). Nested
+    monitored calls report once, from the outermost.
+    """
+
+    def __init__(self, inner, backend: str = "CuTeDSL", gate: bool = True):
         self._inner = inner
+        self._backend = backend
+        self._gate = gate
 
     def __getitem__(self, options) -> "_MonitoredCuteCompile":
-        return _MonitoredCuteCompile(self._inner[options])
+        return _MonitoredCuteCompile(self._inner[options], self._backend, self._gate)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_inner"], name)
 
     def __call__(self, *args, **kwargs):
+        if "trace_finalize_hooks" in kwargs:  # a trace (cache key), not a compile
+            return self._inner(*args, **kwargs)
         kernel = args[0] if args else kwargs.get("function")
         kernel_name = getattr(kernel, "__name__", None)
         if kernel_name is None:
             kernel_name = (
                 kernel.__class__.__name__ if kernel is not None else "<unknown>"
             )
-        _log_cutedsl_jit_compile(kernel_name)
-        return self._inner(*args, **kwargs)
+        frames = getattr(_tls, "cute_frames", None)
+        if frames is None:
+            frames = _tls.cute_frames = []
+        if frames:  # inside a monitored call: it compiles, the outer reports
+            frames[-1]["compiled"] = True
+            frames.append({"compiled": True})
+            try:
+                return self._inner(*args, **kwargs)
+            finally:
+                frames.pop()
+        if self._gate and _gates_now():
+            _handle_jit_event(
+                backend=self._backend, event="JIT compilation", fn_name=kernel_name
+            )
+        frame = {"compiled": False}
+        frames.append(frame)
+        start = time.perf_counter()
+        result = None
+        try:
+            result = self._inner(*args, **kwargs)
+            return result
+        finally:
+            frames.pop()
+            seconds = time.perf_counter() - start
+            # A cache in between that served it without compiling (no
+            # monitored inner call) took a load, or handed it to a peer
+            # process (it resolves at the end of the build phase); with no
+            # cache in between (or one that cannot tell) it is a compile.
+            kind = ""
+            cached = getattr(self._inner, "_k3_cached", False) is True
+            if cached and not frame["compiled"]:
+                deferred = type(result).__name__ == "_Deferred"
+                kind = " (deferred to peer)" if deferred else " (cache load)"
+            _handle_jit_event(
+                backend=self._backend + kind,
+                event="JIT compilation",
+                fn_name=kernel_name,
+                seconds=seconds,
+                gate=self._gate,
+            )
+
+
+def _wrap_compile(owner: Any, backend: str, gate: bool) -> None:
+    """Make ``owner.compile`` a monitored compile if its outermost layer is
+    not one (a compile cache may have wrapped an earlier monitor)."""
+    compile_fn = getattr(owner, "compile", None)
+    if compile_fn is None:
+        return
+    if not isinstance(compile_fn, _MonitoredCuteCompile):
+        compile_fn = owner.compile = _MonitoredCuteCompile(compile_fn, backend, gate)
+    # A compile cache under the monitor: monitor what it calls on a miss too,
+    # so a miss reports "compiled" and a hit "cache load".
+    cache = compile_fn._inner
+    inner = getattr(cache, "_inner", None)
+    if (
+        getattr(cache, "_k3_cached", False) is True
+        and inner is not None
+        and not isinstance(inner, _MonitoredCuteCompile)
+    ):
+        cache._inner = _MonitoredCuteCompile(inner, backend, gate)
 
 
 def _setup_cutedsl_jit_hook() -> None:
-    """Wrap ``cutlass.cute.compile`` to warn on compilation."""
+    """Wrap ``cutlass.cute.compile`` (gated, as before) and
+    ``cutlass.cute.experimental.compile`` (logging only) to report compiles.
+    Re-wraps when a compile cache installed itself over an earlier monitor,
+    so the monitor stays outermost and sees every new kernel variant."""
     global _cutedsl_hook_installed
-    if _cutedsl_hook_installed:
-        return
 
     try:
         import cutlass.cute as cute
@@ -408,7 +662,13 @@ def _setup_cutedsl_jit_hook() -> None:
         logger.debug("CuTeDSL is not available; skipping CuTeDSL JIT monitor.")
         return
 
-    cute.compile = _MonitoredCuteCompile(cute.compile)
+    _wrap_compile(cute, "CuTeDSL", gate=True)
+    try:
+        experimental = importlib.import_module("cutlass.cute.experimental")
+    except Exception:
+        experimental = None
+    if experimental is not None:
+        _wrap_compile(experimental, "CuTeDSL experimental", gate=False)
     _cutedsl_hook_installed = True
 
 
@@ -541,12 +801,14 @@ def _format_verbose_tilelang_compile_details(
 def _log_tilelang_jit_compile(
     fn_name: str,
     detail: str | None = None,
+    seconds: float | None = None,
 ) -> None:
     _handle_jit_event(
         backend="TileLang",
         event="JIT compilation",
         fn_name=fn_name,
         detail=detail,
+        seconds=seconds,
     )
 
 
@@ -579,10 +841,16 @@ def _setup_tilelang_jit_hook() -> None:
     @functools.wraps(original_init)
     def _init_with_monitor(self, *args, **kwargs):
         from_database = bool(_tilelang_arg(args, kwargs, 7, "from_database", False))
-        if not from_database and _tilelang_jitimpl_compile_depth == 0:
-            func = _tilelang_arg(args, kwargs, 0, "func")
-            _log_tilelang_jit_compile(_tilelang_kernel_name(func))
-        return original_init(self, *args, **kwargs)
+        if from_database or _tilelang_jitimpl_compile_depth != 0:
+            return original_init(self, *args, **kwargs)
+        name = _tilelang_kernel_name(_tilelang_arg(args, kwargs, 0, "func"))
+        if _gates_now():
+            _log_tilelang_jit_compile(name)
+        start = time.perf_counter()
+        try:
+            return original_init(self, *args, **kwargs)
+        finally:
+            _log_tilelang_jit_compile(name, seconds=time.perf_counter() - start)
 
     jit_kernel_cls.__init__ = _init_with_monitor
 
@@ -603,16 +871,220 @@ def _setup_tilelang_jit_hook() -> None:
                     )
                 func = getattr(self, "func", None)
                 orig_func = getattr(func, "orig_func", None)
-                _log_tilelang_jit_compile(
-                    _tilelang_kernel_name(orig_func or func), detail
-                )
-                return original_compile(self, *args, **kwargs)
+                name = _tilelang_kernel_name(orig_func or func)
+                if _gates_now():
+                    _log_tilelang_jit_compile(name, detail)
+                start = time.perf_counter()
+                try:
+                    return original_compile(self, *args, **kwargs)
+                finally:
+                    _log_tilelang_jit_compile(
+                        name, detail, seconds=time.perf_counter() - start
+                    )
             finally:
                 _tilelang_jitimpl_compile_depth -= 1
 
         jit_impl_cls.compile = _compile_with_monitor
 
     _tilelang_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# FlashInfer JIT build / cubin load hook (logging only)
+# ------------------------------------------------------------------
+
+
+def _setup_flashinfer_jit_hook() -> None:
+    """Time FlashInfer JIT module builds (``JitSpec._timed_build``, else
+    ``JitSpec.build``) and cubin loads (``cubin_loader.get_artifact``, which
+    downloads a cubin missing from the local cubin directory). Logging only:
+    these events neither fail the startup verification nor raise."""
+    global _flashinfer_hook_installed
+    if _flashinfer_hook_installed:
+        return
+    try:
+        fi_core = importlib.import_module("flashinfer.jit.core")
+        fi_cubin = importlib.import_module("flashinfer.jit.cubin_loader")
+    except Exception:
+        logger.debug("FlashInfer JIT is not available; skipping its monitor.")
+        return
+
+    spec_cls = getattr(fi_core, "JitSpec", None)
+    method = next(
+        (m for m in ("_timed_build", "build") if spec_cls and hasattr(spec_cls, m)),
+        None,
+    )
+    if method is not None and not getattr(
+        getattr(spec_cls, method), "_vllm_monitored", False
+    ):
+        original_build = getattr(spec_cls, method)
+
+        @functools.wraps(original_build)
+        def _build_with_monitor(self, *args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return original_build(self, *args, **kwargs)
+            finally:
+                _handle_jit_event(
+                    backend="FlashInfer",
+                    event="JIT module build",
+                    fn_name=str(getattr(self, "name", "<unknown>")),
+                    seconds=time.perf_counter() - start,
+                    gate=False,
+                )
+
+        cast(Any, _build_with_monitor)._vllm_monitored = True
+        setattr(spec_cls, method, _build_with_monitor)
+
+    original_get = getattr(fi_cubin, "get_artifact", None)
+    if original_get is not None and not getattr(original_get, "_vllm_monitored", False):
+        cubin_dir = getattr(fi_cubin, "FLASHINFER_CUBIN_DIR", None)
+
+        @functools.wraps(original_get)
+        def _get_artifact_with_monitor(file_name, *args, **kwargs):
+            local = None
+            with suppress(Exception):
+                local = os.path.exists(os.path.join(str(cubin_dir), file_name))
+            start = time.perf_counter()
+            try:
+                return original_get(file_name, *args, **kwargs)
+            finally:
+                _handle_jit_event(
+                    backend="FlashInfer cubin",
+                    event="load" if local else "download",
+                    fn_name=os.path.basename(str(file_name)),
+                    seconds=time.perf_counter() - start,
+                    gate=False,
+                )
+
+        cast(Any, _get_artifact_with_monitor)._vllm_monitored = True
+        fi_cubin.get_artifact = _get_artifact_with_monitor
+        if getattr(fi_cubin, "get_cubin", None) is original_get:
+            fi_cubin.get_cubin = _get_artifact_with_monitor
+    _flashinfer_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# torch.utils.cpp_extension build/load hook (logging only)
+# ------------------------------------------------------------------
+
+
+def _setup_cpp_extension_hook() -> None:
+    """Time ``torch.utils.cpp_extension.load`` / ``load_inline`` (in-tree
+    .cu extensions built on first use; a cached build still checks and
+    imports). Callers that import the function at call time see the wrapper.
+    Logging only."""
+    global _cpp_extension_hook_installed
+    if _cpp_extension_hook_installed:
+        return
+    try:
+        cpp_extension = importlib.import_module("torch.utils.cpp_extension")
+    except Exception:
+        return
+    for attr in ("load", "load_inline"):
+        original = getattr(cpp_extension, attr, None)
+        if original is None or getattr(original, "_vllm_monitored", False) is True:
+            continue
+
+        def _make(original=original, attr=attr):
+            @functools.wraps(original)
+            def _load_with_monitor(*args, **kwargs):
+                name = kwargs.get("name", args[0] if args else "<unknown>")
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    _handle_jit_event(
+                        backend="torch cpp_extension",
+                        event=f"{attr} (build or cached load)",
+                        fn_name=str(name),
+                        seconds=time.perf_counter() - start,
+                        gate=False,
+                    )
+
+            cast(Any, _load_with_monitor)._vllm_monitored = True
+            return _load_with_monitor
+
+        setattr(cpp_extension, attr, _make())
+    _cpp_extension_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# DeepGEMM JIT cache watch (logging only)
+# ------------------------------------------------------------------
+
+
+class _DeepGemmCacheWatch:
+    """DeepGEMM compiles and caches its kernels in C++ (no Python hook): watch
+    its cache directory (``DG_JIT_CACHE_DIR``/cache, else ~/.deep_gemm/cache)
+    instead. A new ``<kernel>.<hash>/.committed`` is a build (its duration:
+    from the entry's oldest file to the commit); a newer ``.committed`` mtime
+    on an existing entry is a load (DeepGEMM touches it). The directory is
+    shared by the processes that use it, so an event may come from another
+    process; with a per-run cache directory they are this run's."""
+
+    def __init__(self, root: str, interval: float = 2.0):
+        self.root = root
+        self.interval = interval
+        self.seen = self._scan()
+        self._stop = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="jit-monitor-deepgemm", daemon=True
+        )
+        self.thread.start()
+
+    def _scan(self) -> dict[str, float]:
+        seen: dict[str, float] = {}
+        with suppress(OSError):
+            for entry in os.scandir(self.root):
+                with suppress(OSError):
+                    seen[entry.name] = os.stat(
+                        os.path.join(entry.path, ".committed")
+                    ).st_mtime
+        return seen
+
+    def poll(self) -> None:
+        now = self._scan()
+        for name, mtime in now.items():
+            before = self.seen.get(name)
+            if before is not None and mtime <= before:
+                continue
+            seconds = None
+            if before is None:
+                with suppress(OSError, ValueError):
+                    entry = os.path.join(self.root, name)
+                    first = min(
+                        os.stat(os.path.join(entry, f)).st_mtime
+                        for f in os.listdir(entry)
+                        if f != ".committed"
+                    )
+                    seconds = max(0.0, mtime - first)
+            _handle_jit_event(
+                backend="DeepGEMM",
+                event="kernel build" if before is None else "kernel load",
+                fn_name=name,
+                detail="cache dir watch",
+                seconds=seconds,
+                gate=False,
+            )
+        self.seen = now
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            with suppress(Exception):
+                self.poll()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _setup_deepgemm_watch() -> None:
+    global _deepgemm_watch
+    if _deepgemm_watch is not None:
+        return
+    base = os.environ.get("DG_JIT_CACHE_DIR") or os.path.expanduser("~/.deep_gemm")
+    # Watched even before DeepGEMM creates it (a scan of a missing dir is empty).
+    _deepgemm_watch = _DeepGemmCacheWatch(os.path.join(base, "cache"))
 
 
 @contextlib.contextmanager

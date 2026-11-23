@@ -101,6 +101,9 @@ def _patch_jit_modules(fake_knobs, *, cute_compile=_fake_cute_compile):
                 "triton": fake_triton,
                 **_fake_cute_import_modules(cute_compile),
                 **_fake_tilelang_import_modules(),
+                # The FlashInfer hook has its own tests (test_timing.py).
+                "flashinfer.jit.core": None,
+                "flashinfer.jit.cubin_loader": None,
             },
         ),
         mock.patch.object(jit_monitor, "HAS_TRITON", True),
@@ -146,8 +149,9 @@ def test_activate_logs_info():
         _patch_jit_modules(_make_fake_knobs()),
     ):
         jit_monitor.activate()
-    m.assert_called_once()
-    assert "Kernel JIT monitor activated" in m.call_args[0][0]
+    messages = [c[0][0] for c in m.call_args_list]
+    assert sum("Kernel JIT monitor activated" in msg for msg in messages) == 1
+    assert sum(msg.startswith("JIT_COMPILE_SUMMARY") for msg in messages) == 1
 
 
 def test_activate_rejects_unknown_mode():
