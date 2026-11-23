@@ -54,6 +54,7 @@ from ..common.primitives import (
 )
 from .kernel import load_activation_bf16x4, load_bf16x4, sigmoids
 from .verify_wide import KdaVerifyWide
+from .window import conv_put, conv_tap
 
 THREADS = 256  # 8 warps: 16 state rows each
 
@@ -369,7 +370,7 @@ class KdaVerifyStream(KdaVerifyWide):
         for s in cutlass.range_constexpr(2):
             if (s == 0) | has_v:
                 for t in cutlass.range_constexpr(3):
-                    taps[s, t] = conv_page[channels[s], offset + t]
+                    taps[s, t] = conv_tap(conv_page, channels[s], offset + t)
                 for t in cutlass.range_constexpr(4):
                     coeff[s, t] = weights[
                         sections[s], t, channels[s] - sections[s] * dim
@@ -449,9 +450,9 @@ class KdaVerifyStream(KdaVerifyWide):
                 shared_k[128 * t + c] = xs[t] * factor
         window = (taps[0, 1], taps[0, 2], *(inputs[2 * t] for t in range(T)))
         for i, value in enumerate(window):  # Q / K conv windows
-            conv_page[channels[0], i] = value
+            conv_put(conv_page, (channels[0], i), value)
         if has_v:  # V windows
             window = (taps[1, 1], taps[1, 2], *(inputs[2 * t + 1] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[channels[1], i] = value
+                conv_put(conv_page, (channels[1], i), value)
         cute.arch.sync_threads()  # q, k, v, decays, betas

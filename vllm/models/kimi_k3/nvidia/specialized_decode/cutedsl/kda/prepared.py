@@ -27,6 +27,7 @@ from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
 from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
+from .window import check_conv_cache
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
 # TP16 6), from GB300 sweeps: early predecessor-independent loads (MMA gate modes only;
@@ -502,12 +503,8 @@ class PreparedKda:
     def prepare_caches(self, caches):
         """Policy keys: a batch, or (requests, tokens) for verify steps; prepared
         operands: [requests * tokens, 4 * dim + 8] FP32."""
-        if caches[0].dtype != torch.bfloat16:  # BF16 conv window only
-            from ...shapes import Unsupported
-
-            raise Unsupported(
-                "kda", None, f"a {caches[0].dtype} conv state (this kernel reads BF16)"
-            )
+        # BF16 or FP32 conv window (window.py), checked before any compile
+        check_conv_cache(caches[0], self.dim, self.conv_dim_first, "PreparedKda")
         for key, (pitch, mode) in self.policies.items():
             requests, tokens = key if isinstance(key, tuple) else (key, 1)
             batch, meta = requests * tokens, dict(device="meta")

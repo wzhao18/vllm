@@ -542,12 +542,12 @@ def test_sampled_verify_fp64_gumbel_raises_under_sp(monkeypatch):
         SampledVerify.build(config, None)
 
 
-def test_fp32_conv_state_on_sp_only(monkeypatch):
+def test_fp32_conv_state_on_every_topology(monkeypatch):
     """An FP32 KDA conv state (--mamba-cache-dtype float32) serves on the SP topology
-    and is refused on TP16 = DCP16 (its KDA heads / verify kernels read BF16)."""
+    and on TP16 = DCP16 / TP8 = DCP8 (every TP KDA core converts the window at its
+    loads and stores: window.py, test_specialized_decode_kda_conv_fp32_tp_gpu)."""
     monkeypatch.setattr(
         runtime, "kda_dtypes", lambda config: (torch.float32, torch.float32)
     )
     assert unsupported(deployment()) is None
-    reason = unsupported(tp16())
-    assert reason is not None and "FP32 KDA conv state" in reason, reason
+    assert unsupported(tp16()) is None

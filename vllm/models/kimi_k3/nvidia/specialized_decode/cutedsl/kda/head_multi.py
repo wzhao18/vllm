@@ -65,6 +65,7 @@ from .head import (
 )
 from .head_verify import KDA_CTAS, ROWS, KdaHeadVerify
 from .kernel import sigmoids
+from .window import conv_put, conv_tap
 
 TOKEN_INPUTS = 4 * 128  # an owned token's Q | K | V | gate (128 channels / rows each)
 
@@ -521,7 +522,7 @@ class KdaHeadMulti(KdaHeadVerify):
                 channel = value_channel if s == 2 else qk_channel
                 if (s != 2) | (kt < ROWS):
                     for t in cutlass.range_constexpr(3):
-                        taps[s, t] = conv_page[s * dim + channel, offset + t]
+                        taps[s, t] = conv_tap(conv_page, s * dim + channel, offset + t)
                     for t in cutlass.range_constexpr(4):
                         coeff[s, t] = conv_w[s, t, channel]
                     if cutlass.const_expr(self.has_bias):
@@ -723,7 +724,7 @@ class KdaHeadMulti(KdaHeadVerify):
                     *(inputs[3 * t + 2] for t in range(T)),
                 )
                 for i, value in enumerate(window):
-                    conv_page[channel, i] = value
+                    conv_put(conv_page, (channel, i), value)
             if cutlass.const_expr(T == KDA_CTAS):
                 # token row ``rank`` (position ``block`` of this CTA's request)
                 wait(bar_out)
@@ -734,7 +735,7 @@ class KdaHeadMulti(KdaHeadVerify):
                     window = (taps[s, 1], taps[s, 2])
                     window += tuple(inputs[3 * u + s] for u in range(T))
                     for i, value in enumerate(window):
-                        conv_page[channel, i] = value
+                        conv_put(conv_page, (channel, i), value)
 
     @cute.jit
     def norm_row(self, kt, shared_o, output, row, qk_channel, nw, out_gate, eps):

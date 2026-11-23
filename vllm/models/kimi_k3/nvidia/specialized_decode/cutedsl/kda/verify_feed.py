@@ -69,6 +69,7 @@ from ..common.primitives import (
 from .recover import mul_rn, reciprocal, sqrt_approx, triton_exp, triton_sigmoid
 from .verify_loop import COPY_BYTES, PAGE_BYTES, K, KdaVerifyLoopStock, persistent_ctas
 from .verify_packed import CHUNKS
+from .window import conv_put, conv_tap
 
 MATH_THREADS = 256  # recurrence warps 0-7
 FEED_THREADS = 128  # feed warps 8-11
@@ -364,7 +365,10 @@ class KdaVerifyFeed(KdaVerifyLoopStock):
         n_fa: cutlass.Constexpr = n_x + 16 * T
         n_g: cutlass.Constexpr = n_fa + 16 * T
         n_b: cutlass.Constexpr = n_g + T
-        total: cutlass.Constexpr = n_b + 48 * W
+        # the conv tap blocks are staged from a BF16 window only; an FP32 window's
+        # taps are loaded (converted to BF16) per thread in ``feed_prologue``
+        staged: cutlass.Constexpr = conv_state.element_type == BFloat16
+        total: cutlass.Constexpr = n_b + 48 * W if staged else n_b
         if m < lives:
             index = live_items[m]
             item = first + index
@@ -451,7 +455,11 @@ class KdaVerifyFeed(KdaVerifyLoopStock):
         accum = zeros(3 * T, Float32)
         for s in cutlass.range_constexpr(3):
             for t in cutlass.range_constexpr(3):
-                taps[s, t] = taps_s[b, s, thread * W + offset + t]
+                if cutlass.const_expr(conv_state.element_type == BFloat16):
+                    taps[s, t] = taps_s[b, s, thread * W + offset + t]
+                else:  # FP32 window: not staged (``stage_rows``), lossless to BF16
+                    tap = conv_tap(conv_page, s * dim + channel, offset + t)
+                    taps[s, t] = tap
             for t in cutlass.range_constexpr(4):
                 coeff[s, t] = Float32(conv_w[hs, s, t, thread])
             if cutlass.const_expr(self.has_bias):
@@ -496,7 +504,7 @@ class KdaVerifyFeed(KdaVerifyLoopStock):
         for s in cutlass.range_constexpr(3):  # the conv window
             window = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[s * dim + channel, i] = value
+                conv_put(conv_page, (s * dim + channel, i), value)
 
     @cute.jit
     def feed_gate(self, args, g, lane, hs, b, fb, dts, exp_a, fas, shared_decay):

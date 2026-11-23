@@ -56,6 +56,7 @@ from .head import (
     store_bf16_canonical,
 )
 from .kernel import KdaSplit, sigmoids
+from .window import conv_put, conv_tap
 
 KDA_CTAS = 8  # CTAs that run the recurrence (KdaSplit's B1 verify: cluster 8)
 ROWS = 128 // KDA_CTAS  # state rows per KDA CTA
@@ -354,7 +355,7 @@ class KdaHeadVerify(KdaHeadWide):
                 channel = value_channel if s == 2 else qk_channel
                 if (s != 2) | (kt < ROWS):
                     for t in cutlass.range_constexpr(3):
-                        taps[s, t] = conv_page[s * dim + channel, offset + t]
+                        taps[s, t] = conv_tap(conv_page, s * dim + channel, offset + t)
                     for t in cutlass.range_constexpr(4):
                         coeff[s, t] = conv_w[s, t, channel]
                     if cutlass.const_expr(self.has_bias):
@@ -611,7 +612,7 @@ class KdaHeadVerify(KdaHeadWide):
                     *(inputs[3 * t + 2] for t in range(T)),
                 )
                 for i, value in enumerate(window):
-                    conv_page[channel, i] = value
+                    conv_put(conv_page, (channel, i), value)
             if partition < T:  # token ``partition``: the gated RMS norm
                 wait(bar_out)
                 raw_o = shared_o[self.vkda.output_position(kt)]
@@ -634,7 +635,7 @@ class KdaHeadVerify(KdaHeadWide):
                         window = (taps[s, 1], taps[s, 2])
                         window += tuple(inputs[3 * u + s] for u in range(T))
                         for i, value in enumerate(window):
-                            conv_page[channel, i] = value
+                            conv_put(conv_page, (channel, i), value)
 
 
 @cache

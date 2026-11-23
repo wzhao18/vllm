@@ -61,6 +61,7 @@ from .recover import (
 )
 from .verify_packed import CHUNKS, KdaVerifyPacked
 from .verify_wide import THREADS
+from .window import conv_put, conv_tap
 
 K = 128
 PAGE_BYTES = K * K * 4  # one (slot, head) FP32 state page
@@ -276,7 +277,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
         accum = zeros(3 * T, Float32)
         for s in cutlass.range_constexpr(3):
             for t in cutlass.range_constexpr(3):
-                taps[s, t] = conv_page[s * dim + channel, offset + t]
+                taps[s, t] = conv_tap(conv_page, s * dim + channel, offset + t)
             for t in cutlass.range_constexpr(4):
                 coeff[s, t] = weights[s, t, channel]
             if cutlass.const_expr(self.has_bias):
@@ -327,7 +328,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
         for s in cutlass.range_constexpr(3):  # the conv window
             window = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[s * dim + channel, i] = value
+                conv_put(conv_page, (s * dim + channel, i), value)
 
     @cute.jit
     def loop_gate(self, args, g, lane, head, token, shared_decay, own_gates):
@@ -461,7 +462,7 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
         accum = zeros(3 * T, Float32)
         for s in cutlass.range_constexpr(3):
             for t in cutlass.range_constexpr(3):
-                taps[s, t] = conv_page[s * dim + channel, offset + t]
+                taps[s, t] = conv_tap(conv_page, s * dim + channel, offset + t)
             for t in cutlass.range_constexpr(4):
                 coeff[s, t] = Float32(weights[s, t, channel])
             if cutlass.const_expr(self.has_bias):
@@ -506,7 +507,7 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
         for s in cutlass.range_constexpr(3):  # the conv window
             window = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[s * dim + channel, i] = value
+                conv_put(conv_page, (s * dim + channel, i), value)
 
     @cute.jit
     def loop_gate(self, args, g, lane, head, token, shared_decay, own_gates):
