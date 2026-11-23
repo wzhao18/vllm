@@ -40,7 +40,22 @@ def bump(site: str, rows: int) -> None:
         t[1].add_(int(rows))
 
 
-def report() -> None:
+_TRIGGER = _OUT + "/TRIGGER"
+_seen: set = set()
+
+
+def maybe_report() -> None:
+    """Per step (main thread): write a report for each new trigger file."""
+    try:
+        tag = open(_TRIGGER).read().strip()
+    except OSError:
+        return
+    if tag and tag not in _seen and _dev:
+        _seen.add(tag)
+        report(tag)
+
+
+def report(tag: str = "sig") -> None:
     os.makedirs(_OUT, exist_ok=True)
     lines = []
     for s, t in _dev.items():
@@ -48,6 +63,6 @@ def report() -> None:
         lines.append(f"DEV {s} calls={c} rows={r}")
     for (s, rows, cap), n in sorted(_host.items()):
         lines.append(f"HOST {s} rows={rows} capturing={cap} n={n}")
-    path = f"{_OUT}/{socket.gethostname()}-{os.getpid()}.txt"
+    path = f"{_OUT}/{tag}-{socket.gethostname()}-{os.getpid()}.txt"
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")

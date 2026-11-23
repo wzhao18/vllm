@@ -2070,6 +2070,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        from vllm import _qgcount
+
+        _qgcount.maybe_report()
         iterlog = None if dummy_run else self.iterlog
         if iterlog is not None:
             h_entry = time.perf_counter()
