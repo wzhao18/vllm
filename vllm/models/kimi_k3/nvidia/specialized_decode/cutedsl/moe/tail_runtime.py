@@ -204,7 +204,14 @@ def twoshot_spread(tp, batch, device=None):
 # AttnRes CTAs the fewer registers it holds: at 112 no AttnRes register class (56-96)
 # leaves an in-projection CTA waiting for the AttnRes to exit; at 120 the 72 and 96
 # classes do (1-GPU placement census). ``compile_tail`` raises above it.
-RUBIN_TWOSHOT_REGISTERS = 112
+# 120 since 2026-11-23: the k31 nov-11 image's ptxas allocates 116 at every TP16
+# batch (B17-64) for the unchanged kernel, so 112 refused every TP16 deployment that
+# captures 17+ rows at engine start. Registers are allocated in 8-per-thread granules,
+# so 113-120 occupy the same 120 class; --maxrregcount does not reach this compile
+# (caps 96-110 measured no change) and dropping the min_blocks_per_mp=1 launch bound
+# only reaches 114. Same code and numerics; the co-residency cost is the 120 class's
+# (above).
+RUBIN_TWOSHOT_REGISTERS = 120
 
 
 # Rubin: direct one-group batches whose latent / RS poll exits by a warp vote
