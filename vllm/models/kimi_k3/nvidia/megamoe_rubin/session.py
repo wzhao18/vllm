@@ -402,6 +402,7 @@ class RubinMegaMoeSession:
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
         self._write_spin_record_address()
+        self._write_ep_balance_address()
         # Per-launch scratch of the refreshed inference kernel (src_gp; any content
         # at launch, nothing survives it). The caching allocator aligns to 512 B.
         self.tmp_buffer = (
@@ -705,6 +706,23 @@ class RubinMegaMoeSession:
         records = spin_record.get(self.cfg.rank)
         off = ws.offset(self._RECORD_REGION)
         self.local_workspace[off : off + 8].view(torch.int64).fill_(records.address)
+
+    # dedup router (prefill: global counts) / genphase tail (decode: this rank's local counts)
+    _EPBAL_REGIONS = ("nvlink.token_comm_dedup.epbal_ring_addr", "rubin.genphase_tail.epbal_ring_addr")
+
+    def _write_ep_balance_address(self) -> None:
+        """Point this session's router at the process's served EP-balance ring (ep_balance.py)."""
+        ws = self.kernel._device_workspace
+        names = {r.name for r in ws.regions("local")}
+        regions = [r for r in self._EPBAL_REGIONS if r in names]
+        if not regions:
+            return
+        from vllm.models.kimi_k3.nvidia.megamoe_rubin import ep_balance
+
+        self._ep_balance_ring = ep_balance.new_ring(f"{self.cfg.kernel_variant}-{self.cfg.max_tokens_per_rank}", self.device)
+        for region in regions:
+            off = ws.offset(region)
+            self.local_workspace[off : off + 8].view(torch.int64).fill_(self._ep_balance_ring.address)
 
     def _stamp_issued(self) -> None:
         if torch.cuda.is_current_stream_capturing():
