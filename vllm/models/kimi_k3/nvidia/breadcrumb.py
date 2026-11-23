@@ -101,7 +101,10 @@ class _Crumbs:
             gpu = self.gpu_word()
             if gpu != gpu_prev:
                 gpu_prev, gpu_t = gpu, now
-            if gpu != self.host_code and now - gpu_t >= STALL_S:
+            # Only inside an eager forward: serving steps replay CUDA graphs and write no crumb, so outside a forward
+            # a GPU word behind the last host code is stale, not stuck (K31_BREADCRUMB false positives at serve time,
+            # REGRESS 2026-11-23: 'gpu_stuck 675s gpu_at=size#6/layer92/capture_size' on healthy prefill workers).
+            if self.in_forward and gpu != self.host_code and now - gpu_t >= STALL_S:
                 key = ("gpu", gpu, self.host_code)
                 if key != reported:
                     reported = key
@@ -148,8 +151,14 @@ def crumb(op: int, layer: int | None = None) -> None:
 
 
 def capture_size(index: int | None) -> None:
-    """Index of the capture size being warmed up / captured (None: outside the capture loop)."""
+    """Index of the capture size being warmed up / captured (None: outside the capture loop). At the end of the
+    capture loop the host and GPU words are resynchronized, so a crumb that did not reach the word during capture
+    cannot leave a stale gap behind into serving."""
     c = _get()
     c.size_idx = 0 if index is None else min(index + 1, 255)
     if index is not None:
         c.write(OP_CAPTURE_SIZE)
+    elif c.ok and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+        c.host_code, c.host_t = c.gpu_word(), time.monotonic()
+        c.in_forward = False

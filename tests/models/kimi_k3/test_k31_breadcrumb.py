@@ -212,3 +212,25 @@ def test_sigterm_shutdown_exits_cleanly_after_crumbs():
     out, _ = p.communicate(timeout=60)
     assert p.returncode == 0, (p.returncode, out[-2000:])
     assert "terminate called" not in out
+
+
+@cuda
+def test_capture_loop_end_resyncs_host_and_gpu_words():
+    # REGRESS 2026-11-23: a host code the GPU word never reached (lost during capture) left gpu != host into serving
+    # and the watcher reported 'gpu_stuck' on healthy workers. The end of the capture loop resyncs the two words.
+    from vllm.models.kimi_k3.nvidia import breadcrumb as B
+
+    B.crumb(B.OP_LAYER, 5)
+    torch.cuda.synchronize()
+    c = B._get()
+    c.host_code = (6 << 24) | (92 << 8) | B.OP_FWD_BEGIN  # a host code that never reached the GPU word
+    c.in_forward = True
+    B.capture_size(None)
+    assert c.host_code == c.gpu_word() and not c.in_forward
+
+
+def test_watcher_reports_gpu_stuck_only_inside_a_forward():
+    from vllm.models.kimi_k3.nvidia import breadcrumb as B
+
+    src = open(B.__file__).read()
+    assert "if self.in_forward and gpu != self.host_code and now - gpu_t >= STALL_S:" in src
