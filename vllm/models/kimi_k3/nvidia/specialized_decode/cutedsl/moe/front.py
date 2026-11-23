@@ -734,7 +734,8 @@ class SharedFront:
         self.wide, self.rows = wide, n
         fused = batch_table(FUSED)
         fused = {b for b in batches if b > 8 and counters is not None and fused.get(b)}
-        split = split_table(tp, q > 1, wide)
+        verify = q > 1
+        split = split_table(tp, verify, wide)
         self.split = {b: split[b] for b in fused if split.get(b)}  # down SMs
         if fused:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
