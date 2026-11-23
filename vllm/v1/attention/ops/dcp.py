@@ -1347,6 +1347,9 @@ class DirectDCPQGatherWorkspace(DirectCPWorkspace):
         if self.world_size <= 1:
             raise ValueError("Direct DCP q-gather requires at least two ranks")
         watch_device_faults(self.device)
+        from vllm import _qgcount
+
+        _qgcount.ensure(self.device)
         self.max_num_tokens = max_num_tokens
         self.heads_per_rank = heads_per_rank
         self.gathered_num_heads = gathered_num_heads
@@ -1407,6 +1410,9 @@ class DirectDCPQGatherWorkspace(DirectCPWorkspace):
         )
         query_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
         self.arrive()
+        from vllm import _qgcount
+
+        _qgcount.bump("direct_q_gather", num_tokens)
         torch.ops._C.direct_dcp_q_gather(
             local_query,
             output,

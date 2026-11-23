@@ -734,6 +734,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             if self.dcp_world_size > 1:
                 assert self.dcp_manager is not None
                 assert self.dcp_manager.query_gather is not None
+                from vllm import _qgcount
+
+                _qgcount.bump("mla_stock_dcp", mqa_q.shape[0])
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
             latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self

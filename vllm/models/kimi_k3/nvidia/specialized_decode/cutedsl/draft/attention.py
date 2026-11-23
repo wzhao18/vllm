@@ -1266,4 +1266,6 @@ class DraftLayerDcp:
             s,
         )
         self.merge(attention, metadata, rows, out)
+        from vllm import _qgcount
+        _qgcount.bump("draft_sdec_qgather", rows)
         return True

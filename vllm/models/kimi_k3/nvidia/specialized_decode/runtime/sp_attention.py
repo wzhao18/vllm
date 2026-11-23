@@ -270,6 +270,9 @@ class SpAttentionBlock:
         half (``SpOproj.produce``): returns this rank's partial to push, or None when
         the o-projection pushed it."""
         rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
+        from vllm import _qgcount
+
+        _qgcount.bump("sp_sdec_attend", rows)
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
         attn_out = self.core_output(rows)
@@ -291,6 +294,9 @@ class SpAttentionBlock:
         comm = self.comm
         n = x_shard.shape[0]
         rows = n * comm.tp
+        from vllm import _qgcount
+
+        _qgcount.bump("sp_sdec_run", rows)
         gathered = comm.all_gather(x_shard, self.parity)
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
