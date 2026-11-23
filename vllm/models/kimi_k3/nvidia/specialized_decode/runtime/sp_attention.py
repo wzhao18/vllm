@@ -42,6 +42,18 @@ block, or the build raises ``shapes.Unsupported`` naming the family, R and cause
 FULL decode capture this step cannot plan raises too (``SpStep.plan``). Nothing on
 this path falls back to the stock forward.
 
+DSA-DP (``runtime.dsa_dp_topology``: TP4 at DCP1 over the same EP MegaMoE, "DSA DP,
+GEMM TP"): every DSA layer is the stock owner-segment block, declared (family
+``dsa_dp``): stock ``_pre_attn_norm`` on the shard -> ``ops.dsa_dp.run_segment`` (the
+shard's rows pushed to their owner card, the layer with all 96 heads on the owner's
+DEP_PERM segment and the owner's per-segment DSA metadata, the outputs pushed back) ->
+stock ``_post_attn_norm``, then the layer's ``SpMlp``. KDA layers, MLPs, the drafter,
+the embedding scatter and the final gather are the SP step's as above. The runner
+keeps the DSA-DP DEP order (``DEP_PERM``, refreshed before every replay) and builds
+the DSA metadata per segment; captured rows are whole requests per TP rank (q x TP).
+Steps whose owners do not fit a captured graph run eager (``dep_eager``): the stock
+forward, counted by ``StockSteps``.
+
 Mailbox parities: ``SpComm`` alternates by SP block ordinal (DSA and KDA together),
 the DSA DcpBox by DSA-layer ordinal. With an odd block count the last block of a step
 and the first of the next share a parity; the final ``SpFinalGather`` (a TP
@@ -103,9 +115,16 @@ def sp_layer(decoder, step):
         raise Unsupported(kind, None, f"{where}: {kind} attention (DSA / KDA only)")
     if not getattr(decoder, "use_sequence_parallel", False):
         raise Unsupported("sp_step", None, f"{where}: not a sequence-parallel layer")
-    if attention.o_proj.reduce_results:
+    if getattr(step, "dsa_dp", False) and kind == "dsa":
+        # The stock DSA-DP layer (owner segment, push in / out): no o_proj reduce.
+        if not getattr(decoder, "_dsa_scatter", False):
+            raise Unsupported(
+                "dsa_dp", None,
+                f"{where}: not a DSA-DP scatter layer (ops.dsa_dp SCATTER_IN)",
+            )  # fmt: skip
+    elif attention.o_proj.reduce_results:
         raise Unsupported("oproj_rs", None, f"{where}: a reducing stock o_proj")
-    if getattr(attention, "gemm_rs_ar", None) is not None:
+    elif getattr(attention, "gemm_rs_ar", None) is not None:
         raise Unsupported(
             "oproj_rs", None, f"{where}: a fused GEMM + reduce-scatter stock o_proj"
         )
@@ -387,16 +406,34 @@ class SpStep:
     gathers) happen here, in layer order on every rank, before the KV cache is
     profiled."""
 
+    # DSA-DP (``runtime.dsa_dp_topology``): the stock DSA-DP layers' indices.
+    dsa_dp = False
+    stock_dsa: frozenset = frozenset()
+
     def __init__(self, runtime):
         self.runtime = runtime
         self.ctx = ctx = runtime.context
         self.q, self.device = ctx.q, runtime.device
         backbone = runtime.backbone
-        if not ctx.sequence_parallel or ctx.tp != ctx.dcp:
+        # DSA-DP (TP4 at DCP1): the DSA layers are the stock owner-segment block.
+        self.dsa_dp = dsa_dp = bool(getattr(runtime, "dsa_dp", False))
+        if not ctx.sequence_parallel or ctx.tp != ctx.dcp and not (
+            dsa_dp and ctx.dcp == 1
+        ):
             raise Unsupported(
                 "sp_step", None,
-                f"TP{ctx.tp} / DCP{ctx.dcp}, sequence parallel {ctx.sequence_parallel}",
+                f"TP{ctx.tp} / DCP{ctx.dcp}, sequence parallel {ctx.sequence_parallel}"
+                f", DSA-DP {dsa_dp}",
             )  # fmt: skip
+        if dsa_dp:
+            from ...ops import dsa_dp as dsa_dp_ops
+
+            if not dsa_dp_ops.ENABLED:
+                raise Unsupported(
+                    "dsa_dp", None,
+                    "the DSA-DP layout without ops.dsa_dp configured (the runner's "
+                    "DEP order and per-segment DSA metadata)",
+                )  # fmt: skip
         if not getattr(backbone, "use_sequence_parallel", False):
             raise Unsupported("sp_step", None, "the backbone is not sequence-parallel")
         if not getattr(backbone, "use_attn_res", False):
@@ -404,10 +441,16 @@ class SpStep:
         self.rows = rows = tuple(sorted(set(runtime.captured)))
         if not rows:
             raise Unsupported("sp_step", None, "no captured FULL decode graphs")
+        # DSA-DP: whole q-token requests per TP rank (ops.dsa_dp.dep_order).
+        unit = self.q * ctx.tp if dsa_dp else self.q
         for r in rows:
             shape = Shape(r, self.q)
-            if r % self.q:
-                raise Unsupported("sp_step", shape, f"not whole q{self.q} requests")
+            if r % unit:
+                raise Unsupported(
+                    "sp_step", shape,
+                    f"not whole q{self.q} requests"
+                    + (f" per TP{ctx.tp} rank (DSA-DP)" if dsa_dp else ""),
+                )  # fmt: skip
             shard_rows(shape, ctx)
         self.shard_cap = rows[-1] // ctx.tp
         if self.shard_cap >= 256:  # normalize: one stock RMSNorm launch per shard
@@ -417,6 +460,24 @@ class SpStep:
         self.layers = layers = runtime.layers
         for decoder in layers:
             sp_layer(decoder, self)
+        # The stock DSA-DP layers (declared ``dsa_dp``); every other layer is an SP
+        # block.
+        self.stock_dsa = frozenset(
+            d.layer_idx
+            for d in layers
+            if dsa_dp and attention_kind(d.self_attn) == "dsa"
+        )
+        if layers and layers[0].layer_idx in self.stock_dsa:
+            raise Unsupported(
+                "dsa_dp", None,
+                "a DSA first layer (the embedding scatter feeds an SP block)",
+            )  # fmt: skip
+        for d in layers:
+            if d.layer_idx in self.stock_dsa:
+                # As the stock load (KimiLinearForCausalLM.load_weights without the
+                # specialized decode): the fused DSA forward where it applies.
+                d.self_attn.pack_projections()
+        blocks = [d for d in layers if d.layer_idx not in self.stock_dsa]
         # The release (GQA) drafter's pieces are its own strict build's; the preview
         # (MLA) drafter is the declared stock module but for its attention.
         spec = get_current_vllm_config().speculative_config
@@ -439,7 +500,12 @@ class SpStep:
         prefix_only = not (backbone._aux_attn_res_stream and backbone.use_attn_res)
         indices = {d.layer_idx for d in layers}
         for k, a in enumerate(self.aux_layers):
-            if prefix_only and a in indices and a != backbone.start_layer:
+            if (
+                prefix_only
+                and a in indices
+                and a != backbone.start_layer
+                and a not in self.stock_dsa  # (its stock pre-AttnRes keeps no row)
+            ):
                 self.early_aux[a] = WIDTH * (1 + k)
         self.tail_cols = (0,) + tuple(
             WIDTH * (1 + k)
@@ -455,7 +521,7 @@ class SpStep:
             for col in self.early_aux.values():
                 self.final_gather.prepare_push(r, col, WIDTH)
         self.embedding = sp_embedding(backbone.embed_tokens, ctx)
-        kinds = {attention_kind(d.self_attn) for d in layers}
+        kinds = {attention_kind(d.self_attn) for d in blocks}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
         if "dsa" in kinds:
@@ -469,9 +535,11 @@ class SpStep:
         if "kda" in kinds:
             # "deferred": the KDA cores fold the commit (KimiK3ModelState binds it).
             self.records = prepare_recoverssm(layers, ctx)
+        # (ordinal over the SP blocks only: the SpComm users; the stock DSA-DP
+        # layers exchange through their own Lamport buffers)
         self.blocks = {
             d.layer_idx: SpAttentionBlock(d, self, ordinal)
-            for ordinal, d in enumerate(layers)
+            for ordinal, d in enumerate(blocks)
         }
         self.dense = any(not d.is_moe_layer for d in layers)
         self.moe = any(d.is_moe_layer for d in layers)
@@ -495,7 +563,8 @@ class SpStep:
         for index, nxt in zip(order, order[1:]):
             mlp = self.mlps.get(index)
             aux_bf16 = index + 1 in self.aux_layers and index + 1 not in self.early_aux
-            if mlp is not None and mlp.parts and not aux_bf16:
+            # (a stock DSA-DP layer's pre-AttnRes takes BF16 rows)
+            if mlp is not None and mlp.parts and not aux_bf16 and nxt in self.blocks:
                 self.parts_ok[index] = True
                 delta_parts[nxt] = tuple(sorted(set(mlp.parts.values())))
         # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
@@ -505,7 +574,7 @@ class SpStep:
                 d, self.comm, self.blocks[d.layer_idx], rows,
                 self.mlps.get(d.layer_idx), delta_parts.get(d.layer_idx, ()),
             )  # fmt: skip
-            for d in layers
+            for d in blocks
         }
         self.table = self.plan_coverage()
         self.table.assert_complete(rows)
@@ -522,10 +591,11 @@ class SpStep:
         )
         logger.info_once(
             "Kimi K3 SP decode (TP%d = DCP%d over DP%d, EP%d, q%d, rows %d-%d, %d "
-            "graphs): %d SP blocks (%s), RecoverSSM %s; SP mailboxes %.0f MiB "
-            "symmetric; %s",
+            "graphs): %d SP blocks (%s), %d stock DSA-DP layers, RecoverSSM %s; SP "
+            "mailboxes %.0f MiB symmetric; %s",
             ctx.tp, ctx.dcp, ctx.dp, ctx.ep, self.q, rows[0], rows[-1], len(rows),
-            len(self.blocks), "/".join(sorted(kinds)), self.records,
+            len(self.blocks), "/".join(sorted(kinds)), len(self.stock_dsa),
+            self.records,
             self.comm.nbytes() / 2**20, drafter,
             scope="global",
         )  # fmt: skip
@@ -565,6 +635,12 @@ class SpStep:
             declared["dense"] = "stock dense MLP on the shard"
         if method == "synthetic":
             declared["verify"] = "stock (synthetic rejection)"
+        if self.stock_dsa:
+            declared["dsa_dp"] = (
+                f"{len(self.stock_dsa)} DSA layers: stock DSA-DP owner segment "
+                "(pre-AttnRes, dsa_dp.run_segment push in / all heads / push out, "
+                "post-AttnRes); their MLPs: moe_dense"
+            )
         return declared
 
     def plan_coverage(self):
@@ -638,8 +714,27 @@ class SpStep:
                 f"a FULL decode capture that is not a q{self.q} verify",
             )
         layers = self.layers
-        metadata = [decode_metadata(d.self_attn, context, q, b) for d in layers]
-        missing = [d.layer_idx for d, md in zip(layers, metadata) if md is None]
+        if self.stock_dsa:
+            from ...ops import dsa_dp
+
+            if dsa_dp.graph_mode() != CUDAGraphMode.FULL:
+                raise Unsupported(
+                    "dsa_dp", shape,
+                    f"a FULL capture whose DSA-DP mode is {dsa_dp.graph_mode()} "
+                    "(the runner's DEP order is not set)",
+                )  # fmt: skip
+        # The stock DSA-DP layers read the owner segment's metadata themselves.
+        metadata = [
+            None
+            if d.layer_idx in self.stock_dsa
+            else decode_metadata(d.self_attn, context, q, b)
+            for d in layers
+        ]
+        missing = [
+            d.layer_idx
+            for d, md in zip(layers, metadata)
+            if md is None and d.layer_idx not in self.stock_dsa
+        ]
         if missing:
             raise Unsupported(
                 "sp_step", shape,
@@ -693,18 +788,25 @@ class SpStep:
         main = torch.cuda.current_stream(self.device)
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
-            block, bound = self.blocks[index], self.bounds[index]
-            gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
-            col = early.get(index)
-            if col is not None:  # prefix_sum now holds the previous layer's aux row
-                self.side.wait_stream(main)
-                with torch.cuda.stream(self.side):
-                    self.final_gather.push(prefix_sum, col)
-            partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
-            if col is not None:  # the reduce updates prefix_sum in place
-                main.wait_stream(self.side)
-            out = prefix_sum.new_empty(prefix_sum.shape)
-            hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
+            bound = self.bounds.get(index)
+            if bound is None:  # a stock DSA-DP layer (declared ``dsa_dp``)
+                hidden, prefix_sum, residual = self.run_dsa_dp(
+                    layer, step, hidden, prefix_sum, residual
+                )
+            else:
+                block = self.blocks[index]
+                gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
+                col = early.get(index)
+                if col is not None:  # prefix_sum holds the previous layer's aux row
+                    self.side.wait_stream(main)
+                    with torch.cuda.stream(self.side):
+                        self.final_gather.push(prefix_sum, col)
+                partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
+                if col is not None:  # the reduce updates prefix_sum in place
+                    main.wait_stream(self.side)
+                out = prefix_sum.new_empty(prefix_sum.shape)
+                hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
+            prequantized = bound is not None and bound.out_mx is not None
             mlp = self.mlps.get(index)
             dense = self.dense_mlps.get(index)
             if dense is not None and dense.serves(hidden.shape[0]):
@@ -713,7 +815,7 @@ class SpStep:
                 hidden = layer.mlp(hidden)
             else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
                 hidden = mlp.run(
-                    hidden, prequantized=bound.out_mx is not None,
+                    hidden, prequantized=prequantized,
                     parts=self.parts_ok.get(index, False),
                 )  # fmt: skip
             if index + 1 in self.aux_layers and index + 1 not in early:
@@ -756,12 +858,25 @@ class SpStep:
         aux = remote + aux
         return (hidden, aux) if aux else hidden
 
+    def run_dsa_dp(self, layer, step, hidden, prefix_sum, residual):
+        """A stock DSA-DP layer's attention half on this rank's shard, as the stock
+        decoder's ``_dsa_scatter`` FULL-graph path runs it: the pre-AttnRes, the
+        owner-segment exchange and attention (``ops.dsa_dp.run_segment``), the
+        post-AttnRes. Returns (the MLP input, the prefix sum, the saved blocks)."""
+        from ...ops import dsa_dp
+
+        x, prefix_sum, residual = layer._pre_attn_norm(hidden, residual, prefix_sum)
+        x = dsa_dp.run_segment(layer.self_attn, step.positions, x)
+        return layer._post_attn_norm(x, residual, prefix_sum)
+
     def prepare_kv(self):
         """Compile every block's core for the bound KV cache (the profiling cache,
         then the real one), before any capture."""
         from .decode import caches_of
 
         for decoder in self.layers:
+            if decoder.layer_idx in self.stock_dsa:
+                continue
             block, caches = self.blocks[decoder.layer_idx], caches_of(decoder.self_attn)
             if block.kind == "dsa":
                 block.core.prepare_cache(caches[0])
@@ -775,6 +890,8 @@ class SpStep:
         gather is collective). The packed DSA in-projection is the stock linears'
         storage (``pack_dsa_projection``), so it is current already."""
         for decoder in self.layers:
+            if decoder.layer_idx in self.stock_dsa:
+                continue
             block = self.blocks[decoder.layer_idx]
             if block.kind == "kda":
                 block.core.process_weights_after_loading()

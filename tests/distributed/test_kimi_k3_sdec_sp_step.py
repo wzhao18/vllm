@@ -140,3 +140,46 @@ def test_plan_full_capture_never_stock(monkeypatch):
     step = planner(monkeypatch, True, CUDAGraphMode.FULL, spec_decodes=0)
     with pytest.raises(shapes.Unsupported, match="not a q4 verify"):
         step.plan(positions(8), None)
+
+
+# DSA-DP (TP4 at DCP1): the DSA layers are the declared stock owner segment.
+def dsa_dp_planner(monkeypatch, mode):
+    from vllm.models.kimi_k3.nvidia.ops import dsa_dp
+
+    step = planner(monkeypatch, True, CUDAGraphMode.FULL)
+    kda = SimpleNamespace(layer_idx=0, self_attn=SimpleNamespace(prefix="kda0"))
+    dsa = SimpleNamespace(layer_idx=3, self_attn=SimpleNamespace(prefix="dsa3"))
+    step.layers, step.stock_dsa, step.dsa_dp = (kda, dsa), frozenset({3}), True
+    monkeypatch.setattr(dsa_dp, "graph_mode", lambda: mode)
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import decode
+
+    # Only the KDA layer has uniform verify metadata (the DSA layer's is per owner
+    # segment, read by the stock layer itself).
+    monkeypatch.setattr(
+        decode,
+        "decode_metadata",
+        lambda attention, context, q, b: "md" if attention.prefix == "kda0" else None,
+    )
+    return step
+
+
+def test_dsa_dp_plan_skips_the_stock_dsa_metadata(monkeypatch):
+    step = dsa_dp_planner(monkeypatch, CUDAGraphMode.FULL)
+    plan = step.plan(positions(16), None)
+    assert plan.metadata == ["md", None]
+
+
+def test_dsa_dp_plan_raises_without_the_dep_order(monkeypatch):
+    step = dsa_dp_planner(monkeypatch, CUDAGraphMode.PIECEWISE)
+    with pytest.raises(shapes.Unsupported, match="dsa_dp"):
+        step.plan(positions(16), None)
+
+
+def test_dsa_dp_coverage_declares_the_stock_dsa(monkeypatch):
+    step = stand_in_step(monkeypatch, [Block("kda")])
+    step.stock_dsa = frozenset({3, 7})
+    table = step.plan_coverage()
+    table.assert_complete(ROWS)
+    assert table.plan[16]["dsa_dp"].path is shapes.Path.DECLARED
+    assert "dsa" not in table.plan[16]
+    assert "dsa_dp" in shapes.DECLARED_STOCK

@@ -247,11 +247,15 @@ def rows_policy(entry, shape: Shape, default: Any = _MISSING, name: str = "polic
     return default
 
 
-def captured_rows(capture_sizes: Iterable[int], q: int, limit: int) -> tuple[int, ...]:
+def captured_rows(
+    capture_sizes: Iterable[int], q: int, limit: int, multiple: int = 1
+) -> tuple[int, ...]:
     """Token rows of the FULL decode graphs a deployment captures: the runner rounds
-    each capture size up to whole q-token requests and drops those above ``limit``
+    each capture size up to whole q-token requests (``multiple`` requests: the
+    runner's ``row_multiple``, TP under DSA-DP) and drops those above ``limit``
     (max_num_seqs * q and the largest capture size)."""
-    rows = {-(-size // q) * q for size in capture_sizes}
+    unit = q * multiple
+    rows = {-(-size // unit) * unit for size in capture_sizes}
     return tuple(sorted(m for m in rows if m <= limit))
 
 
@@ -265,6 +269,10 @@ DECLARED_STOCK = frozenset(
         "attn_res",
         "moe",
         "dense",
+        # DSA-DP (``runtime.dsa_dp_topology``): each DSA layer's attention runs the
+        # stock owner segment (ops/dsa_dp.py ``run_segment``) between the SP
+        # step's KDA / MoE blocks.
+        "dsa_dp",
         "final_gather",
         "lm_head",
         "sampler",

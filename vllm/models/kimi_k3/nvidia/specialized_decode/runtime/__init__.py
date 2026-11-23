@@ -35,6 +35,9 @@ class DecodeConfig:
     ep: int = 1
     # ReplaySSM / RecoverSSM records on the KDA layers (--use-replayssm; SP only).
     replayssm: bool = False
+    # The SP topology's DSA-DP variant (``dsa_dp_topology``): TP4 attention groups at
+    # DCP1 whose DSA layers run data-parallel inside the TP group (ops/dsa_dp.py).
+    dsa_dp: bool = False
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -69,8 +72,11 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         q=q,
         capture_sizes=sizes,
         bf16_state=kda_dtypes(vllm_config)[1] == torch.bfloat16,
-        captured=captured_rows(sizes, q, limit),
+        # DSA-DP: the runner rounds every FULL decode graph to whole q-token requests
+        # per TP rank (``row_multiple``; ops/dsa_dp.py dep_order).
+        captured=captured_rows(sizes, q, limit, multiple=dsa_dp_rows(vllm_config)),
         sequence_parallel=sp_topology(vllm_config),
+        dsa_dp=dsa_dp_topology(vllm_config),
         dp=parallel.data_parallel_size,
         ep=(
             parallel.tensor_parallel_size * parallel.data_parallel_size
@@ -81,18 +87,16 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     )
 
 
-def sp_topology(vllm_config) -> bool:
-    """Whether the deployment is the sequence-parallel decode topology: TP4 = DCP4
-    attention groups (one pipeline stage) over expert-parallel MegaMoE without the
-    MoE token shard, i.e. the stock K3 decoder's ``use_sequence_parallel`` at TP4 =
-    DCP4. Any native MegaMoE backend (DeepGEMM, or Rubin on SM107): the SP step runs
-    the stock MoE module on the shard either way."""
+def sp_layout(vllm_config) -> bool:
+    """TP4 attention groups (one pipeline stage) over expert-parallel MegaMoE without
+    the MoE token shard: the stock K3 decoder's ``use_sequence_parallel`` at TP4. Any
+    native MegaMoE backend (DeepGEMM, or Rubin on SM107): the SP step runs the stock
+    MoE module on the shard either way. Its DCP is ``sp_topology``'s."""
     from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 
     parallel = vllm_config.parallel_config
     if not (
         parallel.tensor_parallel_size == 4
-        and parallel.decode_context_parallel_size == 4
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
@@ -101,6 +105,41 @@ def sp_topology(vllm_config) -> bool:
     from ...model import use_moe_token_shard
 
     return not use_moe_token_shard(vllm_config)
+
+
+def dsa_dp_topology(vllm_config) -> bool:
+    """The SP layout at DCP1 on a model with DSA layers (K3.1): DSA-DP decode ("DSA
+    DP, GEMM TP", ops/dsa_dp.py). Each request's DSA rows run on its owner card with
+    all heads (stock ``dsa_dp.run_segment``, declared); KDA, MoE and the layer
+    boundaries are the SP step's. ``dsa_dp.supported`` admits DSA-DP under the
+    specialized decode on this layout only (its plain TP8 / TP16 layouts keep the
+    replicated DSA KV). Config values only."""
+    parallel = vllm_config.parallel_config
+    text = vllm_config.model_config.hf_text_config
+    return (
+        getattr(text, "dsa_config", None) is not None
+        and parallel.decode_context_parallel_size == 1
+        and getattr(parallel, "prefill_context_parallel_size", 1) == 1
+        and sp_layout(vllm_config)
+    )
+
+
+def dsa_dp_rows(vllm_config) -> int:
+    """Requests per FULL decode graph are a multiple of this (the runner's DSA-DP
+    ``row_multiple``: TP), 1 outside DSA-DP."""
+    if not dsa_dp_topology(vllm_config):
+        return 1
+    return vllm_config.parallel_config.tensor_parallel_size
+
+
+def sp_topology(vllm_config) -> bool:
+    """Whether the deployment is the sequence-parallel decode topology: the SP layout
+    (``sp_layout``) at TP4 = DCP4 (C512's decode role: SP DSA blocks over the DCP4
+    DSA KV), or at DCP1 with DSA-DP (``dsa_dp_topology``)."""
+    if not sp_layout(vllm_config):
+        return False
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    return dcp == 4 or dsa_dp_topology(vllm_config)
 
 
 def conv_dtypes():
@@ -177,8 +216,8 @@ def unsupported(vllm_config) -> str | None:
         ),
         (
             parallel.tensor_parallel_size not in (8, 16) and not sp,
-            "TP other than 8/16 (TP4 only as TP4 = DCP4 sequence parallelism over "
-            "expert-parallel MegaMoE)",
+            "TP other than 8/16 (TP4 only as TP4 = DCP4 or DSA-DP DCP1 sequence "
+            "parallelism over expert-parallel MegaMoE)",
         ),
         (
             online_linear_quantization(vllm_config.model_config.quantization_config),
@@ -188,7 +227,8 @@ def unsupported(vllm_config) -> str | None:
         (parallel.pipeline_parallel_size != 1, "pipeline parallelism"),
         (
             parallel.enable_expert_parallel and not sp,
-            "expert parallelism (except TP4 = DCP4 sequence parallelism over MegaMoE)",
+            "expert parallelism (except TP4 = DCP4 or DSA-DP DCP1 sequence "
+            "parallelism over MegaMoE)",
         ),
         (parallel.use_ubatching, "DBO"),
         (
@@ -233,8 +273,8 @@ def unsupported(vllm_config) -> str | None:
                 or vllm_config.cache_config.use_kda_recoverssm
             )
             and not sp,
-            "ReplaySSM / RecoverSSM (--use-replayssm) outside TP4 = DCP4 sequence "
-            "parallelism",
+            "ReplaySSM / RecoverSSM (--use-replayssm) outside TP4 sequence "
+            "parallelism (DCP4 or DSA-DP)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -338,6 +378,7 @@ def sp_unsupported(vllm_config) -> str | None:
     )
     dsa = getattr(vllm_config.model_config.hf_text_config, "dsa_config", None)
     fp8 = cache.cache_dtype in ("fp8", "fp8_e4m3")
+    dsa_dp = dsa_dp_topology(vllm_config)
     checks = (
         (
             not current_platform.is_device_capability((10, 7)),
@@ -373,43 +414,58 @@ def sp_unsupported(vllm_config) -> str | None:
             f"more than {SP_MAX_ROWS} verify rows (max_num_seqs x q)",
         ),
         (
-            parallel.decode_context_parallel_size != parallel.tensor_parallel_size,
-            "decode context parallel other than TP",
+            parallel.decode_context_parallel_size != parallel.tensor_parallel_size
+            and not dsa_dp,
+            "decode context parallel other than TP (or DCP1 with DSA-DP)",
+        ),
+        # DSA-DP: the release (GQA) drafter's strict build (``runtime.draft``); the
+        # preview drafter's specialized attention (DraftDcp) needs DCP = TP.
+        (
+            dsa_dp and not _gqa_drafter(spec),
+            "DSA-DP with a DSpark drafter but the release GQA one (K3GqaDSparkModel)",
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)
     if reason is None:
-        reason = sp_unaligned(vllm_config, q, parallel.tensor_parallel_size)
+        tp, multiple = parallel.tensor_parallel_size, dsa_dp_rows(vllm_config)
+        reason = sp_unaligned(vllm_config, q, tp, multiple=multiple)
     return None if reason is None else f"sequence parallelism on {reason}"
 
 
-def sp_aligned_rows(q: int, tp: int, top: int) -> tuple[int, ...]:
-    """The verify row counts the SP decode can capture up to ``top``: multiples of
-    lcm(q, TP) (whole q-token requests that split evenly over the TP ranks)."""
+def sp_row_step(q: int, tp: int, multiple: int = 1) -> int:
+    """The SP decode's captured rows are multiples of this: lcm(q, TP) (whole q-token
+    requests that split evenly over the TP ranks), and under DSA-DP (``multiple`` =
+    TP) whole requests per TP rank, q x TP (ops/dsa_dp.py dep_order)."""
     import math
 
-    step = math.lcm(q, tp)
+    return math.lcm(q, tp, q * multiple)
+
+
+def sp_aligned_rows(
+    q: int, tp: int, top: int, multiple: int = 1
+) -> tuple[int, ...]:
+    """The verify row counts the SP decode can capture up to ``top``
+    (``sp_row_step``)."""
+    step = sp_row_step(q, tp, multiple)
     return tuple(range(step, top + 1, step))
 
 
-def sp_unaligned(vllm_config, q: int, tp: int) -> str | None:
+def sp_unaligned(vllm_config, q: int, tp: int, multiple: int = 1) -> str | None:
     """Why the deployment's FULL decode graphs do not suit the SP decode: it shards
     every captured R = B x q verify rows evenly over the TP ranks (rank r owns rows
-    [r R / TP, (r + 1) R / TP)), so every R must be a multiple of lcm(q, TP). Batches
-    between two captured sizes run the next captured graph with the runner's padded
-    requests (their rows are discarded). Where the deployment captures its largest
-    batch (max_num_seqs x q within the largest capture size), that batch needs an
-    aligned graph too, else it would run the stock forward. None when aligned."""
-    import math
-
+    [r R / TP, (r + 1) R / TP)), so every R must be a multiple of ``sp_row_step``.
+    Batches between two captured sizes run the next captured graph with the runner's
+    padded requests (their rows are discarded). Where the deployment captures its
+    largest batch (max_num_seqs x q within the largest capture size), that batch needs
+    an aligned graph too, else it would run the stock forward. None when aligned."""
     from ..shapes import captured_rows
 
     compilation = vllm_config.compilation_config
     sizes = tuple(compilation.cudagraph_capture_sizes or ())
     seqs = vllm_config.scheduler_config.max_num_seqs
     limit = min(seqs * q, compilation.max_cudagraph_capture_size or max(sizes, default=0))
-    rows = captured_rows(sizes, q, limit)
-    step = math.lcm(q, tp)
+    rows = captured_rows(sizes, q, limit, multiple=multiple)
+    step = sp_row_step(q, tp, multiple)
     bad = [r for r in rows if r % step]
     top = seqs * q
     # An unaligned largest batch within the capture range has no FULL graph at any
@@ -420,7 +476,7 @@ def sp_unaligned(vllm_config, q: int, tp: int) -> str | None:
     top_ok = top > cap or top % step == 0
     if not bad and top_ok:
         return None
-    want = sp_aligned_rows(q, tp, limit - limit % step)
+    want = sp_aligned_rows(q, tp, limit - limit % step, multiple)
     hint = (
         f"capture sizes {list(want[:3])} .. {want[-1] if want else step} (every "
         f"{step} rows) and max_num_seqs a multiple of {step // q}"
@@ -428,14 +484,20 @@ def sp_unaligned(vllm_config, q: int, tp: int) -> str | None:
     if bad:
         return (
             f"captured q{q} decode rows {bad[:6]}{' ...' if len(bad) > 6 else ''} "
-            f"that do not split over TP{tp} (rows must be multiples of lcm(q, TP) = "
-            f"{step}; use {hint})"
+            f"that do not split over TP{tp} (rows must be multiples of {step}; use "
+            f"{hint})"
         )
     return (
         f"max_num_seqs {seqs} x q{q} = {top} rows without an aligned FULL decode "
-        f"graph (rows must be multiples of lcm(q, TP) = {step}, the largest batch "
-        f"captured; use {hint})"
+        f"graph (rows must be multiples of {step}, the largest batch captured; use "
+        f"{hint})"
     )
+
+
+def _gqa_drafter(spec) -> bool:
+    draft = getattr(spec, "draft_model_config", None)
+    architectures = getattr(draft, "architectures", None) or ()
+    return "K3GqaDSparkModel" in architectures
 
 
 def _stock_prims_ts(vllm_config) -> bool:
