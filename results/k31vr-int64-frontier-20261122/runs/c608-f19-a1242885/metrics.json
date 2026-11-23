@@ -1,0 +1,1 @@
+{"label": "c608-f19", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1242885-agx-x8-k3-c608-f19-1122104139", "gpus": 32, "ok": 86606, "err": 14, "span_min": 60.5, "tput_per_gpu": 107446.7, "p90_itl_ms": 7.8, "p90_intvty": 128.21, "p90_e2e_norm_intvty": 34.72, "p90_e2el_s": 20.515, "p90_ttft_s": 4.014, "p50_ttft_s": 2.007}

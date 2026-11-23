@@ -1,0 +1,359 @@
+name: coreai_cserve_dev-k31e2e.agx-r8-k3-c512-f19-ev
+schema: 2
+model:
+  path: hf:moonshotai/Kimi-K3
+  container: k31ws/img:kimi-k31-wzhao-nov-11
+  precision: fp4
+identity:
+  model:
+    repo: moonshotai/Kimi-K3
+  container:
+    image: k31ws/img:kimi-k31-wzhao-nov-11
+  frameworks:
+    vllm: k31ws E2E overlay g-15c281dc32 (prefill AND decode, at /k31ov), NVFP4 real weights 1d820323, release DSpark drafter e4e6e626 (sha256 83a4f35d), k=3 synthetic AL 3.08, load-format safetensors
+    dynamo: 1.6.1+k31
+dynamo:
+  install: false
+slurm:
+  time_limit: 05:00:00
+health_check:
+  max_attempts: 720
+  interval_seconds: 10
+resources:
+  gpu_type: vrnvl72
+  gpus_per_node: 4
+services:
+- name: etcd
+  type: etcd
+  placement:
+    node: infra
+- name: nats
+  type: nats
+  placement:
+    node: infra
+  options:
+    max_payload_mb: 32
+- name: mooncake-master
+  type: mooncake-master
+  args:
+  - --default_kv_lease_ttl=5000
+  - --eviction_high_watermark_ratio=0.95
+  - --eviction_ratio=0.10
+  options:
+    store_config:
+      metadata_server: P2PHANDSHAKE
+      global_segment_size: 250GB
+      local_buffer_size: 4GB
+      protocol: rdma
+      device_name: roce_vf0_r1,roce_vf0_r2,roce_vf0_r3,roce_vf0_r4,roce_vf1_r1,roce_vf1_r2,roce_vf1_r3,roce_vf1_r4
+      mode: embedded
+      enable_offload: false
+  command:
+  - bash
+  - /opt/k3/bin/mc_exec_0314.sh
+  - mooncake_master
+  - --port=8700
+  - --enable_http_metadata_server=true
+  - --http_metadata_server_port=8701
+  - --rpc_thread_num=16
+  - --enable_metric_reporting=true
+  - --metrics_port=8702
+- name: dloan
+  type: generic
+  start: before_workers
+  placement:
+    node: decode
+  command:
+  - bash
+  - /opt/k3/bin/mc_exec_0314.sh
+  - bash
+  - /opt/k3/bin/dloan.sh
+  cpu_bind: none
+  env:
+    DLOAN_MASTER: '{infra_ip}:8700'
+    DLOAN_ADMIN: '{infra_ip}:8702'
+    DLOAN_HOST: '{node_ip}'
+    DLOAN_INDEX: '{index}'
+    DLOAN_GB: '950'
+    DLOAN_NICS0: roce_vf0_r1,roce_vf0_r2,roce_vf0_r3,roce_vf0_r4,roce_vf1_r1,roce_vf1_r2,roce_vf1_r3,roce_vf1_r4
+    DLOAN_NICS1: roce_vf0_r1,roce_vf0_r2,roce_vf0_r3,roce_vf0_r4,roce_vf1_r1,roce_vf1_r2,roce_vf1_r3,roce_vf1_r4
+    DLOAN_SPLIT: '2'
+    DLOAN_OUT: /logs/dloan
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: least-loaded
+    router-session-affinity-ttl-secs: 900
+    trust-remote-code: true
+  env:
+    DYN_FORWARD_SESSION_ID: '1'
+    DYN_METADATA_HEADER: x-dynamo-
+    DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: '3600'
+    DYN_TOKENIZER_CACHE_BYTES: '8589934592'
+    DYN_TCP_REQUEST_TIMEOUT: '120'
+    DYN_VLLMPROC_FIXES: '1'
+    PYTHONPATH: /opt/k3/ov-fe:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+    HF_HUB_OFFLINE: '1'
+    HF_HUB_CACHE: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/E2E-PERF/hfhub
+engine:
+  type: vllm
+  connector: null
+environment:
+  W1_MC_OVERLAY: /opt/k3/mooncake-0.3.14
+  UCX_GPU_NIC_ASSIGNMENT_MODE: 'off'
+  DYN_TCP_REQUEST_TIMEOUT: '120'
+  DYN_REQUEST_PLANE: tcp
+  ETCD_LEASE_TTL: '600'
+  VLLM_USE_DIRECT_DCP_A2A: '1'
+  VLLM_USE_DIRECT_DCP_Q_GATHER: '1'
+  VLLM_USE_DIRECT_DCP_KV_GATHER: '1'
+  VLLM_ALLREDUCE_USE_FLASHINFER: '1'
+  VLLM_RPC_TIMEOUT: '600000'
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  VLLM_USE_RUST_FRONTEND: '1'
+  VLLM_SERVER_DEV_MODE: '1'
+  VLLM_ENGINE_READY_TIMEOUT_S: '5400'
+  VLLM_MOONCAKE_LOAD_RECV_THREADS: '4'
+  MC_SLICE_SIZE: '1048576'
+  MC_MAX_MR_SIZE: '4294967296'
+  MC_ENABLE_DEST_DEVICE_AFFINITY: '1'
+  WITH_NVIDIA_PEERMEM: '0'
+  NCCL_MNNVL_ENABLE: '1'
+  NCCL_CUMEM_ENABLE: '1'
+  NCCL_NVLS_ENABLE: '1'
+  NCCL_P2P_LEVEL: NVL
+  NCCL_NET_PLUGIN: none
+  VLLM_USE_NCCL_SYMM_MEM: '0'
+  UCX_TLS: rc,cuda_copy
+  UCX_NET_DEVICES: roce_vf0_r1:1,roce_vf0_r2:1,roce_vf0_r3:1,roce_vf0_r4:1,roce_vf1_r1:1,roce_vf1_r2:1,roce_vf1_r3:1,roce_vf1_r4:1
+  UCX_MEMTYPE_CACHE: n
+  UCX_MEMTYPE_REG_WHOLE: n
+  UCX_RCACHE_MAX_UNRELEASED: '1024'
+  UCX_TCP_AF_PRIO: inet
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  TRITON_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/triton
+  CUDA_CACHE_PATH: /raid/scratch/k31ws-agx/nvcache
+  CUDA_CACHE_MAXSIZE: '4294967296'
+  VLLM_CACHE_ROOT: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/vllm
+  CUTE_DSL_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/cutedsl
+  TORCHINDUCTOR_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/inductor
+  FLASHINFER_WORKSPACE_BASE: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/fi
+  DG_JIT_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/deepgemm
+  FLASHINFER_CUBIN_DIR: /opt/k3/fi-cubins-0.7.3.dev20261031
+  TVM_FFI_CACHE_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/jit/tvmffi
+  VLLM_ENABLE_CUDA_COMPATIBILITY: '0'
+  TORCH_EXTENSIONS_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/g-15c281dc32/torch_ext
+  NQ_BUILD: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared
+  K31_DCPX_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dcpx
+  K31_DSAC_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dsac
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+  UCX_IB_GID_INDEX: '3'
+  UCX_IB_TRAFFIC_CLASS: '96'
+  UCX_IB_SL: '1'
+  UCX_IB_ROCE_LOCAL_SUBNET: y
+  UCX_IB_ROCE_SUBNET_PREFIX_LEN: '11'
+  UCX_MAX_RNDV_RAILS: '2'
+roles:
+  prefill:
+    nodes: 4
+    workers: 1
+    gpus: 16
+    env:
+      HF_HUB_OFFLINE: '1'
+      VLLM_ITERLOG_DIR: ''
+      PYTHONPATH: /opt/k3/mooncake-0.3.14:/k31ov:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/venvs/cudnnfe133/site:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+      VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: '1'
+      VLLM_PACKED_KV_STATE_GROUPS: '2'
+      VLLM_ITERLOG_GPU: '1'
+    args:
+      prefix-cache-policy: v2
+      enable-mamba-shared-prefix-checkpoint: true
+      mamba-conversation-max-turns: 5
+      mamba-conversation-max-turns-mode: demote
+      mamba-low-priority-snapshot-prompt-len: 16384
+      mamba-internal-snapshot: true
+      kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k31agx-dep16tp1-nvfp4-fp8kv-mx4idx-fp32ssm-rel","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":true,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;1=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;2=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;3=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":330,"enable_cross_layers_blocks":false,"cache_prefix":"k31agx-dep16tp1-nvfp4-fp8kv-mx4idx-fp32ssm-rel"}}]}}'
+      served-model-name: moonshotai/Kimi-K3
+      load-format: safetensors
+      kv-cache-dtype: fp8
+      mamba-ssm-cache-dtype: float32
+      gpu-memory-utilization: 0.92
+      tensor-parallel-size: 1
+      long-prefill-token-threshold: 16384
+      long-prefill-token-threshold-adaptive: true
+      enable-cumem-allocator: true
+      trust-remote-code: true
+      language-model-only: true
+      enable-expert-parallel: true
+      moe-backend: kimi_k3_mega_moe
+      no-enable-flashinfer-autotune: true
+      attention-backend: FLASHINFER_MLA_SPARSE
+      sparse-indexer-topk-backend: trtllm_gvr2
+      enable-prefix-caching: true
+      prefix-match-unit: 128
+      max-model-len: 1048576
+      max-num-batched-tokens: 16384
+      max-num-seqs: 32
+      max-cudagraph-capture-size: 2048
+      compilation-config: '{"cudagraph_capture_sizes":[7,8,14,16,28,32,56,64,112,128,168,192,224,256,384,512,640,768,896,1024,1280,1536,1792,2048]}'
+      stream-interval: 10
+      numa-bind: true
+      numa-bind-nodes:
+      - 0
+      - 0
+      - 1
+      - 1
+      distributed-timeout-seconds: 1800
+      cpu-distributed-timeout-seconds: 1800
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASH_ATTN","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      reasoning-parser: kimi_k3
+      dyn-tool-call-parser: kimi_k3
+      dyn-reasoning-parser: kimi_k3
+      dyn-enable-structural-tag: true
+      data-parallel-size: 16
+      data-parallel-rpc-port: 13345
+      enable-ep-weight-filter: true
+      attention-config: '{"indexer_kv_dtype":"mxfp4"}'
+      additional-config: '{"decode_backend":"auto"}'
+      use-replayssm: true
+      mamba-extra-tail-checkpoint-tokens: 1024
+    kv_events: true
+  decode:
+    nodes: 4
+    workers: 1
+    gpus: 16
+    env:
+      PYTHONPATH: /k31ov:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/venvs/cudnnfe133/site:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
+      HF_HUB_OFFLINE: '1'
+      VLLM_ITERLOG_DIR: ''
+      K3_PIN_CPUS: '0'
+      VLLM_MM_EMBEDS_ON_CONSUMERS: '0'
+      VLLM_USE_NCCL_SYMM_MEM: '0'
+      K31_DCPX_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dcpx
+      K31_DSAC_BUILD_DIR: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/cache/build/shared/dsac
+      VLLM_PACKED_KV_STATE_GROUPS: '2'
+      VLLM_ITERLOG_GPU: '1'
+    args:
+      kv-transfer-config: '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"recompute","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":true,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;1=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;2=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1;3=roce_vf0_r1:1+roce_vf0_r2:1+roce_vf0_r3:1+roce_vf0_r4:1+roce_vf1_r1:1+roce_vf1_r2:1+roce_vf1_r3:1+roce_vf1_r4:1","kv_lease_duration":60,"kv_lease_check_timeout_s":10,"dcp_pair_exchange":true}}'
+      served-model-name: moonshotai/Kimi-K3
+      load-format: safetensors
+      kv-cache-dtype: fp8
+      mamba-ssm-cache-dtype: float32
+      gpu-memory-utilization: 0.93
+      tensor-parallel-size: 4
+      decode-context-parallel-size: 4
+      cp-kv-cache-interleave-size: 1
+      enable-cumem-allocator: true
+      dcp-comm-backend: a2a
+      trust-remote-code: true
+      language-model-only: true
+      moe-backend: kimi_k3_mega_moe
+      no-enable-flashinfer-autotune: true
+      attention-backend: FLASHINFER_MLA_SPARSE
+      sparse-indexer-topk-backend: deep_select
+      enable-prefix-caching: true
+      prefix-match-unit: 128
+      max-model-len: 1048576
+      max-num-batched-tokens: 384
+      stream-interval: 10
+      additional-config: '{"decode_backend":"latency_specialized"}'
+      kernel-config: '{"flashinfer_sparse_mla_kernel":"trtllm"}'
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASH_ATTN","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      reasoning-parser: kimi_k3
+      dyn-tool-call-parser: kimi_k3
+      dyn-reasoning-parser: kimi_k3
+      dyn-enable-structural-tag: true
+      distributed-timeout-seconds: 1800
+      cpu-distributed-timeout-seconds: 1800
+      data-parallel-size: 4
+      data-parallel-rpc-port: 13345
+      enable-expert-parallel: true
+      enable-ep-weight-filter: true
+      attention-config: '{"indexer_kv_dtype":"mxfp4"}'
+      use-replayssm: true
+      numa-bind: true
+      numa-bind-nodes:
+      - 0
+      - 0
+      - 1
+      - 1
+      max-num-seqs: 96
+      watermark: 0.05
+      max-cudagraph-capture-size: 384
+      compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256,260,264,268,272,276,280,284,288,292,296,300,304,308,312,316,320,324,328,332,336,340,344,348,352,356,360,364,368,372,376,380,384]}'
+extra_mount:
+- /raid/scratch:/raid/scratch
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/dspark-release:/raid/common-models/kimi-k3.1-pro-dspark:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/ov/g-15c281dc32:/k31ov:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws
+- /lustre/share/coreai_comparch_aarwlt/models/nvidia_kimi-k31-pro-nvfp4:/lustre/share/coreai_comparch_aarwlt/models/nvidia_kimi-k31-pro-nvfp4:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e
+sbatch_directives:
+  mem: '0'
+  cpus-per-task: '352'
+srun_options:
+  mem: '0'
+  cpu-bind: none
+  container-workdir: /infmax-workspace
+host_setup:
+  commands:
+  - python3 -c 'import subprocess,sys; r=subprocess.run(["nvidia-smi","--query-gpu=index,clocks.mem","--format=csv,noheader,nounits"],stdout=subprocess.PIPE,text=True); rows=[l.split(",") for l in r.stdout.splitlines() if l.strip()]; sys.exit(0 if len(rows)==4 and all(x[1].strip()=="4752" for x in rows) else "memory clock != 4752 MHz")'
+  nodes: workers
+  ignore_failure: false
+  timeout_seconds: 120
+benchmark:
+  placement:
+    node: head
+  env:
+    AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING: '0'
+    AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID: 'true'
+    AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS: '14400'
+    AIPERF_DATASET_CONFIGURATION_TIMEOUT: '5400'
+    AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT: '5400'
+    RESULT_DIR: /logs/agentic
+    AIPERF_DATASET_MMAP_CACHE_DIR: /aiperf_mmap_cache
+    HF_HUB_CACHE: /hf_hub_cache
+    IS_MULTINODE: 'true'
+    ENABLE_AGENTX_POWER: '0'
+    REQUIRE_POWER: '0'
+    TOKENIZER: /model
+  type: custom
+  command: bash /infmax-workspace/benchmarks/srt_agentic.sh
+  stream_output: true
+observability:
+  tachometer:
+    enabled: false
+post_eval:
+  command:
+  - env
+  - HF_HUB_OFFLINE=0
+  - HF_DATASETS_OFFLINE=0
+  - TRANSFORMERS_OFFLINE=0
+  - MODEL_PATH=/model
+  - bash
+  - '{infmax_workspace}/benchmarks/multi_node/srt_eval.sh'
+  - '{endpoint}'
+  - '{infmax_workspace}'
+  passthrough_env:
+  - AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS
+  - AIPERF_EXPERIMENTAL_FAST
+  - AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID
+  - AIPERF_RUNTIME_DIR
+  - AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING
+  - CONC
+  - ENABLE_AGENTX_POWER
+  - EVAL_ENDPOINT_READY_TIMEOUT_SECONDS
+  - EVAL_MODEL_STABILIZATION_SECONDS
+  - EVAL_CONC
+  - EVAL_ONLY
+  - IS_AGENTIC
+  - OPENAI_API_KEY
+  - PREFILL_DWDP_SIZE
+  - REQUIRE_POWER
+  - SCENARIO_TYPE
+  - SGLANG_TORCH_PROFILER_DIR
+  - VLLM_ENGINE_READY_TIMEOUT_S
+  - VLLM_TORCH_PROFILER_DIR
