@@ -37,6 +37,8 @@ the stock layer at run."""
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+
 from ...shapes import Choice, Path, Unsupported
 
 TOPK, LATENT, HIDDEN = 16, 3584, 7168
@@ -320,8 +322,12 @@ class Nvfp4MoE:
 
     def __init__(
         self, module, state, rows, batches, *, prefetch=None, layer_idx=None,
-        front=None,
+        front=None, tail=None,
     ):  # fmt: skip
+        """``tail``: (``tail_runtime.MoeTailWeights`` with ``permuted``, the model's
+        ``MoeTailBox``): its batches (<= 64 rows) run the front-mode MoeTail over the
+        experts' deferred output into the box's output ring, instead of the wide
+        tail; None: the wide tail at every batch."""
         cause = nvfp4_moe_cause(module)
         if cause is not None:
             raise Unsupported("moe", None, f"NVFP4 MoE layer: {cause}")
@@ -337,6 +343,20 @@ class Nvfp4MoE:
             raise Unsupported(
                 "moe", missing[0], f"NVFP4 MoE: no deferred tail for rows {missing}"
             )
+        self.tail, self.tail_box, self.tail_batches = None, None, frozenset()
+        if tail is not None:
+            self.tail, self.tail_box = tail
+            self.tail_batches = frozenset(self.tail.codes)
+            if not self.tail.permuted:
+                raise Unsupported("moe", None, "NVFP4 MoE: the tail must be permuted")
+            # (the MoeTail reads the permuted rows: the experts must defer there)
+            deferred = self.experts.deferred
+            eager = sorted(b for b in self.tail_batches if not deferred(b))
+            if eager or not self.tail_batches <= self.batches:
+                raise Unsupported(
+                    "moe", (eager or [None])[0], f"NVFP4 MoE tail rows {eager}: the "
+                    "experts finalize there (the MoeTail reads their deferred rows)",
+                )  # fmt: skip
         cap = max(self.batches)
         self.shared = Mxfp8SharedExpert(module.shared_experts, self.batches, cap=cap)
         self.shared_out = torch.empty(
@@ -355,9 +375,12 @@ class Nvfp4MoE:
 
         b, module = x.shape[0], self.module
         if b not in self.batches:
-            raise Unsupported("moe", b, f"NVFP4 MoE: not prepared ({sorted(self.batches)})")
+            prepared = sorted(self.batches)
+            raise Unsupported("moe", b, f"NVFP4 MoE: not prepared ({prepared})")
         if consume is None:
             raise RuntimeError("NVFP4 MoE: the output must be consumed from its ring")
+        if b in self.tail_batches:
+            return self.run_tail(x, out, consume)
         # (the shared rows' RS push on the side stream; joined before NormRows)
         with PreparedMoE.beside(self, lambda: self._shared(x)) as join:
             if self.front is not None and b in self.front.batches:
@@ -372,12 +395,45 @@ class Nvfp4MoE:
             raise RuntimeError("The wide tail output must be consumed from its ring")
         return out
 
+    def run_tail(self, x, out, consume):
+        """A ``tail`` batch: front, the stock experts (deferred) and the shared expert
+        (side stream, joined before the tail: the front-mode MoeTail reads its rows
+        and pushes their shards itself), then the MoeTail into the box's ring."""
+        from .prepared import PreparedMoE
+
+        b, module = x.shape[0], self.module
+        shared = self.shared_out[:b]
+        with PreparedMoE.beside(self, lambda: self.shared.run(x, shared)):
+            if self.front is not None and b in self.front.batches:
+                latent, logits = self.front.route(x)
+            else:
+                latent, logits, _ = module._maybe_overlap_router_and_down_proj(x)
+            partial = self.experts.run(latent, logits)
+            if self.prefetch is not None:  # (as PreparedMoE.finish: after the experts)
+                self.prefetch.fork("next_attention", self.layer_idx, b)
+        if not isinstance(partial, UnfinalizedMoEOutput):
+            raise RuntimeError(f"NVFP4 MoE B{b}: the experts finalized (not deferred)")
+        weights = partial.expert_weights[:b]
+        index = partial.expanded_idx_to_permuted_idx[:b]
+        if weights.dtype != torch.bfloat16 or index.dtype != torch.int32:
+            raise RuntimeError(
+                f"NVFP4 MoE B{b}: routing weights {weights.dtype} / map {index.dtype}"
+            )
+        rows = partial.gemm2_permuted
+        self.tail.run(self.tail_box, rows, weights, shared, index=index)
+        if consume(out) is not out:
+            raise RuntimeError("The MoE tail output must be consumed from its ring")
+        return out
+
     def choice(self, rows):
         tuned = self.front is not None and rows in self.front.batches
         front = "tuned front (WsGemm + logits gather)" if tuned else "stock front"
+        tail = "MoeTail (permuted)" if rows in self.tail_batches else "wide tail"
+        key = ("tuned-front" if tuned else "stock-front",)
+        key += ("moetail" if rows in self.tail_batches else "rows",)
         return Choice(
             Path.GENERIC,
-            ("nvfp4", "tuned-front" if tuned else "stock-front"),
+            ("nvfp4", *key),
             f"{front}, NVFP4 TRT-LLM-Gen experts (stock monolithic), MXFP8 shared "
-            f"({self.shared.choice(rows)}), wide tail",
+            f"({self.shared.choice(rows)}), {tail}",
         )

@@ -180,6 +180,9 @@ def _read_ring(box, rows, group):
     return out
 
 
+_LAYERS: dict = {}
+
+
 def _case(config, rank, device, group, fused_up=False, front=False):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import tail_rows
 
@@ -211,7 +214,14 @@ def _case_body(config, rank, device, group, front=False):
         PreparedTailRows,
     )
 
-    module = _stock_layer(config, rank, device)
+    # one stock layer per process (its experts register their name once)
+    module = _LAYERS.get(rank)
+    if module is None:
+        module = _LAYERS[rank] = _stock_layer(config, rank, device)
+    # (each case starts finalizing; its second half asks the layer to defer)
+    moe_config = module.experts.moe_config
+    moe_config._defer_moe_finalize = False
+    moe_config.defer_moe_finalize_max_num_tokens = -1
     assert nvfp4_moe_cause(module) is None, nvfp4_moe_cause(module)
     owner = (group, device, WORLD, rank)
     state = MoEScratch(WORLD, device, ROWS, owner=owner, tuned=False, rows=True)
