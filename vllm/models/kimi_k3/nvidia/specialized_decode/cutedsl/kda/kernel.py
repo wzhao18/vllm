@@ -32,6 +32,7 @@ from ..common.primitives import (
     zeros,
 )
 from .recover import triton_decay
+from .window import conv_put, conv_tap
 
 load_bf16x4 = partial(load_words, count=2, cache_policy="nc", word_type="u32")
 load_weight_bf16x8 = partial(load_words, count=4, cache_policy="nc", word_type="u32")
@@ -304,7 +305,8 @@ class KdaSplit:
                     channel = value_channel if s == 2 else qk_channel
                     if (s != 2) | (thread < self.rows):
                         for t in cutlass.range_constexpr(3):
-                            taps[s, t] = conv_page[s * dim + channel, offset + t]
+                            tap_row = s * dim + channel
+                            taps[s, t] = conv_tap(conv_page, tap_row, offset + t)
                         for t in cutlass.range_constexpr(4):
                             coeff[s, t] = weights[s, t, channel]
                         if cutlass.const_expr(self.has_bias):
@@ -470,7 +472,7 @@ class KdaSplit:
                         *(inputs[3 * t + 2] for t in range(T)),
                     )
                     for i, value in enumerate(window):
-                        conv_page[channel, i] = value
+                        conv_put(conv_page, (channel, i), value)
 
                 for t in cutlass.range_constexpr(T):
                     if partition == t % self.cluster:
@@ -496,7 +498,7 @@ class KdaSplit:
                                     inputs[3 * u + section] for u in range(T)
                                 )
                                 for i, value in enumerate(window):
-                                    conv_page[channel, i] = value
+                                    conv_put(conv_page, (channel, i), value)
 
     @cute.jit
     def store_rows(self, history, state_row, span, lanes, when=None):

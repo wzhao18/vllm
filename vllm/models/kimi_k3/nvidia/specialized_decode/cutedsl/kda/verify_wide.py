@@ -49,6 +49,7 @@ from ..common.primitives import (
     zeros,
 )
 from .kernel import KdaSplit, load_activation_bf16x4, load_bf16x4, sigmoids
+from .window import conv_put, conv_tap
 
 WARPS = 16  # recurrence warps (8 state rows each)
 THREADS = 32 * WARPS
@@ -228,7 +229,7 @@ class KdaVerifyWide(KdaSplit):
         accum = zeros(3 * T, Float32)
         for s in cutlass.range_constexpr(3):
             for t in cutlass.range_constexpr(3):
-                taps[s, t] = conv_page[s * dim + channel, offset + t]
+                taps[s, t] = conv_tap(conv_page, s * dim + channel, offset + t)
             for t in cutlass.range_constexpr(4):
                 coeff[s, t] = weights[s, t, channel]
             if cutlass.const_expr(self.has_bias):
@@ -279,7 +280,7 @@ class KdaVerifyWide(KdaSplit):
         for s in cutlass.range_constexpr(3):  # the conv window
             window = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[s * dim + channel, i] = value
+                conv_put(conv_page, (s * dim + channel, i), value)
 
     @cute.jit
     def gate(self, args, g, lane, head, token, shared_decay, own_gates):
@@ -509,7 +510,7 @@ class KdaVerifyHalves(KdaVerifyWide):
         for s in cutlass.range_constexpr(2):
             if (s == 0) | has_v:
                 for t in cutlass.range_constexpr(3):
-                    taps[s, t] = conv_page[channels[s], offset + t]
+                    taps[s, t] = conv_tap(conv_page, channels[s], offset + t)
                 for t in cutlass.range_constexpr(4):
                     coeff[s, t] = weights[
                         sections[s], t, channels[s] - sections[s] * dim
@@ -592,11 +593,11 @@ class KdaVerifyHalves(KdaVerifyWide):
         if half == 0:  # Q / K conv windows (CTA 0)
             window = (taps[0, 1], taps[0, 2], *(inputs[2 * t] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[channels[0], i] = value
+                conv_put(conv_page, (channels[0], i), value)
         if has_v:  # this CTA's V rows' windows
             window = (taps[1, 1], taps[1, 2], *(inputs[2 * t + 1] for t in range(T)))
             for i, value in enumerate(window):
-                conv_page[channels[1], i] = value
+                conv_put(conv_page, (channels[1], i), value)
         cute.arch.sync_threads()  # q, k, v, decays, betas
 
     @cute.jit

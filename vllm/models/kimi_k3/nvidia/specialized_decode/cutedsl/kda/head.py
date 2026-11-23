@@ -79,6 +79,7 @@ from ..gemm.splitk import (
 )
 from .kernel import KdaSplit, load_activation_bf16x4, load_bf16x4
 from .recover import mul_rn, triton_decay, triton_rstd, triton_sigmoid, triton_silu
+from .window import check_conv_cache, conv_put, conv_tap
 
 logger = init_logger(__name__)
 
@@ -795,7 +796,7 @@ class KdaHead(SplitKGemm):
             channel = value_channel if s == 2 else qk_channel
             if (s != 2) | (kt < 64):
                 for t in cutlass.range_constexpr(3):
-                    taps[s, t] = conv_page[s * dim + channel, t]
+                    taps[s, t] = conv_tap(conv_page, s * dim + channel, t)
                 for t in cutlass.range_constexpr(4):
                     coeff[s, t] = conv_w[s, t, channel]
                 if cutlass.const_expr(self.has_bias):
@@ -883,7 +884,7 @@ class KdaHead(SplitKGemm):
             if kt < 64:
                 window = (taps[2, 1], taps[2, 2], inputs[2])
                 for i, value in enumerate(window):
-                    conv_page[2 * dim + value_channel, i] = value
+                    conv_put(conv_page, (2 * dim + value_channel, i), value)
             if partition == 0:
                 wait(bar_out)
                 raw_o = shared_o[self.kda.output_position(kt)]
@@ -903,7 +904,7 @@ class KdaHead(SplitKGemm):
                 for s in cutlass.range_constexpr(2):
                     window = (taps[s, 1], taps[s, 2], inputs[s])
                     for i, value in enumerate(window):
-                        conv_page[s * dim + qk_channel, i] = value
+                        conv_put(conv_page, (s * dim + qk_channel, i), value)
         else:
             if partition == 0:
                 output[token, qk_channel] = BFloat16(0)
@@ -1704,12 +1705,8 @@ class PreparedKdaHead:
 
     def prepare_caches(self, caches):
         arch = architecture(self.device)
-        if caches[0].dtype != torch.bfloat16:  # BF16 conv window only
-            from ...shapes import Unsupported
-
-            raise Unsupported(
-                "kda", None, f"a {caches[0].dtype} conv state (this kernel reads BF16)"
-            )
+        # BF16 or FP32 conv window (window.py), checked before any compile
+        check_conv_cache(caches[0], self.core.dim, self.core.conv_dim_first, "KdaHead")
         bf16_state = caches[1].dtype == torch.bfloat16
         meta = dict(device="meta")
         with torch.accelerator.device_index(self.device.index):

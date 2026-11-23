@@ -67,6 +67,7 @@ from ..gemm.splitk import SplitKTactic, _smem
 from ..gemm.splitk_tmem64 import SplitKTmemGemm64, _ld_shared_v4, _st_shared_bf16
 from .kernel import sigmoids
 from .recover import mul_rn, triton_rstd, triton_sigmoid, triton_silu
+from .window import check_conv_cache, conv_put, conv_tap
 
 __all__ = ["PREPARED_PITCH", "KdaInProj64", "KdaInProjQ", "PreparedKdaInProj64"]
 
@@ -195,7 +196,7 @@ class KdaInProj64(SplitKTmemGemm64):
                 if live != 0:
                     page = conv_state[Int64(meta[rq, 2]), None, None]
                     for j in cutlass.range_constexpr(3):
-                        tap[rq, j] = page[row, offset + j]
+                        tap[rq, j] = conv_tap(page, row, offset + j)
         self.pf_tap, self.pf_coeff, self.pf_meta = tap, coeff, meta
 
     @cute.experimental.jit
@@ -243,7 +244,7 @@ class KdaInProj64(SplitKTmemGemm64):
                     tokens = range(self.tokens)
                     window = (taps[1], taps[2], *(xb[8 * rq + t] for t in tokens))
                     for i, value in enumerate(window):
-                        page[row, i] = value
+                        conv_put(page, (row, i), value)
             kept = [t for t in range(16) if self.kept(t)]
             if cutlass.const_expr(self.stock):
                 for t in kept:
@@ -460,6 +461,9 @@ class PreparedKdaInProj64:
         return (prepared, conv_w, bias, conv, slots, accepted)
 
     def prepare_caches(self, caches, requests=8):
+        # BF16 or FP32 conv window (window.py), checked before any compile
+        core = self.core
+        check_conv_cache(caches[0], core.dim, core.conv_dim_first, "KdaInProj64")
         meta, tokens = dict(device="meta"), self.tokens
         rows = requests * tokens
         prepared = torch.empty(rows, PREPARED_PITCH, dtype=torch.float32, **meta)
