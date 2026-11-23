@@ -36,6 +36,7 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BLOCK_FREE_CLOCK, SlotBlockPool
 from vllm.v1.core.encoder_cache_manager import (
@@ -44,7 +45,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, export_block_hashes
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -423,6 +424,12 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        # The block hash function, to hand prompt hashes to a KV consumer.
+        self.block_hash_fn: Callable[[Any], bytes] | None = (
+            get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
+            if vllm_config.kv_transfer_config is not None
+            else None
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -657,6 +664,7 @@ class Scheduler(SchedulerInterface):
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
+        self._kv_fetch_log: Callable[[Request, str | None], None] | None = None
         self._kv_fetch_stages: dict[Request, str] | None = (
             {} if self.log_stats and self.connector is not None else None
         )
@@ -4461,6 +4469,19 @@ class Scheduler(SchedulerInterface):
             delay_free, kv_xfer_params = self.connector.request_finished_all_groups(
                 request, block_ids
             )
+        if (
+            kv_xfer_params
+            and self.block_hash_fn is not None
+            and kv_xfer_params.get("do_remote_prefill")
+        ):
+            # Hand the consumer this request's prompt block hashes, so it adopts
+            # them (after verifying) instead of hashing the prompt again.
+            kv_xfer_params = {
+                **kv_xfer_params,
+                **export_block_hashes(
+                    request, self.hash_block_size, self.block_hash_fn
+                ),
+            }
         return delay_free or partial_tail_delay, kv_xfer_params
 
     def _request_remaining_blocks(self, request: Request) -> int:
@@ -4484,7 +4505,16 @@ class Scheduler(SchedulerInterface):
             check_dsa_region=False,
         )
 
+    def set_kv_fetch_log(
+        self, log: Callable[[Request, str | None], None] | None
+    ) -> None:
+        """Observer of KV connector fetch stage changes (per-iteration log only;
+        it does not change scheduling)."""
+        self._kv_fetch_log = log
+
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
+        if self._kv_fetch_log is not None:
+            self._kv_fetch_log(request, stage)
         kv_fetch_stages = self._kv_fetch_stages
         if kv_fetch_stages is not None:
             prev_stage = kv_fetch_stages.pop(request, None)

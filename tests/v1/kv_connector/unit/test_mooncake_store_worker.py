@@ -8,6 +8,7 @@ import logging
 import math
 import queue
 import sys
+import struct
 import threading
 import types
 from types import SimpleNamespace
@@ -5702,13 +5703,89 @@ def test_prune_policy_targets_use_their_own_delays():
     thread._drain_prune_queue()
 
     db_full, db_mamba = thread.token_databases
+    # Each pruned state goes with its lag1 origin object.
     assert store.batch_remove.call_args.args[0] == [
         *[db_full.key_for(BlockHash(hs[u])) for u in (4, 5)],
         db_mamba.key_for(BlockHash(hs[4])),
+        db_mamba.key_for(BlockHash(hs[4])) + "#origin",
     ]
     assert [entry[2] for entry in thread._prune_heap] == [
-        [db_full.key_for(BlockHash(hs[8])), db_mamba.key_for(BlockHash(hs[7]))]
+        [
+            db_full.key_for(BlockHash(hs[8])),
+            db_mamba.key_for(BlockHash(hs[7])),
+            db_mamba.key_for(BlockHash(hs[7])) + "#origin",
+        ]
     ]
+
+
+def test_lag1_state_origin_objects_are_stored_per_state_boundary():
+    """A request that resumed from 16 records 16 as the origin of every state
+    it stores beyond it, under the state's key plus '#origin'."""
+    store = MagicMock()
+    store.put.return_value = 0
+    thread = _make_prune_send_thread(store)
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        # Mamba (group 1) states at 32 and 48; a full-attention tail at 44.
+        boundary_puts=[(1, 5, 32), (1, 6, 48), (0, 3, 44)],
+        state_origin_tokens=16,
+    )
+
+    thread._store_state_origins(req)
+
+    db_mamba = thread.token_databases[1]
+    assert [c.args for c in store.put.call_args_list] == [
+        (db_mamba.key_for(BlockHash(hs[7])) + "#origin", struct.pack("<q", 16)),
+        (db_mamba.key_for(BlockHash(hs[11])) + "#origin", struct.pack("<q", 16)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected_origin"),
+    [
+        # The producer (another rank) resumed from 20: prune 20 and its origin.
+        (struct.pack("<q", 20), 20),
+        # No origin object (evicted, or the producer resumed from nothing).
+        (b"", None),
+        # A stale or bogus value at or above the resume point is ignored.
+        (struct.pack("<q", 32), None),
+    ],
+)
+def test_lag1_origin_lookup_prunes_the_producers_resume_point(stored, expected_origin):
+    store = MagicMock()
+    store.get.return_value = stored
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_prune_send_thread(store)
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+    req = ReqMeta(
+        req_id="req-b",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        prune_origin_lookups=((32, 0.0),),
+    )
+
+    thread._prune_origin_lookups(req)
+    thread._drain_prune_queue()
+
+    db_full, db_mamba = thread.token_databases
+    assert store.get.call_args.args[0] == (
+        db_mamba.key_for(BlockHash(hs[7])) + "#origin"
+    )
+    if expected_origin is None:
+        store.batch_remove.assert_not_called()
+    else:
+        assert store.batch_remove.call_args.args[0] == [
+            *[db_full.key_for(BlockHash(hs[u])) for u in (4, 5)],
+            db_mamba.key_for(BlockHash(hs[4])),
+            db_mamba.key_for(BlockHash(hs[4])) + "#origin",
+        ]
 
 
 def test_prune_heap_retries_leased_keys_on_the_heap():

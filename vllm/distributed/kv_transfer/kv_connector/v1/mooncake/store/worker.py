@@ -20,6 +20,7 @@ import pickle
 import queue
 import socket
 import threading
+import struct
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -676,6 +677,87 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
         return puts
 
+    # lag1 origin objects: the producer's resume point of a stored state, as a
+    # little-endian int64, under the state's key plus this suffix.
+    _ORIGIN_SUFFIX = "#origin"
+
+    def _origin_key(self, num_tokens: int, hashes: Sequence[BlockHash]) -> str | None:
+        """The origin object key of the state at ``num_tokens`` (keyed by the
+        first participating state group's key), or None when there is none."""
+        idx = num_tokens // self.coord.hash_block_size - 1
+        if num_tokens <= 0 or not 0 <= idx < len(hashes):
+            return None
+        for group_id, db in enumerate(self.token_databases):
+            spec = self.coord.kv_cache_groups[group_id].kv_cache_spec
+            if self.group_participates[group_id] and _has_state_spec(spec):
+                try:
+                    return db.key_for(hashes[idx]) + self._ORIGIN_SUFFIX
+                except RuntimeError:
+                    # Non rank-local (TP-sharded) layouts: no single key.
+                    return None
+        return None
+
+    def _store_state_origins(self, req_meta: ReqMeta) -> None:
+        """lag1: record ``state_origin_tokens`` as the origin object of every
+        state this job stored. Best effort: a missing object only means a later
+        request on another rank cannot prune that origin early (it still goes
+        with the lag TTL or eviction)."""
+        origin = req_meta.state_origin_tokens
+        if origin <= 0:
+            return
+        bounds = {
+            n
+            for g, _, n in req_meta.boundary_puts or []
+            if n > origin
+            and _has_state_spec(self.coord.kv_cache_groups[g].kv_cache_spec)
+        }
+        value = struct.pack("<q", origin)
+        for n in sorted(bounds):
+            key = self._origin_key(n, req_meta.block_hashes)
+            if key is None:
+                continue
+            start = time.perf_counter()
+            try:
+                ret = self._store_call(
+                    "origin_put", self.store.put, key, value, keys=[key]
+                )
+            except Exception as e:
+                logger.debug("Mooncake origin put %s failed: %s", key, e)
+                ret = -1
+            self._record_operation(
+                "origin_put",
+                start,
+                1,
+                num_bytes=len(value),
+                status="ok" if ret == 0 else "error",
+                num_failed_keys=int(ret != 0),
+            )
+
+    def _prune_origin_lookups(self, req_meta: ReqMeta) -> None:
+        """lag1: for each resume state produced on another rank, read its
+        origin object and queue that origin state (with its own origin object)
+        for removal after the given delay."""
+        for resume, delay_s in req_meta.prune_origin_lookups:
+            key = self._origin_key(resume, req_meta.block_hashes)
+            if key is None:
+                continue
+            start = time.perf_counter()
+            try:
+                raw = self._store_call("origin_get", self.store.get, key, keys=[key])
+            except Exception as e:
+                logger.debug("Mooncake origin get %s failed: %s", key, e)
+                raw = b""
+            origin = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
+            self._record_operation(
+                "origin_get", start, 1, num_bytes=len(raw), status="ok"
+            )
+            if not 0 < origin < resume:
+                continue
+            keys = self._resume_state_keys(origin, req_meta.block_hashes)
+            if keys:
+                okey = self._origin_key(origin, req_meta.block_hashes)
+                self._queue_prune(keys + ([okey] if okey else []), delay_s)
+
     def _prune_superseded(self, req_meta: ReqMeta) -> None:
         """Remove this rank's keys of the state the request resumed from.
 
@@ -731,11 +813,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         )
 
     def _prune_policy_targets(self, req_meta: ReqMeta) -> None:
-        """Queue the resume states named by ``req_meta.prune_targets``."""
+        """Queue the resume states named by ``req_meta.prune_targets``, each
+        with its origin object."""
         for resume, delay_s in req_meta.prune_targets:
             keys = self._resume_state_keys(resume, req_meta.block_hashes)
             if keys:
-                self._queue_prune(keys, delay_s)
+                okey = self._origin_key(resume, req_meta.block_hashes)
+                self._queue_prune(keys + ([okey] if okey else []), delay_s)
 
     def _queue_idle_tail_expiry(self, req_meta: ReqMeta) -> None:
         """Expire this job's boundary states ``prune_idle_tail_ttl_s`` after
@@ -957,10 +1041,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # normal positional save, which may be skipped this step).
             if not self._maybe_offload_boundary_states(req_meta):
                 return
+            if req_meta.state_origin_tokens and req_meta.boundary_puts:
+                self._store_state_origins(req_meta)
             if req_meta.prune_resume_tokens:
                 self._prune_superseded(req_meta)
             if req_meta.prune_targets:
                 self._prune_policy_targets(req_meta)
+            if req_meta.prune_origin_lookups:
+                self._prune_origin_lookups(req_meta)
             if self.prune_idle_tail_ttl_s > 0 and req_meta.boundary_puts:
                 self._queue_idle_tail_expiry(req_meta)
 

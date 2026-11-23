@@ -187,7 +187,8 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
             raise Unsupported("kda", shape, cause)
         budget = flow.smem_budget(device)
         # The smallest item-capacity build that serves this shape (flow.ITEM_BUILDS:
-        # 16 up to 141 requests at 24 heads on 212 SMs, unchanged; 20 above).
+        # 16 up to 141 requests at 24 heads on 212 SMs, unchanged; 20 up to 176; 24
+        # up to 212).
         ctas, per_cta, build = flow.item_build(items, requests, sms)
         if build is None:
             raise Unsupported(

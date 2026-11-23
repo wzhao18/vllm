@@ -434,6 +434,8 @@ class SparseMlaPrefillH8:
         # way) (production: knob 0; 9 = always masked)
         # zf (timing only): every cp.async zero-fills (src-size 0: no L2 request), so the
         # gather warps keep their instruction stream without delivering any data
+        # ewslow (timing only, tests): the epw store warp sleeps ewslow ns before each
+        # block of epi_store, so the softmax producer runs ahead of it (production: 0)
         # pace (timing only): every gather lane sleeps pace ns after each of its first
         # 8 cp.async of a row, so a stage's 72 LDGSTS leave the SM in 8-instruction slices
         # nbs: S-free as named barrier NB_SFREE (the owning softmax warpgroup bar.arrives
@@ -453,12 +455,12 @@ class SparseMlaPrefillH8:
         # atom's rows), so the QK MMAs multiply zeros there. The kernel is power-bound at the
         # 2.3 kW cap (P-MLA run184-185: sustained -2.5%, bitwise equal): operand energy is
         # time. Production: knob 0; 9 = off (diagnostic).
-        knobs = tuple(knobs) + (0,) * (27 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (28 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
          self.epb, self.epw, self.msk, self.zf, self.pace, self.nbs, self.nex,
-         self.sw, self.cpb, self.qz) = knobs[:27]
+         self.sw, self.cpb, self.qz, self.ewslow) = knobs[:28]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
@@ -1682,6 +1684,14 @@ class SparseMlaPrefillH8:
             if owner:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+                elif cutlass.const_expr(not self.epw):
+                    # Last token (non-epw): no QLFREE(qi + 1) orders this epilogue after the
+                    # previous token's stores (the other WG may own it, and bulk_wait_read is
+                    # per issuing thread), so wait for its B_EPIDONE: completion qi - 1, parity
+                    # (qi - 1) & 1 (completion qi - 2 is behind the Q warp's wait; qi is ours).
+                    # epw orders every staging half through B_EPIFREE instead.
+                    if qi > 0:
+                        mbar_wait(_bar(base, B_EPIDONE), Uint32((qi - 1) & 1))
                 self.ss(base, cta, lane, u - 1, 23, 1)
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o, u - 1)
 
@@ -1855,13 +1865,23 @@ class SparseMlaPrefillH8:
         for b in cutlass.range_constexpr(4):
             # staging halves alternate between Q atoms 0-1 and 2-3 (block b % 2): block
             # b reuses block b - 2's buffer once its two stores have read it
-            if cutlass.const_expr(b >= 2):
-                if cutlass.const_expr(self.epw):
+            if cutlass.const_expr(self.epw):
+                # The store warp releases each use of a half (B_EPIFREE, 2 completions per
+                # token): block b waits for the previous use's release, completion 2 qi
+                # (block b - 2, parity 0) or, for b < 2, 2 qi - 1 (block b + 2 of token
+                # qi - 1, parity 1; none for the CTA's first token). Every use waits, so
+                # the producer is never two completions ahead on B_EPIFULL / B_EPIFREE and
+                # both parity waits are exact. (Waiting only for b >= 2 let a token's b < 2
+                # blocks overwrite a half before its stores read it and, two completions
+                # ahead, hang epi_store on an aliased parity: the startup stall.)
+                if cutlass.const_expr(b >= 2):
                     mbar_wait(_bar(base, B_EPIFREE + b % 2), Uint32(0))
-                else:
-                    if sp == 0 and lane == 0:
-                        bulk_wait_read2()
-                    named_bar(bid, 128)
+                elif qi > 0:
+                    mbar_wait(_bar(base, B_EPIFREE + b % 2), Uint32(1))
+            elif cutlass.const_expr(b >= 2):
+                if sp == 0 and lane == 0:
+                    bulk_wait_read2()
+                named_bar(bid, 128)
             for hh in cutlass.range_constexpr(2):
                 d0 = 32 * sp + 16 * hh  # first dim (lane) of this 16-lane half
                 ha = lane_addr + Uint32(16 * hh << 16) + Uint32(C_O + 96 * b)
@@ -1925,6 +1945,8 @@ class SparseMlaPrefillH8:
         for qi in range(n_mine):
             row = cta + qi * self.grid
             for b in cutlass.range_constexpr(4):
+                if cutlass.const_expr(self.ewslow):
+                    nanosleep(self.ewslow)
                 mbar_wait(_bar(base, B_EPIFULL + b % 2), Uint32(b // 2))
                 if lane == 0:
                     if cutlass.const_expr(not self.no_store):
