@@ -113,13 +113,19 @@ GENERIC_SPLIT = {"*": f"{WARP_ROWS + 1}-32:64.32.2.8,33-{SPLIT_K_ROWS}:64.64.2.6
 # Bands split midway between measured points; rows past the last band keep the
 # family's GENERIC rule. ``TUNED_WARP`` is empty: "warp" rows take ``warp_tactic``
 # (the tactic measured). Every kind sums K in FP32 and rounds once to BF16.
+# R65-96 (SPLHF D13, 2026-11-23, same chained method, Rhea, us per call cublas / lt /
+# best split-K): dsa_in R65-80 10.4 / 9.9 / 9.9 (64.80.2.5), R84-96 10.45 / 10.3 /
+# 10.8; o_proj R65-80 8.8 / 6.45 / 7.2 (64.80.1.5), R84-96 8.8 / 9.1 / 7.7 (64.96.1.5:
+# not taken, SpOproj's partial GEMM is torch kinds only); wq_b R65-80 3.8 / 3.7, R84-96
+# 3.8 / 3.9 (unchanged: within 0.1 us). latent_up n24-41 cublas 6.75-6.88 / lt
+# 6.98-7.08: the cuBLAS band 25-40 stands.
 TUNED_KIND: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-16:cublas,17-164:lt,165-228:lt,229-288:cublas,"
                          "289-352:lt,353-:cublas"},
-    (5344, 7168): {"*": "65-164:cublas,165-352:lt,353-:cublas"},
+    (5344, 7168): {"*": "65-80:lt,81-164:cublas,165-352:lt,353-:cublas"},
     (4096, 1536): {"*": "1-64:split_k,65-228:lt,229-288:cublas,289-352:lt,"
                         "353-:cublas"},
-    (7168, 3072): {"*": "65-228:cublas,229-352:lt,353-:cublas"},
+    (7168, 3072): {"*": "65-80:lt,81-228:cublas,229-352:lt,353-:cublas"},
     (3584, 7168): {"*": "1-16:warp,17-80:split_k,81-:cublas"},
     (7168, 3584): {"*": "1-12:cublas,13-24:lt,25-40:cublas,41-72:lt,73-:cublas"},
     (12288, 7168): {"*": "1-12:split_k,13-24:cublas,25-64:lt,65-96:split_k,"

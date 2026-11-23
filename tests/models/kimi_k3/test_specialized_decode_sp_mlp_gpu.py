@@ -39,8 +39,9 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (  # noqa: E402
 DEVICE = torch.device("cuda", 0)
 HIDDEN, LATENT, INTER = 7168, 3584, 6144
 # Shard rows n: every kind of the measured tables (sp_policy TUNED_KIND), the split-K
-# 80-column tiles partial (72) and full (80) and a partial 96-column tile (88).
-ROWS = (1, 4, 16, 20, 32, 50, 64, 72, 80, 88, 96, 128)
+# 80-column tiles partial (72) and full (80) and a partial 96-column tile (88); the
+# split-K front's 64-row tile from 33 (36); latent up partials at 128 / 160 / 192.
+ROWS = (1, 4, 16, 20, 32, 36, 50, 64, 72, 80, 88, 96, 128, 160, 192)
 
 
 def context():

@@ -66,7 +66,7 @@ SHAPES = {
 MLP = ("latent_down", "shared_gu", "shared_down", "latent_up", "shared_gu_side",
        "shared_down_side")  # fmt: skip
 CAPTURED = tuple(range(4, 513, 4))
-ROWS = (4, 8, 16, 20, 32, 64, 68, 128, 324, 512)
+ROWS = (4, 8, 16, 20, 32, 64, 68, 84, 128, 324, 512)
 # Shard rows n = R / 4 of the MLP families (every kind of their tables).
 SHARD_CAPTURED = tuple(range(1, 129))
 # 72 / 80: the split-K 80-column tile partial / full; 88: a partial 96-column tile.

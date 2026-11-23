@@ -27,7 +27,7 @@ E, TOPK = 896, 16
 
 def split_rows():
     table = batch_table(sp_mlp.ROUTER_LATENT["*"])
-    rows = [r for r in (1, 8, 16, 24, 32, 64, 96) if isinstance(table.get(r), tuple)]
+    rows = [r for r in (1, 8, 16, 24, 32, 33, 34, 36, 40, 41, 64, 96) if isinstance(table.get(r), tuple)]
     return {r: sp_mlp.rows_policy(sp_mlp.ROUTER_LATENT, Shape(r, 1)) for r in rows}
 
 

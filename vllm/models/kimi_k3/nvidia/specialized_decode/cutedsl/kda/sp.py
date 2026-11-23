@@ -92,10 +92,13 @@ K = 128
 # 32 / 48; k5 +0.11 at n16, -0.69 / -0.76 / -1.29 at n20 / 32 / 48. In the isolated
 # per-layer bench KdaFlow wins from n12; in the step it costs ~10-15 us per layer more
 # than there (under attribution), which only the second-wave KdaWide outweighs.
+# q4 (k3) from n18 as well: the KdaWide second wave (24 x 18 items > 424) does not
+# depend on q.
 _WIDE_Q = "1-2:split,3-17:wide,18-212:flow,213-:wide"
 RECORD_KINDS = {
     24: {
         "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
+        4: _WIDE_Q,
         5: _WIDE_Q,
         6: _WIDE_Q,
         7: _WIDE_Q,
