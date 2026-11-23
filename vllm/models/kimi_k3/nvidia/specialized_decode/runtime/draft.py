@@ -994,7 +994,7 @@ class DraftFastPath:
 
         fast = self.lm_batches | self.wide_batches | self.sk_batches
         rows = [b * self.steps for b in sorted(self.batches - fast)]
-        self.lm_pins = pinned(weight, rows)
+        self.lm_pins = pinned(weight, rows, self.strict)
 
     def prepare_lm_sk(self, model):
         """The die-local stream-K LM-head GEMM of GQA_SK_LM_HEAD batches, once the
@@ -1276,8 +1276,10 @@ def gqa_projection_tactic(shape, tp, rows):
     return table.get(shape)
 
 
-def gqa_projection(weight, tp, rows):
-    """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
+def gqa_projection(weight, tp, rows, strict=False):
+    """The prepared split-K projection of ``weight`` for ``rows`` (or None); rows
+    above the split-K bins on pinned cuBLASLt algorithms (exact-row PINS, row-bin
+    BIN_PINS; ``strict``: a rejected pin raises)."""
     from ..lt_pin import with_pins
 
     policies = {}
@@ -1292,10 +1294,10 @@ def gqa_projection(weight, tp, rows):
         prepared = PreparedProjection(weight, policies).prepare()
     # Rows above the split-K bins: pinned cuBLASLt algorithms where the heuristic
     # pick is slow (lt_pin.PINS; e.g. TP4 gate_up at 288 rows 30.1 -> 17.1 us).
-    return with_pins(prepared, weight, rows)
+    return with_pins(prepared, weight, rows, strict)
 
 
-def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
+def install_gqa_projections(model, tp, query_rows, context_rows, rank=0, strict=False):
     """Split-K projections for the drafter's per-layer linears (``query_rows``) and
     its fused context K/V weight (``context_rows``; ``model.model._context_projection``,
     the context step's K/V GEMM); returns how many were installed. The other rows run
@@ -1308,33 +1310,50 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
         linears += [(mlp.gate_up_proj, query_rows), (mlp.down_proj, query_rows)]
     installed = 0
     stock: dict[tuple, set[int]] = {}
+    pinned_rows: dict[tuple, dict[int, str]] = {}
+
+    def account(weight, rows, prepared):
+        from ..lt_pin import pin_labels
+
+        shape = tuple(weight.shape)
+        served = set(prepared.kernels) if prepared is not None else set()
+        stock.setdefault(shape, set()).update(r for r in rows if r not in served)
+        pins = getattr(prepared, "pins", None)
+        if pins is not None:
+            labels = pin_labels(weight.shape, sorted(pins.kernels))
+            pinned_rows.setdefault(shape, {}).update(labels)
+
     for linear, rows in linears:
         if getattr(linear, "bias", None) is not None:
             raise ValueError("Kimi K3.1 GQA DSpark drafter: biased linear")
-        prepared = gqa_projection(linear.weight, tp, rows)
-        served = set(prepared.kernels) if prepared is not None else set()
-        stock.setdefault(tuple(linear.weight.shape), set()).update(
-            r for r in rows if r not in served
-        )
+        prepared = gqa_projection(linear.weight, tp, rows, strict)
+        account(linear.weight, rows, prepared)
         if prepared is not None:
             linear.quant_method = DraftProjectionMethod(linear.quant_method, prepared)
             installed += 1
     weight = getattr(inner, "_fused_kv_weight", None)
     inner._context_projection = None
     if weight is not None:
-        inner._context_projection = gqa_projection(weight, tp, context_rows)
-        served = inner._context_projection.kernels if inner._context_projection else {}
-        stock.setdefault(tuple(weight.shape), set()).update(
-            r for r in context_rows if r not in served
-        )
+        inner._context_projection = gqa_projection(weight, tp, context_rows, strict)
+        account(weight, context_rows, inner._context_projection)
         installed += inner._context_projection is not None
+    for shape, labels in sorted(pinned_rows.items()):
+        by_label: dict[str, list[int]] = {}
+        for r, label in sorted(labels.items()):
+            by_label.setdefault(label, []).append(r)
+        log_coverage(
+            rank,
+            "draft linear",
+            f"(N, K) {shape}: "
+            + "; ".join(f"{label} at rows {rows}" for label, rows in by_label.items()),
+        )
     for shape, rows in sorted(stock.items()):
         if rows:
             log_coverage(
                 rank,
                 "draft linear",
-                f"(N, K) {shape}: stock cuBLAS at rows {sorted(rows)} (measured: "
-                "release GEMM bench)",
+                f"(N, K) {shape}: stock cuBLAS at rows {sorted(rows)} (no split-K "
+                "tactic or cuBLASLt pin covers them)",
             )
     return installed
 
@@ -1755,7 +1774,9 @@ class GqaDraftFastPath(DraftFastPath):
                 "no fused K/V weight (the context buffers are not built or the qkv "
                 "projections are not unquantized)",
             )
-        installed = install_gqa_projections(model, tp, query_rows, context_rows, rank)
+        installed = install_gqa_projections(
+            model, tp, query_rows, context_rows, rank, strict
+        )
         if installed:
             logger.info_once(
                 "Kimi K3.1 GQA DSpark drafter: split-K projections on %d linears",
@@ -1838,18 +1859,28 @@ class GqaDraftFastPath(DraftFastPath):
         lm = sorted(b * steps for b in fast.lm_batches)
         wide_lm = sorted(b * steps for b in fast.wide_batches)
         sk_lm = sorted(b * steps for b in fast.sk_batches)
-        stock_lm = sorted(
+        rest = sorted(
             b * steps
             for b in batches
             if b not in fast.lm_batches | fast.wide_batches | fast.sk_batches
         )
+        from ..lt_pin import pin_labels
+
+        # The LM head's rank shard: [vocab / TP, hidden] (``prepare_lm_pins``).
+        shard = (model.config.vocab_size // tp, GQA_HIDDEN)
+        labels = pin_labels(shard, rest)
+        by_label: dict[str, list[int]] = {}
+        for r, label in labels.items():
+            by_label.setdefault(label, []).append(r)
+        stock_lm = [r for r in rest if r not in labels]
+        pinned_lm = "; ".join(f"{k} at rows {v}" for k, v in by_label.items())
         log_coverage(
             rank,
             "draft LM head",
             f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, die-local stream-K "
-            f"GEMM rows {sk_lm}, stock cuBLAS shard "
-            f"GEMM rows {stock_lm} (GQA_WIDE_LM_HEAD: measured choices, as the "
-            "preview drafter's)",
+            f"GEMM rows {sk_lm}, {pinned_lm or 'no pinned cuBLASLt rows'}, stock "
+            f"cuBLAS shard GEMM rows {stock_lm} (GQA_WIDE_LM_HEAD: measured choices, "
+            "as the preview drafter's)",
         )
         return fast
 
