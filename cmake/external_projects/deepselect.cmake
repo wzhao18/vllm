@@ -18,8 +18,13 @@ if(DEEPSELECT_SRC_DIR)
 else()
   FetchContent_Declare(
         deepselect
-        GIT_REPOSITORY https://github.com/vllm-project/DeepSelect.git
-        GIT_TAG d96d33afe1fab0d6066da49cdc91e64c2bee65ea
+        # Temporary: d96d33a (vllm-project/DeepSelect dev, not on main) plus
+        # the CUTLASS v4.8.1 submodule bump. The CUTLASS that d96d33a pins
+        # (ae6bccf, ~v4.4) has no SM107 arch macros, so on sm_107a every TMA
+        # load of the top-k scan compiles to a trap. Move back to
+        # vllm-project/DeepSelect once vllm-project/DeepSelect#3 lands.
+        GIT_REPOSITORY https://github.com/Juntian777/DeepSelect.git
+        GIT_TAG 6be4c49ab504b5f5932eb5dfe7d4258c908dc1a8
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
