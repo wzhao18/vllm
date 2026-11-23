@@ -26,6 +26,7 @@ Launch: one pytest per node over two nodes (``srun -N2 --ntasks-per-node=1``), w
 MASTER_ADDR (node 0) and MASTER_PORT set; each pytest spawns its node's 4 ranks
 (global rank = SLURM_NODEID x 4 + local). Skipped elsewhere."""
 
+import gc
 import os
 import time
 
@@ -223,12 +224,19 @@ def _case(box, size, rank, local, q, batch, parity):
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream(dev)
     side.wait_stream(torch.cuda.current_stream(dev))
-    with torch.cuda.stream(side), torch.cuda.graph(
-        graph, stream=side, capture_error_mode="thread_local"
-    ):
-        query_kernel(*query_args(mla, query, q_c), *publish, stream(dev))
-        wait(publish[0], stream(dev))
-        run_value(*args, totals, None, projected, out, w_uv_gathered)
+    # (no cyclic GC inside the capture: an earlier case's symmetric buffers freed
+    # there would invalidate it)
+    gc.collect()
+    gc.disable()
+    try:
+        with torch.cuda.stream(side), torch.cuda.graph(
+            graph, stream=side, capture_error_mode="thread_local"
+        ):
+            query_kernel(*query_args(mla, query, q_c), *publish, stream(dev))
+            wait(publish[0], stream(dev))
+            run_value(*args, totals, None, projected, out, w_uv_gathered)
+    finally:
+        gc.enable()
     dist.barrier()
     for replay in range(3):
         out.zero_()
