@@ -215,6 +215,12 @@ def parse_args():
     )
     p.add_argument("--ref-samples", type=int, default=64, help="0 disables references")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--kernel-profile", type=int, default=0, metavar="N",
+        help="MEGAMOEFIX prefill floor split: N eager moe.forward calls under torch.profiler (CUPTI) per point; prints "
+             "KPROF lines per rank: mean device time per kernel name, the call span (first kernel start -> last kernel "
+             "end) and the summed gaps between kernels inside the span; skips the timing",
+    )
     p.add_argument("--json", default=None, help="append result lines to this file")
     p.add_argument(
         "--weights",
@@ -520,6 +526,48 @@ def env_identity(pkg_dir):
 # ---------------------------------------------------------------------------------
 
 
+def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rms, variant, n, rank):
+    """CUPTI kernel timeline of N eager forwards (MEGAMOEFIX MegaMoE prefill floor split)."""
+    import statistics as st
+
+    from torch.profiler import ProfilerActivity, profile
+
+    fwd = lambda: moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms)  # noqa: E731
+    for _ in range(8):
+        fwd()
+    torch.cuda.synchronize()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(args.kernel_profile):
+            fwd()
+            torch.cuda.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+    evs = sorted((e for e in prof.events() if e.device_type.name == "CUDA" and e.time_range.elapsed_us() > 0),
+                 key=lambda e: e.time_range.start)
+    # group kernels into calls: a gap > 200 us (the per-call sync + barrier) starts a new call
+    calls, cur = [], []
+    for e in evs:
+        if cur and e.time_range.start - cur[-1].time_range.end > 200:
+            calls.append(cur); cur = []
+        cur.append(e)
+    if cur:
+        calls.append(cur)
+    per = {}
+    spans, gaps = [], []
+    for c in calls:
+        spans.append(c[-1].time_range.end - c[0].time_range.start)
+        gaps.append(sum(max(0, b.time_range.start - a.time_range.end) for a, b in zip(c, c[1:])))
+        for e in c:
+            per.setdefault(e.name[:70], []).append(e.time_range.elapsed_us())
+    calls_n = max(1, len(calls))
+    rows = sorted(per.items(), key=lambda kv: -sum(kv[1]))
+    body = " | ".join(f"{k} x{len(v) / calls_n:.1f} {st.median(v):.1f}us" for k, v in rows[:8])
+    print(f"KPROF rank={rank} {variant}/{n} calls={len(calls)} span_med={st.median(spans):.1f}us "
+          f"gaps_med={st.median(gaps):.1f}us :: {body}", flush=True)
+
+
 def main():
     args = parse_args()
     rank, world, device = init_distributed()
@@ -802,6 +850,10 @@ def main():
             # noise floor: the stock chain and the kernel vs an unquantized activation
             result["shared_rel_l2_stock_vs_exact_act"] = rel(want, exact)
             result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
+
+        if args.kernel_profile:
+            _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rms, variant, n, rank)
+            continue
 
         def launch():
             session.launch(weights, target, rmsnorm=rms, shared=fused)
