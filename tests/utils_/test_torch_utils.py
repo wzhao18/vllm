@@ -4,10 +4,12 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     OMP_NUM_THREADS_SET_BY_VLLM,
     LayerName,
     async_tensor_h2d,
+    aux_stream,
     available_cpu_count,
     common_broadcastable_dtype,
     current_stream,
@@ -178,6 +180,46 @@ def test_current_stream_multithread():
     )
 
     _test_stream_thread(main_dedicated_stream)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs CUDA")
+def test_current_stream_never_aliases_a_pooled_stream():
+    """PyTorch hands out pooled streams round-robin, 32 per device. Side streams
+    such as aux_stream() are pooled, so a pooled current stream would eventually
+    be one of them, and work forked onto it would run in order."""
+    main = current_stream()
+    assert all(torch.cuda.Stream().cuda_stream != main.cuda_stream for _ in range(64))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs CUDA")
+@pytest.mark.usefixtures("dist_init")
+def test_aux_stream_fork_stays_concurrent_in_every_capture():
+    """Each graph_capture() (one per `vllm bench forward` case) keeps work forked
+    onto aux_stream() a concurrent branch of the graph. A fresh pooled capture
+    stream is, every 32nd time, aux_stream() itself: the fork is then captured in
+    order, as a K3.1 decode graph lost every shared-expert / MegaMoE overlap."""
+    from cuda.bindings import driver
+
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    events = (torch.cuda.Event(), torch.cuda.Event())
+    for _ in range(40):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with (
+            graph_capture(device) as context,
+            torch.cuda.graph(graph, stream=context.stream),
+        ):
+            maybe_execute_in_parallel(
+                lambda: torch.cuda._sleep(1000),
+                lambda: torch.cuda._sleep(1000),
+                *events,
+                aux_stream(),
+            )
+        raw = driver.CUgraph(graph.raw_cuda_graph())
+        # Two kernel nodes; an edge between them means the fork serialized.
+        assert driver.cuGraphGetEdges(raw, 0)[-1] == 0
 
 
 @pytest.fixture

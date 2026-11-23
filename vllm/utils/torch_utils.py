@@ -811,6 +811,29 @@ class _StreamPlaceholder:
         self.synchronize = lambda: None
 
 
+def unpooled_stream(device: torch.types.Device = None) -> torch.cuda.Stream:
+    """A non-blocking CUDA stream outside PyTorch's stream pool, never destroyed.
+
+    ``torch.cuda.Stream()`` hands out 32 pooled streams per device round-robin,
+    so a stream that others fork from (the process stream, a capture stream)
+    would every 32nd time be a pooled side stream such as ``aux_stream()``, and
+    work forked onto it would run in order.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return torch.cuda.Stream(device=device)
+    from cuda.bindings import driver
+
+    with torch.cuda.device(device):
+        err, handle = driver.cuStreamCreate(
+            driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value
+        )
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuStreamCreate failed: {err}")
+        return torch.cuda.ExternalStream(int(handle))
+
+
 def current_stream() -> torch.cuda.Stream:
     """Replace `torch.cuda.current_stream()` with `vllm.utils.current_stream()`.
     it turns out that `torch.cuda.current_stream()` is quite expensive,
@@ -835,7 +858,7 @@ def current_stream() -> torch.cuda.Stream:
         # for more details. Therefore, we create a dedicated stream per process.
         if current_platform.is_rocm() or current_platform.is_cuda():
             # Ensure new stream is ordered w.r.t. replaced stream's work.
-            new_stream = torch.cuda.Stream()
+            new_stream = unpooled_stream()
             new_stream.wait_stream(torch.cuda.current_stream())
             # torch.cuda.set_stream here is the alias of _pathed_set_stream
             torch.cuda.set_stream(new_stream)

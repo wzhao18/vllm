@@ -60,6 +60,7 @@ from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
+    unpooled_stream,
 )
 
 if TYPE_CHECKING:
@@ -1691,6 +1692,20 @@ def _aiter_registers_graph_buffers(group: GroupCoordinator) -> bool:
     return comm is not None and comm.registers_graph_buffers
 
 
+_capture_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _default_capture_stream(device: torch.device) -> torch.cuda.Stream:
+    """The device's capture stream, outside PyTorch's stream pool: a fresh
+    pooled one is every 32nd time a side stream the captured model forks onto
+    (e.g. ``aux_stream()``), which serializes that fork in the graph."""
+    device = torch.device(device)
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in _capture_streams:
+        _capture_streams[index] = unpooled_stream(index)
+    return _capture_streams[index]
+
+
 @contextmanager
 def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None):
     """`graph_capture` is a context manager which should surround the code that
@@ -1704,14 +1719,15 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
     the graph capture is running on a separate stream from the default stream,
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
-    A given ``stream`` is reused instead, so graphs captured on it share the
-    caching allocator's free blocks of the graph pool.
+    A given ``stream`` is used instead of the device's capture stream; graphs
+    captured on the same stream share the caching allocator's free blocks of
+    the graph pool.
     """
     from vllm.device_allocator.alloc_conf import non_expandable_allocations
     from vllm.platforms import current_platform
 
     tp, pp, dp = get_tp_group(), get_pp_group(), get_dp_group()
-    context = GraphCaptureContext(stream or torch.cuda.Stream(device=device))
+    context = GraphCaptureContext(stream or _default_capture_stream(device))
     # Let AITER all-reduce register captured buffers instead of copying them.
     # Not with DP AITER collectives: they reduce workspaces allocated earlier.
     non_expandable = (
