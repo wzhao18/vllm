@@ -932,8 +932,9 @@ def _worker(rank: int, port: int, case: str, args: tuple, q: int = 4) -> None:
     """One TP4 = DCP4 rank: the vLLM groups (and their symmetric memory), the
     workspace and the DCP top-k merge's buffers, then ``case`` at verify length
     ``q`` (the spawned module's Q)."""
-    global Q
+    global Q, CAP
     Q = q
+    CAP = 512 - 512 % math.lcm(q, WORLD)  # the largest aligned captured row
     os.environ.update(DEPLOYED_ENV)
     torch.accelerator.set_device_index(rank)
     device = torch.device("cuda", rank)

@@ -41,8 +41,8 @@ def verify_length(monkeypatch, request):
 def test_record_kind_per_q(verify_length):
     q = verify_length
     flow = "flow" if q in (2, 4) else "wide"
-    assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, 20, 21, 128)] == [
-        "split", "split", "wide", "wide", flow, flow,
+    assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, 20, 21, 128, 212, 213)] == [
+        "split", "split", "wide", "wide", flow, flow, flow, "wide",
     ]  # fmt: skip
 
 

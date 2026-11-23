@@ -85,9 +85,12 @@ K = 128
 # products only, as between any two record cores. Cost at q4 sizes (deferred, us per
 # layer, docstring): n24 24.5 vs KdaFlow 20.2, n64 51.7 vs 38.9, n128 95.2 vs 71.0.
 # NQ-TUNE: KdaFlow at q5..8 (a kernel rewrite: block sums, page ring vs group blocks).
+# KdaFlow's largest item build (flow.ITEM_BUILDS 24) serves up to 212 requests at 24
+# heads on VR200's 212 SMs; above (q2 / q4 at 213+ requests per DP group: rows up
+# to 1020) KdaWide.
 RECORD_KINDS = {
     24: {
-        "*": "1-2:split,3-20:wide,21-:flow",
+        "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
         3: "1-2:split,3-:wide",
         5: "1-2:split,3-:wide",
         6: "1-2:split,3-:wide",
