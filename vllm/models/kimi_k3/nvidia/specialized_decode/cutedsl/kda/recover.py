@@ -36,6 +36,7 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
+from .window import conv_tap
 
 load_bf16x4 = partial(load_words, count=2, cache_policy="nc", word_type="u32")
 load_weight_bf16x8 = partial(load_words, count=4, cache_policy="nc", word_type="u32")
@@ -302,16 +303,20 @@ class KdaSplit:
                             values = load_f32x4(state_row(row, column))
                             for e in cutlass.range_constexpr(4):
                                 history[p, j, e] = values[e]
-                # BF16 or FP32 conv state (every tap a BF16 input, exact in both).
+                # BF16 or FP32 conv state (every tap a BF16 input, exact in both):
+                # the taps live in BF16 registers (an FP32 tap converts losslessly at
+                # the load, window.py; FP32 registers cost the q4 B16 TP8 verify
+                # +2.98 us per layer) and are stored back at the state's dtype.
                 conv_type: cutlass.Constexpr = conv_state.element_type
-                taps = zeros((3, 3), conv_type)
+                taps = zeros((3, 3), BFloat16)
                 coeff = zeros((3, 4), weights.element_type if self.early else Float32)
                 accum = zeros(3 * T, Float32)
                 for s in cutlass.range_constexpr(3):
                     channel = value_channel if s == 2 else qk_channel
                     if (s != 2) | (thread < self.rows):
                         for t in cutlass.range_constexpr(3):
-                            taps[s, t] = conv_page[s * dim + channel, offset + t]
+                            tap_row = s * dim + channel
+                            taps[s, t] = conv_tap(conv_page, tap_row, offset + t)
                         for t in cutlass.range_constexpr(4):
                             coeff[s, t] = weights[s, t, channel]
                         if cutlass.const_expr(self.has_bias):

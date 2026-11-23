@@ -63,7 +63,15 @@ SPEC_SCHEDULE = {
 # AttnRes stand-in (us/call over the chain 14.34 -> 12.52). B4 also marks its
 # checkpoint stores L2 evict-first (the same values; that chain, BF16 state: 10.46 ->
 # 9.98 us, 13.00 -> 12.52 us/call; B2 gains nothing from it).
-DEVICE_SPEC_SCHEDULE = {(10, 7): {6: "4:1.16.2.8.1,17-64:1.8.3.4"}}
+# TP8 (12 heads) B13-16: two CTAs per SM instead of GB300's three (1.8.3.2 spills and,
+# at an FP32 conv state, costs +2.7..3.0 us more per layer at q4). VR200 TP8 verify
+# alone (69 layers, own cold FP32 slots, CUDA graph, us per layer, BF16 / FP32 conv),
+# 1.8.3.2 -> 1.8.2.2: q4 B13 11.83 / 13.27 -> 9.36 / 9.44, B16 14.41 / 17.30 -> 10.00
+# / 10.14; q8 B13 17.73 / 18.06 -> 15.85 / 16.99, B16 23.09 / 23.57 -> 16.24 / 17.57
+# (TPKDA kbs.py; same lanes, so the same reduction order: outputs bitwise).
+DEVICE_SPEC_SCHEDULE = {
+    (10, 7): {6: "4:1.16.2.8.1,17-64:1.8.3.4", 12: "13-16:1.8.2.2"}
+}
 # Compute capabilities whose verify steps activate only the gates a CTA uses and each
 # beta once per CTA (``KdaSplit(lean=True)``, bitwise identical). Rubin TP16 B8 x q8,
 # 1-GPU in-projection -> KdaSplit -> o-projection-footprint chain: 14.76 -> 14.66 us.
