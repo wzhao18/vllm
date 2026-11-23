@@ -1305,7 +1305,9 @@ class MooncakeStoreScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
-        self._join_summary.add_waits(meta.join_waits, meta.join_timeouts)
+        summary = getattr(self, "_join_summary", None)
+        if summary is not None:
+            summary.add_waits(meta.join_waits, meta.join_timeouts)
         for req_id, seconds in meta.load_seconds.items():
             tokens = getattr(self, "_early_tokens", {}).pop(req_id, None)
             if tokens is not None:
