@@ -96,8 +96,11 @@ logger = init_logger(__name__)
 # 65-256 rows too (axhb-sw3, 16 ranks, mirrored, 93 layers, 32k, us/step: B9 -11, B17
 # -19, B24 -14, B28 -37, B32 -5): the stock embedding + FlashInfer two-shot all-reduce
 # (~36 us at 256 rows) leave the step head.
-# Above 256 rows too (TP16NV LHF; the head box grows to the largest ring batch).
-RING_HEAD = {16: "1-:1"}
+# TP8 (TP8WIDE, DFn on Rubin): 1-256 rows (the gather is shard-agnostic: one owner rank
+# per token row, the others publish nothing; test_kimi_k3_sdec_tp8_lhf). TP16 above 256
+# rows too (TP16NV LHF; the head box grows to the largest ring batch). Reconciled at the
+# batch merge: each TP keeps its own lane's tested rows.
+RING_HEAD = {8: "1-256:1", 16: "1-:1"}
 # Rubin verify graphs above the tuned rows (token rows by q, "*": any) that run the
 # specialized decode (generic kernels and stock seams, ``wide``); others run the stock
 # forward. A point leaves this table when its in-graph step measures slower than the
@@ -140,15 +143,16 @@ def wide_gate(q, *, rubin, seams, dsa, tp, dcp):
     """Why the captured verify rows above the tuned providers run the stock forward
     (None: those in ``WIDE_ROWS`` run the specialized decode). Wide steps need Rubin,
     q > 1 and every rank's full rows (no sequence parallelism: the o-projection seam),
-    and with K3.1 DSA layers (seam S2-DSA) TP16 = DCP16, where the fused wide
-    o-projection serves every such row: elsewhere they would run untested fallback
-    seams."""
+    and with K3.1 DSA layers (seam S2-DSA) DCP over every TP rank (TP16 = DCP16, TP8 =
+    DCP8: WideDsa's widened DcpBox at every wide row, the o-projection fused where
+    ``oproj.prepared.WIDE_TWOSHOT`` admits the TP, else seam S3). Other DSA layouts
+    (DCP below TP) were never run there."""
     if not (rubin and q > 1):
         return f"no prepared providers above {PREPARED_MAX} rows"
     if not seams:
         return "sequence parallelism"
-    if dsa and (tp, dcp) != (16, 16):
-        return "DSA wide steps need TP16 = DCP16"
+    if dsa and (tp not in (8, 16) or dcp != tp):
+        return "DSA wide steps need TP = DCP (TP8 or TP16)"
     return None
 
 
@@ -231,6 +235,7 @@ class SpecializedDecode:
     it; none of the TP8 / TP16 providers below is built."""
 
     sp = None  # the SP step (sp_attention.SpStep) under sequence parallelism
+    strict_wide = False  # NQ-NOFALLBACK beyond the target topology (``__init__``)
 
     def __init__(self, backbone, config):
         self.backbone, self.buffers = backbone, {}
@@ -269,6 +274,12 @@ class SpecializedDecode:
             q, rubin=cc == (10, 7), seams=seams, dsa=dsa, tp=self.tp, dcp=self.dcp
         )
         self.wide = () if self.wide_off else wide_rows(self.captured, q)
+        # NQ-NOFALLBACK beyond the target topology: a K3.1 DSA deployment with wide
+        # steps (TP8 = DCP8) runs every captured verify row specialized or refuses to
+        # start, and its DSA / KDA layers never take the whole stock seams (S2-DSA,
+        # S1) there; the o-projection seam (S3) stays a logged choice inside the
+        # specialized step (``check_wide``).
+        self.strict_wide = dsa and self.wide_off is None and q > 1
         self.batches = tuple(sorted({*self.tuned, *self.wide}))
         self.capacity = self.batches[-1]  # rows of every decode buffer
         self.context = Context(
@@ -490,7 +501,7 @@ class SpecializedDecode:
         wide_moe = tuple(b for b in moe_batches if b > PREPARED_MAX)
         # (the wide batches whose routed experts run on the wide engines, behind
         # FrontRows; the others run the stock router and experts into the wide tail)
-        wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
+        wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b, tp))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
             MoeTailBox(*owner) if packed else None,
@@ -619,9 +630,13 @@ class SpecializedDecode:
         core, S2 stock MLA, S2-DSA stock DSA attention, S3 stock o-projection +
         all-reduce + unfused AttnRes, S4 stock MoE layer): each family's ``choose``
         admits every wide row there today, and a table edit that stops admitting one
-        fails the startup instead of rerouting the shape. Elsewhere (out of scope)
-        the seams stay logged coverage choices."""
-        if not self.context.target:
+        fails the startup instead of rerouting the shape. A K3.1 DSA deployment with
+        wide steps off the target (``strict_wide``: TP8 = DCP8) refuses S1 and S2-DSA
+        the same way; its S3 seam (no TP8 entry in WIDE_TWOSHOT) is a logged choice
+        inside the specialized step. Elsewhere (out of scope) the seams
+        stay logged coverage choices."""
+        target = self.context.target
+        if not (target or self.strict_wide):
             return
         moe = any(isinstance(m, PreparedMoE) for m in self.feed_forward.values())
         for m in self.wide:
@@ -632,9 +647,9 @@ class SpecializedDecode:
                     refuse("KDA core", "seam S1, kda.prepared.STOCK_ROWS", shape)
                 if kind == "dsa" and m not in attention.dsa_wide:
                     refuse("DSA attention", "seam S2-DSA, dsa.wide.DSA_WIDE", shape)
-                if kind == "mla" and m not in attention.mla_wide:
+                if target and kind == "mla" and m not in attention.mla_wide:
                     refuse("MLA attention", "seam S2, mla.prepared.choose", shape)
-                if m not in attention.oproj_wide:
+                if target and m not in attention.oproj_wide:
                     refuse("o-projection", "seam S3, oproj WIDE_TWOSHOT", shape)
             if moe and m not in self.moe_batches:
                 refuse("MoE layer", "seam S4, moe.prepared.WIDE_TAIL", shape)
@@ -698,9 +713,9 @@ class SpecializedDecode:
                 why = f"no prepared providers above {PREPARED_MAX} rows"
                 if b > PREPARED_MAX:
                     why = self.wide_off or "not in WIDE_ROWS"
-                if self.context.target:
-                    # NQ-NOFALLBACK: a target deployment's captured row never runs
-                    # the whole-step stock forward.
+                if self.context.target or self.strict_wide:
+                    # NQ-NOFALLBACK: a target deployment's (or a TP8 = DCP8 DSA
+                    # one's) captured row never runs the whole-step stock forward.
                     refuse("decode step", f"whole stock forward: {why}", Shape(b, q))
                 coverage.stock(b, why)
             elif b in self.wide:
@@ -755,7 +770,11 @@ class SpecializedDecode:
         if attention is not None and b in attention.oproj_wide:
             choices["oproj"] = oproj_choose(Shape(b, q), self.context)
         else:
-            choices["oproj"] = Choice(stock, note="S3")
+            choices["oproj"] = Choice(
+                stock,
+                note=f"S3: stock o_proj GEMM + all-reduce, unfused AttnRes "
+                f"(oproj WIDE_TWOSHOT: no TP{self.tp} entry)",
+            )
         nvfp4 = next(
             (m for m in self.feed_forward.values() if isinstance(m, Nvfp4MoE)), None
         )
@@ -765,7 +784,10 @@ class SpecializedDecode:
             if b in self.moe_batches:
                 choices["moe"] = moe_choose(Shape(b, q), self.context)
             else:
-                choices["moe"] = Choice(stock, note="S4")
+                choices["moe"] = Choice(
+                    stock,
+                    note=f"S4: stock MoE layer (moe WIDE_TAIL: no TP{self.tp} entry)",
+                )
         if any(isinstance(m, PreparedDenseMLP) for m in self.feed_forward.values()):
             dense = Choice(generic, note="splitk") if b <= GENERIC_ROWS else None
             choices["dense"] = dense or Choice(
@@ -870,7 +892,7 @@ class SpecializedDecode:
         # DCP) a FULL graph outside ``batches`` keeps the stock forward, as before,
         # and is logged once per row count.
         if full_capture():
-            if self.context.target:
+            if self.context.target or self.strict_wide:
                 refuse("decode step (FULL graph capture)", why, Shape(b, self.q))
             logger.info_once(
                 "Kimi K3 decode: B%d FULL graph captured on the stock forward (%s; "

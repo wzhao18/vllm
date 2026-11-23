@@ -87,9 +87,19 @@ ROWS = 16
 # 16.59 / 18.60, x2048 18.60 / 49.45 (envs lane exact4): -4.8 / -5.9 us per layer on
 # balanced rows. 16-rank step (TP16 = DCP16, AgentX, new drafter, #63 merge; us per
 # step, same node, core / trtllm-gen): q8 B1 M8 4913 / 5133, B2 M16 6705 / 6899.
-# q4 / q6 (TP16NV, LHF): the q8 variant at the same 1-16 rows (q4 measured with it
-# above: B1 5852 -> 5601, B8 9449 -> 8825 us/step).
-VARIANT = {4: "1-16:2x16s2", 6: "1-16:2x16s2", 8: "1-16:2x16s2"}
+# q2-q7 (TP8WIDE + TP16NV, reconciled at the batch merge): the table is keyed by q only
+# and the core is q-agnostic (rows are tokens), so one entry serves TP8 = DCP8 and TP16 =
+# DCP16; q8 keeps its original entry. TP16 q4 (TP16NV LHF): B1 5852 -> 5601, B8 9449 ->
+# 8825 us/step. DCP8 rank shapes (TP8WIDE; 96 gathered heads, 12 per rank, CUDA graphs,
+# one VR200, us per call, core / trtllm-gen chain, 2-16 rows): balanced 256 local
+# entries per rank-row 9.8-10.5 / 11.0-14.8; one row at 384 14.6-14.9 / 11.0-14.8; at
+# 600 18.6-18.9 / 11.9-15.4. With the core's pushed DcpValue against the "proj" one the
+# chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to
+# -6 us per DSA layer on balanced rows, even with one row at 384 entries.
+VARIANT = {
+    **{q: "1-16:2x16s2" for q in range(2, 8)},  # q2-q7
+    8: "1-16:2x16s2",  # q8: the original entry (928a80c56b), unchanged
+}
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
 # serving deadline (600 s) and DcpBox's polls (none). DsaCore's own 5 s stays for tests.

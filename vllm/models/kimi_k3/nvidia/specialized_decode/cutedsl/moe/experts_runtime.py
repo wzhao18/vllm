@@ -500,8 +500,12 @@ def scratch(tp, device, rows=64):
 # shared expert then finishes first; split batches leave their down SMs, see
 # ``moe.prepared``); B2-4 on 192 with the shared expert's down rows beside them (B3-4
 # ~0.7 us per layer faster than 212); B1 on 152 (TP16 B1-2 run the small-batch chain).
-GRID = {(8, 152): 136, (16, 152): 152, (16, 212): 212}
-GRIDS = {(8, 152): "3-4:148,5-6:128,7:132,9-64:152", (16, 212): "1:152,2-4:192"}
+GRID = {(8, 152): 136, (8, 212): 212, (16, 152): 152, (16, 212): 212}
+GRIDS = {
+    (8, 152): "3-4:148,5-6:128,7:132,9-64:152",
+    (8, 212): "1:152,2-4:192",
+    (16, 212): "1:152,2-4:192",
+}
 
 
 def grids(tp, device):

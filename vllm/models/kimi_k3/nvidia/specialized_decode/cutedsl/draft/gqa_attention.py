@@ -93,8 +93,8 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 # B96 23.3 vs GqaWindow's best 29.6 (B64 20.4 vs 19.6, B32 12.9 vs 12.3: one CTA per
 # (request, KV head) is a serial stage chain at small batches; above ~106 requests
 # its 97 KB / 256-column CTAs exceed one wave).
-# The TP8 rows (prefill instances, which run the stock drafter) and TP4 k7 (no
-# deployment) take shapes measured at the same CTA counts.
+# The TP8 rows (DFn decode, and prefill instances, which run the stock drafter) and
+# TP4 k7 (no deployment) take shapes measured at the same CTA counts.
 GQA_WINDOW = {
     (1, 7): ((4, (16, 4, 2, 0)), (8, (16, 2, 3, 0)), (16, (8, 4, 3, 0)), (32, (4, 4, 4, 0)),
              (0, (2, 4, 4, 0))),
@@ -119,9 +119,13 @@ GQA_WINDOW = {
 # take k3's, k6 (36 rows, above it: no GqaWindowUmma shape) takes k7's; as (1, 5) does
 # for TP16 k5. Every shape is checked against stock per q (test_dspark_gqa_attention_int
 # test_window_tp4_any_q). NQ-TUNE: --shape sweeps at TP4 k1 / k2 / k4 / k5 / k6.
+# TP8 (DFn: TP8 = DCP8 decode, 2 KV heads per rank) at k1, k2, k4, k5, k6 the same
+# way, from (2, 3) / (2, 7) (test_window_tp8_any_q).
 for _k in (1, 2, 4, 5):
     GQA_WINDOW[(4, _k)] = GQA_WINDOW[(4, 3)]
+    GQA_WINDOW[(2, _k)] = GQA_WINDOW[(2, 3)]
 GQA_WINDOW[(4, 6)] = GQA_WINDOW[(4, 7)]
+GQA_WINDOW[(2, 6)] = GQA_WINDOW[(2, 7)]
 del _k
 
 

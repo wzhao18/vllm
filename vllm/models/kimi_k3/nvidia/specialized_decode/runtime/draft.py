@@ -59,7 +59,7 @@ logger = init_logger(__name__)
 # slices: the same drafts.) Markov rank 512 (128 rows per CTA, markov.CTA_ROWS) takes
 # the rank-256 choices. NQ-TUNE: rank 512 gate / staged / settle per batch
 # (scripts/dsdraft/markov_test.py at B1-B8) and B65-B192 launches vs the stock loop.
-FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-:1"}
+FUSED_MARKOV = {8: "1-8:1,9-:1", 16: "1-2:2,3-8:3,9-:1"}
 # FUSED_MARKOV requests whose kernel waits at a CTA barrier between each position's key
 # poll and its shuffle maxima (cutedsl.draft.markov ``settle``), per TP. 16 ranks, real
 # DSpark weights, us: B1 31.19 -> 30.65 (31.37 -> 30.73), B2 / B8 flat; drafts
@@ -69,7 +69,9 @@ SETTLED_MARKOV = {16: "1:1"}
 # at most 8 rows, the shard read in place with an L2 evict-first policy), per TP, on
 # Rubin. 1 GPU, cold L2, 7 rows: 15.3 vs 18.5 us (torch.mm; 16-rank serving: cuBLAS
 # 18.5 + split-K reduce 3.8). An FP32 accumulation reorder of the base logits.
-FAST_LM_HEAD = {16: "1-7:1"}
+# TP8 (DFn on Rubin): the same rows on the 2x vocabulary shard (the verify LM head
+# already runs both kernels on it at every TP; test_specialized_decode_tp8_lmhead_gpu).
+FAST_LM_HEAD = {8: "1-7:1", 16: "1-7:1"}
 # Query rows whose LM-head shard GEMM runs with evict-first weight
 # loads (cutedsl.verify.lmhead.PreparedWideLmHead: the projection core without a K
 # split, BF16 logits bitwise equal to cuBLAS's unsplit kernels), per TP, on Rubin:
@@ -88,7 +90,7 @@ FAST_LM_HEAD = {16: "1-7:1"}
 # Above 64 rows cuBLAS as before. NQ-TUNE: 9-16 rows, the sweep's split-K 64.16.1.8 is
 # 14.23-14.30 us vs cuBLAS 14.55-14.60 (-2%, an FP32 K-order reorder: no K split): a
 # drafter LM head on that projection tactic is not wired.
-WIDE_LM_HEAD = {16: "17-32:1"}
+WIDE_LM_HEAD = {8: "17-32:1", 16: "17-32:1"}
 # Query rows whose LM-head shard GEMM is the die-local persistent stream-K token-wide
 # GEMM (cutedsl.gemm.wide_sk: the shard's two halves homed on the two dies, one CTA
 # pair per SM pair, all rows on the MMA's N), per TP, for the release drafter
@@ -141,7 +143,7 @@ FAST_DCP = {4: "1-:1", 8: "1-64:1", 16: "1-:1"}
 # replicated context_proj GEMM (514 MB of weights per rank).
 # (hb192: to 768 context rows, DL3 B192; open above: cutedsl.draft.context keeps the
 # rows its per-row gather CTAs can hold at once.) NQ-TUNE: above 768 context rows.
-FAST_CONTEXT = {8: "1-64:1", 16: "1-:1"}
+FAST_CONTEXT = {8: "1-:1", 16: "1-:1"}
 # Query rows whose forward runs the all-reduce + residual + RMSNorm sites as Lamport
 # kernels (cutedsl.draft.allreduce): 1 one-shot, 2 two-shot (common.twoshot), per TP,
 # on Rubin. 16 ranks, us/site one-shot / two-shot (scripts/dsdraft/ar_test.py, chain
@@ -156,26 +158,26 @@ FAST_CONTEXT = {8: "1-64:1", 16: "1-:1"}
 # from the deployment's rows. Beyond one wave of 1024-thread CTAs a row's CTA waits
 # only on the same row's CTAs of the other ranks, which push before they wait.)
 # NQ-TUNE: ArNormRows above 576 rows (DL7 B83+) vs the stock site.
-FAST_AR = {8: "1-7:1", 16: "1-7:1,8-64:2,65-:3"}
+FAST_AR = {8: "1-7:1,8-64:2,65-:3", 16: "1-7:1,8-64:2,65-:3"}
 # FAST_AR one-shot batches whose sites gate their 16-source poll on one fragment per
 # source (cutedsl.draft.allreduce ``gate``), per TP, on Rubin. 16 ranks, the B1
 # drafter forward (scripts/dsdraft/layer_test.py, in process), us ungated -> gated:
 # 210.1 -> 206.4 (209.3 -> 206.2); with the gated q gather 208.4 -> 204.5 (207.2 ->
 # 204.1); outputs bitwise identical.
-GATED_AR = {16: "1-7:1"}
+GATED_AR = {8: "1-7:1", 16: "1-7:1"}
 # VALID_AR one-shot query rows whose polled sites run before their PDL wait and
 # wait at the end (cutedsl.draft.allreduce ArNorm ``early``), released by ring
 # o_proj / down_proj producers that trigger after their own wait, per TP, on Rubin.
 # 16 ranks, the B1 drafter forward (5 layers), us: 8.8k context 181.9 -> 178.5, 64k
 # 196.4 -> 195.0; outputs bitwise identical.
-SITE_DEFERRED = {16: "1-7:1"}
+SITE_DEFERRED = {8: "1-7:1", 16: "1-7:1"}
 # One-shot (FAST_AR 1) query rows whose polled sites land their TP slots with
 # validity-reporting bulk copies (cutedsl.draft.allreduce ArNorm ``valid``, mla.qvalid)
 # instead of gated LSU polls, per TP, on Rubin. 16 ranks, the B1 drafter forward
 # (scripts/dsdraft/layer_test.py), us LSU -> validity copies: 187.4 / 186.7 / 186.8 ->
 # 181.7 / 181.0 / 181.7 at local 560, 202.6 / 201.7 -> 196.2 / 196.2 at local 4096;
 # bitwise identical.
-VALID_AR = {16: "1-7:1"}
+VALID_AR = {8: "1-7:1", 16: "1-7:1"}
 # Rubin TP16, drafter GEMMs of at most 8 rows (B1: 7 query rows, 8 context rows): the
 # split-K projection (cutedsl.gemm.projection) instead of cuBLAS, tactic by (N, K).
 # 1 GPU, cold weights, us (cuBLAS -> split-K): qkv_a 6.19 -> 3.91, q_b 3.45 -> 1.80,

@@ -184,7 +184,7 @@ def compile_oproj_l1(*args):
 # Rubin (compute capability 10.7) two-shot batches per TP whose column owners poll
 # their TP receive slots with every load in flight (``OprojConsumer(batched=True)``)
 # instead of one dependent round trip per slot. Bitwise identical.
-TWOSHOT_BATCHED = {16: "17-64:1"}
+TWOSHOT_BATCHED = {8: "33-64:1", 16: "17-64:1"}
 
 
 def twoshot_batched(tp, batch, device):
@@ -204,7 +204,7 @@ def twoshot_batched(tp, batch, device):
 # 1-GPU front proxy behind a consumer-shaped predecessor: -1.5 us per MoE layer.
 # M32 too (16 ranks, 32-layer proxy, same nodes, median us/step 64 -> 32+64, graph
 # shas equal: DL7 B4 2781.4 -> 2741.0, DL3 B8 2732.4 -> 2706.1).
-CONSUMER_CARVEOUT = {16: "32:100,64:100"}
+CONSUMER_CARVEOUT = {8: "32:100,64:100", 16: "32:100,64:100"}
 
 
 def consumer_carveout(tp, batch, device):
@@ -226,7 +226,7 @@ def consumer_carveout(tp, batch, device):
 # - M24: 14.48 -> 14.43 / 39.81 -> 39.64;
 # - M40: 15.55 -> 14.85 / 39.83 -> 39.80.
 # 4 ranks + 12 emulated, pair us/call: one-shot M16 (ONESHOT_RING) 6.93 -> 6.56.
-PRODUCER_CARVEOUT = {16: "9-40:80"}
+PRODUCER_CARVEOUT = {8: "9-40:80", 16: "9-40:80"}
 
 
 def producer_carveout(tp, batch, device):

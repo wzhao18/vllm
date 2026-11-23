@@ -120,10 +120,6 @@ class VerifyArgmax:
                 f"{THREADS * VECTOR}-aligned and rank-contiguous"
             )
             return None
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            UnquantizedEmbeddingMethod,
-        )
-
         from ..cutedsl.verify import lmhead
         from ..cutedsl.verify.argmax import PreparedArgmax
 
@@ -132,7 +128,7 @@ class VerifyArgmax:
         fused = wide = logits = None
         weight = lm_head.weight[:vocab_rank]
         if (
-            isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+            plain_lm_head(lm_head.quant_method)
             and getattr(lm_head, "bias", None) is None
             and lmhead.supports(weight)
         ):
@@ -206,3 +202,22 @@ class VerifyArgmax:
             end = min(start + MAX_ROWS, rows)
             self.prepared.run(logits[start:end], out[start:end])
         return out
+
+
+def plain_lm_head(method) -> bool:
+    """Whether the LM head's quant method is the plain BF16 GEMM the fused kernels
+    reproduce: ``UnquantizedEmbeddingMethod``, or ``UnquantizedLinearMethod`` (a
+    quantized checkpoint that lists the LM head in its ignore list, e.g. the NVFP4
+    ``modelopt_mixed`` one) on the default unquantized GEMM; both apply the weight
+    through ``dispatch_unquantized_gemm`` with no bias."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    if isinstance(method, UnquantizedEmbeddingMethod):
+        return True
+    return isinstance(method, UnquantizedLinearMethod) and (
+        getattr(method, "_gemm_impl", None) is dispatch_unquantized_gemm()
+    )

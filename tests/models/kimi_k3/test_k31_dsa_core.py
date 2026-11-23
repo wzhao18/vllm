@@ -495,9 +495,9 @@ def test_trtllm_kv_ctas():
 
 
 def test_dsa_core_policy():
-    """The core's tables (no switch): by q, then rows (a q without a table and rows
-    past ROWS keep FlashInfer), split_min in the variant name; a test table for
-    every q."""
+    """The core's tables (no switch): by q (every verify length q2-q8), then rows (a
+    q without a table and rows past ROWS keep FlashInfer), split_min in the variant
+    name; a test table for every q."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
     assert decode.parse_variant("2x16s2") == (2, 16, 2)
@@ -508,7 +508,8 @@ def test_dsa_core_policy():
     dsac = decode.DsacDecode(torch.device("cuda"), H)
     assert dsac.rows == decode.ROWS == 16
     assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 2)
-    assert dsac.variant(8, 4) is None  # no q4 table
+    assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 2)  # every q2-q8
+    assert dsac.variant(8, 1) is None  # (no verify: no table)
     assert dsac.variant(24, 8) is None  # past ROWS
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:4x32")
     assert every.variant(8, 4) == (1, 16, 4) and every.variant(64, 8) == (4, 32, 4)
@@ -532,7 +533,9 @@ def _model(kv_dtype="fp8", dcp=16, prims_ts=False):
     "kv_dtype,dcp,sp,q,prims_ts,reason",
     [
         ("fp8", 16, False, 8, False, None),  # C1 / C8 / C48 / C64: the core runs
-        ("fp8", 16, False, 4, False, "verify length 4"),  # C160 / C256: no q4 table
+        ("fp8", 16, False, 4, False, None),  # C160 / C256 (q4): the core runs too
+        ("fp8", 8, False, 6, False, None),  # DFn k5 (TP8 = DCP8)
+        ("fp8", 16, False, 1, False, "verify length 1"),  # no verify: no table
         ("fp8", 4, True, 4, False, "sequence-parallel"),  # C512: SpDsaCore
         ("fp8", 1, False, 8, False, "no DCP"),
         ("nvfp4_ds_mla", 16, False, 8, False, "nvfp4_ds_mla"),  # FP8 rows only

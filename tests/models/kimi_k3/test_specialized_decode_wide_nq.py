@@ -84,11 +84,11 @@ def captured(q, top=2048):
     return captured_rows(range(1, top + 1), q, top)
 
 
-def context(q, max_rows=2048, sms=212, bf16_state=False):
+def context(q, max_rows=2048, sms=212, bf16_state=False, tp=16):
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Context
 
     return Context(
-        arch="rubin", tp=16, rank=0, dcp=16, sms=sms, q=q, max_rows=max_rows,
+        arch="rubin", tp=tp, rank=0, dcp=tp, sms=sms, q=q, max_rows=max_rows,
         max_context=1 << 20, bf16_state=bf16_state,
     )  # fmt: skip
 
@@ -145,6 +145,65 @@ def test_families_choose_every_wide_row(q):
             expect = Path.STOCK if m >= 384 else Path.GENERIC
             assert attn_res_choose(shape, ctx).path is expect, m
             assert kda_choose(shape, ctx) is not None, m
+
+
+TP8_Q_ROWS = {4: range(68, 1537, 4), 6: range(66, 1537, 6), 8: range(72, 1537, 8)}
+
+
+@pytest.mark.parametrize("q", [4, 6, 8])
+def test_tp8_every_captured_row_is_wide(q):
+    """TP8 = DCP8 (DFn): K3.1's DSA layers take every captured verify row above 64
+    (up to its 1536-row capacity anchor) as a wide row of the specialized decode, not
+    the whole-step stock forward; the target-topology refusal stays TP16-only."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (
+        wide_gate,
+        wide_rows,
+    )
+
+    assert wide_gate(q, rubin=True, seams=True, dsa=True, tp=8, dcp=8) is None
+    rows = captured(q, 1536)
+    assert wide_rows(rows, q) == tuple(m for m in rows if m > 64)
+    assert wide_rows(rows, q) == tuple(TP8_Q_ROWS[q])
+    assert not context(q, tp=8).target
+
+
+@pytest.mark.parametrize("q", [4, 6, 8])
+def test_tp8_families_choose_every_wide_row(q):
+    """Each family's ``choose`` at every TP8 = DCP8 wide row (Rubin, FP32 and BF16 KDA
+    state): DSA runs WideDsa, KDA its TP8 verify kernels (gate mode 1), AttnRes as at
+    TP16; the o-projection takes seam S3 (no TP8 entry in WIDE_TWOSHOT) and the MXFP4
+    MoE layer the wide tail behind the stock routed experts (no TP8 wide engine);
+    nothing raises."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
+        choose as attn_res_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        choose as dsa_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.prepared import (
+        choose as kda_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (
+        choose as moe_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.prepared import (  # noqa: E501
+        choose as oproj_choose,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Path, Shape
+
+    for bf16_state in (False, True):
+        ctx = context(q, max_rows=1536, bf16_state=bf16_state, tp=8)
+        for m in TP8_Q_ROWS[q]:
+            shape = Shape(m, q)
+            dsa = dsa_choose(shape, ctx)
+            assert dsa is not None and dsa.tactic == "wide", m
+            assert oproj_choose(shape, ctx) is None, m  # S3
+            moe = moe_choose(shape, ctx)  # the wide tail behind the stock experts
+            assert moe.path is Path.GENERIC and "no TP8 wide engine" in moe.note, m
+            expect = Path.STOCK if m >= 384 else Path.GENERIC
+            assert attn_res_choose(shape, ctx).path is expect, m
+            kda = kda_choose(shape, ctx)
+            assert kda.path is Path.GENERIC, m
 
 
 class Built(Exception):
@@ -364,10 +423,10 @@ def test_dsa_partials_automatic():
     # by verify length: BF16 only on the rows the DSA sparse core serves at that q
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import ROWS, VARIANT
 
-    for q in (1, 4, 8):
+    for q in (1, 2, 4, 6, 8):
         expect = f"1-{ROWS}:bf16,{ROWS + 1}-:proj" if q in VARIANT else "proj"
         assert r1.dsa_partials(None, fp8=True, q=q) == expect
-    assert r1.dsa_partials(None, fp8=True, q=4) == "proj"
+    assert r1.dsa_partials(None, fp8=True, q=1) == "proj"
     assert r1.dsa_partials(None, fp8=False, q=4) == "bf16"
     assert r1.dsa_partials("proj") == "proj"
     for bad in ("fp8", "1-64:int8", "1-64"):
@@ -604,7 +663,7 @@ def test_decode_feeds_front_rows_single_launch_batches():
         if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "wide_engines"
     ]
     assert ast.unparse(engines) == (
-        "tuple((b for b in wide_moe if wide_experts_batch(b)))"
+        "tuple((b for b in wide_moe if wide_experts_batch(b, tp)))"
     )
     guards = [
         ast.unparse(n.test)
@@ -686,6 +745,8 @@ def test_wide_experts_single_launch_only():
     for rows in (68, 256, 512, WIDE_MAX):
         assert prepared.wide_experts_batch(rows), rows
         assert "wide experts" in prepared.choose(Shape(rows, 4), ctx).note, rows
+    for rows in (68, 256, 512, WIDE_MAX):  # TP8: no wide engine at any row
+        assert not prepared.wide_experts_batch(rows, 8), rows
     for rows in (WIDE_MAX + 4, 1024, 2048):
         assert not prepared.wide_experts_batch(rows), rows
         note = prepared.choose(Shape(rows, 4), ctx).note
@@ -694,3 +755,101 @@ def test_wide_experts_single_launch_only():
             note,
         )
         assert "wide engines lose above one launch" in note, (rows, note)
+
+
+def test_tp8_rubin_shared_down_splits():
+    """TP8 on Rubin-class devices (DFn) takes ``SPLITS_WIDE``'s verify entries as TP16
+    does (SharedDown on 8 SMs at 13-63 rows, 4 at 64); GB300 keeps its TP8 tables, and
+    q = 1 steps are unchanged."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.front import (
+        split_table,
+    )
+
+    rubin, gb300 = split_table(8, True, True), split_table(8, True, False)
+    assert [rubin.get(b) for b in (12, 13, 16, 32, 48, 63, 64)] == [6, 8, 8, 8, 8, 8, 4]
+    assert [gb300.get(b) for b in (13, 16, 24, 32, 48, 64)] == [6, 6, 4, 4, 3, 3]
+    plain = split_table(8, False, True), split_table(8, False, False)
+    assert all(plain[0].get(b) == plain[1].get(b) for b in range(1, 65))
+    tp16 = split_table(16, True, True)
+    assert [tp16.get(b) for b in (13, 32, 64)] == [8, 8, 4]
+
+
+def test_tp8_rubin_prefetch_tables():
+    """TP8 on Rubin-class devices (DFn) takes the ``prefetch.WIDE`` entries (the
+    next-attention cap within one die's resident L2, no ``oproj_down`` prefetch);
+    prefetches move no data a kernel computes with: no precision change."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import prefetch
+
+    assert prefetch.WIDE[8] == prefetch.WIDE[16]
+    spec, grid, front, shared = prefetch.WIDE[8]
+    assert grid == 96 and front == ""
+    table = prefetch.batch_table(spec)
+    assert [table.get(b) for b in (1, 7, 8, 9)] == [48, 48, 24, None]
+
+
+def test_plain_lm_head_methods():
+    """The fused verify LM head takes the BF16 LM head of the NVFP4 checkpoint too
+    (``modelopt_mixed`` lists it in ``ignore``: ``UnquantizedLinearMethod``), as the
+    MXFP4 one's ``UnquantizedEmbeddingMethod``; both run the default unquantized
+    GEMM. A non-default linear backend or a quantized method is refused."""
+    pytest.importorskip("cutlass")
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.verify import (
+        plain_lm_head,
+    )
+
+    assert plain_lm_head(UnquantizedEmbeddingMethod())
+    linear = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+    linear._gemm_impl = dispatch_unquantized_gemm()
+    assert plain_lm_head(linear)
+    linear._gemm_impl = lambda *args: None  # another linear backend
+    assert not plain_lm_head(linear)
+    assert not plain_lm_head(object())
+
+
+def test_tp8_inprojection_generic_rows_run_cublas():
+    """``PROJECTION_GENERIC`` is keyed by TP: TP8's 65-128 rows (KDA 6288, DSA 3808
+    per rank) run cuBLAS, where split-K 64.64.2.6 measured ~10 / ~6 us slower per
+    call; TP16 keeps its split-K there. The tuned bins are unchanged."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import providers
+
+    for rows in (6288, 3808):
+        tp8 = providers.projection_policies(8, rows, (8, 64, 72, 128), sms=212, q=4)
+        assert 72 not in tp8 and 128 not in tp8, (rows, tp8)
+    tp16 = providers.projection_policies(16, 3216, (128,), sms=212, q=4)
+    assert tp16 == {128: (64, 64, 2, 6)}
+
+
+def test_tp8_rubin_tables_take_tp16_entries():
+    """DFn (TP8 = DCP8 on Rubin) table extensions that take TP16's measured Rubin
+    entries: the experts' grid (every SM; B1 152, B2-4 192), the merged front at 16-32
+    rows (a stated FP32 K reorder), the o-projection's batched consumer polls and
+    carve-outs (launch attributes, bitwise), and the drafter's Markov (MarkovWide above
+    8 requests: identical drafts), context step, all-reduce sites and their gates."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime,
+        front,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import (
+        prepared as oproj,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+    assert experts_runtime.GRID[(8, 212)] == 212
+    assert experts_runtime.GRIDS[(8, 212)] == experts_runtime.GRIDS[(16, 212)]
+    assert front.MERGED_WIDE[8] == front.MERGED_WIDE[16]
+    assert oproj.CONSUMER_CARVEOUT[8] == oproj.CONSUMER_CARVEOUT[16]
+    assert oproj.PRODUCER_CARVEOUT[8] == oproj.PRODUCER_CARVEOUT[16]
+    assert oproj.TWOSHOT_BATCHED[8] == oproj.TWOSHOT[8]  # the TP8 two-shot rows
+    for table in ("FAST_CONTEXT", "FAST_AR", "GATED_AR", "SITE_DEFERRED", "VALID_AR"):
+        assert getattr(draft, table)[8] == getattr(draft, table)[16], table
+    markov = draft.batch_table(draft.FUSED_MARKOV[8])
+    assert all(markov.get(b) == 1 for b in (1, 8, 9, 64, 384))

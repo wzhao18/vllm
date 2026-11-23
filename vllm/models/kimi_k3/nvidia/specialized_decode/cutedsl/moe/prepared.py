@@ -13,6 +13,7 @@ from ...shapes import Choice, Path, rows_policy
 from ..common.policy import batch_table
 from ..oproj.prepared import OprojMailbox
 from .experts_runtime import scratch as expert_scratch
+from .experts_runtime import WIDE as WIDE_ENGINES
 from .experts_runtime import wide_chunks
 from .shared import scratch as shared_scratch
 from .tail_rows import TailRowsBox
@@ -104,7 +105,9 @@ class PreparedMoE:
         self.rows, self.module = rows, module
         self.front_rows = front_rows if rows is not None else None
         self.wide_experts, self.wide_batches = None, frozenset()
-        wide = [b for b in state.batches if b > CAP and wide_experts_batch(b)]
+        wide = [
+            b for b in state.batches if b > CAP and wide_experts_batch(b, state.tp)
+        ]
         if rows is not None and wide:
             from .experts_runtime import WideExperts
 
@@ -444,7 +447,9 @@ def deferred_rows(module, batches):
 # earlier kernels' rows (NormRows, OutRows), its boxes are the largest graph's, and the
 # wide experts run in launches of at most ``experts_wide.WIDE_MAX`` rows above it
 # (``experts_runtime.PersistentExperts.prepare_wide``). 65-768 measured (hb192).
-WIDE_TAIL = {16: "65-:1"}
+# TP8 (DFn: TP8 = DCP8): the same wide tail behind the stock router, latent-down,
+# shared and routed experts (no TP8 wide engines: ``wide_experts_batch``).
+WIDE_TAIL = {8: "65-:1", 16: "65-:1"}
 # Wide batches' routed experts: v8moe's wide engines (``experts_runtime.WideExperts``)
 # on the stock router's routes, instead of the stock layer's kernel.
 WIDE_EXPERTS = True
@@ -457,7 +462,7 @@ WIDE_EXPERTS = True
 WIDE_FRONT = True
 
 
-def wide_experts_batch(rows):
+def wide_experts_batch(rows, tp=16):
     """Whether a wide batch's routed experts run on the wide engines (``WIDE_EXPERTS``,
     in one launch: at most ``experts_wide.WIDE_MAX`` rows), else the stock layer's
     routed experts behind the stock front, into the same wide tail. Above WIDE_MAX the
@@ -465,8 +470,11 @@ def wide_experts_batch(rows):
     expert's weights again, while the stock kernel's time stays nearly flat (VR200, 1
     GPU, real q4 routes, us wide vs stock FlashInfer: M512 98 vs 154, M768 127 vs 159,
     M832 177 vs 162, M1024 196 vs 168, M1536 257 vs 195, M2048 358 vs 197; nqbench
-    kern-moe experts)."""
-    return WIDE_EXPERTS and len(wide_chunks(rows)) == 1
+    kern-moe experts). Only where the wide engines serve the TP
+    (``experts_runtime.WIDE``: TP16; the TP8 shard's 768-row w13 has no wide engine,
+    so TP8 wide rows run the stock routed experts into the wide tail)."""
+    engines = batch_table(WIDE_ENGINES.get(tp, "")).get(rows)
+    return WIDE_EXPERTS and bool(engines) and len(wide_chunks(rows)) == 1
 
 
 def choose(shape, ctx):
@@ -484,17 +492,20 @@ def choose(shape, ctx):
         return None
     # As the runtime selects them (runtime.decode: FrontRows with WIDE_EXPERTS and
     # WIDE_FRONT, else the stock router + latent-down and shared expert).
-    wide = wide_experts_batch(shape.rows)
+    wide = wide_experts_batch(shape.rows, ctx.tp)
     front = "FrontRows front" if wide and WIDE_FRONT else "stock front"
     # NQ-NOFALLBACK: the stock experts above one wide launch are a measured choice
     # (``wide_experts_batch``: the wide engines lose from M832, VR200 1 GPU 177 vs
     # 162 us); the coverage log names it.
-    experts = (
-        "wide experts"
-        if wide
-        else "stock FlashInfer experts (wide engines lose above one launch: M832 177 "
-        "vs 162 us)"
-    )
+    if wide:
+        experts = "wide experts"
+    elif not WIDE_ENGINES.get(ctx.tp):
+        experts = f"stock routed experts (no TP{ctx.tp} wide engine)"
+    else:
+        experts = (
+            "stock FlashInfer experts (wide engines lose above one launch: M832 177 "
+            "vs 162 us)"
+        )
     return Choice(
         Path.GENERIC, ("rows", "stock-front"), f"{front}, {experts}, wide tail"
     )

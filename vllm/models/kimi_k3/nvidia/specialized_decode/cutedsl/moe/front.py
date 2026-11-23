@@ -544,7 +544,20 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # 40-56); on 8 SMs, us/layer over 3-8 real-route layers (79-300 distinct): M16
 # -1.2..-8.9, M24 -2.4..-5.6, M32 -5.4..-16.1, M40-56 -17.1..-30.4 (6 SMs within
 # 0.5 of 8; M64 stays at 4: 6 / 8 within -1.1..+0.6).
-SPLITS_WIDE = {16: ("", "13-63:8,64:4")}
+# TP8 (DFn on Rubin): the TP16 verify entries (the shared expert's down rows are 2x
+# the TP16 shard, so SharedDown on GB300's 3-6 SMs outlasts the experts there too).
+SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
+
+
+def split_table(tp, verify, wide):
+    """SharedDown's SMs per fused batch (``SPLIT``, then ``SPLITS``, then on Rubin-class
+    devices ``SPLITS_WIDE``; later entries override)."""
+    splits = SPLITS[tp][verify]
+    if wide and tp in SPLITS_WIDE:
+        splits = f"{splits},{SPLITS_WIDE[tp][verify]}"
+    return batch_table(f"{SPLIT},{splits}")
+
+
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
@@ -556,7 +569,7 @@ MERGED = {8: "41-64:1", 16: "33-64:1"}
 # -0.68..-1.26, M32 -1.20..-1.43 (q8) / -1.56 (q4); with the rows 4 us late M16-32
 # +0.03..-0.31. The front's K split changes (a stated FP32 reorder of the logits and
 # the latent rows); top-16 ids identical on the test routes.
-MERGED_WIDE = {16: "16-32:1"}
+MERGED_WIDE = {8: "16-32:1", 16: "16-32:1"}
 # Devices with more SMs than GB300's 152 (Rubin), by packed front rows: ``MERGED``
 # batches whose merged front + gate/up kernel is ``MoeFrontTmem64`` (128-row tiles
 # split over K in clusters of 8, the weights staged in tensor memory before the PDL
@@ -722,10 +735,7 @@ class SharedFront:
         fused = batch_table(FUSED)
         fused = {b for b in batches if b > 8 and counters is not None and fused.get(b)}
         verify = q > 1
-        splits = SPLITS[tp][verify]
-        if wide and tp in SPLITS_WIDE:
-            splits = f"{splits},{SPLITS_WIDE[tp][verify]}"
-        split = batch_table(f"{SPLIT},{splits}")
+        split = split_table(tp, verify, wide)
         self.split = {b: split[b] for b in fused if split.get(b)}  # down SMs
         if fused:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
