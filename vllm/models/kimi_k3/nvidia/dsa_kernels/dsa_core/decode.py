@@ -87,7 +87,9 @@ ROWS = 16
 # 16.59 / 18.60, x2048 18.60 / 49.45 (envs lane exact4): -4.8 / -5.9 us per layer on
 # balanced rows. 16-rank step (TP16 = DCP16, AgentX, new drafter, #63 merge; us per
 # step, same node, core / trtllm-gen): q8 B1 M8 4913 / 5133, B2 M16 6705 / 6899.
-VARIANT = {8: "1-16:2x16s2"}
+# q4 / q6 (TP16NV, LHF): the q8 variant at the same 1-16 rows (q4 measured with it
+# above: B1 5852 -> 5601, B8 9449 -> 8825 us/step).
+VARIANT = {4: "1-16:2x16s2", 6: "1-16:2x16s2", 8: "1-16:2x16s2"}
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
 # serving deadline (600 s) and DcpBox's polls (none). DsaCore's own 5 s stays for tests.

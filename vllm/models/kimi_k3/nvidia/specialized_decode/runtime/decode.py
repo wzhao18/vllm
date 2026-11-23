@@ -101,7 +101,8 @@ logger = init_logger(__name__)
 # 65-256 rows too (axhb-sw3, 16 ranks, mirrored, 93 layers, 32k, us/step: B9 -11, B17
 # -19, B24 -14, B28 -37, B32 -5): the stock embedding + FlashInfer two-shot all-reduce
 # (~36 us at 256 rows) leave the step head.
-RING_HEAD = {16: "1-256:1"}
+# Above 256 rows too (TP16NV LHF; the head box grows to the largest ring batch).
+RING_HEAD = {16: "1-:1"}
 # Rubin verify graphs above the tuned rows (token rows by q, "*": any) that run the
 # specialized decode (generic kernels and stock seams, ``wide``); others run the stock
 # forward. A point leaves this table when its in-graph step measures slower than the
@@ -113,7 +114,8 @@ RING_HEAD = {16: "1-256:1"}
 # B17-B192); NQ-TUNE: the 16-rank in-graph step vs the stock forward at q4 M1024 /
 # M1536 / M2048 and q8 M1024 / M2048 (a point that loses leaves this table).
 WIDE_ROWS = {"*": "65-:1"}
-RING_DENSE = {16: "1-8:1"}
+# 9-64 rows too (TP16NV LHF; the dense ring box holds PREPARED_MAX rows).
+RING_DENSE = {16: "1-64:1"}
 
 
 def head_batches(attention, q):

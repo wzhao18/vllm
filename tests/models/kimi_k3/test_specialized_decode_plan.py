@@ -973,7 +973,7 @@ def test_kda_q1_decode_math_by_state_dtype(bf16_state):
 
 
 def test_kda_fp32_fold_is_stock_math_at_q8_only():
-    """The B8 fold of an FP32 state: q8 only (KDA_FOLD64_FP32, the step A/B: the q4
+    """The B8 fold of an FP32 state: q8 / q6 only (KDA_FOLD64_FP32, the step A/B: the q4
     fold paid nothing), and its prepared verify computes the stock verify's math
     (``stock``; KdaVerifyCols at B8, as for a BF16 state)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.policy import (
@@ -986,7 +986,7 @@ def test_kda_fp32_fold_is_stock_math_at_q8_only():
 
     fp32 = batch_table(providers_module.KDA_FOLD64_FP32[16])
     bf16 = batch_table(providers_module.KDA_FOLD64[16])
-    assert fp32.get(64) and not fp32.get(32)
+    assert fp32.get(64) and fp32.get(48) and not fp32.get(32)  # (q8 B8, q6 B8)
     assert bf16.get(64) and bf16.get(32)
     for q in (4, 8):
         for bf16_state in (False, True):
