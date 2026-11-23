@@ -143,12 +143,19 @@ class _DeviceFaultWatch:
     POLL_S = 1.0
 
     def __init__(self, device_index: int) -> None:
-        from cuda.bindings import runtime
+        # Driver API only: the thin calls below never initialize a CUDA
+        # runtime, so the watcher thread cannot stall the main thread (a
+        # cuda-python runtime init on the thread's first call can hold the GIL
+        # for seconds, enough start-up skew to trip the peers' device waits).
+        from cuda.bindings import driver
 
-        self.runtime = runtime
+        self.driver = driver
         self.device_index = device_index
         self.stream = torch.cuda.Stream(device=device_index)
         self.stream_handle = self.stream.cuda_stream
+        with torch.cuda.device(device_index):
+            torch.cuda.current_stream().query()  # the primary context is current
+            _, self.context = driver.cuCtxGetCurrent()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._watch, name="direct-cp-fault-watch", daemon=True
@@ -162,17 +169,15 @@ class _DeviceFaultWatch:
             self._thread.join(timeout=5.0)
 
     def query(self) -> Any:
-        """cudaSuccess while the context is healthy, else its sticky error."""
-        (error,) = self.runtime.cudaStreamQuery(
-            self.runtime.cudaStream_t(self.stream_handle)
-        )
+        """CUDA_SUCCESS while the context is healthy, else its sticky error."""
+        (error,) = self.driver.cuStreamQuery(self.driver.CUstream(self.stream_handle))
         return error
 
     def check(self) -> bool:
         error = self.query()
         if error in (
-            self.runtime.cudaError_t.cudaSuccess,
-            self.runtime.cudaError_t.cudaErrorNotReady,
+            self.driver.CUresult.CUDA_SUCCESS,
+            self.driver.CUresult.CUDA_ERROR_NOT_READY,
         ):
             return False
         self._abort(
@@ -190,10 +195,10 @@ class _DeviceFaultWatch:
         os._exit(DEVICE_FAULT_EXIT_CODE)
 
     def _watch(self) -> None:
-        runtime = self.runtime
-        runtime.cudaSetDevice(self.device_index)
-        runtime.cudaThreadExchangeStreamCaptureMode(
-            runtime.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+        driver = self.driver
+        driver.cuCtxSetCurrent(self.context)
+        driver.cuThreadExchangeStreamCaptureMode(
+            driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
         )
         while not self._stop.wait(self.POLL_S):
             if self.check():
