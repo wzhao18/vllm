@@ -830,8 +830,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.recoverssm_backend = "cute" if supported else "triton"
             if self.recoverssm_backend == "triton":
                 logger.info_once(
-                    "Using the Triton KDA RecoverSSM verify and commit: the CuTe "
-                    "kernels cannot run (%s).",
+                    "Stock-path KDA RecoverSSM backend: Triton (the CuTe kernels "
+                    "cannot run: %s). Under the specialized decode the FULL decode "
+                    "steps install the deferred FP32 commit instead; Triton runs "
+                    "only on stock steps.",
                     reason,
                 )
             else:

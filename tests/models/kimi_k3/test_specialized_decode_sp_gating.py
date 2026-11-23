@@ -6,6 +6,7 @@ trtllm-gen, FP32 KDA state, ReplaySSM), its coverage contract (``shapes``), and 
 verify builds' declared-stock / raise behaviour under SP. TP8 / TP16 keep their
 gating."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -223,15 +224,83 @@ def test_tp16_gate_unchanged():
             "FLASHINFER_MLA_SPARSE",
         ),
         ({"kernel_config.flashinfer_sparse_mla_kernel": "prims_ts"}, "prims_ts"),
-        ({"speculative_config.num_speculative_tokens": 7}, "DSpark with 3"),
+        ({"speculative_config.num_speculative_tokens": 8}, "more than 7"),
         ({"speculative_config.method": "eagle3"}, "DSpark"),
-        ({"scheduler_config.max_num_seqs": 256}, "512 verify rows"),
+        ({"scheduler_config.max_num_seqs": 512}, "1024 verify rows"),
     ],
 )
 def test_sp_refuses_other_than_c512(overrides, cause):
     """Under SP every setting off C512's decode role raises with its own reason."""
     reason = unsupported(deployment(**overrides))
     assert reason is not None and cause in reason, reason
+
+
+def aligned(k, rows=384):
+    """C512's decode role at DSpark k: captured rows every lcm(k + 1, 4) up to
+    ``rows`` and max_num_seqs filling the largest one."""
+    q = k + 1
+    step = math.lcm(q, 4)
+    top = rows - rows % step
+    return deployment(
+        **{
+            "speculative_config.num_speculative_tokens": k,
+            "compilation_config.cudagraph_capture_sizes": list(range(step, top + 1, step)),
+            "compilation_config.max_cudagraph_capture_size": top,
+            "scheduler_config.max_num_seqs": top // q,
+        }
+    )
+
+
+@pytest.mark.parametrize("k", range(1, 8))
+def test_sp_serves_dspark_k1_to_k7_on_aligned_graphs(k):
+    """DSpark k = 1..7 (q2..q8) on SP: every captured R a multiple of lcm(q, 4)."""
+    config = aligned(k)
+    assert unsupported(config) is None, unsupported(config)
+    decode = specialized_decode_config(config)
+    step = math.lcm(k + 1, 4)
+    assert decode.q == k + 1 and decode.sequence_parallel
+    assert decode.captured and all(r % step == 0 for r in decode.captured)
+    assert decode.captured[-1] == config.scheduler_config.max_num_seqs * (k + 1)
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 5, 6])
+def test_sp_refuses_unaligned_capture_rows(k):
+    """Rows every 4 (the k3 renders) round up to q-multiples that do not split over
+    TP4 at k != 3, 7: refused at load, naming the aligned list."""
+    config = deployment(
+        **{
+            "speculative_config.num_speculative_tokens": k,
+            "compilation_config.max_cudagraph_capture_size": 384,
+            "compilation_config.cudagraph_capture_sizes": list(range(4, 385, 4)),
+            "scheduler_config.max_num_seqs": 96 * 4 // (k + 1),
+        }
+    )
+    reason = unsupported(config)
+    step = math.lcm(k + 1, 4)
+    assert reason is not None and "do not split over TP4" in reason, reason
+    assert f"every {step} rows" in reason, reason
+
+
+def test_sp_refuses_unaligned_largest_batch():
+    """q6 with max_num_seqs 63 (378 rows, inside the capture range): the largest
+    batch has no aligned graph."""
+    config = aligned(5)
+    config.scheduler_config.max_num_seqs = 63
+    reason = unsupported(config)
+    assert reason is not None and "max_num_seqs 63" in reason, reason
+
+
+def test_sp_k3_gate_unchanged_by_alignment():
+    """At q4 every R is aligned: the alignment check never fires for k3, whatever
+    the capture list (a sparse list keeps today's behavior)."""
+    config = deployment(
+        **{
+            "compilation_config.cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "compilation_config.max_cudagraph_capture_size": 512,
+            "scheduler_config.max_num_seqs": 100,
+        }
+    )
+    assert unsupported(config) is None
 
 
 def test_sp_refuses_without_dsa_or_speculation():

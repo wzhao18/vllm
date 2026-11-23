@@ -55,6 +55,7 @@ from vllm.models.kimi_k3.nvidia.dspark_mla import (
     _aux_rows,
 )
 from vllm.models.kimi_k3.nvidia.ops import prefill_glue
+from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import count_drafter_stock
 
 logger = init_logger(__name__)
 
@@ -93,6 +94,7 @@ def stock_attention_core(attn: nn.Module, qkv: torch.Tensor, positions: torch.Te
 
 
 def _no_window_attention(why: str, impl, layer) -> None:
+    count_drafter_stock(f"draft attention: {why.split(' ')[0]}", 0)
     logger.info_once(
         "Kimi K3.1 DSpark draft attention: stock path (%s: %s %s)",
         why, type(impl).__name__, getattr(impl, "vllm_flash_attn_version", None),
@@ -172,6 +174,7 @@ def _eager_window_attention(layer: nn.Module, q, k, v) -> torch.Tensor | None:
 
 def _uncovered(states: torch.Tensor, why: str) -> bool:
     """Log (once) why a long context step keeps the stock K/V path; False."""
+    count_drafter_stock(f"context K/V: {why}", states.shape[0])
     logger.info_once(
         "Kimi K3.1 DSpark context K/V: stock path at %d rows (%s)",
         states.shape[0], why,

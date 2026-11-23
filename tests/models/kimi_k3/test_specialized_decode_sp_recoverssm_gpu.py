@@ -77,7 +77,7 @@ def relative(got, want):
 @pytest.mark.parametrize("n", REQUESTS)
 def test_recoverssm_chain_matches_stock(n, graph):
     assert kda.is_conv_state_dim_first()
-    assert record_kind(HEADS, n) is not None, n
+    assert record_kind(HEADS, n, Q) is not None, n
     rows, slots = Q * n, 2 * n + 2
     ours, stock = kda.layer(), kda.layer()  # the same weights, their own records
     kv = kda.caches(slots)

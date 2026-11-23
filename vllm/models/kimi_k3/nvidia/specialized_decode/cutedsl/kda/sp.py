@@ -74,8 +74,24 @@ from .stream import KdaStream
 from .wide import KdaWide
 
 K = 128
-# Record core per request count n, by heads per rank (items = heads x n, see above).
-RECORD_KINDS = {24: "1-2:split,3-20:wide,21-:flow"}
+# Record core per request count n, by heads per rank (items = heads x n, see above),
+# then by verify length q (exact q first, then "*"). KdaFlow is built for q = 2..4
+# (``flow.SUMS``: 2q + q^2 + q block sums <= 32, and its shared-memory budget), so at
+# q = 5..8 (DSpark k4..k7) KdaWide serves every n >= 3: the same deferred fold (FOLDS,
+# the stock Triton commit's math bit for bit) and the same verify math (FP32 state and
+# recurrence, BF16 roundings), another FP32 reduction order of the recurrence's dot
+# products only, as between any two record cores. Cost at q4 sizes (deferred, us per
+# layer, docstring): n24 24.5 vs KdaFlow 20.2, n64 51.7 vs 38.9, n128 95.2 vs 71.0.
+# NQ-TUNE: KdaFlow at q5..8 (a kernel rewrite: block sums, page ring vs group blocks).
+RECORD_KINDS = {
+    24: {
+        "*": "1-2:split,3-20:wide,21-:flow",
+        5: "1-2:split,3-:wide",
+        6: "1-2:split,3-:wide",
+        7: "1-2:split,3-:wide",
+        8: "1-2:split,3-:wide",
+    }
+}
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
 # by n; empty: the batch defaults (eight-CTA clusters at n1, then four; 16 lanes).
 SP_SPEC_SCHEDULE = {24: ""}
@@ -92,9 +108,12 @@ FOLDS = ("fused", "fused_ws", "wide", "flow")
 MODES = ("deferred", "triton", "none")
 
 
-def record_kind(heads, requests):
-    """The record core at ``requests`` (RECORD_KINDS), or None."""
-    return batch_table(RECORD_KINDS.get(heads, "")).get(requests)
+def record_kind(heads, requests, q):
+    """The record core at ``requests`` of q tokens (RECORD_KINDS), or None."""
+    entry = RECORD_KINDS.get(heads, "")
+    if isinstance(entry, dict):  # by q: the exact q, then "*"
+        entry = entry.get(q, entry.get("*", ""))
+    return batch_table(entry).get(requests)
 
 
 def replays(heads, requests):
@@ -324,7 +343,7 @@ class SpKdaCore:
             if records == "triton" and n > slots:
                 raise Unsupported("kda", shape, f"{n} requests > {slots} record rows")
             replay = records == "deferred" and replays(heads, n)
-            kind = "fused_ws" if replay else record_kind(heads, n)
+            kind = "fused_ws" if replay else record_kind(heads, n, self.q)
             if kind is None:
                 raise Unsupported("kda", shape, f"no record core at {heads} heads")
             self.kinds[r] = kind

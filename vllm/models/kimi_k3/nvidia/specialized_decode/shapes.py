@@ -209,6 +209,24 @@ class StockSteps:
             )  # fmt: skip
 
 
+_DRAFTER_STOCK: "StockSteps | None" = None
+
+
+def count_drafter_stock(cause: str, rows: int) -> None:
+    """NQ-NOFALLBACK, logging only: one serving-time call of the DSpark drafter's
+    stock context K/V or stock draft attention (``dspark_gqa``: ``_uncovered`` /
+    ``_no_window_attention``), counted per cause like ``StockSteps`` (startup dummy
+    runs and captures are not counted). Expected 0 on FULL decode steps; nonzero
+    counts come only from steps that already run stock (mixed / eager)."""
+    global _DRAFTER_STOCK
+    if _DRAFTER_STOCK is None:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        _DRAFTER_STOCK = StockSteps("DSpark drafter (stock K/V or attention)", rank)
+    _DRAFTER_STOCK.count(cause, rows)
+
+
 _MISSING = object()
 
 

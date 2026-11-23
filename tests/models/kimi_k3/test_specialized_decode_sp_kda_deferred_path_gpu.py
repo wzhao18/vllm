@@ -225,7 +225,7 @@ def _new_request(kv, ref_kv, slot, seed):
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", REQUESTS)
 def test_deferred_serving_path_matches_stock(n, graph, eager_rows):
-    kind = record_kind(HEADS, n)
+    kind = record_kind(HEADS, n, Q)
     assert kind is not None, n
     rows, slots = Q * n, 2 * n + 2
     stock, ours = kda.layer(), kda.layer()  # the same weights, their own records
