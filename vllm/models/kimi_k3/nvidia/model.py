@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
+from vllm.models.kimi_k3.nvidia import breadcrumb
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.kernel import KIMI_K3_MEGA_MOE, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -2560,10 +2561,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # (_aux_copy_keeps_prefix).
         aux_dst: torch.Tensor | None = None
         dense = dense_dwdp.get()
+        breadcrumb.crumb(breadcrumb.OP_FWD_BEGIN, self.start_layer)
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            breadcrumb.crumb(breadcrumb.OP_LAYER, layer_idx)
             if aux_dst is not None:
                 layer._aux_prefix_out = aux_dst
                 layer._aux_prefix_used = False
@@ -2601,6 +2604,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
                 aux_hidden_states.append(aux_hidden_state)
 
+        breadcrumb.crumb(breadcrumb.OP_FWD_END)
         assert hidden_states is not None or prefix_sum is not None
         assert residual is not None
         if not get_pp_group().is_last_rank:

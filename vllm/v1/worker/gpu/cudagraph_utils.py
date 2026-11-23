@@ -449,6 +449,7 @@ class CudaGraphManager:
         """
         with graph_capture(self.device, stream) as context, ExitStack() as stack:
             self.capture_stream = context.stream
+            stack.callback(_k31_breadcrumb_size, None)  # size label ends with the capture
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
                 stack.callback(self.ubatch_runner.abort_pending_run)
@@ -470,7 +471,8 @@ class CudaGraphManager:
                     descs = descs[: self._max_full_descs_to_capture]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
-                for desc in descs:
+                for size_index, desc in enumerate(descs):
+                    _k31_breadcrumb_size(size_index)
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
@@ -1057,6 +1059,15 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             _teardown_profiling_state(runner)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
+
+
+def _k31_breadcrumb_size(index: int | None) -> None:
+    """Kimi K3 progress breadcrumb (no-op for other models' graphs): the capture size being warmed up."""
+    try:
+        from vllm.models.kimi_k3.nvidia import breadcrumb
+    except Exception:  # noqa: BLE001
+        return
+    breadcrumb.capture_size(index)
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
