@@ -89,3 +89,37 @@ def touched_kv_views(
                 )
                 views.append(tensor.narrow(dim, first * factor, (end - first) * factor))
     return views
+
+
+def snapshot_state(
+    views: list[torch.Tensor], free_bytes: int | None = None
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], str]:
+    """Restore copies of the state a step writes, and where they live.
+
+    Kept on the device when the copies fit in half the free device memory (the
+    other half stays for capture and the timed run); otherwise in pinned host
+    memory, restored by an H2D copy. Both restore the same bytes; the host copy
+    only lets large recurrent-state snapshots (e.g. FP32 KDA state of B256 x
+    (k+1) slots at u132k, ~45 GiB per rank) coexist with the KV pool."""
+    total = sum(v.numel() * v.element_size() for v in views)
+    if free_bytes is None:
+        free_bytes = (
+            torch.cuda.mem_get_info(views[0].device)[0]
+            if views and views[0].is_cuda
+            else total * 2
+        )
+    if total * 2 <= free_bytes:
+        return [(v, v.clone()) for v in views], "device"
+    pin = torch.cuda.is_available()
+    saved = []
+    for v in views:
+        host = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=pin)
+        host.copy_(v)
+        saved.append((v, host))
+    return saved, "host"
+
+
+def restore_state(snapshots: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    for view, saved in snapshots:
+        view.copy_(saved, non_blocking=True)
+
