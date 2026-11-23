@@ -148,8 +148,14 @@ def crumb(op: int, layer: int | None = None) -> None:
 
 
 def capture_size(index: int | None) -> None:
-    """Index of the capture size being warmed up / captured (None: outside the capture loop)."""
+    """Index of the capture size being warmed up / captured (None: outside the capture loop). At the end of the
+    capture loop the host and GPU words are resynchronized, so a crumb that did not reach the word during capture
+    cannot leave a stale gap behind into serving."""
     c = _get()
     c.size_idx = 0 if index is None else min(index + 1, 255)
     if index is not None:
         c.write(OP_CAPTURE_SIZE)
+    elif c.ok and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+        c.host_code, c.host_t = c.gpu_word(), time.monotonic()
+        c.in_forward = False
