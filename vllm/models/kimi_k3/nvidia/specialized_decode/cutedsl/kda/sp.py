@@ -72,6 +72,7 @@ from .recover import KdaSplit
 from .specialized import KdaWS
 from .stream import KdaStream
 from .wide import KdaWide
+from .window import check_conv_cache
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above),
@@ -400,6 +401,8 @@ class SpKdaCore:
         if self.plain is not None:
             self.plain.prepare_caches(caches)
             return self
+        # BF16 or FP32 conv window, DS taps contiguous (window.py), before any compile
+        check_conv_cache(caches[0], self.dim, self.conv_dim_first, "SpKdaCore")
         state = caches[1]
         if self.mode == "deferred":
             from .commit import supported
