@@ -123,7 +123,9 @@ def caches(slots, seed=1):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     conv = torch.randn(slots, 3 * DIM, Q + 2, generator=g, device=DEVICE)
     state = torch.randn(slots, HEADS, 128, 128, generator=g, device=DEVICE) * 0.1
-    return conv.bfloat16().to(CONV_DTYPE), state  # the window holds BF16 in-proj inputs
+    # BF16 values at either dtype: the served window only ever holds BF16
+    # in-projection inputs, so an FP32 window is the BF16 one widened.
+    return conv.to(torch.bfloat16).to(CONV_DTYPE), state
 
 
 def step(n, slots, seed=2):

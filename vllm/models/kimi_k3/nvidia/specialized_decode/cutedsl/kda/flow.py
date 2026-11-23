@@ -32,9 +32,14 @@ Per item (group g):
    butterfly (lane l ends with row 8 b + l); its correction goes to the store
    buffer, from which the lane group reads its 8 rows' corrections back.
 
-State stream: a ring of three page slots per CTA; item j uses slot j % 3, and each
-warp refills its own rows of the slot with item j + 3's as soon as its scan has read
-them.
+State stream: a ring of three page slots per CTA (two above q4, ``ring_slots``); item
+j uses slot j % slots, and each warp refills its own rows of the slot with item
+j + slots's as soon as its scan has read them.
+
+Verify lengths q2..q8 (DSpark k1..k7): odd q pad the 2q scan vectors to whole float4
+chunks (``vectors``); above q4 the block sums run in rounds of 32 (``sums_count``) and
+the scan walks its 8 rows in two halves of 4 (``scan_halves``: the q8 partials fit the
+register file), with a lane -> row permutation the epilogue follows.
 
 Prologue order: the head constants (synchronous loads) and the small copies the
 prologue waits on (F_B, F_A with the betas' 16 B row chunks, the first items'
@@ -76,6 +81,7 @@ from ..common.primitives import (
     launch,
     load_bf16x8,
     mma_into,
+    scatter_reduce,
     store_words,
     try_wait,
     wait,
@@ -108,7 +114,17 @@ THREADS = GROUPS * GROUP_THREADS
 ROWS = 8  # state rows per scan thread: 8 (c // 8) + [0, 8)
 LANES = 8  # scan threads per row
 CHUNKS = 4  # 4-key chunks per thread and row: keys 4 (c % 8 + 8 j)
-SLOTS = 3  # the CTA's state page ring
+SLOTS = 3  # the CTA's state page ring (q <= 4)
+# The page ring above q4 (q5..q8): two slots. The groups take alternate items, so slot
+# j % 2 is always the same group's: its next page loads under its own prep and solve
+# (more work per item than at q4). Two slots leave room for the larger per-group
+# blocks (2q scan vectors, q^2 couplings) in the 320 KiB budget.
+SLOTS_WIDE = 2
+
+
+def ring_slots(tokens):
+    """Page slots of the ring at verify length ``tokens``."""
+    return SLOTS if tokens <= 4 else SLOTS_WIDE
 MAX_ITEMS = 16  # items per CTA (tables, raw gates) of the default build
 # Item-capacity builds (a KdaFlow specialization parameter): 16 serves up to 141
 # requests per DP group at 24 heads on Rubin's 212 SMs (24 n / 212 <= 16); 20 serves
@@ -131,12 +147,41 @@ PACKED = True
 # Tuning: a warp sync after every FOLD_FENCE scan chunks (bounds how far ptxas
 # hoists the independent chunks' loads into spills).
 FOLD_FENCE = 1
-# Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms (<= 32).
+# Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms, q previous
+# output squares (q^2 + 4q: 12, 21, 32 at q2..q4; one 32-value reduction). Above q4
+# (45 / 60 / 77 / 96 at q5..q8) ``block_sums_rounds`` reduces them 32 at a time.
 SUMS = 32
-# Verify lengths KdaFlow serves: q4 (C512) and q2, both checked against the stock
-# Triton verify / commit (test_specialized_decode_sp_kda_anyq_gpu). q3 compiles but
-# its outputs are wrong (checkpoints and corrections right); q5..8 do not fit SUMS.
-FLOW_TOKENS = (2, 4)
+
+
+def sums_count(tokens):
+    """Block sums one prep reduces (SUMS up to q4, else whole 32-value rounds)."""
+    need = tokens * tokens + 4 * tokens
+    return SUMS if need <= SUMS else 32 * -(-need // 32)
+
+
+# Verify lengths KdaFlow serves (DSpark k1..k7), each checked against the stock Triton
+# verify / commit (test_specialized_decode_sp_kda_anyq_gpu). q <= 4 is the C512 build
+# (q3 padded vectors); q5..8 add the block-sum rounds (``sums_count``), the two-half
+# scan (``scan_halves``) and the two-slot page ring (``ring_slots``).
+FLOW_TOKENS = (2, 3, 4, 5, 6, 7, 8)
+
+
+def vectors(tokens):
+    """Scan vectors stored per key (float4 chunks): the 2q vectors G_t k_t, G_t q_t,
+    padded to a multiple of 4 with zeros (odd q: 2q = 6, 10, 14). Without the pad the
+    chunk loops (2q // 4 chunks) dropped the last two output vectors at odd q (q3:
+    the outputs of tokens 1, 2 were wrong, corrections and checkpoints right)."""
+    return 4 * -(-2 * tokens // 4)
+
+
+def padded_vectors_bytes(tokens):
+    """Shared bytes of the separate padded vector block (odd q) per group; 0 where
+    the 2q vectors fill whole float4 chunks (their block overlays qkvd as before)."""
+    if vectors(tokens) == 2 * tokens:
+        return 0
+    return vectors(tokens) * K * 4
+
+
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -145,10 +190,12 @@ CONSTS = 17
 A_EXP, DT = 15, 16
 
 
-def group_bytes(tokens, window, conv_size):
-    """One group's operand block, staging and store buffers (bytes)."""
-    block = 6 * tokens * K * 4 + K * 4 + tokens * K * 2 + SUMS * 16  # x v w u, D
-    staging = 4 * tokens * K * 2 + 6 * K * window * conv_size + tokens * K * 8
+def group_bytes(tokens, window, conv_size, conv_bufs=2):
+    """One group's operand block, staging and store buffers (bytes); ``conv_bufs``
+    convolution window buffers (see ``conv_buffers``)."""
+    block = 6 * tokens * K * 4 + K * 4 + tokens * K * 2 + sums_count(tokens) * 16  # x v w u, D
+    staging = (4 * tokens * K * 2 + conv_bufs * 3 * K * window * conv_size
+               + tokens * K * 8)  # fmt: skip
     stores = tokens * 2 * K * 2  # new key / gate records
     return block + staging + stores + 16 * 4 * 4
 
@@ -163,12 +210,14 @@ def fa_spill_bytes(tokens, items):
     return max(0, items * tokens * K * 2 - covered)
 
 
-def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS):
-    pages = SLOTS * PAGE_BYTES
+def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1, items=MAX_ITEMS,
+                 conv_bufs=2):  # fmt: skip
+    pages = ring_slots(tokens) * PAGE_BYTES
     heads = 2 * CONSTS * K * 4
     gates = items * tokens * K * 2
     tables = items * (META + 8) * 4
-    groups = GROUPS * group_bytes(tokens, window, conv_size)
+    groups = GROUPS * (group_bytes(tokens, window, conv_size, conv_bufs)
+                       + padded_vectors_bytes(tokens))  # fmt: skip
     spill = fa_spill_bytes(tokens, items)
     return pages + heads + gates + tables + groups + spill + 64 * 8 + 4096  # (+ alignment)
 
@@ -184,14 +233,26 @@ def smem_budget(device):
 
 def max_stages(tokens, conv_dim_first, window, conv_size, limit, items=MAX_ITEMS):
     """1 when KdaFlow (an ``items``-item build) runs this layout (dim-first
-    convolution window) within ``limit`` bytes of shared memory, else 0."""
+    convolution window) within ``limit`` bytes of shared memory (with one window
+    buffer per group at least), else 0."""
     if not conv_dim_first:
         return 0
-    size = shared_bytes(tokens, conv_dim_first, window, conv_size, items=items)
+    size = shared_bytes(tokens, conv_dim_first, window, conv_size, items=items,
+                        conv_bufs=1)  # fmt: skip
     return int(size <= limit)
 
 
-def page_barrier(state_full, j):
+def conv_buffers(tokens, window, conv_size, limit, items=MAX_ITEMS):
+    """Convolution window buffers per group: 2 (the next item's window streams in
+    while this item's leaves) where they fit ``limit``, else 1. One buffer is
+    refilled only after this item's window bulk store has read it (FP32 conv
+    state: q4 20- / 24-item builds, q7 / q8). The window bytes and the math are the
+    same either way; only when the next window copy is issued differs."""
+    two = shared_bytes(tokens, True, window, conv_size, items=items, conv_bufs=2)
+    return 2 if two <= limit else 1
+
+
+def page_barrier(state_full, j, slots=SLOTS):
     """The page barrier of item j: ring slot j % SLOTS, one of two barriers by the
     slot's generation j // SLOTS. The two groups share the ring, so the consumer of
     item j can reach its wait before item j - SLOTS's page has landed (the other
@@ -201,12 +262,12 @@ def page_barrier(state_full, j):
     'Warp Barrier Arrival Mismatch'). With a barrier per generation parity, the
     phase two back on item j's barrier is item j - 2 SLOTS's, which this group
     consumed itself, so the parity wait is exact."""
-    return state_full + j % SLOTS + SLOTS * ((j // SLOTS) % 2)
+    return state_full + j % slots + slots * ((j // slots) % 2)
 
 
-def page_parity(j):
+def page_parity(j, slots=SLOTS):
     """The mbarrier phase parity of item j's page on page_barrier(j)."""
-    return (j // (2 * SLOTS)) % 2
+    return (j // (2 * slots)) % 2
 
 
 def item_build(items, requests, sms):
@@ -292,7 +353,7 @@ class KdaFlow(KdaWS):
     """KdaWS's operands and semantics for RecoverSSM record steps (``tokens`` q > 1,
     records always written, dim-first convolution window); with the deferred
     operands (``record_rows``, ``pending`` after the records) every item folds its
-    pending commit first. ``stages``: 1 (the page ring has SLOTS slots); ``ctas``
+    pending commit first. ``stages``: 1 (the page ring has ring_slots(tokens) slots); ``ctas``
     persistent CTAs."""
 
     def __init__(
@@ -307,13 +368,17 @@ class KdaFlow(KdaWS):
         stages=1,
         mx=False,
         items=MAX_ITEMS,
+        conv_bufs=2,
     ):
         assert tokens in FLOW_TOKENS and stages == 1 and conv_dim_first
+        assert conv_bufs in (1, 2), conv_bufs
         assert items in ITEM_BUILDS and items % 2 == 0, items
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
+        self.slots = ring_slots(tokens)  # page ring depth (3 up to q4, 2 above)
+        self.conv_bufs = conv_bufs  # convolution window buffers per group
         self.items = items  # items per CTA this build tables (ITEM_BUILDS)
         # MXFP8 output (``quantize_outputs``): two more operands after the others,
         # the E4M3 bytes [R, D] and the F8_128x4 scales of the online-MXFP8
@@ -440,7 +505,7 @@ class KdaFlow(KdaWS):
         page slot ``s``: one of the slot barrier's four arrivals (a padded row's
         arrival carries no bytes)."""
         slot, head = table[j, SLOT], table[j, HEAD]
-        barrier = page_barrier(state_full, j)
+        barrier = page_barrier(state_full, j, self.slots)
         if slot > 0:
             rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, COPY_BYTES)
@@ -490,7 +555,12 @@ class KdaFlow(KdaWS):
                         copy_g2s(at(xs, t, part, 0),
                                  at(x, token + t, part * dim + head * K), K * 2,
                                  barrier)  # fmt: skip
-            if c == 32:
+            # The window: thread 32 with two buffers; with one, thread 0 once its
+            # bulk store of the current window (same buffer) has read it.
+            conv_thread: cutlass.Constexpr = 32 if self.conv_bufs == 2 else 0
+            if c == conv_thread:
+                if cutlass.const_expr(self.conv_bufs == 1):
+                    wait_bulk_reads()
                 page = conv_state[Int64(table[j, CONV_SLOT]), None, None]
                 for part in cutlass.range_constexpr(3):
                     copy_g2s(at(convs, part, 0), at(page, part * dim + head * K, 0),
@@ -531,7 +601,7 @@ class KdaFlow(KdaWS):
         conv_type: cutlass.Constexpr = conv_state.element_type
 
         smem = cutlass.utils.SmemAllocator()
-        pages = alloc(smem, Float32, (SLOTS, K * K), align=1024)
+        pages = alloc(smem, Float32, (self.slots, K * K), align=1024)
         hcs = alloc(smem, Float32, (2, CONSTS, K))  # per head slot, channel
         raw = alloc(smem, BFloat16, (self.items, T, K), align=16)  # raw gates
         table = alloc(smem, Int32, (self.items, META))
@@ -544,6 +614,8 @@ class KdaFlow(KdaWS):
             cute.make_layout((GROUPS, 2 * T * K), stride=(4 * T * K, 1)),
         )
         v_s, fw_s = qkvd[None, 2, None, None], qkvd[None, 3, None, None]
+        if cutlass.const_expr(vectors(T) != 2 * T):  # odd q: a padded vector block
+            xv = alloc(smem, Float32, (GROUPS, vectors(T) * K), align=128)
         fu_s = alloc(smem, Float32, (GROUPS, T, K))  # the old corrections u_t
         # The prologue F_A scratch (``fas`` below) overlays qkvd and fu_s; a build with
         # more items reserves the bytes past them here, directly after fu_s, so the
@@ -554,24 +626,25 @@ class KdaFlow(KdaWS):
         fd_s = alloc(smem, Float32, (GROUPS, K))  # D_n
         ce_s = alloc(smem, Float32, (GROUPS, T * T))  # the scan's token couplings
         g_s = alloc(smem, BFloat16, (GROUPS, T, K))
-        convs = alloc(smem, conv_type, (GROUPS, 2, 3, K * self.window), align=128)
+        convs = alloc(smem, conv_type, (GROUPS, self.conv_bufs, 3, K * self.window),
+                      align=128)  # fmt: skip
         xs = alloc(smem, BFloat16, (GROUPS, T, 3, K), align=128)
         gs = alloc(smem, BFloat16, (GROUPS, T, K), align=128)
         kgs = alloc(smem, BFloat16, (GROUPS, T, 2 * K), align=128)
         uss = alloc(smem, Float32, (GROUPS, T, K), align=128)
         kgo = alloc(smem, BFloat16, (GROUPS, T, 2 * K), align=128)  # new key/gate
-        sums = alloc(smem, Float32, (GROUPS, SUMS, 4))
+        sums = alloc(smem, Float32, (GROUPS, sums_count(T), 4))
         # Two page barriers per ring slot, alternating by the slot's generation
-        # (item j // SLOTS): see page_barrier.
-        bars = smem.allocate(cutlass.Uint64, 2 * SLOTS + GROUPS + 2)
-        state_full, stage_full = bars, bars + 2 * SLOTS
-        fb_full = bars + 2 * SLOTS + GROUPS
-        fa_full = bars + 2 * SLOTS + GROUPS + 1
+        # (item j // self.slots): see page_barrier.
+        bars = smem.allocate(cutlass.Uint64, 2 * self.slots + GROUPS + 2)
+        state_full, stage_full = bars, bars + 2 * self.slots
+        fb_full = bars + 2 * self.slots + GROUPS
+        fa_full = bars + 2 * self.slots + GROUPS + 1
         # Prologue scratch: the F_B rows of the CTA's heads in the last page slot (its
         # page is loaded after the gate projection), the F_A rows of its items over
         # the q / k / v / decay blocks (unused until the first prep).
         fbs = cute.make_tensor(
-            cute.recast_ptr(at(pages, SLOTS - 1, 0), dtype=BFloat16),
+            cute.recast_ptr(at(pages, self.slots - 1, 0), dtype=BFloat16),
             cute.make_layout((2, K, K), stride=(K * K, K, 1)),
         )
         fas = cute.make_tensor(
@@ -580,7 +653,7 @@ class KdaFlow(KdaWS):
         )
 
         if tid == 0:
-            for s in cutlass.range_constexpr(2 * SLOTS):  # one arrival per quarter
+            for s in cutlass.range_constexpr(2 * self.slots):  # one arrival per quarter
                 cute.arch.mbarrier_init(state_full + s, PAGE_BYTES // COPY_BYTES)
             for g in cutlass.range_constexpr(GROUPS):
                 cute.arch.mbarrier_init(stage_full + g, 1)
@@ -689,7 +762,7 @@ class KdaFlow(KdaWS):
         # landed (issued earlier, they queue behind the chip-wide page burst); its
         # first pages fill during the gate projection.
         if tid == 0:
-            for s in cutlass.range_constexpr(SLOTS - 1):
+            for s in cutlass.range_constexpr(self.slots - 1):
                 if s < count:
                     self.load_page(args, pages, s, table, s, state_full)
         cute.arch.sync_warp()
@@ -709,8 +782,9 @@ class KdaFlow(KdaWS):
                 if cta_t % 53 == 0:
                     cute.printf("PTRACE cta {} count {} table {} hc+issue {} pdl {} fa+stage-issue {} fbwait {} fawait+burst {} gate {} page0 {}", cta_t, count, ps[1] - k0, ps[2] - ps[1], ps[3] - ps[2], ps[0] - ps[3], ps[7] - ps[0], ps[4] - ps[7], ps[5] - ps[4], ps[6] - k0)  # noqa: E501
         if tid == 0:
-            if SLOTS - 1 < count:
-                self.load_page(args, pages, SLOTS - 1, table, SLOTS - 1, state_full)
+            if self.slots - 1 < count:
+                last = self.slots - 1
+                self.load_page(args, pages, last, table, last, state_full)
         cute.arch.sync_warp()
         ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
         outs = (kgo[g, None, None],)
@@ -798,7 +872,13 @@ class KdaFlow(KdaWS):
         lane, warp = c % 32, c // 32
         lane_in, base = c % LANES, (c // LANES) * ROWS  # rows base + [0, 8)
         own = base + lane_in
-        nw = args[12][c]
+        if cutlass.const_expr(T > 4):  # scan_halves' row order (see there)
+            own = base + 4 * (lane_in & 1) + 2 * ((lane_in >> 2) & 1) + ((lane_in >> 1) & 1)
+        # The output channel / norm weight / gate of this thread's row: c up to q4.
+        col = c
+        if cutlass.const_expr(T > 4):
+            col = own
+        nw = args[12][col]
         mine = (count - g + 1) // 2  # this group's items: g, g + 2, ...
         pt = zeros(6, Int64)  # TRACE: prep sub-phases
         # The group's previous item (outputs before the gated norm, output gates,
@@ -828,7 +908,7 @@ class KdaFlow(KdaWS):
             if cutlass.const_expr(self.trace):
                 tw = clock64()
                 tr[6] = tr[6] + (tw - ta)
-            item_buffers = (buffers[0][jj % 2, None, None], *buffers[1:])
+            item_buffers = (buffers[0][jj % self.conv_bufs, None, None], *buffers[1:])
             if cutlass.const_expr("prep" not in self.skip):
                 self.prep_item(args, g, c, j, slot, pending, table[j, CONV_OFFSET],
                                raw, hcs[head - h0, None, None], item_buffers, ops,
@@ -838,12 +918,12 @@ class KdaFlow(KdaWS):
                 tr[7] = tr[7] + (tp - tw)
             if pm[0] != 0:  # the previous item's outputs
                 if slot > 0:
-                    self.finish(args, c, sums_g[0], NV + T * T + T, po, pg, pm, nw)
+                    self.finish(args, col, sums_g[0], NV + T * T + T, po, pg, pm, nw)
                 else:
-                    self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw)
+                    self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw, col)
                 pm[0] = Int32(0)
             for t in cutlass.range_constexpr(T):  # this item's output gates
-                pg[t] = Float32(g_s[g, t, c])
+                pg[t] = Float32(g_s[g, t, col])
             self.group_sync(g)  # the block is complete; the staging buffers are read
             if c == 0:
                 recst = slot > 0
@@ -860,16 +940,17 @@ class KdaFlow(KdaWS):
                     for part in cutlass.range_constexpr(3):
                         store_bulk(at(page, part * dim + head * K, 0),
                                    at(convs, part, 0), part_bytes)  # fmt: skip
-                    bulk_commit()  # read by the next item's start (window: 2 buffers)
+                    bulk_commit()  # read by the next item's start (one window buffer: its stage)
             if jj + 1 < mine:  # the group's next item's inputs
                 self.stage_item(args, table, j + GROUPS, buffers, stage_full,
-                                (jj + 1) % 2, c)  # fmt: skip
+                                (jj + 1) % self.conv_bufs, c)  # fmt: skip
             cute.arch.sync_warp()
             if cutlass.const_expr(self.trace):
                 tb = clock64()
                 tr[1] = tr[1] + (tb - ta)
-            s = j % SLOTS
-            self.bwait(page_barrier(state_full, j), page_parity(j), "state_full")
+            s = j % self.slots
+            self.bwait(page_barrier(state_full, j, self.slots),
+                       page_parity(j, self.slots), "state_full")  # fmt: skip
             if cutlass.const_expr(self.trace):
                 tc = clock64()
                 tr[2] = tr[2] + (tc - tb)
@@ -877,24 +958,29 @@ class KdaFlow(KdaWS):
                 stored = pending > 0
                 if cutlass.const_expr("store" in self.skip):
                     stored = pending < 0
-                acc = cute.make_rmem_tensor((ROWS, NV), Float32)
                 destination = state[Int64(slot), head, None, None]
-                self.scan(acc, g, s, pages, pending, lane_in, base, xv, fw_s, fu_s,
-                          fd_s, destination, stored)  # fmt: skip
+                if cutlass.const_expr(T <= 4):
+                    acc = cute.make_rmem_tensor((ROWS, NV), Float32)
+                    self.scan(acc, g, s, pages, pending, lane_in, base, xv, fw_s, fu_s,
+                              fd_s, destination, stored)  # fmt: skip
+                else:
+                    values = self.scan_halves(g, s, pages, pending, lane_in, base, xv,
+                                              fw_s, fu_s, fd_s, destination, stored)  # fmt: skip
                 # The checkpoint left from registers: the warp's quarter of the slot
                 # (its own rows, read) is free for the next page at once.
                 fence_async_shared()
                 cute.arch.sync_warp()
                 if lane == 0:
-                    if j + SLOTS < count:
-                        self.load_quarter(args, pages, s, table, j + SLOTS,
+                    if j + self.slots < count:
+                        self.load_quarter(args, pages, s, table, j + self.slots,
                                           state_full, warp)  # fmt: skip
                 cute.arch.sync_warp()
                 if cutlass.const_expr(self.trace):
                     td = clock64()
                     tr[3] = tr[3] + (td - tc)
                 if cutlass.const_expr("solve" not in self.skip):
-                    values = self.rows_reduce(acc, lane_in)
+                    if cutlass.const_expr(T <= 4):
+                        values = self.rows_reduce(acc, lane_in)
                     self.solve(values, g, betas, j, own, v_s, ce_s,
                                args[18][rec, head, None, None], po)  # fmt: skip
                     pm[0], pm[1], pm[2] = Int32(1), token, head
@@ -911,7 +997,7 @@ class KdaFlow(KdaWS):
                 for t in cutlass.range_constexpr(T):
                     output[token + t, head * K + c] = BFloat16(0)
         if pm[0] != 0:  # the group's last item
-            self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw)
+            self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw, col)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
             if c == 0:
                 cta, _, _ = cute.arch.block_idx()
@@ -921,12 +1007,13 @@ class KdaFlow(KdaWS):
     @cute.jit
     def release_slot(self, args, c, j, count, pages, table, state_full, stored):
         """Item j's slot is free once its checkpoint store has read it: thread 0
-        refills it with item j + SLOTS's page."""
+        refills it with item j + self.slots's page."""
         if c == 0:
             if stored:
                 wait_bulk_reads()
-            if j + SLOTS < count:
-                self.load_page(args, pages, j % SLOTS, table, j + SLOTS, state_full)
+            if j + self.slots < count:
+                self.load_page(args, pages, j % self.slots, table, j + self.slots,
+                               state_full)  # fmt: skip
         cute.arch.sync_warp()
 
     # ------------------------------------------------------------------- scan
@@ -947,6 +1034,7 @@ class KdaFlow(KdaWS):
         vectors (x = [G_t k_t; G_t q_t])."""
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
+        NVP: cutlass.Constexpr = vectors(T)
         start = Float32(0)
         if pending == 0:
             start = Float32(-0.0)  # S + (-0) == S for every S, -0 included
@@ -963,11 +1051,11 @@ class KdaFlow(KdaWS):
             key = 4 * (lane_in + LANES * ch)
             d4 = load_shared_f32x4(at(fd_s, b, key))
             w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
-            xs = cute.make_rmem_tensor((4, NV), Float32)
+            xs = cute.make_rmem_tensor((4, NVP), Float32)
             for e in cutlass.range_constexpr(4):
-                for h in cutlass.range_constexpr(NV // 4):
+                for h in cutlass.range_constexpr(NVP // 4):
                     # swizzled: [chunk][e][h][lane][4] (lanes read 128 B in a row)
-                    pos = (((ch * 4 + e) * (NV // 4) + h) * LANES + lane_in) * 4
+                    pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
                     x4 = load_shared_f32x4(at(xv, b, pos))
                     for i in cutlass.range_constexpr(4):
                         xs[e, 4 * h + i] = x4[i]
@@ -1002,6 +1090,97 @@ class KdaFlow(KdaWS):
                         store_global_f32x4(at(destination, base + rr, key), new)
             if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
                 cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+
+    @cute.jit
+    def scan_halves(self, b, s, pages, pending, lane_in, base, xv, fw_s, fu_s, fd_s,
+                    destination, stored):
+        """``scan`` + ``rows_reduce`` above q4 (2q = 10..16 vectors): the thread's 8 rows
+        in two halves of 4 (rows base + 4 h + [0, 4)), so the live partials are
+        acc[4][2q] and us[4][q] (~200 registers at q8, not ~290). Each half walks every
+        key chunk (the chunk's vectors and fold weights are read once per half) and is
+        reduced over the 8 lanes by the transposed butterfly's ^4, ^2 stages; a last
+        transposed ^1 across the two halves leaves lane l the full sums of row
+        base + 4 (l & 1) + 2 ((l >> 2) & 1) + ((l >> 1) & 1). Per element the fold and
+        the dot-product partials are ``scan``'s operations in ``scan``'s order (chunks,
+        then keys), and every row sum is the same xor-4, 2, 1 tree: only which lane ends
+        up with which row differs."""
+        T: cutlass.Constexpr = self.tokens
+        NV: cutlass.Constexpr = 2 * T
+        NVP: cutlass.Constexpr = vectors(T)
+        HALF: cutlass.Constexpr = ROWS // 2
+        start = Float32(0)
+        if pending == 0:
+            start = Float32(-0.0)  # S + (-0) == S for every S, -0 included
+        reduced = []
+        for hf in cutlass.range_constexpr(2):
+            us = cute.make_rmem_tensor((HALF, T), Float32)
+            for t in cutlass.range_constexpr(T):
+                u4 = load_shared_f32x4(at(fu_s, b, t, base + HALF * hf))
+                for e in cutlass.range_constexpr(4):
+                    us[e, t] = u4[e]
+            acc = cute.make_rmem_tensor((HALF, NV), Float32)
+            for rr in cutlass.range_constexpr(HALF):
+                for m in cutlass.range_constexpr(NV):
+                    acc[rr, m] = Float32(0)
+            for ch in cutlass.range_constexpr(CHUNKS):
+                key = 4 * (lane_in + LANES * ch)
+                d4 = load_shared_f32x4(at(fd_s, b, key))
+                w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
+                xs = cute.make_rmem_tensor((4, NVP), Float32)
+                for e in cutlass.range_constexpr(4):
+                    for h in cutlass.range_constexpr(NVP // 4):
+                        pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
+                        x4 = load_shared_f32x4(at(xv, b, pos))
+                        for i in cutlass.range_constexpr(4):
+                            xs[e, 4 * h + i] = x4[i]
+                for r4 in cutlass.range_constexpr(HALF):
+                    row = base + HALF * hf + r4
+                    sv = load_shared_f32x4(at(pages, s, row * K + key))
+                    new = [Float32(0) for _ in range(4)]
+                    for p in cutlass.range_constexpr(2):
+                        fc = (start, start)
+                        for i in cutlass.range_constexpr(T):
+                            t = T - 1 - i
+                            fc = self.pfma((us[r4, t], us[r4, t]),
+                                           (w4[t][2 * p], w4[t][2 * p + 1]), fc)  # fmt: skip
+                        pair = self.pfma((sv[2 * p], sv[2 * p + 1]),
+                                         (d4[2 * p], d4[2 * p + 1]), fc)  # fmt: skip
+                        new[2 * p], new[2 * p + 1] = pair
+                    for e in cutlass.range_constexpr(4):
+                        for p in cutlass.range_constexpr(NV // 2):
+                            pair = (acc[r4, 2 * p], acc[r4, 2 * p + 1])
+                            pair = self.pfma((new[e], new[e]),
+                                             (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
+                            acc[r4, 2 * p], acc[r4, 2 * p + 1] = pair
+                    if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
+                        if stored:
+                            store_global_f32x4(at(destination, row, key), new)
+                if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
+                    cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+            # This half's 4 rows over the 8 lanes: transposed ^4, ^2.
+            rows = [[acc[rr, m] for m in range(NV)] for rr in range(HALF)]
+            for stage in cutlass.range_constexpr(2):
+                offset: cutlass.Constexpr = 4 >> stage
+                half: cutlass.Constexpr = len(rows) // 2
+                upper = (lane_in & offset) != 0
+                merged = []
+                for i in cutlass.range_constexpr(half):
+                    row_v = []
+                    for m in cutlass.range_constexpr(NV):
+                        send = rows[i][m] if upper else rows[i + half][m]
+                        keep = rows[i + half][m] if upper else rows[i][m]
+                        row_v.append(keep + cute.arch.shuffle_sync_bfly(send, offset))
+                    merged.append(row_v)
+                rows = merged
+            reduced.append(rows[0])
+        # Across the halves: transposed ^1 (lane bit 0 keeps the second half's row).
+        upper = (lane_in & 1) != 0
+        values = []
+        for m in cutlass.range_constexpr(NV):
+            send = reduced[0][m] if upper else reduced[1][m]
+            keep = reduced[1][m] if upper else reduced[0][m]
+            values.append(keep + cute.arch.shuffle_sync_bfly(send, 1))
+        return values
 
     @cute.jit
     def rows_reduce(self, acc, lane_in):
@@ -1048,8 +1227,8 @@ class KdaFlow(KdaWS):
 
     @cute.jit
     def finish(self, args, c, sums, at_sum, po, pg, pm, nw):
-        """Gated RMSNorm of the group's previous item (thread c: channel c of every
-        token) from its squares' block sums sums[at_sum + t] (synced by the caller);
+        """Gated RMSNorm of the group's previous item (``c``: this thread's channel,
+        its scan row: c itself up to q4, scan_halves' permutation above) from its squares' block sums sums[at_sum + t] (synced by the caller);
         the outputs leave from registers."""
         eps, output = args[15], args[10]
         T: cutlass.Constexpr = self.tokens
@@ -1063,17 +1242,28 @@ class KdaFlow(KdaWS):
             output[token + t, head * K + c] = BFloat16(result)
 
     @cute.jit
-    def finish_alone(self, args, g, c, sums, po, pg, pm, nw):
+    def finish_alone(self, args, g, c, sums, po, pg, pm, nw, col):
         """``finish`` with its own block reduction (no prep to ride on)."""
         T: cutlass.Constexpr = self.tokens
-        count: cutlass.Constexpr = 4 if T > 2 else 2
+        count: cutlass.Constexpr = 2 if T <= 2 else (4 if T <= 4 else 8)
         terms = [Float32(0) for _ in range(count)]
         for t in cutlass.range_constexpr(T):
             terms[t] = po[t] * po[t]
         self.block_sums(terms, sums, c, count)
         self.group_sync(g)
-        self.finish(args, c, sums, 0, po, pg, pm, nw)
+        self.finish(args, col, sums, 0, po, pg, pm, nw)
         self.group_sync(g)  # sums free again
+
+    @cute.jit
+    def block_sums_rounds(self, values, sums, p, count: cutlass.Constexpr):
+        """``block_sums`` for more than 32 values: rounds of 32 (sums[32 r + i, warp]).
+        Every value's reduction tree is the 32-value one (lanes xor 16, 8, 4, 2, 1),
+        whatever its index, so each total is the q <= 4 build's bit for bit."""
+        lane, warp = p % 32, p // 32
+        for r in cutlass.range_constexpr(count // 32):
+            chunk = [values[32 * r + i] for i in range(32)]
+            total, selected = scatter_reduce(chunk, lane, 32)
+            sums[32 * r + selected, warp] = total
 
     # ------------------------------------------------------------------- prep
     def bulk_head_constants(self, args):
@@ -1198,7 +1388,8 @@ class KdaFlow(KdaWS):
 
             # One block reduction: q / k squares, the couplings (raw q / k), the
             # recorded-key squares.
-            terms = [Float32(0) for _ in range(SUMS)]
+            NS: cutlass.Constexpr = sums_count(T)
+            terms = [Float32(0) for _ in range(NS)]
             for t in cutlass.range_constexpr(T):
                 terms[2 * t] = values[0, t] * values[0, t]
                 terms[2 * t + 1] = values[1, t] * values[1, t]
@@ -1212,7 +1403,10 @@ class KdaFlow(KdaWS):
                     weighted = mul_rn(weighted, ratio[(t, s)])
                 other = values[1, t] if kind == "c" else values[0, t]
                 terms[NV + i] = mul_rn(weighted, other)
-            self.block_sums(terms, sums, c, SUMS)
+            if cutlass.const_expr(NS == SUMS):
+                self.block_sums(terms, sums, c, SUMS)
+            else:
+                self.block_sums_rounds(terms, sums, c, NS)
             if cutlass.const_expr(self.trace):
                 q3 = clock64()
             fence_async_shared()  # the window and records leave by bulk stores
@@ -1228,15 +1422,16 @@ class KdaFlow(KdaWS):
                 fk[t] = reciprocal(sqrt_approx(kn))
             # The scan vectors (swizzled: [chunk][e][h][lane][4], key c =
             # 4 (lane + 8 chunk) + e).
-            vec = [Float32(0) for _ in range(NV)]
+            NVP: cutlass.Constexpr = vectors(T)
+            vec = [Float32(0) for _ in range(NVP)]  # the pad stays +0
             for t in cutlass.range_constexpr(T):
                 q_t = mul_rn(mul_rn(values[0, t], fq[t]), scale)
                 k_t = mul_rn(values[1, t], fk[t])
                 vec[t] = mul_rn(cumulative[t], k_t)
                 vec[T + t] = mul_rn(cumulative[t], q_t)
             chunk, lane_in, e = c // (4 * LANES), (c // 4) % LANES, c % 4
-            for h in cutlass.range_constexpr(NV // 4):
-                pos = (((chunk * 4 + e) * (NV // 4) + h) * LANES + lane_in) * 4
+            for h in cutlass.range_constexpr(NVP // 4):
+                pos = (((chunk * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
                 store_shared_f32x4(at(xv, blk, pos), [vec[4 * h + i] for i in range(4)])
             if cutlass.const_expr(self.trace):
                 q5 = clock64()

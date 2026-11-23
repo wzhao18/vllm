@@ -75,27 +75,30 @@ from .wide import KdaWide
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above),
-# then by verify length q (exact q first, then "*"). KdaFlow serves q2 and q4 only
-# (``flow.FLOW_TOKENS``: at q5..8 its block sums, 2q + q^2 + q > 32, and shared memory
-# do not fit; at q3 its outputs are wrong: test_specialized_decode_sp_kda_anyq_gpu
-# q3-n33, output max abs error 9.8 with correct checkpoints / corrections), so at q3
-# and q5..q8 (DSpark k2, k4..k7) KdaWide serves every n >= 3: the same deferred fold (FOLDS,
-# the stock Triton commit's math bit for bit) and the same verify math (FP32 state and
-# recurrence, BF16 roundings), another FP32 reduction order of the recurrence's dot
-# products only, as between any two record cores. Cost at q4 sizes (deferred, us per
-# layer, docstring): n24 24.5 vs KdaFlow 20.2, n64 51.7 vs 38.9, n128 95.2 vs 71.0.
-# NQ-TUNE: KdaFlow at q5..8 (a kernel rewrite: block sums, page ring vs group blocks).
-# KdaFlow's largest item build (flow.ITEM_BUILDS 24) serves up to 212 requests at 24
-# heads on VR200's 212 SMs; above (q2 / q4 at 213+ requests per DP group: rows up
-# to 1020) KdaWide.
+# then by verify length q (exact q first, then "*"). KdaFlow serves q2..q8 (DSpark
+# k1..k7; ``flow.FLOW_TOKENS``): q <= 4 the C512 build (q3 with padded scan vectors:
+# before, its last two output vectors were dropped), q5..q8 with block-sum rounds, a
+# two-half scan and a two-slot page ring (flow.py). Every record core runs the same
+# deferred fold (FOLDS: the stock Triton commit's math) and verify math (FP32 state
+# and recurrence, BF16 roundings); they differ only in the FP32 reduction order of
+# the recurrence's dot products. KdaFlow's largest item build (flow.ITEM_BUILDS 24)
+# serves up to 212 requests at 24 heads on VR200's 212 SMs; above (213+
+# requests per DP group: rows up to 1020) KdaWide. A build whose shared memory does
+# not fit raises at make_core (no fallback). q5..q8 run KdaFlow from n18, where KdaWide
+# (2 x 212 CTAs) needs a second CTA wave (24 x 18 items > 424). Chosen by the DC
+# in-step ABBA (Rhea 2026-11-22, kf-ab-DCk7 / DCk5, KdaWide vs KdaFlow from n12):
+# k7 B - A +0.33 / +0.43 ms at n16 / n17, -0.54 / -0.88 / -0.72 / -1.66 at n18 / 20 /
+# 32 / 48; k5 +0.11 at n16, -0.69 / -0.76 / -1.29 at n20 / 32 / 48. In the isolated
+# per-layer bench KdaFlow wins from n12; in the step it costs ~10-15 us per layer more
+# than there (under attribution), which only the second-wave KdaWide outweighs.
+_WIDE_Q = "1-2:split,3-17:wide,18-212:flow,213-:wide"
 RECORD_KINDS = {
     24: {
         "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
-        3: "1-2:split,3-:wide",
-        5: "1-2:split,3-:wide",
-        6: "1-2:split,3-:wide",
-        7: "1-2:split,3-:wide",
-        8: "1-2:split,3-:wide",
+        5: _WIDE_Q,
+        6: _WIDE_Q,
+        7: _WIDE_Q,
+        8: _WIDE_Q,
     }
 }
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
@@ -227,8 +230,10 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
             raise Unsupported("kda", shape, cause)
         if build != flow.MAX_ITEMS:
             _log_build(shape, build, per_cta)
+        bufs = flow.conv_buffers(tokens, streamed[1], conv_size, budget, items=build)
         return flow.KdaFlow(
-            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build
+            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build,
+            conv_bufs=bufs,
         )
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
