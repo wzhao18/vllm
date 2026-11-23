@@ -741,6 +741,7 @@ def test_worker_writes_a_per_step_join_record(monkeypatch, tmp_path):
     # J joins the engine's S records by time, not only by step_seq.
     anchors = [r for r in records if r[0] == "A"]
     assert records[0][0] == "H" and len(anchors) >= 2
-    assert anchors[0][1] <= jobs[0][2] <= anchors[-1][1]
+    # Same clock: the writer opens at the first bind (just after its t_bind).
+    assert anchors[0][1] - 1.0 <= jobs[0][2] <= jobs[-1][2] <= anchors[-1][1]
     assert jobs[0][3:] == [0.0, 0, 0]
     assert jobs[1][3] >= 0.009 and jobs[1][4:] == [1, 1]
