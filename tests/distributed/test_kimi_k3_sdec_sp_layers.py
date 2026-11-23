@@ -1717,9 +1717,18 @@ def _kda_case(config, rank, device, rows, steps, graph, refusals):
         run = SimpleNamespace(slot_mapping={}, q=Q)
         replay = replayed = None
         if graph:  # the specialized block captured once, replayed every step
+            # One eager run first, as serving's warm-up does before any capture:
+            # lazy library state (torch's cuBLAS handle for the block's torch GEMM
+            # kinds) cannot be created inside a capture. Its writes are undone.
+            with override_forward_context(forward):
+                block.run(x_shard.zero_(), caches["ours"], md, run)
+            torch.accelerator.synchronize()
+            for ours, theirs in zip(caches["ours"], caches["stock"]):
+                ours.copy_(theirs)
             _barrier()
             replay = torch.cuda.CUDAGraph()
             with (
+                override_forward_context(forward),
                 graph_capture(device) as capture,
                 torch.cuda.graph(replay, stream=capture.stream),
             ):
