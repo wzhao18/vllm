@@ -115,7 +115,9 @@ UP_GEMM = "cublas"
 # 1-64 rows: only the NVFP4 checkpoint's MoE layers reach this tail there (``nvfp4``:
 # every batch on the wide tail; the MXFP4 layers' tuned tail serves them). TP16NV
 # (16 ranks, DA NVFP4, step ABBA vs 928a: see perf/TP16NV.md).
-UP_ROWS = {16: "1-80:1,129-256:1"}
+# Above 256 rows (LHF: q8 M264-376 on the DA frontier; from 384 rows the row-sharded
+# AttnRes takes the owners' OutRows instead, ``PreparedTailRows.run``).
+UP_ROWS = {16: "1-80:1,129-:1"}
 
 # Rows whose NormRows skips the PDL dependency wait (``NormRows(polled=True)``): its
 # inputs are Lamport-polled (the gather rows, the RS slots) or static (gamma), and
