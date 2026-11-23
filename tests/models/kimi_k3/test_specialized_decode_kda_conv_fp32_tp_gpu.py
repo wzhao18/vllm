@@ -232,3 +232,39 @@ def test_prefill_keeps_fp32_window_bf16_valued():
         torch.cuda.synchronize()
         windows[dtype] = state
     assert_twin("prefill window", windows[FP32], windows[BF16])
+
+
+# ---- TP8 B13-16 verify schedule (Rubin override 1.8.2.2 vs GB300's 1.8.3.2) ----
+
+
+@pytest.mark.parametrize("q,requests", [(4, 13), (4, 16), (8, 13), (8, 16)])
+@pytest.mark.parametrize("dtype", [BF16, FP32], ids=["bf16-conv", "fp32-conv"])
+def test_tp8_b13_16_schedule_bitwise(monkeypatch, q, requests, dtype):
+    """Two CTAs per SM (1.8.2.2) instead of three (1.8.3.2) at TP8 B13-16: the same
+    lanes per state row (8), so the same reduction order. Output, recurrent state
+    and conv window bitwise equal to the GB300 schedule's."""
+    heads, mode, rubin = 12, 1, (10, 7)
+    assert prepared.schedule_of(heads, requests, mode, q, rubin, False) == (1, 8, 2, 2)
+
+    def once(override):
+        with conv_dtype(monkeypatch, dtype), monkeypatch.context() as patch:
+            if override is not None:
+                patch.setattr(prepared, "DEVICE_SPEC_SCHEDULE", override)
+            attention = tp_loop.kda_attention(heads=heads)
+            slots = requests * q + 1
+            base = tp_loop.caches(slots, q, heads=heads)
+            table, accepted = tp_loop.spec_inputs(requests, q, slots)
+            pitch = tp_loop.pitch_of(heads)
+            projected = tp_loop.projected_rows(requests * q, pitch=pitch)
+            prepared.executable.cache_clear()
+            core = prepared.PreparedKda(attention, {(requests, q): (pitch, mode)}, True)
+            core.prepare_caches(base)
+            result = tp_loop.run(core, projected, base, table, accepted)
+            prepared.executable.cache_clear()
+            return result
+
+    gb300 = {rubin: {6: prepared.DEVICE_SPEC_SCHEDULE[rubin][6]}}  # no TP8 override
+    want, got = once(gb300), once(None)
+    tp_loop.assert_bitwise("output", got[0], want[0])
+    tp_loop.assert_bitwise("recurrent state", got[1][1], want[1][1])
+    tp_loop.assert_bitwise("conv window", got[1][0], want[1][0])
