@@ -115,7 +115,7 @@ def sp_layer(decoder, step):
         raise Unsupported(kind, None, f"{where}: {kind} attention (DSA / KDA only)")
     if not getattr(decoder, "use_sequence_parallel", False):
         raise Unsupported("sp_step", None, f"{where}: not a sequence-parallel layer")
-    if step.dsa_dp and kind == "dsa":
+    if getattr(step, "dsa_dp", False) and kind == "dsa":
         # The stock DSA-DP layer (owner segment, push in / out): no o_proj reduce.
         if not getattr(decoder, "_dsa_scatter", False):
             raise Unsupported(
