@@ -42,6 +42,75 @@ def group_bytes(rows: int, pitch: int) -> int:
     return (rows + 1) * per_row + pitch * 2
 
 
+def wave_cap_items(pitch: int, sms: int) -> int:
+    """Most work items a group of widest request ``pitch`` may hold: whole waves of
+    ``sms`` items (one CTA per SM; an item is BQ rows walking its request's whole
+    context, so a group costs ceil(items / sms) item latencies), as many as the
+    scratch budget and GROUP_ROWS allow; 0 when not even one wave fits (the budget
+    alone then bounds the group). Grouping never changes a row's selection."""
+    per_row = group_bytes(1, pitch) - group_bytes(0, pitch)
+    fit = min(GROUP_ROWS, (SCRATCH_BUDGET - group_bytes(0, pitch)) // per_row)
+    return (fit // pidx.BQ) // sms * sms
+
+
+def _seg_pitch(seg) -> int:
+    return -(-seg[4] // pidx.TILE) * pidx.TILE
+
+
+def pack_groups(segs, sms: int):
+    """Row groups (lists of segments, in token order) from the step's segments
+    (chunk, request in chunk, rows, last row's keys, key count, request).
+
+    Each group holds whole waves of work items (wave_cap_items at its widest
+    request): a segment that would pass the group's last whole wave is split at
+    that row (its first part ends ``rows - k`` keys earlier), so every group but
+    the last costs exactly its waves. When not even one wave fits the scratch
+    budget, groups close on segment boundaries by the budget alone. A row's keys
+    and selection do not depend on its group: results are identical."""
+    groups, cur, rows, items, pitch = [], [], 0, 0, 0
+
+    def close():
+        nonlocal cur, rows, items, pitch
+        if cur:
+            groups.append(cur)
+        cur, rows, items, pitch = [], 0, 0, 0
+
+    for seg in segs:
+        while seg is not None:
+            p = max(pitch, _seg_pitch(seg))
+            cap = wave_cap_items(p, sms)
+            s_items = -(-seg[2] // pidx.BQ)
+            if cap == 0:
+                if cur and group_bytes(rows + seg[2], p) > SCRATCH_BUDGET:
+                    close()
+                    continue
+                cur.append(seg)
+                rows, items, pitch = rows + seg[2], items + s_items, p
+                seg = None
+                if rows >= GROUP_ROWS:
+                    close()
+                continue
+            room = cap - items
+            if room <= 0:
+                close()
+                continue
+            if s_items <= room:
+                cur.append(seg)
+                rows, items, pitch = rows + seg[2], items + s_items, p
+                seg = None
+                if items == cap:
+                    close()
+                continue
+            k = room * pidx.BQ  # rows of the head part (whole items)
+            head = (seg[0], seg[1], k, seg[3] - (seg[2] - k), seg[4], seg[5])
+            seg = (seg[0], seg[1], seg[2] - k, seg[3], seg[4], seg[5])
+            cur.append(head)
+            rows, items, pitch = rows + k, items + room, p
+            close()
+    close()
+    return groups
+
+
 def reserved_bytes() -> int:
     """Bytes the memory profile reserves for this path's per-layer scratch."""
     return SCRATCH_BUDGET
@@ -174,9 +243,9 @@ def _layout(chunks, device):
     else:
         host, event = _host_copies(chunks)
         event.synchronize()
-    groups, segs, r0 = [], [], chunks[0].token_start
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    all_segs, r0 = [], chunks[0].token_start
     next_row = r0
-    pitch = 0
     for ci, (c, (ks, ke, cu, bt)) in enumerate(zip(chunks, host)):
         ks, ke, cu = ks.tolist(), ke.tolist(), cu.tolist()
         assert c.token_start == next_row and len(ks) == c.token_end - c.token_start, (
@@ -184,7 +253,6 @@ def _layout(chunks, device):
         )
         next_row = c.token_end
         starts = {s: b for b, s in enumerate(cu[:-1])}
-        chunk_segs = []
         i = 0
         while i < len(ks):
             j = i
@@ -195,21 +263,13 @@ def _layout(chunks, device):
             # the request's identity: its blocks (a request split over chunks has
             # the same block table row in each)
             req = bt[b].numpy().tobytes()
-            chunk_segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
+            all_segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
             i = j + 1
-        c_rows = sum(s[2] for s in chunk_segs)
-        c_pitch = max(-(-s[4] // pidx.TILE) * pidx.TILE for s in chunk_segs)
+    groups = []
+    for segs in pack_groups(all_segs, sms):
         rows = sum(s[2] for s in segs)
-        if segs and group_bytes(rows + c_rows, max(pitch, c_pitch)) > SCRATCH_BUDGET:
-            # the chunk would push the group past the scratch budget
-            groups.append(_Group(segs, r0, r0 + rows, device))
-            segs, r0, pitch = [], r0 + rows, 0
-        segs += chunk_segs
-        pitch = max(pitch, c_pitch)
-        rows = sum(s[2] for s in segs)
-        if rows >= GROUP_ROWS or ci == len(chunks) - 1:
-            groups.append(_Group(segs, r0, r0 + rows, device))
-            segs, r0, pitch = [], r0 + rows, 0
+        groups.append(_Group(segs, r0, r0 + rows, device))
+        r0 += rows
     chunks[0].logits_inputs[_KEY] = groups
     return groups
 
