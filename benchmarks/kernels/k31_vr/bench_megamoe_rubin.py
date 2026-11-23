@@ -220,6 +220,8 @@ def parse_args():
     )
     p.add_argument("--ref-samples", type=int, default=64, help="0 disables references")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--kernel-profile-graph", action="store_true",
+                   help="with --kernel-profile: profile CUDA-graph replays of the forward instead of eager calls")
     p.add_argument(
         "--kernel-profile", type=int, default=0, metavar="N",
         help="MEGAMOEFIX prefill floor split: N eager moe.forward calls under torch.profiler (CUPTI) per point; prints "
@@ -554,6 +556,15 @@ def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rm
     for _ in range(8):
         fwd()
     torch.cuda.synchronize()
+    mode = "eager"
+    if args.kernel_profile_graph:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fwd()
+        for _ in range(4):
+            g.replay()
+        torch.cuda.synchronize()
+        fwd, mode = g.replay, "graph"
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -580,9 +591,35 @@ def _kernel_profile(args, moe, hidden, ids, wts, weights, bucket, out, fused, rm
         for e in c:
             per.setdefault(e.name[:70], []).append(e.time_range.elapsed_us())
     calls_n = max(1, len(calls))
+    # per-call cross-rank SKEW at the main MegaMoE kernel: absolute host-clock start of every occurrence (kineto trace
+    # start + relative start); exact within a node (shared host clock), cross-node only as good as the clock sync
+    try:
+        base_ns = int(prof.profiler.kineto_results.trace_start_ns())
+    except Exception:  # noqa: BLE001
+        base_ns = None
+    mega = [e for e in evs if e.name.startswith("kernel_cutlass__kernel_")]
+    starts = [base_ns + int(e.time_range.start * 1000) for e in mega] if base_ns is not None else []
+    allst = [starts]
+    if torch.distributed.is_initialized():
+        allst = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(allst, starts)
+    if rank == 0 and allst and all(len(x) == len(allst[0]) and x for x in allst):
+        nper = 4
+        sk_all, sk_node = [], []
+        for c in range(len(allst[0])):
+            col = [x[c] for x in allst]
+            sk_all.append((max(col) - min(col)) / 1e3)
+            for n0 in range(0, len(col), nper):
+                grp = col[n0:n0 + nper]
+                sk_node.append((max(grp) - min(grp)) / 1e3)
+        print(f"KSKEW {mode} {variant}/{n} calls={len(allst[0])} ranks={len(allst)} "
+              f"intra_node_skew_med={st.median(sk_node):.1f}us p90={sorted(sk_node)[int(0.9 * (len(sk_node) - 1))]:.1f}us "
+              f"all_ranks_skew_med={st.median(sk_all):.1f}us (cross-node part depends on host clock sync)", flush=True)
+    elif rank == 0:
+        print(f"KSKEW {mode} {variant}/{n} unavailable (base_ns={base_ns}, counts={[len(x) for x in allst]})", flush=True)
     rows = sorted(per.items(), key=lambda kv: -sum(kv[1]))
     body = " | ".join(f"{k} x{len(v) / calls_n:.1f} {st.median(v):.1f}us" for k, v in rows[:8])
-    print(f"KPROF rank={rank} {variant}/{n} calls={len(calls)} span_med={st.median(spans):.1f}us "
+    print(f"KPROF rank={rank} {mode} {variant}/{n} calls={len(calls)} span_med={st.median(spans):.1f}us "
           f"gaps_med={st.median(gaps):.1f}us :: {body}", flush=True)
 
 
