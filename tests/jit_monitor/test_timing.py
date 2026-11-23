@@ -16,6 +16,9 @@ from .test_hooks import _make_fake_knobs, _patch_jit_modules, _triton_hook_kwarg
 
 pytestmark = pytest.mark.cpu_test
 
+# Captured at import: conftest replaces it with a no-op for the other tests.
+_REAL_CPP_HOOK = jit_monitor._setup_cpp_extension_hook
+
 
 def _messages(m: mock.MagicMock) -> list[str]:
     return [c[0][0] % c[0][1:] for c in m.call_args_list]
@@ -275,3 +278,63 @@ def test_summary_orders_backends_by_seconds():
     assert line.startswith("JIT_COMPILE_SUMMARY startup: 2 compiles, 6.0 s")
     assert line.index("Triton 1x 5.0 s") < line.index("CuTeDSL 1x 1.0 s")
     assert "(slowest b 5.0 s)" in line
+
+
+def test_deepgemm_cache_watch_logs_builds_and_loads(tmp_path):
+    import os
+
+    watch = jit_monitor._DeepGemmCacheWatch(str(tmp_path), interval=3600)
+    try:
+        entry = tmp_path / "sm100_paged_mqa_logits_metadata.abc"
+        entry.mkdir()
+        (entry / "kernel.cu").write_text("x")
+        os.utime(entry / "kernel.cu", (100.0, 100.0))
+        (entry / ".committed").write_text("")
+        os.utime(entry / ".committed", (112.5, 112.5))
+        with mock.patch.object(jit_monitor.logger, "info") as info:
+            jit_monitor._timing_installed = True
+            watch.poll()
+            watch.poll()  # unchanged: nothing new
+            os.utime(entry / ".committed", (200.0, 200.0))
+            watch.poll()  # DeepGEMM touched it: a load
+        lines = _messages(info)
+        assert len(lines) == 2
+        assert lines[0].startswith("JIT_COMPILE DeepGEMM kernel build")
+        assert "[12.500 s]" in lines[0]
+        assert lines[1].startswith("JIT_COMPILE DeepGEMM kernel load")
+        assert jit_monitor.compile_stats("startup")["DeepGEMM"][0] == 2
+    finally:
+        watch.stop()
+
+
+def test_deepgemm_watch_after_ready_is_logging_only(tmp_path):
+    watch = jit_monitor._DeepGemmCacheWatch(str(tmp_path / "missing"), interval=3600)
+    try:
+        watch.poll()  # a missing directory scans empty
+        jit_monitor.activate(mode="error")
+        (tmp_path / "missing" / "k.1").mkdir(parents=True)
+        (tmp_path / "missing" / "k.1" / ".committed").write_text("")
+        with mock.patch.object(jit_monitor.logger, "error") as err:
+            watch.poll()
+        (line,) = _messages(err)
+        assert line.startswith("JIT_AFTER_WARMUP DeepGEMM kernel build")
+    finally:
+        watch.stop()
+
+
+def test_cpp_extension_load_timed():
+    cpp = cast(Any, ModuleType("torch.utils.cpp_extension"))
+    cpp.load = mock.MagicMock(return_value="mod")
+    cpp.load_inline = mock.MagicMock(return_value="mod_inline")
+    with mock.patch.dict(sys.modules, {"torch.utils.cpp_extension": cpp}):
+        _REAL_CPP_HOOK()  # conftest stubs the module attribute
+        jit_monitor._timing_installed = True
+        with mock.patch.object(jit_monitor.logger, "info") as info:
+            assert cpp.load(name="kda_conv_ext", sources=[]) == "mod"
+            assert cpp.load_inline("situ_ext", cpp_sources="") == "mod_inline"
+    lines = _messages(info)
+    assert [x.split(":")[0] for x in lines] == [
+        "JIT_COMPILE torch cpp_extension load (build or cached load)",
+        "JIT_COMPILE torch cpp_extension load_inline (build or cached load)",
+    ]
+    assert "kda_conv_ext" in lines[0] and "situ_ext" in lines[1]

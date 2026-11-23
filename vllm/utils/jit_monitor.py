@@ -61,6 +61,8 @@ _flashinfer_hook_installed: bool = False
 # ``install_timing_hooks()`` ran: startup compiles log their duration.
 _timing_installed: bool = False
 _triton_autotune_listener_installed: bool = False
+_cpp_extension_hook_installed: bool = False
+_deepgemm_watch: "_DeepGemmCacheWatch | None" = None
 
 # Compile time by phase ("startup" before ``activate()``, "serving" after)
 # and backend: [compiles, seconds, slowest (seconds, name)].
@@ -125,6 +127,8 @@ def _install_jit_hooks() -> None:
     _setup_triton_autotune_listener()
     _setup_cutedsl_jit_hook()
     _setup_flashinfer_jit_hook()
+    _setup_cpp_extension_hook()
+    _setup_deepgemm_watch()
 
     # Refer to #51159. tilelang ships broken symbols
     # on rocm.
@@ -958,6 +962,129 @@ def _setup_flashinfer_jit_hook() -> None:
         if getattr(fi_cubin, "get_cubin", None) is original_get:
             fi_cubin.get_cubin = _get_artifact_with_monitor
     _flashinfer_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# torch.utils.cpp_extension build/load hook (logging only)
+# ------------------------------------------------------------------
+
+
+def _setup_cpp_extension_hook() -> None:
+    """Time ``torch.utils.cpp_extension.load`` / ``load_inline`` (in-tree
+    .cu extensions built on first use; a cached build still checks and
+    imports). Callers that import the function at call time see the wrapper.
+    Logging only."""
+    global _cpp_extension_hook_installed
+    if _cpp_extension_hook_installed:
+        return
+    try:
+        cpp_extension = importlib.import_module("torch.utils.cpp_extension")
+    except Exception:
+        return
+    for attr in ("load", "load_inline"):
+        original = getattr(cpp_extension, attr, None)
+        if original is None or getattr(original, "_vllm_monitored", False):
+            continue
+
+        def _make(original=original, attr=attr):
+            @functools.wraps(original)
+            def _load_with_monitor(*args, **kwargs):
+                name = kwargs.get("name", args[0] if args else "<unknown>")
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    _handle_jit_event(
+                        backend="torch cpp_extension",
+                        event=f"{attr} (build or cached load)",
+                        fn_name=str(name),
+                        seconds=time.perf_counter() - start,
+                        gate=False,
+                    )
+
+            cast(Any, _load_with_monitor)._vllm_monitored = True
+            return _load_with_monitor
+
+        setattr(cpp_extension, attr, _make())
+    _cpp_extension_hook_installed = True
+
+
+# ------------------------------------------------------------------
+# DeepGEMM JIT cache watch (logging only)
+# ------------------------------------------------------------------
+
+
+class _DeepGemmCacheWatch:
+    """DeepGEMM compiles and caches its kernels in C++ (no Python hook): watch
+    its cache directory (``DG_JIT_CACHE_DIR``/cache, else ~/.deep_gemm/cache)
+    instead. A new ``<kernel>.<hash>/.committed`` is a build (its duration:
+    from the entry's oldest file to the commit); a newer ``.committed`` mtime
+    on an existing entry is a load (DeepGEMM touches it). The directory is
+    shared by the processes that use it, so an event may come from another
+    process; with a per-run cache directory they are this run's."""
+
+    def __init__(self, root: str, interval: float = 2.0):
+        self.root = root
+        self.interval = interval
+        self.seen = self._scan()
+        self._stop = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="jit-monitor-deepgemm", daemon=True
+        )
+        self.thread.start()
+
+    def _scan(self) -> dict[str, float]:
+        seen: dict[str, float] = {}
+        with suppress(OSError):
+            for entry in os.scandir(self.root):
+                with suppress(OSError):
+                    seen[entry.name] = os.stat(
+                        os.path.join(entry.path, ".committed")
+                    ).st_mtime
+        return seen
+
+    def poll(self) -> None:
+        now = self._scan()
+        for name, mtime in now.items():
+            before = self.seen.get(name)
+            if before is not None and mtime <= before:
+                continue
+            seconds = None
+            if before is None:
+                with suppress(OSError, ValueError):
+                    entry = os.path.join(self.root, name)
+                    first = min(
+                        os.stat(os.path.join(entry, f)).st_mtime
+                        for f in os.listdir(entry)
+                        if f != ".committed"
+                    )
+                    seconds = max(0.0, mtime - first)
+            _handle_jit_event(
+                backend="DeepGEMM",
+                event="kernel build" if before is None else "kernel load",
+                fn_name=name,
+                detail="cache dir watch",
+                seconds=seconds,
+                gate=False,
+            )
+        self.seen = now
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            with suppress(Exception):
+                self.poll()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _setup_deepgemm_watch() -> None:
+    global _deepgemm_watch
+    if _deepgemm_watch is not None:
+        return
+    base = os.environ.get("DG_JIT_CACHE_DIR") or os.path.expanduser("~/.deep_gemm")
+    # Watched even before DeepGEMM creates it (a scan of a missing dir is empty).
+    _deepgemm_watch = _DeepGemmCacheWatch(os.path.join(base, "cache"))
 
 
 @contextlib.contextmanager
