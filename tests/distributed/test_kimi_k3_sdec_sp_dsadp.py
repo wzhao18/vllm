@@ -78,11 +78,14 @@ def _armed(comm, parity, rows):
 
 def _owners(rows, step, world):
     """Owner card of each real request of a ``rows``-row step: a random number of
-    real requests, unbalanced, each owner at most ``per`` (DEP_PERM pads the rest)."""
+    real requests, skewed (one owner full, one empty), each owner at most ``per``
+    (DEP_PERM pads the rest)."""
     per = rows // (world * Q)
     rng = np.random.default_rng(zlib.crc32(repr(("own", rows, step)).encode()))
     counts = rng.integers(0, per + 1, size=world)
-    counts[rng.integers(0, world)] = per  # one owner full
+    full, empty = rng.choice(world, size=2, replace=False)
+    counts[full] = per  # skewed: one owner full (the others pad up to it)
+    counts[empty] = 0  # and one with an empty share (its segment all padding)
     owners = np.repeat(np.arange(world), counts)
     rng.shuffle(owners)
     return owners
