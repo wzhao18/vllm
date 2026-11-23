@@ -44,5 +44,8 @@ def test_tp8_drafter_lm_head(rows):
     torch.cuda.synchronize()
     ref = (x.float() @ weight.float().t()).bfloat16()
     assert torch.equal(out, again)
-    ulp = (out.float() - ref.float()).abs() / ref.float().abs().clamp(min=2**-20)
-    assert float(ulp.max()) <= 2**-7, float(ulp.max())  # within one BF16 ulp
+    # one BF16 ulp of the value, or of the row's largest logit near zero
+    exact = x.float() @ weight.float().t()
+    tol = 2**-7 * torch.maximum(exact.abs(), 2**-8 * exact.abs().amax(1, keepdim=True))
+    assert bool(((out.float() - exact).abs() <= tol).all())
+    assert bool(((ref.float() - exact).abs() <= tol).all())
