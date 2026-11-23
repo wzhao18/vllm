@@ -68,6 +68,11 @@ def test_wide_gemm(rows, n, k, split, silu):
     [
         (96, 3584, 7168, 7, False),  # latent_down at r24: uneven token regions
         (96, 4480, 7168, 5, True),  # router | latent_down: n % 256 != 0, partials
+        # latent up partials (sp_mlp.LATENT_UP_PARTS): uneven 3-way token regions
+        # at 128 / 160, even at 192
+        (128, 7168, 3584, 3, True),
+        (160, 7168, 3584, 3, True),
+        (192, 7168, 3584, 3, True),
     ],
 )
 def test_wide_gemm_decode_front(rows, n, k, split, partials):

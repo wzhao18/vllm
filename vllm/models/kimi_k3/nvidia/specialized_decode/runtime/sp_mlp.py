@@ -95,7 +95,11 @@ PREWAIT_ROWS = (64, 96)
 # releases its dependents at entry (its completion follows the shared expert's
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
-LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
+# n128 / 160 / 192 (q8 B64 / B80 / B96, one MMA of N = n tokens) at split 3 too
+# (168 CTAs; cuBLAS badd ran there: DB k7 B64 latent_up:cublas). n224 has no legal
+# split on 212 SMs: split 3 fails the uneven-region ring check (``wide._exchange_fits``),
+# split 4 is 224 CTAs (> 212, ``PreparedWide`` raises); it keeps cuBLAS.
+LATENT_UP_PARTS = {"*": "32:3,64:3,96:3,128:3,160:3,192:3"}
 
 
 class SplitKFront:
