@@ -595,6 +595,13 @@ def test_window_tp4_any_q(q):
     test_window_matches_stock(4, q, "slots")
 
 
+@pytest.mark.parametrize("q", [1, 2, 4, 5, 6])
+def test_window_tp8_any_q(q):
+    """TP8 (DFn: TP8 = DCP8 decode, 2 KV heads) at DSpark k1 / k2 / k4 / k5 / k6:
+    every GQA_WINDOW shape of the draft length matches stock, as at k3 / k7."""
+    test_window_matches_stock(8, q, "slots")
+
+
 def test_window_umma_redo(monkeypatch):
     """GqaWindowUmma's moved-metadata path (its speculated first loads drained and
     reissued, those ring slots' phases offset; forced on unmoved metadata): the
