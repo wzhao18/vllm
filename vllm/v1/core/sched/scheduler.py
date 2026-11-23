@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import itertools
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -66,6 +67,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    get_mamba_crossing_checkpoint_position,
     get_mamba_extra_tail_checkpoint_position,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
@@ -135,16 +137,97 @@ def _log_bucket(n: int) -> int:
 
 
 def _stop_mamba_chunk_at_block_end(
-    request: Request, start: int, num_new_tokens: int, block_size: int
+    request: Request,
+    start: int,
+    num_new_tokens: int,
+    block_size: int,
+    may_cross: bool = False,
 ) -> int:
-    """Only a chunk that finishes the prefill exports its checkpoint into the
-    column of the mid-block state it resumes from. A chunk starting mid-block
-    that a stop or cap ends short of the prefill must stop at the block's end:
-    otherwise that column's full-block hash names the wrong state."""
+    """Only a chunk that finishes the prefill, or a crossing chunk that exports
+    the boundary state (``may_cross``, see
+    ``get_mamba_crossing_checkpoint_position``), writes the column of the
+    mid-block state it resumes from. Any other chunk starting mid-block that a
+    stop or cap ends short of the prefill must stop at the block's end:
+    otherwise that column's full-block hash names the wrong state. A crossing
+    chunk still never runs past the next boundary after that one."""
     prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
     if start % block_size and start + num_new_tokens < prefill_end:
-        num_new_tokens = min(num_new_tokens, block_size - start % block_size)
+        num_new_tokens = min(
+            num_new_tokens,
+            block_size - start % block_size + (block_size if may_cross else 0),
+        )
     return num_new_tokens
+
+
+def _dp_prefill_ctx_weight() -> float:
+    """Per-rank context weight of a prompt token (step_cost.RANK_CTX_WEIGHT):
+    the DP prefill pull-up fills a lighter rank up to the busiest rank's own,
+    pre-MoE work, where the lockstep's imbalance lives."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import step_cost
+
+    return step_cost.RANK_CTX_WEIGHT
+
+
+def _prefill_chunk_cost(num_tokens: int, context: int) -> float:
+    """Cost of ``num_tokens`` new tokens after ``context`` computed ones: each
+    token weighted by 1 + w * (its context), summed exactly."""
+    w = _dp_prefill_ctx_weight()
+    return num_tokens * (1.0 + w * (context + (num_tokens - 1) / 2))
+
+
+def _max_tokens_for_prefill_cost(cost: float, context: int) -> int:
+    """Largest n with ``_prefill_chunk_cost(n, context) <= cost``."""
+    w = _dp_prefill_ctx_weight()
+    b = 1.0 + w * (context - 0.5)
+    n = (
+        int((-b + math.sqrt(b * b + 2.0 * w * max(cost, 0.0))) / w)
+        if w > 0
+        else int(max(cost, 0.0) / b)
+    )
+    while n > 0 and _prefill_chunk_cost(n, context) > cost:
+        n -= 1
+    while _prefill_chunk_cost(n + 1, context) <= cost:
+        n += 1
+    return n
+
+
+def _mamba_may_cross(sched, start: int, end: int, prefill_end: int) -> bool:
+    """Whether the chunk ``[start, end)`` may cross its block boundary and export
+    the boundary state internally (``Scheduler.mamba_crossing_chunks``: the
+    backend's prefill snapshot and sparse retention). Only the DP prefill
+    pull-up forms crossing chunks (``_mamba_crossing_pull`` set by
+    ``_dp_pull_chunk``): it fills ranks below the step's busiest up to the
+    busiest's cost, so a crossing never lengthens the lockstep step. ``sched``
+    is a Scheduler or a unit test stand-in, hence getattr."""
+    if not (
+        getattr(sched, "mamba_crossing_chunks", False)
+        and getattr(sched, "_mamba_crossing_pull", False)
+    ):
+        return False
+    return (
+        get_mamba_crossing_checkpoint_position(
+            query_start=start,
+            query_end=end,
+            prefill_end=prefill_end,
+            mamba_block_size=sched.mamba_block_size,
+            hash_block_size=sched.hash_block_size,
+            checkpoint_alignment=sched.mamba_prefill_checkpoint_alignment,
+        )
+        > 0
+    )
+
+
+def _stop_at_block_end(sched, request: Request, start: int, num_new_tokens: int) -> int:
+    """``_stop_mamba_chunk_at_block_end`` with the scheduler's crossing rule: a
+    cap that leaves a crossing chunk past its boundary keeps it there."""
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    return _stop_mamba_chunk_at_block_end(
+        request,
+        start,
+        num_new_tokens,
+        sched.mamba_block_size,
+        may_cross=_mamba_may_cross(sched, start, start + num_new_tokens, prefill_end),
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -598,6 +681,26 @@ class Scheduler(SchedulerInterface):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        # Crossing chunks (get_mamba_crossing_checkpoint_position) export a
+        # crossed block boundary from inside an intermediate chunk. That is the
+        # one state an intermediate chunk publishes under sparse retention (0)
+        # or a retention grid of one Mamba block (the boundary is a grid point,
+        # the mid-block chunk end is not). Under finer (dense) retention every
+        # chunk end is published too, and a sequence exports at most one
+        # checkpoint per step, so crossing chunks are not formed there. A
+        # capability check: on wherever the backend's prefill snapshot and such
+        # a retention are present (production K3.1 prefill), no switch.
+        self.mamba_crossing_chunks = (
+            self.mamba_internal_snapshot
+            and kv_cache_config.prefix_cache_retention_interval
+            in (0, self.mamba_block_size)
+        )
+        if self.mamba_crossing_chunks:
+            logger.info_once(
+                "Mamba crossing chunks: ON (intermediate prefill chunks cross one "
+                "%d-token block boundary and export it in-step)",
+                self.mamba_block_size,
+            )
         if (
             self.cache_config.mamba_internal_snapshot
             and not self.mamba_internal_snapshot
@@ -823,12 +926,26 @@ class Scheduler(SchedulerInterface):
             )
         if use_internal_checkpoint:
             last_cache_position = 0
+        # An intermediate chunk resuming mid-block may cross the next boundary
+        # B and export the state at B from inside the step
+        # (get_mamba_crossing_checkpoint_position), instead of stopping at B
+        # with the rest of its step budget unused. Its end stays on the hash
+        # grid so the next chunk can do the same.
+        crossing = False
+        boundary = (start // block_size + 1) * block_size
+        if not use_internal_checkpoint and start % block_size and end < prefill_end:
+            cand = min(end, boundary + block_size)
+            if cand % block_size:
+                cand = cand // self.hash_block_size * self.hash_block_size
+            if _mamba_may_cross(self, start, cand, prefill_end):
+                end, crossing = cand, True
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
-        # to the boundary. A block too wide for one chunk advances sub-block
-        # and re-aligns at the next boundary.
-        if end < prefill_end:
+        # to the boundary, and a crossing chunk, which exports the boundary
+        # state from inside the step. A block too wide for one chunk advances
+        # sub-block and re-aligns at the next boundary.
+        if end < prefill_end and not crossing:
             max_prefill_tokens = self.max_num_scheduled_tokens
             # getattr: the split is also called on bare scheduler stand-ins
             # (unit tests), like the other optional attributes it reads.
@@ -877,10 +994,11 @@ class Scheduler(SchedulerInterface):
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
+            if start % block_size != 0 and not use_internal_checkpoint and not crossing
             else 0,
-            # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
+            # Never run past the last cacheable block boundary mid-chunk (a
+            # crossing chunk exports its boundary B internally).
+            0 if crossing and last_cache_position == boundary else last_cache_position,
             # Stop at the prompt checkpoint unless the backend saves it internally.
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
@@ -891,9 +1009,7 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return _stop_mamba_chunk_at_block_end(
-            request, start, max(end - start, 0), block_size
-        )
+        return _stop_at_block_end(self, request, start, max(end - start, 0))
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -1179,11 +1295,8 @@ class Scheduler(SchedulerInterface):
             )
             if self.need_mamba_block_aligned_split:
                 # The caps above can cut a final chunk short.
-                num_new_tokens = _stop_mamba_chunk_at_block_end(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    self.mamba_block_size,
+                num_new_tokens = _stop_at_block_end(self, 
+                    request, request.num_computed_tokens, num_new_tokens
                 )
 
             if num_new_tokens == 0:
@@ -1822,11 +1935,8 @@ class Scheduler(SchedulerInterface):
                     )
                     if self.need_mamba_block_aligned_split:
                         # The caps above can cut a final chunk short.
-                        num_new_tokens = _stop_mamba_chunk_at_block_end(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            self.mamba_block_size,
+                        num_new_tokens = _stop_at_block_end(self, 
+                            request, num_computed_tokens, num_new_tokens
                         )
 
                     if num_new_tokens == 0:
@@ -3524,6 +3634,15 @@ class Scheduler(SchedulerInterface):
         """
         self._dp_step_token_cap = cap
 
+    def dp_prefill_cost(self, num_scheduled_tokens: dict[str, int]) -> float:
+        """This step's context-weighted cost: each scheduled chunk's tokens,
+        weighted by the context they attend (``_prefill_chunk_cost``)."""
+        return sum(
+            _prefill_chunk_cost(n, self.requests[rid].num_computed_tokens)
+            for rid, n in num_scheduled_tokens.items()
+            if rid in self.requests
+        )
+
     def dp_prefill_demand(self, num_scheduled_tokens: dict[str, int]) -> int:
         """Prompt tokens this rank can compute after this step's schedule:
         running prefills plus waiting requests whose prefix hit is known and
@@ -3588,7 +3707,17 @@ class Scheduler(SchedulerInterface):
         self, request: Request, num_new_tokens: int, token_room: int
     ) -> int:
         """The running loop's clamps of a chunk, for a pull-up chunk (no
-        encoder inputs, no spec tokens: see the running loop)."""
+        encoder inputs, no spec tokens: see the running loop). A pull-up chunk
+        may cross one Mamba block boundary (get_mamba_crossing_checkpoint_position)."""
+        self._mamba_crossing_pull = True
+        try:
+            return self._dp_pull_chunk_clamped(request, num_new_tokens, token_room)
+        finally:
+            self._mamba_crossing_pull = False
+
+    def _dp_pull_chunk_clamped(
+        self, request: Request, num_new_tokens: int, token_room: int
+    ) -> int:
         num_new_tokens = min(num_new_tokens, token_room)
         num_new_tokens = min(
             num_new_tokens,
@@ -3602,11 +3731,8 @@ class Scheduler(SchedulerInterface):
             request, request.num_computed_tokens, num_new_tokens
         )
         if self.need_mamba_block_aligned_split:
-            num_new_tokens = _stop_mamba_chunk_at_block_end(
-                request,
-                request.num_computed_tokens,
-                num_new_tokens,
-                self.mamba_block_size,
+            num_new_tokens = _stop_at_block_end(self, 
+                request, request.num_computed_tokens, num_new_tokens
             )
         return num_new_tokens
 
@@ -3632,6 +3758,7 @@ class Scheduler(SchedulerInterface):
         from vllm.models.kimi_k3.nvidia.ops import dsa_dp
 
         drafts_needed = False
+        room = 0.0
         if owner_left is not None:
             cap = self._dsa_step_cap
             used = [cap - left for left in owner_left]
@@ -3641,12 +3768,19 @@ class Scheduler(SchedulerInterface):
             if dsa_dp.PROF:
                 dsa_dp.sched_stat(cap, used, busiest)
         else:
-            num_tokens = sum(num_scheduled_tokens.values())
-            extra = max(
-                exchange(num_tokens, self.dp_prefill_demand(num_scheduled_tokens))
-                - num_tokens,
-                0,
+            # The lockstep step waits for the rank with the most work, and a
+            # prompt token costs more the longer its context: exchange the
+            # step's context-weighted cost (dp_prefill_cost), so a lighter rank
+            # is pulled up to the busiest rank's cost, not its token count.
+            own_cost = self.dp_prefill_cost(num_scheduled_tokens)
+            room = max(
+                exchange(
+                    round(own_cost), self.dp_prefill_demand(num_scheduled_tokens)
+                )
+                - own_cost,
+                0.0,
             )
+            extra = 1 << 62 if room > 0 else 0
         for request_id, (request, num_unclipped) in pull_reqs.items():
             if request_id not in num_scheduled_tokens:
                 # Preempted later in the step (priority policy); its booking was
@@ -3656,13 +3790,20 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = num_stock
             if extra > 0:
                 want = num_stock + min(extra, num_unclipped - num_stock)
+                ctx = request.num_computed_tokens
                 if owner_left is not None:
                     o = getattr(request, "dsa_owner", 0)
-                    ctx = request.num_computed_tokens
                     want = min(
                         want,
                         dsa_dp.max_tokens_for_cost(
                             dsa_dp.chunk_cost(num_stock, ctx) + room_o[o], ctx
+                        ),
+                    )
+                else:
+                    want = min(
+                        want,
+                        _max_tokens_for_prefill_cost(
+                            _prefill_chunk_cost(num_stock, ctx) + room, ctx
                         ),
                     )
                 # The stock clamps decide the pulled chunk too; both it and the
@@ -3677,6 +3818,10 @@ class Scheduler(SchedulerInterface):
                     room_o[o] -= dsa_dp.chunk_cost(
                         num_new_tokens, ctx
                     ) - dsa_dp.chunk_cost(num_stock, ctx)
+                elif num_new_tokens > num_stock:
+                    room -= _prefill_chunk_cost(
+                        num_new_tokens, ctx
+                    ) - _prefill_chunk_cost(num_stock, ctx)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,

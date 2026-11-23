@@ -13,6 +13,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
+    get_mamba_crossing_checkpoint_position,
     get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
@@ -30,6 +31,7 @@ def compute_mamba_prefill_checkpoints(
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
     first_chunk: list[bool] | None = None,
+    prefill_ends: list[int] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
@@ -45,6 +47,13 @@ def compute_mamba_prefill_checkpoints(
     column (CacheConfig.mamba_internal_snapshot): a running request's
     append-only table can hold a stale block id there.
 
+    ``prefill_ends``: per row, where the request's prefill ends (the
+    scheduler's ``max(num_prompt_tokens, num_tokens - 1)``). An intermediate
+    chunk that crosses its block boundary exports that boundary's state into
+    the column it resumed from (``get_mamba_crossing_checkpoint_position``),
+    in lockstep with the scheduler and ``MambaManager``. Needs the snapshot
+    capability, like the first-chunk snapshot.
+
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
         its block-table column. ``0`` and ``-1`` mean the row has none.
@@ -54,6 +63,23 @@ def compute_mamba_prefill_checkpoints(
     cols: list[int] = []
     for i, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
         query_start = seq_len - query_len
+        if prefill_ends is not None:
+            boundary = get_mamba_crossing_checkpoint_position(
+                query_start=query_start,
+                query_end=seq_len,
+                prefill_end=prefill_ends[i],
+                mamba_block_size=mamba_block_size,
+                hash_block_size=hash_block_size,
+                checkpoint_alignment=checkpoint_alignment,
+            )
+            if boundary > 0:
+                offsets.append(boundary - query_start)
+                cols.append(
+                    get_mamba_prefill_checkpoint_col(
+                        query_start, seq_len, mamba_block_size
+                    )
+                )
+                continue
         position = get_mamba_prefill_checkpoint_position(
             seq_len,
             cache_hit_alignment_tokens,
@@ -140,9 +166,11 @@ class MambaPrefillCheckpointBuilder:
         m: CommonAttentionMetadata,
         request_rows: list[int],
         first_chunk_rows: Sequence[bool] | None = None,
+        prefill_end_rows: Sequence[int] | None = None,
     ) -> MambaPrefillCheckpointMetadata | None:
         """``first_chunk_rows``: per batch row, whether the row is its
-        request's first scheduled chunk (V2 runner, only consulted when the
+        request's first scheduled chunk; ``prefill_end_rows``: per batch row,
+        where its prefill ends (both from the V2 runner, only consulted when the
         spec declares ``prefill_snapshot``)."""
         if self.vllm_config.cache_config.mamba_cache_mode != "align":
             return None
@@ -171,6 +199,11 @@ class MambaPrefillCheckpointBuilder:
             first_chunk=(
                 [bool(first_chunk_rows[row]) for row in request_rows]
                 if self.kv_cache_spec.prefill_snapshot and first_chunk_rows is not None
+                else None
+            ),
+            prefill_ends=(
+                [int(prefill_end_rows[row]) for row in request_rows]
+                if self.kv_cache_spec.prefill_snapshot and prefill_end_rows is not None
                 else None
             ),
         )

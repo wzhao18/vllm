@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    get_mamba_crossing_checkpoint_position,
     get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
@@ -1813,6 +1814,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.has_prefill_checkpoint_blocks and kv_cache_spec.prefill_snapshot
         )
         self._first_chunk_reqs: set[str] = set()
+        # Request -> real prefill end, for crossing chunks (set_prefill_end).
+        self._prefill_ends: dict[str, int] = {}
         self._snapshot_cols: dict[str, int] = {}
         # (request, column, block) of each snapshot block placed for a running
         # request this step. Its worker block table is append-only, so the
@@ -2044,6 +2047,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
+    def set_prefill_end(self, request_id: str, prefill_end: int) -> None:
+        """The request's real prefill end for crossing chunks (0: crossing
+        chunks are not formed, e.g. under dense retention). The allocation's
+        own ``prefill_end`` is zeroed under any retention but sparse."""
+        if prefill_end:
+            self._prefill_ends[request_id] = prefill_end
+        else:
+            self._prefill_ends.pop(request_id, None)
+
     def set_first_chunk(self, request_id: str, first_chunk: bool) -> None:
         if first_chunk:
             self._first_chunk_reqs.add(request_id)
@@ -2255,7 +2267,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
             )
             snapshot_col = -1
-            if not self._needs_internal_checkpoint(
+            # A crossing chunk exports only its crossed block boundary B, a
+            # full block (and a retention grid point); it reserves no chunk-end
+            # checkpoint, so it publishes what a chunk stopping at B would.
+            crossing = self._is_crossing_chunk(
+                total_computed_tokens,
+                num_tokens,
+                self._prefill_ends.get(request_id, 0),
+            )
+            if crossing:
+                checkpoint_position = 0
+            elif not self._needs_internal_checkpoint(
                 request_id,
                 total_computed_tokens,
                 num_tokens,
@@ -2313,6 +2335,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.has_prefill_checkpoint_blocks
                     and total_computed_tokens % self.block_size != 0
                     and checkpoint_position == 0
+                    and not crossing
                     and num_tokens - total_computed_tokens
                     > self.block_pool.hash_block_size
                     and num_tokens > cdiv(total_computed_tokens, self.block_size)
@@ -2526,6 +2549,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._chunk_starts.pop(request_id, None)
             self._snapshot_cols.pop(request_id, None)
             self._first_chunk_reqs.discard(request_id)
+            self._prefill_ends.pop(request_id, None)
             self._checkpoints_in_initial_state_block.discard(request_id)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
@@ -2569,7 +2593,7 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int],
     ) -> None:
         if self.mamba_cache_mode == "align":
-            self._skip_stale_initial_state(request, num_tokens)
+            self._skip_stale_initial_state(request, num_tokens, retention_interval)
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         extra_checkpoint = getattr(request, "mamba_extra_checkpoint", None)
         if extra_checkpoint:
@@ -2674,7 +2698,30 @@ class MambaManager(SingleTypeKVCacheManager):
             keys, self._pending_handoff_block_ids()
         )
 
-    def _skip_stale_initial_state(self, request: Request, num_tokens: int) -> None:
+    def _is_crossing_chunk(
+        self, query_start: int, query_end: int, prefill_end: int
+    ) -> bool:
+        """The worker exports this intermediate chunk's crossed block boundary
+        into its initial-state column (same rule as the scheduler and
+        ``compute_mamba_prefill_checkpoints``)."""
+        if not self.prefill_snapshot:
+            return False
+        assert isinstance(self.kv_cache_spec, MambaSpec)
+        return (
+            get_mamba_crossing_checkpoint_position(
+                query_start=query_start,
+                query_end=query_end,
+                prefill_end=prefill_end,
+                mamba_block_size=self.block_size,
+                hash_block_size=self.block_pool.hash_block_size,
+                checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
+            )
+            > 0
+        )
+
+    def _skip_stale_initial_state(
+        self, request: Request, num_tokens: int, retention_interval: int | None = None
+    ) -> None:
         """Never publish the initial-state block of a prefill chunk that started
         mid-block and ran past that block's end.
 
@@ -2687,7 +2734,15 @@ class MambaManager(SingleTypeKVCacheManager):
         start = self._chunk_starts.pop(request.request_id, None)
         if start is None or start % self.block_size == 0:
             return
-        if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return
+        if retention_interval in (0, self.block_size) and self._is_crossing_chunk(
+            start, num_tokens, prefill_end
+        ):
+            # The chunk exported the state at the block end into this column
+            # (get_mamba_crossing_checkpoint_position), so its full-block hash
+            # names the right state: publish it like a block-ended chunk's.
             return
         initial_state_col = start // self.block_size
         if num_tokens <= (initial_state_col + 1) * self.block_size:

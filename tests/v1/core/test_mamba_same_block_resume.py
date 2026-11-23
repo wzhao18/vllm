@@ -64,6 +64,7 @@ class _Engine:
         self, *, snapshot: bool, num_spec: int = 0, retention_interval=0
     ) -> None:
         self.snapshot = snapshot
+        self.retention_interval = retention_interval
         self.num_spec = num_spec
         self.manager = make_full_mamba_manager(
             dcp_world_size=1,
@@ -105,6 +106,10 @@ class _Engine:
             mamba_has_prefill_checkpoint_blocks=True,
             mamba_prefill_checkpoint_alignment=16,
             mamba_internal_snapshot=self.snapshot,
+            # Scheduler.mamba_crossing_chunks: snapshot support + sparse retention.
+            mamba_crossing_chunks=(
+                self.snapshot and self.retention_interval in (0, BLOCK)
+            ),
             kv_cache_manager=self.manager,
         )
         return Scheduler._mamba_block_aligned_split(stub, request, num_new, local)
@@ -166,6 +171,13 @@ class _Engine:
             cache_hit_alignment_tokens=HASH,
             first_chunk=(
                 [self.snapshot_start.get(rid) == start] if self.snapshot else None
+            ),
+            # The V2 model state ships each row's prefill end with the snapshot
+            # support (crossing-chunk boundary export).
+            prefill_ends=(
+                [max(request.num_prompt_tokens, request.num_tokens - 1)]
+                if self.snapshot and self.retention_interval in (0, BLOCK)
+                else None
             ),
         )
         if offsets[0] and table[cols[0]] != self.null_id:
@@ -251,7 +263,9 @@ def _next_turn(engine: _Engine, new_tokens: int, request_id: str = "t1"):
     return _turn(request_id, tokens)
 
 
-@pytest.mark.parametrize("retention_interval", [None, 0], ids=["dense", "sparse"])
+@pytest.mark.parametrize(
+    "retention_interval", [None, 0, BLOCK], ids=["dense", "sparse", "grid"]
+)
 @pytest.mark.parametrize("num_spec", [0, 3])
 @pytest.mark.parametrize(
     ("new_tokens", "budgets", "spans"),
@@ -264,6 +278,7 @@ def _next_turn(engine: _Engine, new_tokens: int, request_id: str = "t1"):
         (11072, [2000], [(RESUME, CUT), (CUT, 131072)]),
         # The first chunk stops at the block end; the last chunk starts at the
         # boundary and ends in that block: was 3 passes (checkpoint 134912).
+        # (Crossing chunks come only from the DP pull-up, not this split.)
         (15000, [12000], [(RESUME, 131072), (131072, PREFIX + 15000)]),
         # A first chunk ending in its block: the first-chunk snapshot, as before.
         (5000, [], [(RESUME, PREFIX + 5000)]),
@@ -294,13 +309,17 @@ def test_last_chunk_ending_in_its_block_runs_in_one_pass(
     _, num_hit, _ = engine.manager.get_computed_blocks(nxt)
     assert num_hit == (
         prompt_len
-        if prompt_len % BLOCK == 0 and retention_interval is None
+        # A full block at the prompt end is kept by dense retention and by a
+        # one-block grid (it is a grid point).
+        if prompt_len % BLOCK == 0 and retention_interval in (None, BLOCK)
         else checkpoint
     )
     assert engine.stale_blocks() == []
 
 
-@pytest.mark.parametrize("retention_interval", [None, 0], ids=["dense", "sparse"])
+@pytest.mark.parametrize(
+    "retention_interval", [None, 0, BLOCK], ids=["dense", "sparse", "grid"]
+)
 @pytest.mark.parametrize(
     ("new_tokens", "budgets"),
     [(5000, [2000]), (11072, [2000]), (15000, [12000]), (5000, []), (15000, [])],
