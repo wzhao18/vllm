@@ -97,6 +97,22 @@ class SchedulerConfig:
     queued and running requests. Only applies when
     long_prefill_token_threshold is nonzero."""
 
+    prefill_context_cost_c0: int = Field(default=0, ge=0)
+    """Size prefill chunks by cost instead of tokens; 0 disables (default).
+
+    The value is the context length at which a prefill token's context-bound
+    work (a sparse-attention indexer scores every cached token) costs as much
+    as the rest of its work. A chunk of n tokens after c computed ones costs
+    n * (1 + (c + n / 2) / prefill_context_cost_c0) token units, and a step may
+    spend the cost of max_num_batched_tokens tokens after
+    prefill_context_cost_ref_len. Data-parallel ranks wait for each other in
+    every step, so long-context ranks take fewer tokens instead of setting the
+    step time for all of them."""
+
+    prefill_context_cost_ref_len: int = Field(default=0, ge=0)
+    """Context length at which a full max_num_batched_tokens chunk fits one
+    step's cost budget (see prefill_context_cost_c0)."""
+
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
     at the same time, or None for no limit. When the limit is reached, new
@@ -358,6 +374,13 @@ class SchedulerConfig:
                 "* max_model_len (%d). This may lead to unexpected behavior.",
                 self.max_num_batched_tokens,
                 self.max_num_seqs * max_model_len,
+            )
+
+        if self.prefill_context_cost_c0 and self.long_prefill_token_threshold:
+            raise ValueError(
+                "prefill_context_cost_c0 cannot be combined with "
+                "long_prefill_token_threshold: the DP prefill pull-up that the "
+                "threshold enables sizes chunks by tokens."
             )
 
         if self.long_prefill_token_threshold > max_model_len:

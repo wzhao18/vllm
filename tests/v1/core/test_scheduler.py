@@ -8765,3 +8765,165 @@ def test_dcp_shardq_context_imports_without_cutedsl():
         "assert 'cutlass' not in sys.modules"
     )
     subprocess.check_call([sys.executable, "-c", code])
+
+
+def _ctx_cost(n: int, ctx: int, c0: int) -> float:
+    return n * (1.0 + (ctx + 0.5 * n) / c0)
+
+
+def _finish_prefill_step(scheduler, output, requests) -> None:
+    """Report a step that sampled nothing (every scheduled chunk is a prompt
+    chunk), so the requests' computed tokens advance by their chunks."""
+    ids = [
+        r.request_id for r in requests if r.request_id in output.num_scheduled_tokens
+    ]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={rid: i for i, rid in enumerate(ids)},
+            sampled_token_ids=[[] for _ in ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def test_context_cost_shrinks_long_context_chunks():
+    """With prefill_context_cost_c0, a chunk after a long context takes fewer
+    tokens: the most whose cost fits the step budget (the cost of a full
+    max_num_batched_tokens chunk after prefill_context_cost_ref_len tokens),
+    so every DP rank's step costs about the same."""
+    c0, mnbt = 2048, 256
+    scheduler = create_scheduler(
+        max_num_batched_tokens=mnbt,
+        max_model_len=2048,
+        prefill_context_cost_c0=c0,
+    )
+    budget = _ctx_cost(mnbt, 0, c0)
+    request = create_requests(num_requests=1, num_tokens=1800)[0]
+    scheduler.add_request(request)
+    chunks = []
+    for _ in range(4):
+        ctx = request.num_computed_tokens
+        output = scheduler.schedule()
+        n = output.num_scheduled_tokens[request.request_id]
+        chunks.append(n)
+        assert _ctx_cost(n, ctx, c0) <= budget < _ctx_cost(n + 1, ctx, c0)
+        _finish_prefill_step(scheduler, output, [request])
+    assert chunks[0] == mnbt
+    assert chunks[0] > chunks[1] > chunks[2] > chunks[3]
+
+
+def test_context_cost_ref_len_keeps_full_chunks_below_it():
+    """Chunks after less context than prefill_context_cost_ref_len stay at
+    max_num_batched_tokens; the cost only cuts longer contexts."""
+    c0, mnbt, ref = 2048, 256, 512
+    scheduler = create_scheduler(
+        max_num_batched_tokens=mnbt,
+        max_model_len=2048,
+        prefill_context_cost_c0=c0,
+        prefill_context_cost_ref_len=ref,
+    )
+    request = create_requests(num_requests=1, num_tokens=1800)[0]
+    scheduler.add_request(request)
+    chunks = []
+    for _ in range(4):
+        output = scheduler.schedule()
+        chunks.append(output.num_scheduled_tokens[request.request_id])
+        _finish_prefill_step(scheduler, output, [request])
+    # Contexts 0, 256 and 512 fit full chunks; 768 does not.
+    assert chunks[:3] == [mnbt] * 3
+    assert chunks[3] < mnbt
+
+
+def test_context_cost_disabled_is_token_budget():
+    """prefill_context_cost_c0=0 (default) leaves chunks at the token budget."""
+    scheduler = create_scheduler(max_num_batched_tokens=256, max_model_len=2048)
+    request = create_requests(num_requests=1, num_tokens=1800)[0]
+    scheduler.add_request(request)
+    for _ in range(4):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[request.request_id] == 256
+        _finish_prefill_step(scheduler, output, [request])
+
+
+def _ctx_cost_max_tokens(cost: float, ctx: int, c0: int) -> int:
+    n = 0
+    while _ctx_cost(n + 1, ctx, c0) <= cost:
+        n += 1
+    return n
+
+
+def test_context_cost_leftover_goes_to_next_request():
+    """The step's cost budget is shared: after a running long-context chunk,
+    a waiting request takes the most tokens the leftover cost buys, and the
+    step's total cost stays within the budget."""
+    c0, mnbt = 2048, 256
+    budget = _ctx_cost(mnbt, 0, c0)
+    # Three cost-sized chunks, then 100 tokens to finish the prompt.
+    ctx = 0
+    for _ in range(3):
+        ctx += min(mnbt, _ctx_cost_max_tokens(budget, ctx, c0))
+    scheduler = create_scheduler(
+        max_num_batched_tokens=mnbt,
+        max_model_len=2048,
+        prefill_context_cost_c0=c0,
+    )
+    long_req = create_requests(num_requests=1, num_tokens=ctx + 100, req_ids=["l"])[0]
+    short_req = create_requests(num_requests=1, num_tokens=1000, req_ids=["s"])[0]
+    scheduler.add_request(long_req)
+    for _ in range(3):
+        output = scheduler.schedule()
+        _finish_prefill_step(scheduler, output, [long_req])
+    assert long_req.num_computed_tokens == ctx
+    scheduler.add_request(short_req)
+    output = scheduler.schedule()
+    n_long = output.num_scheduled_tokens[long_req.request_id]
+    n_short = output.num_scheduled_tokens[short_req.request_id]
+    assert n_long == 100
+    left = budget - _ctx_cost(n_long, ctx, c0)
+    assert n_short == _ctx_cost_max_tokens(left, 0, c0)
+    assert n_long + n_short < mnbt
+
+
+def test_context_cost_first_request_always_progresses():
+    """A context so long that no token fits the budget still gets one token
+    for the step's first request, so a step is never empty; later requests
+    get none."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64, max_model_len=2048, prefill_context_cost_c0=1
+    )
+    assert scheduler._ctx_cost_tokens(scheduler.ctx_cost_budget, 10**6, True) == 1
+    assert scheduler._ctx_cost_tokens(scheduler.ctx_cost_budget, 10**6, False) == 0
+    assert scheduler._ctx_cost_tokens(-1.0, 0, False) == 0
+
+
+def test_context_cost_rejects_long_prefill_threshold():
+    """The cost budget and the DP pull-up (long_prefill_token_threshold) size
+    chunks differently, so the config refuses both."""
+    with pytest.raises(ValueError, match="prefill_context_cost_c0"):
+        create_scheduler(
+            max_num_batched_tokens=1024,
+            long_prefill_token_threshold=400,
+            prefill_context_cost_c0=8192,
+        )
+
+
+def test_context_cost_cli_flags():
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--prefill-context-cost-c0",
+            "2300000",
+            "--prefill-context-cost-ref-len",
+            "100000",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.prefill_context_cost_c0 == 2300000
+    assert engine_args.prefill_context_cost_ref_len == 100000

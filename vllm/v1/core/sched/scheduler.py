@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import itertools
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -204,6 +205,16 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
+        )
+        # Cost-sized prefill chunks (SchedulerConfig.prefill_context_cost_c0).
+        self.ctx_cost_c0 = self.scheduler_config.prefill_context_cost_c0
+        self.ctx_cost_budget = (
+            self._ctx_cost(
+                self.max_num_scheduled_tokens,
+                self.scheduler_config.prefill_context_cost_ref_len,
+            )
+            if self.ctx_cost_c0
+            else 0.0
         )
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
@@ -965,6 +976,10 @@ class Scheduler(SchedulerInterface):
         # DSA-DP: each owner card of the TP group gets an equal share of the step's
         # tokens, so the cards' DSA work (owned rows only) stays balanced.
         owner_left = self._dsa_owner_budgets(token_budget)
+        # Cost-sized prefill chunks; DSA-DP sizes them per owner card instead.
+        ctx_left = (
+            self.ctx_cost_budget if self.ctx_cost_c0 and owner_left is None else None
+        )
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
@@ -1124,6 +1139,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._dsa_owner_take(
                     owner_left, request, request.num_computed_tokens, num_new_tokens
                 )
+            if ctx_left is not None:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self._ctx_cost_tokens(
+                        ctx_left, request.num_computed_tokens, not num_scheduled_tokens
+                    ),
+                )
             if (
                 loaded_kv_reserve > 0
                 and request.num_computed_tokens < request.num_prompt_tokens
@@ -1277,6 +1299,10 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
+                            if ctx_left is not None:
+                                ctx_left += self._ctx_cost(
+                                    restored, preempted_req.num_computed_tokens
+                                )
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -1339,6 +1365,8 @@ class Scheduler(SchedulerInterface):
                 self._dsa_owner_charge(
                     owner_left, request, request.num_computed_tokens, num_new_tokens
                 )
+            if ctx_left is not None:
+                ctx_left -= self._ctx_cost(num_new_tokens, request.num_computed_tokens)
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
@@ -1726,6 +1754,16 @@ class Scheduler(SchedulerInterface):
                             # This owner card's share of the step is full.
                             skip_request(request_queue)
                             continue
+                    if ctx_left is not None:
+                        request_token_budget = min(
+                            request_token_budget,
+                            self._ctx_cost_tokens(
+                                ctx_left, num_computed_tokens, not num_scheduled_tokens
+                            ),
+                        )
+                        if request_token_budget <= 0:
+                            # The step's cost budget is spent.
+                            break
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
                         num_replay_tokens = self._mark_prefix_replay(
@@ -2054,6 +2092,8 @@ class Scheduler(SchedulerInterface):
                     self._dsa_owner_charge(
                         owner_left, request, num_computed_tokens, num_new_tokens
                     )
+                if ctx_left is not None:
+                    ctx_left -= self._ctx_cost(num_new_tokens, num_computed_tokens)
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -3850,6 +3890,19 @@ class Scheduler(SchedulerInterface):
             bs = self.cache_config.block_size
             n = max(0, (ctx + n) // bs * bs - ctx)
         return n
+
+    def _ctx_cost(self, num_tokens: int, ctx: int) -> float:
+        """Cost in token units of ``num_tokens`` tokens after ``ctx`` computed
+        ones (SchedulerConfig.prefill_context_cost_c0)."""
+        return num_tokens * (1.0 + (ctx + 0.5 * num_tokens) / self.ctx_cost_c0)
+
+    def _ctx_cost_tokens(self, cost_left: float, ctx: int, first: bool) -> int:
+        """Most tokens after ``ctx`` computed ones that fit ``cost_left``; at
+        least one for the step's first request, so every step makes progress."""
+        a = 0.5 / self.ctx_cost_c0
+        b = 1.0 + ctx / self.ctx_cost_c0
+        n = int((math.sqrt(b * b + 4 * a * max(cost_left, 0.0)) - b) / (2 * a))
+        return max(n, 1) if first else max(n, 0)
 
     def _dsa_owner_charge(
         self, owner_left: list[float], request: Request, ctx: int, num_new_tokens: int
