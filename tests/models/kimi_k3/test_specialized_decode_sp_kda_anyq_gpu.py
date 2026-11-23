@@ -6,7 +6,7 @@ request replaced mid-chain) and the fold-then-verify chain against the stock Tri
 verify / commit, re-run from the q4 tests at another q.
 
 Record cores per q (``cutedsl.kda.sp.RECORD_KINDS``): KdaSplit at n1-2, KdaWide from
-n3, KdaFlow from n21 (q2..q4) / n12 (q5..q8) at every q (q3 with padded scan vectors; q5..q8 with block-sum
+n3, KdaFlow from n21 (q2..q4) / n18 (q5..q8) at every q (q3 with padded scan vectors; q5..q8 with block-sum
 rounds, the two-half scan and the two-slot page ring).
 The request counts pick one core each: n1 split, n9 wide, n33 / n64 flow; plus each
 q's largest KdaFlow item build at the SP row cap (q5 n192: 24 items per CTA, q6
@@ -39,8 +39,8 @@ def verify_length(monkeypatch, request):
 @pytest.mark.parametrize("verify_length", QS, indirect=True, ids=lambda q: f"q{q}")
 def test_record_kind_per_q(verify_length):
     q = verify_length
-    # q5..q8 run KdaFlow from n12, q2..q4 from n21.
-    first = 12 if q > 4 else 21
+    # q5..q8 run KdaFlow from n18 (KdaWide's second CTA wave), q2..q4 from n21.
+    first = 18 if q > 4 else 21
     assert [record_kind(kda.HEADS, n, q) for n in (1, 2, 3, first - 1, first, 128, 212, 213)] == [
         "split", "split", "wide", "wide", "flow", "flow", "flow", "wide",
     ]  # fmt: skip
