@@ -67,26 +67,42 @@ def warmup_paged_mqa_logits_metadata(
     attn_groups: Iterable[Iterable[Any]], vllm_config: Any
 ) -> int:
     """Build the paged MQA logits metadata of each distinct indexer builder
-    (block size, SM count, decode query length) at every row count of
-    ``metadata_row_counts``, as one-row (``next_n`` 1) and decode-query-length
-    rows. Returns the number of metadata builds."""
+    (block size, SM count, decode query length, varlen) at every row count of
+    ``metadata_row_counts``, in the form the builder's serving step calls it:
+    varlen (``supports_varlen``: one row per decode token, ``(rows, 1)``
+    context lengths and per-token request indices, as
+    ``DeepseekV32IndexerMetadataBuilder`` passes them), else ``(batch,
+    query_len)`` rows for one-row and decode-query-length steps. Returns the
+    number of metadata builds."""
     from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata
 
     calls = 0
-    seen: set[tuple[int, int, int]] = set()
+    seen: set[tuple[int, int, int, bool]] = set()
     for builder in _indexer_builders(attn_groups):
         block = int(builder.kv_cache_spec.num_states)
         next_n = int(builder.decode_threshold)
-        key = (block, int(builder.num_sms), next_n)
+        varlen = bool(builder.supports_varlen)
+        key = (block, int(builder.num_sms), next_n, varlen)
         if key in seen:
             continue
         seen.add(key)
         max_rows = max_decode_rows(vllm_config, next_n)
-        for query_len in sorted({1, next_n}):
-            for rows in metadata_row_counts(max_rows):
+        device = builder.device
+        for rows in metadata_row_counts(max_rows):
+            if varlen:
+                context_lens = torch.full(
+                    (rows, 1), block, dtype=torch.int32, device=device
+                )
+                indices = torch.arange(rows, dtype=torch.int32, device=device) // next_n
+                get_paged_mqa_logits_metadata(
+                    context_lens, block, builder.num_sms, indices=indices
+                )
+                calls += 1
+                continue
+            for query_len in sorted({1, next_n}):
                 batch = max(1, rows // query_len)
                 context_lens = torch.full(
-                    (batch, query_len), block, dtype=torch.int32, device=builder.device
+                    (batch, query_len), block, dtype=torch.int32, device=device
                 )
                 get_paged_mqa_logits_metadata(context_lens, block, builder.num_sms)
                 calls += 1
@@ -94,7 +110,7 @@ def warmup_paged_mqa_logits_metadata(
         torch.accelerator.synchronize()
         logger.info(
             "DSA indexer metadata warmup: %d DeepGEMM paged MQA logits metadata "
-            "builds for %d builder configuration(s) (block, SMs, next_n): %s.",
+            "builds for %d builder configuration(s) (block, SMs, next_n, varlen): %s.",
             calls,
             len(seen),
             sorted(seen),

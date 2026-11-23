@@ -51,10 +51,11 @@ def test_max_decode_rows_caps_by_budget_and_seqs():
 
 
 class _FakeBuilder:
-    def __init__(self, block, sms, next_n):
+    def __init__(self, block, sms, next_n, supports_varlen=False):
         self.kv_cache_spec = SimpleNamespace(num_states=block)
         self.num_sms = sms
         self.decode_threshold = next_n
+        self.supports_varlen = supports_varlen
         self.device = "cpu"
 
 
@@ -97,3 +98,33 @@ def test_warmup_builds_each_distinct_builder_once_at_every_row_count():
     # b2 adds nothing: 2 builder configurations x 2 query lengths.
     expected = sum(len(w.metadata_row_counts(min(8192, 160 * nn))) * 2 for nn in (4, 8))
     assert n == expected
+
+
+def test_warmup_varlen_builds_the_serving_form():
+    """A varlen builder (DeepGEMM varlen paged MQA logits, as served): one
+    (rows, 1) build per row count, with per-token request indices."""
+    cfg = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=160)
+    )
+    b = _FakeBuilder(64, 148, 4, supports_varlen=True)
+    groups = [[SimpleNamespace(metadata_builders=[b])]]
+    calls = []
+
+    def fake_metadata(context_lens, block, sms, indices=None):
+        calls.append((tuple(context_lens.shape), block, sms, indices))
+
+    with (
+        mock.patch(
+            "vllm.v1.attention.backends.mla.indexer.DeepseekV32IndexerMetadataBuilder",
+            _FakeBuilder,
+        ),
+        mock.patch("vllm.utils.deep_gemm.get_paged_mqa_logits_metadata", fake_metadata),
+        mock.patch("torch.accelerator.synchronize"),
+    ):
+        n = w.warmup_paged_mqa_logits_metadata(groups, cfg)
+    counts = w.metadata_row_counts(min(8192, 160 * 4))
+    assert n == len(calls) == len(counts)
+    assert [c[0] for c in calls] == [(r, 1) for r in counts]
+    for (rows, _), _, _, indices in calls:
+        assert indices is not None and indices.shape == (rows,)
+        assert indices.tolist() == [i // 4 for i in range(rows)]

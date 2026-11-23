@@ -36,10 +36,12 @@ _PROBE = textwrap.dedent(
     max_rows, next_n = int(sys.argv[1]), int(sys.argv[2])
     sms = num_compute_units(0)
     edges, before = [], variants()
-    for rows in range(next_n, max_rows + 1, next_n):
-        lens = torch.full((rows // next_n, next_n), 64, dtype=torch.int32,
-                          device="cuda")
-        get_paged_mqa_logits_metadata(lens, 64, sms)
+    # The serving (varlen) form: one row per decode token, (rows, 1) context
+    # lengths and per-token request indices (next_n tokens per request).
+    for rows in range(1, max_rows + 1):
+        lens = torch.full((rows, 1), 64, dtype=torch.int32, device="cuda")
+        idx = torch.arange(rows, dtype=torch.int32, device="cuda") // next_n
+        get_paged_mqa_logits_metadata(lens, 64, sms, indices=idx)
         torch.cuda.synchronize()
         now = variants()
         if now > before:
@@ -82,9 +84,8 @@ def test_row_counts_reach_every_installed_metadata_variant(tmp_path, next_n):
         return sum(rows >= e for e in edges)
 
     for max_rows in (512, 640, 1024, 2048, 2560, MAX_ROWS):
-        reachable = {variant(r) for r in range(next_n, max_rows + 1, next_n)}
-        # As the warmup builds them: batch = rows // next_n, next_n rows each.
-        built = {
-            variant(max(1, r // next_n) * next_n) for r in metadata_row_counts(max_rows)
-        }
+        # Varlen: a step can hold any number of decode token rows up to max_rows;
+        # the warmup builds exactly the metadata_row_counts rows.
+        reachable = {variant(r) for r in range(1, max_rows + 1)}
+        built = {variant(r) for r in metadata_row_counts(max_rows)}
         assert built >= reachable, (max_rows, edges, sorted(built), sorted(reachable))
