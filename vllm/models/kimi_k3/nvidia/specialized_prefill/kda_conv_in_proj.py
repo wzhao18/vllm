@@ -113,6 +113,14 @@ class PrefillKdaConvInProj:
         s = lin.weight_scale.data.view(torch.uint8).reshape(-1)
         cut = nq * (k // 32)
         self.w_rest, self.s_rest = w[nq:], s[cut:]
+        # g | f_a | beta columns of the rest GEMM; TP-sharded in_proj rows may
+        # end in padding (layer.in_proj_padding, e.g. 4 rows at TP8), which the
+        # caller's split must not see.
+        self.rest_cols = (
+            self.layer.local_projection_size
+            + self.layer.head_dim
+            + self.layer.local_num_heads
+        )
         cw = self.layer.conv1d.weight
         self.conv_w = cw.view(cw.shape[0], cw.shape[-1])
         self._gemm = KdaConvGemm(
@@ -212,6 +220,8 @@ class PrefillKdaConvInProj:
             scale_b=self.s_rest.view(torch.float8_e8m0fnu),
             out_dtype=torch.bfloat16,
         )
+        if rest.shape[-1] != self.rest_cols:
+            rest = rest[:, : self.rest_cols]  # drop the in_proj padding rows
         return planes, rest, ckpt_rows
 
 
