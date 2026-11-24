@@ -21,6 +21,7 @@ from cutlass.cute.runtime import make_fake_stream
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
 from ..common.host import fake, prepare_shared_carveout, stream, to_cute
+from ..gemm.ltpin import LtPin, pinned_rows
 from ..gemm.projection import PreparedProjection, weight_map
 from ..mla.query import MlaQuery
 from .front import IndexFront
@@ -50,6 +51,16 @@ RUBIN_INDEX_TACTICS = {
 
 def is_rubin(device):
     return torch.cuda.get_device_capability(device) == (10, 7)
+
+
+def index_pin(weight, batches, rubin):
+    """Rubin wq_b rows above the split-K table that have a pinned cuBLASLt algorithm
+    (``ltpin``, measured at exactly these rows): one LtPin over them, else None (the
+    other rows above 128 run torch.mm, as the stock ``wq_index``)."""
+    rows = [b for b in batches if b > 128 and b in pinned_rows("wq_b")] if rubin else []
+    if not rows:
+        return None
+    return LtPin("wq_b", *weight.shape, rows, device=weight.device)
 
 
 def index_policies(batches, rubin=False):
@@ -266,6 +277,7 @@ class QueryStage:
         policies = index_policies(sorted(pitches), is_rubin(device))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
+        self.index_pin = index_pin(wq, sorted(pitches), is_rubin(device))
         self.wq_view = to_cute(wq)
         # The fused index front's weight TMA map (128-row boxes: one head).
         self.wq_map = weight_map(wq, 128)
@@ -310,9 +322,13 @@ class QueryStage:
         batch = projected.shape[0]
         proj = self.index_projection  # (the SP decode swaps in a DecodeProjection)
         if isinstance(proj, PreparedProjection) and batch not in proj.kernels:
-            # no split-K tactic at these rows (Rubin > 128): cuBLAS, as stock
-            wq = self.indexer.wq_index.weight
-            iq = torch.mm(self.qc[:batch], wq.t(), out=self.iq[:batch])
+            # no split-K tactic at these rows (Rubin > 128): the pinned cuBLASLt
+            # algorithm where measured, else cuBLAS, as stock
+            wq, qc, iq = self.indexer.wq_index.weight, self.qc[:batch], self.iq[:batch]
+            if self.index_pin is not None and batch in self.index_pin.plans:
+                self.index_pin.run(wq, qc, iq)
+            else:
+                torch.mm(qc, wq.t(), out=iq)
         else:
             iq = proj.run(self.qc[:batch], self.iq[:batch])
         rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)

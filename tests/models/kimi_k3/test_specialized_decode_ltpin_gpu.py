@@ -30,6 +30,8 @@ BF16 = {  # name: (N, K, out32, beta)
     "dsa_o": (7168, 3072, False, False),
     "q_b": (4608, 1536, False, False),
     "wq_b": (4096, 1536, False, False),
+    "kda_in_tp16": (3216, 7168, False, False),
+    "dsa_in_tp16": (3040, 7168, False, False),
     "latent_down": (3584, 7168, False, False),
     "latent_up": (7168, 3584, False, True),
     "router_latent": (4480, 7168, True, False),
@@ -71,3 +73,31 @@ def test_bf16_pins(name):
         if out32:  # stock's BF16 -> FP32 cuBLAS GEMM: summation order only
             stock = torch.mm(x, w.t(), out_dtype=torch.float32)
             assert ((out - stock).abs() <= scale * 1e-5 + 1e-5).all(), (name, r)
+
+
+def test_tp16_dispatch_rows():
+    """The TP16 decode prepares a pinned GEMM only at rows measured for it, above its
+    split-K rows: wq_b (``dsa.query_stage.index_pin``, rows above 128) and the KDA /
+    DSA in-projections (``runtime.providers.inproj_pin``); other rows keep cuBLAS."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_stage import (
+        index_pin,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
+        inproj_pin,
+    )
+
+    torch.cuda.set_device(DEVICE)
+    wq = _rand((4096, 1536), 0.02, 1)
+    rows = [64, 128, 256, 320, 384, 512]
+    assert index_pin(wq, rows, rubin=False) is None
+    assert sorted(index_pin(wq, rows, rubin=True).plans) == [256, 384, 512]
+    split_k = SimpleNamespace(kernels={64: None, 128: None})
+    for kind, n in (("kda", 3216), ("dsa", 3040)):
+        w = _rand((n, 7168), 0.02, 2)
+        pin = inproj_pin(w, kind, split_k, rows, 212, 16)
+        assert sorted(pin.plans) == [512], kind
+        assert inproj_pin(w, kind, split_k, rows, 212, 8) is None
+        assert inproj_pin(w, kind, split_k, rows[:3], 212, 16) is None
+    assert inproj_pin(_rand((2880, 7168)), "mla", split_k, rows, 212, 16) is None
