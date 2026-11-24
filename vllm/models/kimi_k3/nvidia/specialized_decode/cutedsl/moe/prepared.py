@@ -145,7 +145,7 @@ class PreparedMoE:
         for b in (b for b in state.batches if b <= CAP):
             _, expanded, buffers = state.views[b]
             publish, planned = tail.publish.get(b, ()), front.planned(b)
-            beside = b in getattr(front, "situ_down", {})  # SharedDown pushes them
+            beside = b in front.situ_down  # SharedDown pushes them
             if publish and not beside and experts_push(state.tp, b, state.device):
                 # The experts push the shared rows; they must launch after the shared
                 # expert completed, i.e. join the side stream before (``run``): their
