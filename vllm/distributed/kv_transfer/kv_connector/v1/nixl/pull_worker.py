@@ -334,6 +334,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
             num_groups = len(meta.local_block_ids)
+            aligned_local = meta.local_physical_block_ids
+            aligned_remote = meta.remote.block_ids
+            split, _ = self._remote_block_split.get(engine_id, (1, False))
+            if (
+                split > 1
+                and not dcp_active
+                and self.block_size == remote_info.remote_block_size
+            ):
+                aligned_local, aligned_remote = self._align_split_block_ids(
+                    aligned_local,
+                    aligned_remote,
+                    meta.local_num_computed_blocks,
+                    meta.remote.num_tokens,
+                    split,
+                )
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
                 return [
@@ -394,8 +409,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_info.remote_physical_blocks_per_logical,
                     )
                 else:
-                    local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
-                    remote_physical_ids = group_ids(meta.remote.block_ids, rank)
+                    local_physical_ids = group_ids(aligned_local, rank)
+                    remote_physical_ids = group_ids(aligned_remote, rank)
                 read_specs.append(
                     ReadSpec(
                         remote_rank=rank,
@@ -437,6 +452,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     if self._mixed_mem_types
                     else None
                 )
+            elif (chunks := self._remote_region_chunks.get(engine_id)) is not None:
+                # Padded remote rows cut into units with per-head draft ranges.
+                local_xfer_side_handle = self._chunked_src_handles[chunks]
+                local_dram_handle = None
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
@@ -734,6 +753,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
+        region_chunks = self._remote_region_chunks.get(dst_engine_id)
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
@@ -750,6 +770,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if read_spec.block_ids_by_region
                 else self.dst_uses_region_group_mapping[dst_engine_id]
             ),
+            region_chunks=region_chunks,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
@@ -767,6 +788,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if read_spec.block_ids_by_region
                 else self._uses_region_group_mapping
             ),
+            region_chunks=region_chunks,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)

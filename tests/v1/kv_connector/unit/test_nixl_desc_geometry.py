@@ -1923,3 +1923,142 @@ def test_packed_blocks_transfer_whole_for_small_kernel_block_drafts(
     )
 
     assert select_common_block_size(1024, backends, specs) == transfer_block_size
+
+
+def _run_padded_split_case(num_tokens, local_hits, split=4, remote_pad=2):
+    # A 16-token local page (192 bytes) holds the 112-byte KDA state.
+    """Pull from a remote whose blocks are ``split`` local blocks of padded rows
+    (page stride ``remote_pad`` x page, as K3.1's packed MLA rows: a TP1
+    prefiller's KDA state needs 4x the block of a TP4 decoder's). Returns the
+    (local token, remote token) pairs of the attention units and the SSM pairs.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    local_block = 16
+    matched = num_tokens - 1  # mamba N-1 rule
+    n_local_total = -(-matched // local_block)
+    remote_block = split * local_block
+    n_remote = -(-matched // remote_block)
+    worker = _make_mla_hybrid_worker(
+        local_block_size=local_block,
+        kernel_block_size=local_block,
+        num_logical_blocks=2 * n_local_total + 6,
+    )
+    worker.vllm_config.cache_config.enable_prefix_caching = True
+    page = worker.block_len_per_layer[0]
+    remote_page = page * split
+    remote_stride = remote_page * remote_pad
+    remote_rows = 2 * n_remote + 4
+    remote_bases = [0x10_000_000, 0x20_000_000]
+    meta_r = NixlAgentMetadata(
+        engine_id="remote-engine",
+        agent_metadata=b"remote-agent-meta",
+        device_id=0,
+        kv_caches_base_addr=list(remote_bases),
+        num_blocks=remote_rows,
+        block_lens=[remote_page, remote_page],
+        block_strides=[remote_stride, remote_stride],
+        kv_cache_layout=worker.kv_cache_layout,
+        block_size=remote_block,
+        ssm_sizes=(48, 64),
+        attn_backend_name=worker.backend_name,
+        physical_blocks_per_logical_kv_block=1,
+    )
+    _register_remote_agents(worker, meta_r, 1)
+    assert worker._remote_block_split["remote-engine"] == (split, True)
+
+    # The local list starts after the prefix hit; D holds one more block for
+    # the token it recomputes when ``num_tokens`` starts a new block.
+    n_local_alloc = -(-num_tokens // local_block)
+    local_attn = [2 * i + 1 for i in range(local_hits, n_local_alloc)]
+    remote_attn = [2 * i + 2 for i in range(n_remote)]
+    local_ids = (local_attn, [0], [2 * n_local_total + 2])
+    remote_ids = [remote_attn, [1], [0]]
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="req-b",
+        local_block_ids=local_ids,
+        kv_transfer_params={
+            "remote_block_ids": remote_ids,
+            "remote_engine_id": "remote-engine",
+            "remote_request_id": "prefill-req-b",
+            "remote_host": "remote-host",
+            "remote_port": 1234,
+            "tp_size": 1,
+            "remote_num_tokens": matched,
+        },
+        local_num_computed_blocks=(local_hits, 0, 0),
+    )
+    meta = metadata.reqs_to_recv["req-b"]
+    meta.local_physical_block_ids = worker._logical_to_kernel_block_ids(
+        meta.local_block_ids, worker._physical_blocks_per_logical_kv_block
+    )
+    worker._recving_metadata["req-b"] = meta
+    worker._read_blocks_for_req("req-b", meta)
+
+    nixl = worker.nixl_wrapper
+    local_bases = [t.data_ptr() for t in worker._test_tensors]
+    local_page = worker._test_unified_page
+    local_fa_descs = len(local_bases) * worker.dst_num_blocks[worker.engine_id]
+    remote_fa_descs = len(remote_bases) * remote_rows * split
+    attn_pairs, ssm_pairs = [], []
+    for _, lh, lids, rh, rids in nixl.xfers:
+        larr, rarr = nixl.dlists[lh], nixl.dlists[rh]
+        for li, ri in zip(lids, rids):
+            laddr, llen, _ = (int(x) for x in larr[int(li)])
+            raddr, rlen, _ = (int(x) for x in rarr[int(ri)])
+            assert llen == rlen
+            lreg = next(
+                k
+                for k, t in enumerate(worker._test_tensors)
+                if 0 <= laddr - t.data_ptr() < t.numel()
+            )
+            rreg = next(
+                k
+                for k, b in enumerate(remote_bases)
+                if 0 <= raddr - b < remote_rows * remote_stride
+            )
+            assert lreg == rreg
+            loff, roff = laddr - local_bases[lreg], raddr - remote_bases[rreg]
+            row, in_row = divmod(roff, remote_stride)
+            if int(li) < local_fa_descs:
+                assert int(ri) < remote_fa_descs
+                block, in_page = divmod(loff, local_page)
+                assert in_page == 0 and llen == page
+                assert in_row % page == 0 and in_row < remote_page
+                local_tok = local_attn.index(block) * local_block
+                local_tok += local_hits * local_block
+                remote_tok = remote_attn.index(row) * remote_block + in_row // page * (
+                    local_block
+                )
+                attn_pairs.append((lreg, local_tok, remote_tok))
+            else:
+                assert int(ri) >= remote_fa_descs
+                assert in_row + rlen <= remote_stride
+                ssm_pairs.append((loff // local_page, row, in_row, llen))
+    return attn_pairs, ssm_pairs, matched
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("local_hits", [0, 1, 5])
+@pytest.mark.parametrize(
+    "num_tokens", [2, 17, 18, 33, 64, 65, 66, 129, 130, 191, 192, 193]
+)
+def test_padded_remote_rows_split_into_local_blocks(num_tokens, local_hits):
+    """D's 16-token blocks pull from P's padded 64-token rows (block size
+    ratio 1/4, local prefix hits on D): every attention unit pairs by token
+    position, the partial last remote row contributes only its filled units,
+    and the SSM state slots are read within the remote row."""
+    matched = num_tokens - 1
+    if local_hits * 16 >= matched:
+        pytest.skip("the prefix hit covers the transfer")
+    attn_pairs, ssm_pairs, matched = _run_padded_split_case(num_tokens, local_hits)
+    assert all(lt == rt for _, lt, rt in attn_pairs), attn_pairs
+    # Each unit once per region, from the first uncached block to the block
+    # holding the last matched token.
+    expected = list(range(local_hits * 16, (matched - 1) // 16 * 16 + 1, 16))
+    for region in (0, 1):
+        assert sorted(lt for r, lt, _ in attn_pairs if r == region) == expected
+    assert ssm_pairs
