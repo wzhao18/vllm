@@ -50,7 +50,7 @@ class MoeFrontTmem64(SplitKTmemGemm64):
     """Front rows (``valid`` router rows padded to ``split_rows``, then ``shard``
     latent rows) and ``hidden`` gate/up pairs at 64 tokens; split K 8."""
 
-    def __init__(self, *, valid, split_rows, shard, hidden, stamps=False):
+    def __init__(self, *, valid, split_rows, shard, hidden, stamps=True):
         super().__init__(
             tactic=SplitKTactic(128, 64, 8, 14), k=7168, stamps=stamps, owners=8
         )
@@ -65,10 +65,11 @@ class MoeFrontTmem64(SplitKTmemGemm64):
         self, packed: cute.Tensor, x: cute.Tensor, h: cute.Tensor, box: cute.Tensor,
         mc: cutlass.Int64, slot: cutlass.Int32, base: cutlass.Int32,
         beta: cutlass.Float32, linear_beta: cutlass.Float32, front_map: cutlass.Int64,
-        gate_map: cutlass.Int64, stream: _cuda.CUstream,
+        gate_map: cutlass.Int64, st: cute.Tensor, stream: _cuda.CUstream,
     ):  # fmt: skip
         self.kernel(
-            packed, x, h, box, mc, slot, base, beta, linear_beta, front_map, gate_map
+            packed, x, h, box, mc, slot, base, beta, linear_beta, front_map, gate_map,
+            st,
         ).launch(
             grid=(self.tiles, cute.ceil_div(x.layout.shape[0], 64) * self.split_k, 1),
             block=(self.threads_per_cta, 1, 1),
@@ -83,12 +84,12 @@ class MoeFrontTmem64(SplitKTmemGemm64):
         self, mA: cute.Tensor, mB: cute.Tensor, h: cute.Tensor, box: cute.Tensor,
         mc: cutlass.Int64, slot: cutlass.Int32, base: cutlass.Int32,
         beta: cutlass.Float32, linear_beta: cutlass.Float32, front_map: cutlass.Int64,
-        gate_map: cutlass.Int64,
+        gate_map: cutlass.Int64, st: cute.Tensor,
     ):  # fmt: skip
         tokens = mB.layout.shape[0]
         self.gate_map = gate_map
         out = (box, mc, slot, base, tokens, h, beta, linear_beta)
-        self.body(mA, mB, box, front_map, out)
+        self.body(mA, mB, st, front_map, out)
 
     @cute.experimental.jit
     def issue_a(self, dst, barrier, a_map, k0, row0):
@@ -177,7 +178,7 @@ class MoeFrontRows(MoeFrontTmem64):
 
     def __init__(self, *, valid, split_rows, shard, hidden=0, n=64):
         tactic = SplitKTactic(128, n, 8, 14 if n == 64 else 8)  # N96 / N128 / N160: 8 x slots
-        SplitKTmemGemm64.__init__(self, tactic=tactic, k=7168, owners=8)
+        SplitKTmemGemm64.__init__(self, tactic=tactic, k=7168, owners=8, stamps=True)
         self.valid, self.split_rows, self.shard, self.hidden = (
             valid, split_rows, shard, hidden,
         )  # fmt: skip
@@ -189,10 +190,11 @@ class MoeFrontRows(MoeFrontTmem64):
         self, packed: cute.Tensor, x: cute.Tensor, h: cute.Tensor, box: cute.Tensor,
         mc: cutlass.Int64, slot: cutlass.Int32, base: cutlass.Int32,
         beta: cutlass.Float32, linear_beta: cutlass.Float32, front_map: cutlass.Int64,
-        gate_map: cutlass.Int64, stream: _cuda.CUstream,
+        gate_map: cutlass.Int64, st: cute.Tensor, stream: _cuda.CUstream,
     ):  # fmt: skip
         self.kernel(
-            packed, x, h, box, mc, slot, base, beta, linear_beta, front_map, gate_map
+            packed, x, h, box, mc, slot, base, beta, linear_beta, front_map, gate_map,
+            st,
         ).launch(
             grid=(
                 self.tiles,

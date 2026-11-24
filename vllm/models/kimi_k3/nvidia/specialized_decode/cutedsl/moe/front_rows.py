@@ -150,7 +150,7 @@ def compile_front_rows(valid, split, shard, hidden, rows, device, n=64):
 
     args: tuple = (matrix(), matrix(), matrix(2), fake((1, rows, WIDTH)))
     args += (c.Int64(0), Int32(0), Int32(0), c.Float32(1), c.Float32(1))
-    args += (c.Int64(0), c.Int64(0), make_fake_stream())
+    args += (c.Int64(0), c.Int64(0), fake((1024, 16), None, c.Int64), make_fake_stream())
     with torch.accelerator.device_index(device):
         arch = "sm_{}{}a".format(*torch.cuda.get_device_capability(device))
         return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
@@ -247,6 +247,9 @@ class FrontRows:
             hidden = shared if b in self.merged else 0
             front = compile_front_rows(valid, split, shard, hidden, rows, dev, n)
             self.plans[b] = views, route, situ, args, blocks, front
+        from .front import diag_stamps
+
+        self.diag = diag_stamps(packed.device, sorted(batches), "rows")
 
     def merged_batch(self, batch):
         """Rows whose front kernel also leaves h: ``shared_expert`` then runs the down
@@ -265,7 +268,8 @@ class FrontRows:
         shared down rows between it and ``route_only``)."""
         views, *_, front = self.plans[x.shape[0]]
         h = dynamic_view(views[4])
-        front(*self.front_args, matrix_view(x), h, *self.box_args, stream(self.device))
+        st = self.diag[x.shape[0]]
+        front(*self.front_args, matrix_view(x), h, *self.box_args, st, stream(self.device))
 
     def route_only(self, x):
         """``route``'s routing kernel, after ``front``."""

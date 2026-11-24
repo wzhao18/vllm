@@ -669,10 +669,33 @@ def compile_front_tmem(split, valid, shard, hidden, device):
 
     args: tuple = (matrix(), matrix(), fake((64, hidden)), fake((1, 64, WIDTH)))
     args += (c.Int64(0), Int32(0), Int32(0), c.Float32(1), c.Float32(1))
-    args += (c.Int64(0), c.Int64(0), make_fake_stream())
+    args += (c.Int64(0), c.Int64(0), fake((1024, 16), None, c.Int64), make_fake_stream())
     with torch.accelerator.device_index(device):
         arch = "sm_{}{}a".format(*torch.cuda.get_device_capability(device))
         return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
+
+
+_DIAG: list = []
+
+
+def diag_stamps(device, batches, tag):
+    """DIAGNOSTIC ONLY (never merged): per-batch [1024, 16] int64 globaltimer stamps of
+    the front kernel, dumped at exit."""
+    import atexit
+    import os
+
+    bufs = {b: torch.zeros(1024, 16, dtype=torch.int64, device=device) for b in batches}
+    if not _DIAG:
+        def dump():
+            out = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/sol16/L4diag"
+            run = os.environ.get("SLURM_JOB_ID", "j") + "." + os.environ.get("SLURM_STEP_ID", "s")
+            os.makedirs(f"{out}/{run}", exist_ok=True)
+            rank = os.environ.get("SLURM_PROCID", "0")
+            data = [(t, {b: v.cpu() for b, v in d.items()}) for t, d in _DIAG]
+            torch.save(data, f"{out}/{run}/rank{rank}.pt")
+        atexit.register(dump)
+    _DIAG.append((tag, bufs))
+    return {b: to_cute(v) for b, v in bufs.items()}
 
 
 @functools.cache
@@ -757,6 +780,8 @@ class SharedFront:
                     self.tmem_views = matrix_view(packed)
                 maps = tuple(c.Int64(m.data_ptr()) for m in self.tmem_maps)
                 self.front_tmem[b] = code, maps
+        if self.front_tmem:
+            self.diag = diag_stamps(packed.device, sorted(self.front_tmem), "tmem")
         if self.merged:  # gate/up, down and front maps; unused RS arguments
             self.merged_maps = weight_maps(gate_up, down, front=packed)
             # Kept alive here: a CuTe view does not hold its tensor.
@@ -826,7 +851,7 @@ class SharedFront:
         if x.shape[0] in self.front_tmem:
             tmem, maps = self.front_tmem[x.shape[0]]
             work = (self.tmem_views, matrix_view(x), args[7], *self.box)
-            tmem(*work, *self.scalars[1:], *maps, s)
+            tmem(*work, *self.scalars[1:], *maps, self.diag[x.shape[0]], s)
         elif x.shape[0] in self.merged:
             maps, unused = self.merged_args
             work = (to_cute(x), maps, args[7], self.fused[1], unused)
