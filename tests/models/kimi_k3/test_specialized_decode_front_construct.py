@@ -91,6 +91,8 @@ def test_shared_front_constructs(monkeypatch, tp, q, wide):
         expect.update({b: n for b, n in situ.items() if b in BATCHES})
     assert built.split == expect
     assert set(built.situ_down) == {b for b in expect if b <= 8}
+    if wide and tp == 16 and q > 1:  # B1 verify (8 rows): a table change must not drop it
+        assert 8 in built.situ_down, built.situ_down
     if wide and q > 1:
         assert all(built.split[b] == 8 for b in (16, 32, 48)), built.split
     assert built.merged <= set(built.split)
