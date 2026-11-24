@@ -673,12 +673,16 @@ class OprojUmmaRows(OprojUmma):
 
     CHUNK = 64
 
-    def __init__(self, k, *, stages=8, owners=False, chunk=64):
+    def __init__(self, k, *, stages=8, owners=False, chunk=64, issuers=None):
         super().__init__(k, twoshot=True, reduce=True, resident=True)
         assert chunk in (64, 80, 96)
         self.chunk = chunk
         # x's ring stages that fit beside the 96 KB of weights and the D tiles
         self.stages = min(stages, {64: 8, 80: 7, 96: 6}[chunk])
+        # x's TMA issuing lanes (``stream_x``): one per ring stage by default; a
+        # divisor of the stages (each stage keeps one issuer)
+        self.issuers = self.stages if issuers is None else issuers
+        assert self.stages % self.issuers == 0
         # ``owners`` (row-sharded AttnRes, ``attn_res.sharded``): each token's 8-column
         # chunks go to the token's row owner instead of the column owners (args: x,
         # the weight, the owners' receive view [TP, per_cap, 7168], their bases, this
@@ -734,8 +738,8 @@ class OprojUmmaRows(OprojUmma):
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if warp == 5:
-            if lane == 0:
-                self.stream_x(args[-1], xring, full, empty, chunks)
+            if lane < self.issuers:  # issuing lanes (``stream_x``)
+                self.stream_x(args[-1], xring, full, empty, chunks, lane)
         elif warp == 4:
             sync = (full, empty, weights, accfull, accfree)
             self.multiply_rows(wring, xring, sync, tmem, chunks)
@@ -754,11 +758,15 @@ class OprojUmmaRows(OprojUmma):
         return 64 if self.chunk == 64 else 128
 
     @cute.jit
-    def stream_x(self, x_map, xring, full, empty, chunks: Constexpr):
-        """One thread: x's [chunk rows, 64 K] tile of each (chunk, K block) in order."""
+    def stream_x(self, x_map, xring, full, empty, chunks: Constexpr, issuer):
+        """x's [chunk rows, 64 K] tile of each (chunk, K block) in order, lane
+        ``issuer`` < ``issuers`` issuing tiles i = issuer mod issuers: a TMA issuing
+        thread completes a bounded number of ring stages per microsecond whatever the
+        ring depth, so a single issuer of these small tiles set the o-projection's
+        time behind its input above 64 rows. Same tiles, stages and MMA order."""
         S: Constexpr = self.stages
         tile: Constexpr = self.chunk * 128
-        for i in range(chunks * self.blocks):
+        for i in range(issuer, chunks * self.blocks, self.issuers):
             s = i % S
             if i >= S:
                 wait(empty + s, (i // S - 1) % 2)
