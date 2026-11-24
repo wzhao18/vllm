@@ -269,9 +269,9 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
     kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer is None or not kv_transfer.is_kv_producer:
         return False
-    extra = vllm_config.additional_config
+    extra = getattr(vllm_config, "additional_config", None)
     backend = extra.get("decode_backend", "auto") if isinstance(extra, dict) else "auto"
-    return not (kv_transfer.is_kv_consumer and backend == "latency_specialized")
+    return not (backend == "latency_specialized" and kv_transfer.is_kv_consumer)
 
 
 # Smallest step (tokens, after CUDA-graph padding) whose token-shard MoE finishes with
