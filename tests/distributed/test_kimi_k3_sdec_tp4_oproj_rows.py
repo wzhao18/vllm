@@ -4,13 +4,11 @@
 weight-stationary tcgen05 over token chunks, two-shot reduce-scatter into the
 column owners, owner reduce and multicast gather) over 4 ranks of one node.
 
-x's tiles stream from one issuing lane per ring stage (``OprojUmmaRows.issuers``);
-the <= 64-row producer (``OprojUmma``, resident, x multicast over 4-CTA clusters)
-issues K block kb's multicast tile from lane kb (``OprojUmma.x_lanes``), checked the
-same way at rows 32 / 64.
+x's tiles stream from ``OprojUmmaRows.issuers`` issuing lanes (one per ring stage
+with 64-row chunks, one with 80 / 96-row chunks by default).
 Per case (rows 72 / 128 / 256 / 512, chunks 64 / 80 / 96) every rank's x [M, 768] and
 weight [7168, 768] (BF16, random) through the producer with one issuing lane and with
-the default lanes:
+one lane per ring stage:
 
 - the gathered all-reduce rows bitwise between the two (same tiles, stages, MMAs);
 - vs the reference (each rank's BF16 partial, summed over the ranks in FP32, one BF16
@@ -18,9 +16,9 @@ the default lanes:
 
 Each form is also replayed REPS times (gather re-armed between launches, ranks
 released by a barrier, CUDA events around the launch on every rank); rank 0 prints the
-min and median over the replays of the slowest rank's time (one issuing lane vs the
-default) so the issuing-lane change is measured at kernel level. Timing is reported,
-not asserted.
+min and median over the replays of the slowest rank's time (one issuing lane vs one
+per ring stage) so the issuing-lane change is measured at kernel level. Timing is reported,
+not asserted (barrier-exit skew across the ranks dominates a single launch).
 
 Run on a node with 4 Rubin (SM107) GPUs and multicast memory; skipped elsewhere."""
 
@@ -34,7 +32,6 @@ import torch.distributed as dist
 WORLD = 4
 H, K, CAP = 7168, 768, 512
 CASES = ((72, 80), (128, 64), (256, 96), (512, 64))
-SMALL = (32, 64)  # OprojUmma (resident, xmc 4) rows
 TIMEOUT = 600
 REPS = 20
 SENTINEL = -0x80000000
@@ -77,29 +74,12 @@ def _compile(batch, chunk, issuers):
     box = fake((1, CAP, H), (CAP * H, H, 1))
     mc, slot = cutlass.Int64(0), cutlass.Int32(0)
     kernel = OprojUmmaRows(K, chunk=chunk, issuers=issuers)
-    assert kernel.issuers == (kernel.stages if issuers is None else issuers)
+    assert kernel.issuers == issuers
     return cute.compile(kernel, x, w, recv, peers, slot, box, mc, mc, make_fake_stream())
 
 
-def _compile_small(batch, x_lanes):
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import make_fake_stream
-
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.producer import (
-        OprojUmma,
-    )
-
-    x, w = fake((batch, K), (K, 1)), fake((H, K), (K, 1))
-    recv, peers = fake((WORLD, CAP, H // WORLD)), fake((WORLD,), None, torch.int64)
-    box = fake((1, CAP, H), (CAP * H, H, 1))
-    mc, slot = cutlass.Int64(0), cutlass.Int32(0)
-    kernel = OprojUmma(
-        K, twoshot=True, reduce=True, resident=True, xmc=4, x_lanes=x_lanes
-    )
-    tail = (recv, peers, slot, box, mc, mc)
-    return cute.compile(kernel, x, w, *tail, make_fake_stream())
+def _stages(chunk):
+    return {64: 8, 80: 7, 96: 6}[chunk]
 
 
 def _timed(code, args, gather, dev):
@@ -120,6 +100,14 @@ def _timed(code, args, gather, dev):
         times.append(slowest.item())
     times.sort()
     return times[0], times[len(times) // 2]
+
+
+def _default_issuers(chunk):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.producer import (
+        OprojUmmaRows,
+    )
+
+    return OprojUmmaRows(768, chunk=chunk).issuers
 
 
 def _worker(rank, port, result):
@@ -170,7 +158,7 @@ def _worker(rank, port, result):
             cutlass.Int64(gather_mc), cutlass.Int64(tma.data_ptr()),
         )  # fmt: skip
         outs, timing = [], {}
-        for issuers in (1, None):
+        for issuers in (1, _stages(chunk)):
             code = _compile(batch, chunk, issuers)
             gather.view(torch.int32).fill_(SENTINEL)
             torch.accelerator.synchronize()
@@ -182,6 +170,8 @@ def _worker(rank, port, result):
             args = (to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
             timing[issuers] = _timed(code, args, gather, dev)
         single, lanes = outs
+        default = _default_issuers(chunk)
+        assert default == (_stages(chunk) if chunk == 64 else 1), default
         assert torch.equal(single.view(torch.int16), lanes.view(torch.int16)), batch
         ref = torch.zeros(batch, H, dtype=torch.float32, device=dev)
         for xr, wr in zip(xs, ws):
@@ -191,38 +181,9 @@ def _worker(rank, port, result):
         del tma
         if rank == 0:
             print(f"TP4 oproj rows M{batch} chunk {chunk}: ok "
-                  f"{time.monotonic() - start:.1f} s; us min/median issuers=1 "
-                  f"{timing[1][0]:.2f}/{timing[1][1]:.2f} default "
-                  f"{timing[None][0]:.2f}/{timing[None][1]:.2f}")  # fmt: skip
-    for batch in SMALL:
-        tma = weight_map(x_buffer[:batch], (batch + 7) // 8 * 8 // 4)
-        head = (
-            to_cute(recv), to_cute(peers), cutlass.Int32(rank), to_cute(gather),
-            cutlass.Int64(gather_mc), cutlass.Int64(tma.data_ptr()),
-        )  # fmt: skip
-        outs, timing = [], {}
-        for lanes in (1, None):
-            code = _compile_small(batch, lanes)
-            gather.view(torch.int32).fill_(SENTINEL)
-            torch.accelerator.synchronize()
-            dist.barrier()
-            code(to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
-            torch.accelerator.synchronize()
-            dist.barrier()
-            outs.append(gather[0, :batch].clone())
-            args = (to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
-            timing[lanes] = _timed(code, args, gather, dev)
-        assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
-        ref = torch.zeros(batch, H, dtype=torch.float32, device=dev)
-        for xr, wr in zip(xs, ws):
-            part = torch.mm(xr[:batch].float(), wr.float().t()).to(torch.bfloat16)
-            ref = ref + part.float()
-        torch.testing.assert_close(outs[1].float(), ref, atol=2e-2, rtol=2e-2)
-        del tma
-        if rank == 0:
-            print(f"TP4 oproj umma M{batch} xmc 4: ok; us min/median x_lanes=1 "
-                  f"{timing[1][0]:.2f}/{timing[1][1]:.2f} default "
-                  f"{timing[None][0]:.2f}/{timing[None][1]:.2f}")  # fmt: skip
+                  f"{time.monotonic() - start:.1f} s; us min/median 1 lane "
+                  f"{timing[1][0]:.2f}/{timing[1][1]:.2f}, 1 per stage "
+                  f"{timing[_stages(chunk)][0]:.2f}/{timing[_stages(chunk)][1]:.2f}")  # fmt: skip
     dist.barrier()
     dist.destroy_process_group()
     result.put((rank, "ok"))

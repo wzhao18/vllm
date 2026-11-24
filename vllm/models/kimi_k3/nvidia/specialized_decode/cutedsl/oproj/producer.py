@@ -435,7 +435,7 @@ class OprojUmma(OprojProducer):
 
     def __init__(
         self, k, *, twoshot=False, budget=184 * 1024, reduce=False, resident=False,
-        xmc=1, x_lanes=None,
+        xmc=1,
     ):  # fmt: skip
         # resident: every K block gets its own ring stage (12 x 16 KB at k 768, b<=64),
         # so all weights load before the PDL wait and x streams with no stage reuse.
@@ -457,11 +457,6 @@ class OprojUmma(OprojProducer):
         # argument (box {64, N / xmc}).
         self.xmc = xmc
         assert xmc == 1 or resident
-        # x_lanes (xmc): K block kb's multicast tile is issued by lane kb mod x_lanes
-        # of warp 0 (default one lane per block): a TMA issuing thread completes a
-        # bounded number of operations per unit time, so one thread issuing every
-        # block serialized the x stream. Same tiles: bitwise.
-        self.x_lanes = min(self.blocks, 32) if x_lanes is None else x_lanes
 
     def geometry(self, batches):
         """(N, ring stage bytes, stages, TMEM columns)."""
@@ -590,7 +585,7 @@ class OprojUmma(OprojProducer):
                     self.load(weight, tile, 64, -1, row0, kb * 64)
                     cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + slot)
                 if cutlass.const_expr(self.xmc > 1):
-                    if tid == kb % self.x_lanes:
+                    if tid == 0:
                         self.multicast_x(args, tile + 8192, bars.iterator + slot, n, kb)
                 else:
                     self.load(x, tile + 8192, n, x.shape[0], 0, kb * 64)
@@ -611,7 +606,7 @@ class OprojUmma(OprojProducer):
 
     @cute.jit
     def multicast_x(self, args, tile, barrier, n: Constexpr, kb: Constexpr):
-        """The issuing lane: expect the whole x tile of K block ``kb``, then TMA-load this
+        """Thread 0: expect the whole x tile of K block ``kb``, then TMA-load this
         cluster rank's 1 / xmc of its rows into every cluster CTA."""
         x_map = args[-1]
         rank = cute.arch.block_idx_in_cluster()
@@ -684,9 +679,13 @@ class OprojUmmaRows(OprojUmma):
         self.chunk = chunk
         # x's ring stages that fit beside the 96 KB of weights and the D tiles
         self.stages = min(stages, {64: 8, 80: 7, 96: 6}[chunk])
-        # x's TMA issuing lanes (``stream_x``): one per ring stage by default; a
-        # divisor of the stages (each stage keeps one issuer)
-        self.issuers = self.stages if issuers is None else issuers
+        # x's TMA issuing lanes (``stream_x``), a divisor of the stages (each stage
+        # keeps one issuer). Per shape, from the TP16 step A/B: one lane per ring stage
+        # with 64-row chunks (faster at 128 and 512 rows), one lane with the wide
+        # 80 / 96-row chunks (more lanes were slower at 256 rows).
+        if issuers is None:
+            issuers = self.stages if chunk == 64 else 1
+        self.issuers = issuers
         assert self.stages % self.issuers == 0
         # ``owners`` (row-sharded AttnRes, ``attn_res.sharded``): each token's 8-column
         # chunks go to the token's row owner instead of the column owners (args: x,
