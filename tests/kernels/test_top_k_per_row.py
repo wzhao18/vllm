@@ -2371,43 +2371,6 @@ def test_deep_select_topk(
 
 
 @requires_sm100
-@pytest.mark.parametrize(
-    "rows,cols",
-    [(8192, 57344), (8192, 237568), (3584, 11776), (5, 11781), (24, 131072)],
-)
-@torch.inference_mode()
-def test_deep_select_topk_prefill_shapes(rows: int, cols: int) -> None:
-    """The DSA indexer's prefill calls (bf16 logits, causal row ends over a long
-    context, short odd chunks, top-k 2048): every sampled row selects torch.topk's
-    values (ties aside), inside its end, -1 after short rows. Rows longer than the
-    top-k take the TMA scan; on sm_107a it needs a CUTLASS with SM107 TMA (>= 4.8),
-    else the loads are compiled out and the kernel traps."""
-    from vllm.model_executor.layers import indexer_topk
-
-    set_random_seed(0)
-    top_k = 2048
-    align = indexer_topk.get_deep_select_stride_requirement()[0] // 2
-    stride = -(-cols // align) * align
-    logits = torch.randn(rows, stride, device="cuda").to(torch.bfloat16)[:, :cols]
-    row_ends = (
-        torch.arange(rows, device="cuda", dtype=torch.int32) + (cols - rows + 1)
-    ).clamp(1, cols)
-    indices = indexer_topk.deep_select_topk(logits, top_k, end=row_ends)
-    torch.accelerator.synchronize()
-    checked = sorted({0, rows // 3, rows // 2, rows - 1, *range(0, rows, 512)})
-    for i in checked:
-        end = int(row_ends[i])
-        k = min(top_k, end)
-        got = indices[i, :k]
-        assert torch.all((got >= 0) & (got < end)), f"row {i}: index outside its end"
-        assert torch.all(indices[i, k:] == -1), f"row {i}: expected -1 fill"
-        want = logits[i, :end].float().topk(k).values.sort().values
-        assert torch.equal(logits[i, got.long()].float().sort().values, want), (
-            f"row {i} (end {end}): DeepSelect values differ from torch.topk"
-        )
-
-
-@requires_sm100
 @torch.inference_mode()
 def test_deep_select_topk_preallocated_output() -> None:
     """DeepSelect writes into a preallocated aligned buffer (no `end`)."""

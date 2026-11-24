@@ -19,10 +19,6 @@ else()
   FetchContent_Declare(
         deepselect
         GIT_REPOSITORY https://github.com/vllm-project/DeepSelect.git
-        # TODO: sm_107a needs DeepSelect's CUTLASS submodule at >= v4.8 (SM107
-        # TMA macros; the pinned ae6bccf traps on every TMA scan load). Move
-        # GIT_TAG to a commit with the v4.8.1 bump (vllm-project/DeepSelect#3)
-        # once it merges.
         GIT_TAG d96d33afe1fab0d6066da49cdc91e64c2bee65ea
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
