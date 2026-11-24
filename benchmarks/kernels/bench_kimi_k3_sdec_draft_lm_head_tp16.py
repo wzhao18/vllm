@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--rows", default="7,14,28,56,112,224,448")
     ap.add_argument("--n", type=int, default=10240)
     ap.add_argument("--k", type=int, default=7168)
-    ap.add_argument("--arms", default="gemv,cublas,sk,skip,skst")
+    ap.add_argument("--arms", default="gemv,cublas,sk,skip,skst,sp,spip")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.verify import lmhead
@@ -86,19 +86,22 @@ def main():
             o = torch.empty(t, n, device=dev, dtype=torch.bfloat16)
             res["gemv"] = time_graph(lambda i: lms[i].run(x, o), ncopy)
             del lms
-        for arm, place in (("sk", "copy"), ("skip", "inplace"), ("skst", "none")):
+        for arm, place in (("sk", "copy"), ("skip", "inplace"), ("skst", "none"),
+                           ("sp", "copy"), ("spip", "inplace")):
             if arm not in arms:
                 continue
-            if not wide_sk.supports(rows, n, k, pairs):
+            spread = arm.startswith("sp")
+            if not wide_sk.supports(rows, n, k, pairs, spread=spread):
                 res[arm] = float("nan")
                 continue
             if place == "inplace":
                 # re-home each copy in place: the die-homed allocation replaces it
                 homed = [wide_sk.place_halves(w) for w in ws]
-                pk = [wide_sk.PreparedWideSK(h, [rows], place=False).prepare()
+                pk = [wide_sk.PreparedWideSK(h, [rows], place=False, spread=spread).prepare()
                       for h in homed]
             else:
-                pk = [wide_sk.PreparedWideSK(w, [rows], place=place == "copy").prepare()
+                pk = [wide_sk.PreparedWideSK(w, [rows], place=place == "copy",
+                                             spread=spread).prepare()
                       for w in ws]
             out.zero_()
             pk[0].run(xp, out)
