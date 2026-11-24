@@ -46,7 +46,7 @@ from .config import (
     RubinMoeProblem,
 )
 from .session import RubinMegaMoeSession, layout_tag
-from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
+from .staging import PREFILL_STAGE_MIN_TOKENS, EplbStage, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
 from .weights import (
     RubinMoeWeights,
@@ -289,7 +289,9 @@ class RubinMegaMoE:
             f"({self.buckets[-1].max_tokens})."
         )
 
-    def _stage(self, session, hidden, topk_ids, topk_weights, is_padding=None) -> None:
+    def _stage(
+        self, session, hidden, topk_ids, topk_weights, is_padding=None, eplb=None
+    ) -> None:
         stage_inputs(
             hidden,
             topk_ids,
@@ -303,6 +305,7 @@ class RubinMegaMoE:
             num_experts=self.problem.num_experts,
             input_norm_const=self.problem.input_norm_const,
             is_padding=is_padding,
+            eplb=eplb,
         )
 
     def warmup(
@@ -390,6 +393,7 @@ class RubinMegaMoE:
         ep_tokens: int | None = None,
         rmsnorm: tuple[torch.Tensor, float] | None = None,
         shared: Any = None,
+        eplb: EplbStage | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
@@ -413,6 +417,8 @@ class RubinMegaMoE:
         there, refused elsewhere); the result is then ``(routed, shared_out)`` with
         ``shared_out`` the shared expert's BF16 [n, hidden] rows (session-owned,
         valid until the next launch of this bucket).
+        ``eplb``: ``topk_ids`` are LOGICAL ids, mapped to physical ones (and their
+        load recorded) in the stager (``staging.EplbStage``).
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -423,7 +429,7 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         breadcrumb.crumb(breadcrumb.OP_MOE_IN)
-        self._stage(session, hidden, topk_ids, topk_weights, is_padding)
+        self._stage(session, hidden, topk_ids, topk_weights, is_padding, eplb)
         unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
         if unfused_norm is not None:
             rmsnorm = None

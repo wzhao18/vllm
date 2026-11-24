@@ -147,3 +147,67 @@ def test_stager_nvfp4_rounding_ties(n):
     torch.cuda.synchronize()
     assert torch.equal(x, rx)
     assert torch.equal(x_sf, rsf)
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(("n", "capacity"), [(1, 256), (78, 256), (600, 2048)])
+@pytest.mark.parametrize("record", [False, True])
+@pytest.mark.parametrize("unpadded", [None, "short"])
+def test_stager_eplb_matches_mask_and_map_launches(ids_dtype, n, capacity, record,
+                                                   unpadded):  # fmt: skip
+    """With ``eplb`` the stager maps LOGICAL ids (after the padding mask) and records
+    their load exactly as the separate ``torch.where`` + ``eplb_map_to_physical_and_
+    record`` launches did before a plain stage: same staged routes, weights,
+    activations and recorded loads."""
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        eplb_map_to_physical_and_record,
+    )
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.staging import EplbStage, stage_inputs
+
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(n + capacity + int(record))
+    logical, slots, physical = 48, 3, E
+    sf_cols = H // 16 + 4
+    replicas = torch.randint(1, slots + 1, (logical,), device=dev, generator=g)
+    l2p = torch.full((logical, slots), -1, dtype=torch.int64, device=dev)
+    perm = torch.randperm(physical, device=dev, generator=g)
+    for e in range(logical):  # replicas of e on distinct physical slots
+        r = int(replicas[e])
+        l2p[e, :r] = perm[(e * slots + torch.arange(r, device=dev)) % physical]
+    hid = (torch.randn((n, H), device=dev, generator=g) * 3).to(torch.bfloat16)
+    ids = torch.randint(-1, logical, (n, TOPK), device=dev, generator=g).to(ids_dtype)
+    wts = torch.rand((n, TOPK), device=dev, generator=g)
+    pad = torch.zeros(n, dtype=torch.bool, device=dev)
+    pad[n - n // 4 :] = True
+    rec = torch.tensor(record, device=dev)
+    nun = None if unpadded is None else torch.tensor(max(1, n // 2), device=dev)
+
+    def buffers():
+        return (torch.zeros((capacity, H // 2), dtype=torch.uint8, device=dev),
+                torch.zeros((capacity, sf_cols), dtype=torch.uint8, device=dev),
+                torch.zeros((capacity, TOPK), dtype=torch.int32, device=dev),
+                torch.zeros((capacity, TOPK), device=dev),
+                torch.zeros(2, dtype=torch.int64, device=dev),
+                torch.zeros(physical, dtype=torch.int32, device=dev))  # fmt: skip
+
+    x, x_sf, idx, sw, err, load = buffers()
+    masked = torch.where(pad.unsqueeze(1), -1, ids)
+    mapped = eplb_map_to_physical_and_record(
+        masked, load, l2p, replicas, rec, num_unpadded_tokens=nun
+    )
+    stage_inputs(hid, mapped, wts, x, x_sf, idx, sw, route_error=err,
+                 quant_kind="nvfp4", num_experts=physical)  # fmt: skip
+    fx, fx_sf, fidx, fsw, ferr, fload = buffers()
+    stage_inputs(hid, ids, wts, fx, fx_sf, fidx, fsw, route_error=ferr,
+                 quant_kind="nvfp4", num_experts=physical, is_padding=pad,
+                 eplb=EplbStage(l2p, replicas, fload, rec, nun))  # fmt: skip
+    torch.cuda.synchronize()
+    assert torch.equal(fidx, idx)
+    assert torch.equal(fsw, sw)
+    assert torch.equal(fx, x)
+    assert torch.equal(fx_sf, x_sf)
+    assert torch.equal(fload, load)
+    assert ferr.tolist() == err.tolist() == [0, 0]
+    assert bool((fidx[:n] >= 0).any())
+    if record:
+        assert int(fload.sum()) > 0

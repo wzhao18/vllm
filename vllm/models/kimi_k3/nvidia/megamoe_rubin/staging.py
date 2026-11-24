@@ -30,7 +30,10 @@ Rows ``< n``:
 
 ``E`` (``num_experts``) is the PHYSICAL expert count of the EP group and placement must
 be linear: global id ``g`` lives on rank ``g // E_local``. Logical-to-physical mapping
-(EPLB) happens before this call.
+(EPLB) happens before this call, or here when ``eplb`` is given (:class:`EplbStage`):
+after the padding mask, each LOGICAL id is mapped (and its load recorded) exactly as
+``eplb_map_to_physical_and_record`` does it, so the separate mask, dtype conversion and
+mapping launches of every MoE layer fold into this one.
 
 Rows ``[n, capacity)``: ``topk_idx = -1``; activations / weights are left as they are
 (masked routes are never read). ``reference.stage_inputs_torch`` is the pure-torch
@@ -46,9 +49,21 @@ dtype combinations are compiled by ``RubinMegaMoE.warmup``.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+
+class EplbStage(NamedTuple):
+    """An EPLB layer state's tensors (``EplbLayerState``) for the in-stager mapping."""
+
+    logical_to_physical_map: torch.Tensor  # (num_logical, map_slots)
+    logical_replica_count: torch.Tensor  # (num_logical,)
+    expert_load_view: torch.Tensor  # (num_physical,) recorded loads
+    record_enabled: torch.Tensor  # scalar: record this forward
+    num_unpadded_tokens: torch.Tensor | None  # scalar: rows past it are not recorded
 
 
 @triton.jit
@@ -94,6 +109,13 @@ def _rows_per_program(n: int) -> int:
         "hid_stride",
         "ids_stride",
         "wts_stride",
+        "l2p_ptr",
+        "replica_ptr",
+        "load_ptr",
+        "record_ptr",
+        "unpadded_ptr",
+        "num_logical",
+        "map_slots",
     ]
 )
 def _stage_kernel(
@@ -111,10 +133,17 @@ def _stage_kernel(
     sw_ptr,
     err_ptr,
     pad_ptr,
+    l2p_ptr,
+    replica_ptr,
+    load_ptr,
+    record_ptr,
+    unpadded_ptr,
     n_tokens,
     n_live_programs,
     n_dead_rows,
     num_experts,
+    num_logical,
+    map_slots,
     scale_mult,
     norm_const,
     H: tl.constexpr,
@@ -126,6 +155,8 @@ def _stage_kernel(
     TOPK: tl.constexpr,
     TOPK_P2: tl.constexpr,
     HAS_PAD: tl.constexpr,
+    HAS_EPLB: tl.constexpr,
+    HAS_UNPADDED: tl.constexpr,
     DEAD: tl.constexpr,
     ROWS: tl.constexpr,
 ):
@@ -144,6 +175,31 @@ def _stage_kernel(
             if HAS_PAD:
                 padded = tl.load(pad_ptr + rows, mask=rm, other=0) != 0
                 ids = tl.where(padded[:, None], -1, ids)
+            if HAS_EPLB:
+                # eplb_map_to_physical_and_record on the masked logical ids: a
+                # replica by the row's Knuth hash (floor(2^32 / phi)), then the
+                # recorded load of the replica.
+                logical = (ids >= 0) & (ids < num_logical)
+                safe = tl.where(logical, ids, 0)
+                replicas = tl.load(replica_ptr + safe, mask=m2 & logical, other=1)
+                replicas = tl.maximum(replicas, 1).to(tl.int64)
+                hashed = (rows[:, None] * 2654435769) & 0xFFFFFFFF
+                replica = hashed % replicas
+                ids = tl.load(
+                    l2p_ptr + safe * map_slots + replica,
+                    mask=m2 & logical,
+                    other=-1,
+                ).to(tl.int64)
+                record = m2 & (tl.load(record_ptr) != 0)
+                if HAS_UNPADDED:
+                    record = record & (rows[:, None] < tl.load(unpadded_ptr))
+                record = record & (ids >= 0) & (ids < num_experts)
+                tl.atomic_add(
+                    load_ptr + tl.where(record, ids, 0),
+                    tl.full([ROWS, TOPK_P2], 1, load_ptr.dtype.element_ty),
+                    mask=record,
+                    sem="relaxed",
+                )
             w = tl.load(
                 wts_ptr + rows[:, None] * wts_stride + k[None, :], mask=m2, other=0.0
             ).to(tl.float32)
@@ -289,12 +345,14 @@ def stage_inputs(
     num_experts: int,
     input_norm_const: float = 1.0,
     is_padding: torch.Tensor | None = None,
+    eplb: EplbStage | None = None,
 ) -> None:
     """Stage ``hidden_states[:n]`` and its routes into a session's buffers (n may be
     0). ``route_error``: the caller's sticky int64 ``[2]`` device flag (see module
     docstring); ``num_experts``: the physical expert count (linear placement);
     ``is_padding``: optional bool ``(n,)`` device mask, a set row's routes are all
-    masked to -1 (activations are still staged, as for any row)."""
+    masked to -1 (activations are still staged, as for any row); ``eplb``: the
+    ids are LOGICAL and are mapped (and recorded) here (module docstring)."""
     if (
         route_error.dtype != torch.int64
         or route_error.numel() != 2
@@ -340,6 +398,21 @@ def stage_inputs(
             f"is_padding must be a contiguous bool ({n},) tensor on the device, got "
             f"{is_padding.dtype} {tuple(is_padding.shape)} on {is_padding.device}."
         )
+    if eplb is not None:
+        l2p = eplb.logical_to_physical_map
+        if (
+            l2p.dim() != 2
+            or not l2p.is_contiguous()
+            or not eplb.logical_replica_count.is_contiguous()
+            or not eplb.expert_load_view.is_contiguous()
+            or eplb.logical_replica_count.shape[0] != l2p.shape[0]
+            or eplb.expert_load_view.shape[0] != num_experts
+        ):
+            raise ValueError(
+                "eplb: contiguous logical_to_physical_map (logical, slots), "
+                "logical_replica_count (logical,) and expert_load_view "
+                f"({num_experts},) expected."
+            )
     ch = _chunk(hidden, vec)
     x_u8 = x.view(torch.uint8)
     sf_u8 = x_sf.view(torch.uint8)
@@ -363,10 +436,21 @@ def stage_inputs(
         staged_weights,
         route_error,
         is_padding if is_padding is not None else route_error,
+        eplb.logical_to_physical_map if eplb is not None else route_error,
+        eplb.logical_replica_count if eplb is not None else route_error,
+        eplb.expert_load_view if eplb is not None else route_error,
+        eplb.record_enabled if eplb is not None else route_error,
+        (
+            eplb.num_unpadded_tokens
+            if eplb is not None and eplb.num_unpadded_tokens is not None
+            else route_error
+        ),
         n,
         n_live,
         n_dead,
         num_experts,
+        eplb.logical_to_physical_map.shape[0] if eplb is not None else 0,
+        eplb.logical_to_physical_map.shape[1] if eplb is not None else 0,
         float(input_norm_const) / 6.0,
         float(input_norm_const),
         H=hidden,
@@ -378,6 +462,8 @@ def stage_inputs(
         TOPK=topk,
         TOPK_P2=triton.next_power_of_2(topk),
         HAS_PAD=is_padding is not None,
+        HAS_EPLB=eplb is not None,
+        HAS_UNPADDED=eplb is not None and eplb.num_unpadded_tokens is not None,
         DEAD=DEAD_ROWS,
         ROWS=rows,
         num_warps=4,

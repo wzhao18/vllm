@@ -48,6 +48,9 @@ def _vllm_config(mnbt=8192, dp=1):
         parallel_config=SimpleNamespace(data_parallel_size=dp),
         compilation_config=SimpleNamespace(static_forward_context={}),
         additional_config={},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=1)
+        ),
     )
 
 
@@ -491,7 +494,7 @@ class _FakeRuntime:
     def __init__(self, kind):
         self.kind, self.calls = kind, []
 
-    def prepare_weights(self, w13, s13, w2, s2, *, layer_id):
+    def prepare_weights(self, w13, s13, w2, s2, *, layer_id, experts=None):
         return W.prepare_weights(
             self.kind, w13, s13, w2, s2, hidden=128, intermediate=128,
             layer_id=layer_id, expert_offset=4,
@@ -499,9 +502,10 @@ class _FakeRuntime:
 
     def forward(
         self, hidden, ids, weights, kernel_weights, *, bucket, out=None,
-        is_padding=None, ep_tokens=None, owner=None,
+        is_padding=None, ep_tokens=None, owner=None, eplb=None,
     ):  # fmt: skip
         assert out is None  # the stock layer lets the runtime allocate
+        self.eplb = eplb
         if is_padding is not None:  # the stager's folded padding mask
             ids = torch.where(is_padding.unsqueeze(1), -1, ids)
         assert ep_tokens == hidden.shape[0]  # DP1: the rank's own (EP-uniform) count
@@ -550,6 +554,24 @@ def test_process_weights_converts_and_frees(monkeypatch, ep, small_bucket, mnbt,
     assert staged_ids.tolist() == [[4, 5], [-1, -1], [0, 1]]
     assert staged_ids.dtype == torch.int32 and staged_wts is wts
     assert kernel_weights is w and bucket is module.buckets[0]
+    assert runtime.eplb is None
+    # EPLB: the logical ids and the padding mask go to the stager unchanged, with the
+    # layer's EPLB tensors (the stager maps and records; no separate launches).
+    st = module.eplb_state
+    st.logical_to_physical_map = torch.arange(16).view(8, 2)
+    st.logical_replica_count = torch.ones(8, dtype=torch.int64)
+    st.expert_load_view = torch.zeros(4, dtype=torch.int32)
+    st.should_record_tensor = torch.tensor(True)
+    st.num_unpadded_tokens_tensors = [torch.tensor(2)]
+    module(hidden, wts, ids, is_padding=pad)
+    assert runtime.calls[-1][0].tolist() == [[4, 5], [-1, -1], [0, 1]]
+    e = runtime.eplb
+    assert e.logical_to_physical_map is st.logical_to_physical_map
+    assert e.logical_replica_count is st.logical_replica_count
+    assert e.expert_load_view is st.expert_load_view
+    assert e.record_enabled is st.should_record_tensor
+    assert e.num_unpadded_tokens is st.num_unpadded_tokens_tensors[0]
+    st.logical_to_physical_map = None
     if mnbt == 4096:
         big = torch.zeros(2049, 128, dtype=torch.bfloat16)
         module(big, torch.rand(2049, 2), torch.zeros(2049, 2, dtype=torch.int32))

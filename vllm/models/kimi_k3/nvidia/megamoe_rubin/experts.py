@@ -52,9 +52,6 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MegaMoEActivation,
     MegaMoEWeightFormat,
 )
-from vllm.model_executor.layers.fused_moe.router.base_router import (
-    eplb_map_to_physical_and_record,
-)
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -73,6 +70,7 @@ from .config import (
     make_buckets,
 )
 from .session import ep_mean_tokens
+from .staging import EplbStage
 from .weights import MX_BLOCK, NV_BLOCK, RubinMoeWeights
 
 if TYPE_CHECKING:
@@ -1167,28 +1165,23 @@ class KimiK3MegaMoEExperts(nn.Module):
             self.capture_fn(topk_ids)
 
         eplb_state = self.eplb_state
-        if is_padding is not None and eplb_state.logical_to_physical_map is not None:
-            # EPLB maps and records the masked ids: mask before it.
-            topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
-            is_padding = None
+        eplb = None
         if eplb_state.logical_to_physical_map is not None:
             assert eplb_state.expert_load_view is not None
             assert eplb_state.logical_replica_count is not None
             assert eplb_state.should_record_tensor is not None
-            topk_ids = eplb_map_to_physical_and_record(
-                topk_ids=topk_ids,
-                expert_load_view=eplb_state.expert_load_view,
-                logical_to_physical_map=eplb_state.logical_to_physical_map,
-                logical_replica_count=eplb_state.logical_replica_count,
-                record_enabled=eplb_state.should_record_tensor,
-                num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
-                    dbo_current_ubatch_id()
-                ]
+            # The stager masks the padding, then maps the logical ids and records
+            # the load (eplb_map_to_physical_and_record) in its one launch.
+            eplb = EplbStage(
+                eplb_state.logical_to_physical_map,
+                eplb_state.logical_replica_count,
+                eplb_state.expert_load_view,
+                eplb_state.should_record_tensor,
+                eplb_state.num_unpadded_tokens_tensors[dbo_current_ubatch_id()]
                 if eplb_state.num_unpadded_tokens_tensors is not None
                 else None,
             )
 
-        # Without EPLB the padding mask is folded into the stager launch.
         extra = {}
         if output_rmsnorm is not None:
             if shared_experts is not None:
@@ -1217,6 +1210,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             is_padding=is_padding,
             owner=self.prefix,
             ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
+            eplb=eplb,
             **extra,
         )
         if drop_shared:
