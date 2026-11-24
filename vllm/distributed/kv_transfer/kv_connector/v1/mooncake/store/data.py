@@ -786,6 +786,9 @@ class LoadSpec:
     can_load: bool
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    # The request computes in its admission step: the worker waits for this
+    # load before that step's forward instead of reporting it finished.
+    same_step: bool = False
 
 
 @dataclass
@@ -1003,6 +1006,8 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # Loads this step's forward waits for (LoadSpec.same_step).
+        self.same_step_load_ids: list[str] = []
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

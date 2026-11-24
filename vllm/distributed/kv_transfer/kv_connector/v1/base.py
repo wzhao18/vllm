@@ -695,6 +695,22 @@ class KVConnectorBase_V1(ABC):
         return
 
 
+    def load_lands_before_step(self, request: "Request") -> bool:
+        """Whether the synchronous load ``get_num_new_matched_tokens`` just
+        reported for ``request`` starts at admission and lands before its step's
+        forward (the worker waits for it in ``start_load_kv``). The scheduler
+        then computes ``request`` in that step and calls
+        ``confirm_load_before_step``, or, if it cannot, schedules the load as an
+        async one instead (no confirmation). A failed load is reported in
+        ``failed_recving`` of that step.
+        """
+        return False
+
+    def confirm_load_before_step(self, request: "Request") -> None:
+        """``request`` computes in its admission step (see
+        ``load_lands_before_step``). Called before ``update_state_after_alloc``."""
+        return
+
     def take_deferred_recving(self) -> set[str]:
         """Scheduler side, at the start of each schedule(): requests whose
         finished loads this connector withheld from an earlier

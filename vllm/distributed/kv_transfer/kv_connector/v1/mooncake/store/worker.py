@@ -1362,6 +1362,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
     ):
+        # Set by MooncakeStoreWorker: reports a same-step load's end (failed?)
+        # to the step waiting for it.
+        self.report_same_step_done: Callable[[str, bool], None] | None = None
+        # Whether the load being handled is a same-step load.
+        self._same_step = False
         super().__init__(
             store,
             token_databases,
@@ -1446,7 +1451,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return failed
 
     def _report_load_error(self, req_id: str, block_ids: list[int]) -> None:
-        if self._is_hma_required:
+        # A same-step load's request already runs: the scheduler recomputes it
+        # from failed_recving (block-level errors only cover waiting requests).
+        if self._is_hma_required or self._same_step:
             self.set_failed_request(req_id)
         else:
             self._add_load_error_block_ids(block_ids)
@@ -1458,6 +1465,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
+        self._same_step = bool(req_meta.load_spec and req_meta.load_spec.same_step)
         # Every load must report back: a load that raises before reporting
         # would leave its request in WAITING_FOR_REMOTE_KVS forever.
         try:
@@ -1469,8 +1477,20 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._report_load_error(
                 req_meta.req_id, [b for group in req_meta.block_ids for b in group]
             )
-            self.set_finished_request(req_meta.req_id)
+            self._finish_load(req_meta.req_id, failed=True)
             self.request_queue.task_done()
+
+    def _finish_load(self, req_id: str, failed: bool) -> None:
+        """Report the end of a load as finished (a clean one also early); a
+        same-step load also to the step waiting for it, and only in-band: its
+        finished_recving lets that step's output carry a failure from every
+        worker, and the scheduler skips it."""
+        if self._same_step:
+            assert self.report_same_step_done is not None
+            self.set_finished_request(req_id)
+            self.report_same_step_done(req_id, failed)
+            return
+        self.set_finished_request(req_id, clean=not failed)
 
     def _wait_load_ready(self, req_meta: ReqMeta) -> None:
         """Block until the GPU work queued before the load was issued is done.
@@ -1555,6 +1575,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         if not key_list and dsa_skipped:
             # DSA-DP: every hit chunk is another card's DSA KV.
+            if self._same_step:
+                self._finish_load(req_id, failed=False)
             return
         if not key_list:
             # The lookup reported a hit this rank has no keys for.
@@ -1606,7 +1628,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         oversized_key_bytes,
                         self.disk_offload_buffer_budget_bytes,
                     )
-                    self.set_finished_request(req_id)
+                    self._finish_load(req_id, failed=True)
                     self.request_queue.task_done()
                     return
                 load_batches = []
@@ -1703,7 +1725,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
 
         # Load errors are recorded above, before the request is reported.
-        self.set_finished_request(req_id, clean=not load_failed)
+        self._finish_load(req_id, load_failed)
         self.request_queue.task_done()
 
 
@@ -1946,6 +1968,20 @@ class MooncakeStoreWorker:
         self._device_regions: dict[int, int] = {}
         # Device regions unregistered for sleep and not yet registered again.
         self._released_regions: set[int] = set()
+        # Same-step loads (LoadSpec.same_step): req id -> whether the load
+        # failed, set by the recv threads, taken by wait_same_step_loads().
+        self._same_step_cond = threading.Condition()
+        self._same_step_landed: dict[str, bool] = {}
+        # This step's failed same-step loads: their requests recompute, so the
+        # KV this step computes for them is not stored.
+        self._same_step_failed: set[str] = set()
+        # Same-step loads received but not yet waited for by the step that
+        # computes them. An early load can land while the previous step still
+        # runs (batch queue); its in-band report is held until its own step's
+        # output, which the scheduler expects to carry it.
+        self._same_step_unwaited: set[str] = set()
+        self._held_finished_recving: set[str] = set()
+        self._held_failed_recving: set[str] = set()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
@@ -2471,6 +2507,7 @@ class MooncakeStoreWorker:
             )
             recv_thread._dsa_dp_owner = self._dsa_dp_owner
             recv_thread._dsa_dp_block_ids = self._dsa_dp_block_ids
+            recv_thread.report_same_step_done = self._report_same_step_done
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)
@@ -2499,6 +2536,7 @@ class MooncakeStoreWorker:
         load_spec = req_meta.load_spec
         assert load_spec is not None and load_spec.can_load
         load_spec.token_len = load_spec.kvpool_cached_tokens
+        self._mark_same_step_unwaited(req_meta)
         req_meta.load_ready_event = None
         req_meta.load_issue_time = time.perf_counter()
         self._increment_kv_connector_counter("load_issued_early", 1)
@@ -2579,9 +2617,66 @@ class MooncakeStoreWorker:
             load_spec = request.load_spec
             assert load_spec is not None
             load_spec.token_len = load_spec.kvpool_cached_tokens
+            self._mark_same_step_unwaited(request)
             request.load_ready_event = ready_event
             request.load_issue_time = issue_time
             self.recv_request_queue.put(request)
+
+    def _mark_same_step_unwaited(self, req_meta: ReqMeta) -> None:
+        """Before a same-step load can land: hold its report until the step
+        that computes it has waited for it."""
+        if req_meta.load_spec is not None and req_meta.load_spec.same_step:
+            with self._same_step_cond:
+                self._same_step_unwaited.add(req_meta.req_id)
+
+    def _hold_unwaited_same_step(self, req_ids: set[str], held: set[str]) -> set[str]:
+        """``req_ids`` plus earlier held ones, minus same-step loads whose step
+        has not waited for them yet (kept in ``held`` for a later output)."""
+        with self._same_step_cond:
+            req_ids = req_ids | held
+            held.clear()
+            held |= req_ids & self._same_step_unwaited
+            return req_ids - held
+
+    def _report_same_step_done(self, req_id: str, failed: bool) -> None:
+        with self._same_step_cond:
+            self._same_step_landed[req_id] = failed
+            self._same_step_cond.notify_all()
+
+    def wait_same_step_loads(self, req_ids: Sequence[str]) -> None:
+        """Block until this step's same-step loads have landed.
+
+        Called right before the step's forward. The scheduler issued the loads
+        early when it admitted their requests, while the previous step was
+        still in flight on the GPU, so they normally land before this point.
+        Like any async load, a load cannot be abandoned (a late write would
+        land in blocks the step reuses), so this keeps waiting and warns.
+        """
+        pending = set(req_ids)
+        failed: set[str] = set()
+        start = time.perf_counter()
+        with self._same_step_cond:
+            while True:
+                for req_id in pending & self._same_step_landed.keys():
+                    pending.discard(req_id)
+                    if self._same_step_landed.pop(req_id):
+                        failed.add(req_id)
+                if not pending:
+                    break
+                if not self._same_step_cond.wait(timeout=30.0):
+                    logger.warning(
+                        "Waiting %.0f s for same-step Mooncake loads of %d "
+                        "request(s) before the forward",
+                        time.perf_counter() - start,
+                        len(pending),
+                    )
+            # This step's output may now report them.
+            self._same_step_unwaited.difference_update(req_ids)
+        self._same_step_failed = failed
+        if req_ids:
+            self._record_kv_connector_operation(
+                "load_wait_same_step", time.perf_counter() - start, len(req_ids)
+            )
 
     def poll_finished_recving(self) -> set[str]:
         """Drain loads that finished without error, for an early report.
@@ -2622,8 +2717,12 @@ class MooncakeStoreWorker:
         for request in metadata.requests:
             if not request.can_save:
                 continue
-            request.current_event = current_event
             assert self.kv_send_thread is not None
+            if request.req_id in self._same_step_failed:
+                # Computed over a failed load: report the job done, store nothing.
+                self.kv_send_thread.finish_store_job(request)
+                continue
+            request.current_event = current_event
             self.kv_send_thread.add_request(request)
 
     def get_finished(
@@ -2651,6 +2750,9 @@ class MooncakeStoreWorker:
                 done_recving |= recv_thread.get_and_clear_finished_requests(
                     include_clean=include_clean
                 )
+            done_recving = self._hold_unwaited_same_step(
+                done_recving, self._held_finished_recving
+            )
             if done_recving:
                 self._increment_kv_connector_counter(
                     "recv_reported_in_band", len(done_recving)
@@ -2683,6 +2785,9 @@ class MooncakeStoreWorker:
         if self.load_async:
             for recv_thread in self.kv_recv_threads:
                 failed_recving |= recv_thread.get_and_clear_failed_requests()
+            failed_recving = self._hold_unwaited_same_step(
+                failed_recving, self._held_failed_recving
+            )
 
         return KVConnectorTransferResults(
             finished_sending=done_sending,

@@ -58,6 +58,8 @@ def create_mock_connector() -> Mock:
     # schedule() drains the connector's late-reported loads first; a bare Mock
     # attribute is truthy and not iterable (base default: none deferred).
     connector.take_deferred_recving.return_value = set()
+    # Likewise no load lands before its step (same-step loads).
+    connector.load_lands_before_step.return_value = False
     connector.get_external_cache_hit_sources.side_effect = lambda request, num_tokens: (
         {CacheHitSource.EXTERNAL_UNSPECIFIED: num_tokens} if num_tokens else {}
     )

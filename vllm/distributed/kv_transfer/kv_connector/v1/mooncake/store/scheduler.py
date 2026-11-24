@@ -334,6 +334,14 @@ class MooncakeStoreScheduler:
         ):
             self._early_loads = EarlyLoadClient(vllm_config)
             logger.info("Mooncake early loads on (issued at schedule time)")
+        # Same-step loads: an early load lands within the step already in
+        # flight, so the request can compute in its admission step; the worker
+        # waits for the load right before that step's forward.
+        self.load_same_step = self._early_loads is not None and bool(
+            kvc_extra_config.get("load_same_step", False)
+        )
+        self._same_step_confirmed: set[str] = set()
+        self._same_step_load_ids: list[str] = []
         # Tokens per block of each KV cache group (indexes the request's blocks).
         self._group_block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
@@ -499,7 +507,15 @@ class MooncakeStoreScheduler:
             tail_key_boundaries=lookup_result.tail_key_boundaries,
         )
 
-        return need_to_allocate, self.load_async
+        # A same-step load is synchronous for the scheduler (the request computes
+        # in this step); it falls back to async if the request cannot.
+        return need_to_allocate, self.load_async and not self.load_same_step
+
+    def load_lands_before_step(self, request: Request) -> bool:
+        return self.load_same_step and request.request_id in self.load_specs
+
+    def confirm_load_before_step(self, request: Request) -> None:
+        self._same_step_confirmed.add(request.request_id)
 
     def update_state_after_alloc(
         self,
@@ -508,6 +524,8 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        same_step = request.request_id in self._same_step_confirmed
+        self._same_step_confirmed.discard(request.request_id)
         # Admitted: its lookup result is used up (the next admission, e.g.
         # after preemption, looks up again).
         self.client.discard(request.request_id)
@@ -540,6 +558,9 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        if same_step:
+            self.load_specs[request.request_id].same_step = True
+            self._same_step_load_ids.append(request.request_id)
         if getattr(self, "_early_loads", None) is not None:
             self._issue_load_early(request.request_id, blocks)
 
@@ -617,6 +638,10 @@ class MooncakeStoreScheduler:
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
             preempted_ids,
+        )
+        meta.same_step_load_ids, self._same_step_load_ids = (
+            self._same_step_load_ids,
+            [],
         )
 
         # Handle new requests

@@ -2330,6 +2330,16 @@ class MambaManager(SingleTypeKVCacheManager):
             if snapshot_col >= 0:
                 # The snapshot block replaces a null below the initial state.
                 num_new_blocks = max(num_new_blocks, 0) + 1
+            if (
+                not self.req_to_blocks[request_id]
+                and total_computed_tokens > num_local_computed_tokens
+                and cdiv(num_tokens, self.block_size)
+                > cdiv(total_computed_tokens, self.block_size)
+            ):
+                # A first allocation that also computes past the external hit's
+                # block (a same-step load): allocate_external_computed_blocks
+                # takes the hit's state block besides the blocks capped above.
+                num_new_blocks = max(num_new_blocks, 0) + 1
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks

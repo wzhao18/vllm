@@ -271,6 +271,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    def load_lands_before_step(self, request: Request) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.load_lands_before_step(request)
+
+    def confirm_load_before_step(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.confirm_load_before_step(request)
+
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
@@ -428,6 +436,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert metadata is self._loads_issued_for, (
             "Mooncake store loads must be issued when the metadata is bound"
         )
+        assert isinstance(metadata, MooncakeStoreConnectorMetadata)
+        # Runs before the forward when the step has synchronous loads.
+        self.connector_worker.wait_same_step_loads(metadata.same_step_load_ids)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # No layerwise support - no-op

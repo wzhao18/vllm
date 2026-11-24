@@ -3756,6 +3756,12 @@ def _make_bare_worker(
     worker._recv_poller_active = False
     worker._device_regions = {}
     worker._released_regions = set()
+    worker._same_step_cond = threading.Condition()
+    worker._same_step_landed = {}
+    worker._same_step_failed = set()
+    worker._same_step_unwaited = set()
+    worker._held_finished_recving = set()
+    worker._held_failed_recving = set()
     worker.finished_store_req = set()
     worker.tp_size = 1
     worker.store_tp_size = None

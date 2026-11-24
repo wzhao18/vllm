@@ -70,6 +70,9 @@ def _make_bare_scheduler(
     scheduler._store_group_ids = (0,)
     scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1}
     scheduler.load_specs = {}
+    scheduler.load_same_step = False
+    scheduler._same_step_confirmed = set()
+    scheduler._same_step_load_ids = []
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}

@@ -536,6 +536,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._extra_async_saves = {}
         return metadata
 
+    def load_lands_before_step(self, request: "Request") -> bool:
+        idx = self._requests_to_connector.get(request.request_id)
+        return idx is not None and self._connectors[idx].load_lands_before_step(request)
+
+    def confirm_load_before_step(self, request: "Request") -> None:
+        self._connectors[
+            self._requests_to_connector[request.request_id]
+        ].confirm_load_before_step(request)
+
     def take_deferred_recving(self) -> set[str]:
         ready: set[str] = set()
         for c in self._connectors:

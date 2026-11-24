@@ -343,6 +343,13 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Requests computing in their admission step over a connector load that
+        # lands before the forward (load_lands_before_step), until that step's
+        # output: req id -> num_computed_tokens without the loaded tokens.
+        self._same_step_loads: dict[str, int] = {}
+        # Same-step loads whose step output arrived or whose request finished:
+        # the workers also list them in finished_recving, which skips them.
+        self._same_step_landed: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1720,6 +1727,28 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
+                # A load that lands before this step's forward lets the request
+                # compute now. Only a prefill-only request (max_tokens 1) that
+                # finishes its prompt in this step does, so a failed load only
+                # costs this step's output (_handle_failed_recving); any other
+                # request, or one admitted without compute budget (load-ahead,
+                # deferred prefill step), takes the async path.
+                same_step_load = (
+                    not load_kv_async
+                    and num_external_computed_tokens > 0
+                    and self.connector is not None
+                    and self.connector.load_lands_before_step(request)
+                )
+                if same_step_load and (
+                    request.max_tokens != 1
+                    or owner_left is not None
+                    or request.has_encoder_inputs
+                    or self.prefix_replay_tokens
+                    or load_ahead
+                    or defer_prefills
+                ):
+                    load_kv_async, same_step_load = True, False
+
                 if load_ahead and not load_kv_async:
                     # Nothing to load ahead: it waits for compute budget.
                     skip_request(request_queue)
@@ -1887,6 +1916,14 @@ class Scheduler(SchedulerInterface):
                         # not stall the requests behind it.
                         skip_request(request_queue)
                         continue
+                    if (
+                        same_step_load
+                        and num_computed_tokens + num_new_tokens < request.num_tokens
+                    ):
+                        # The prompt does not finish in this step: load async.
+                        load_kv_async, same_step_load = True, False
+                        num_new_tokens = 0
+                        pad_spec_decode = False
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1942,7 +1979,7 @@ class Scheduler(SchedulerInterface):
                 # step: take them from settled free blocks (BlockFreeClock).
                 with (
                     BLOCK_FREE_CLOCK.settled()
-                    if load_kv_async
+                    if load_kv_async or same_step_load
                     else contextlib.nullcontext()
                 ):
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1952,10 +1989,14 @@ class Scheduler(SchedulerInterface):
                         new_computed_blocks=new_computed_blocks,
                         num_lookahead_tokens=effective_lookahead_tokens,
                         num_external_computed_tokens=num_external_computed_tokens,
-                        delay_cache_blocks=load_kv_async,
+                        # A same-step load lands before the step zeroes new
+                        # blocks; its blocks are cached once its step's output
+                        # arrives (update_from_output).
+                        delay_cache_blocks=load_kv_async or same_step_load,
                         skip_zeroing_group_ids=(
                             self.connector.get_loaded_kv_cache_group_ids(request)
-                            if load_kv_async and self.connector is not None
+                            if (load_kv_async or same_step_load)
+                            and self.connector is not None
                             else ()
                         ),
                         num_encoder_tokens=num_encoder_tokens,
@@ -1996,6 +2037,11 @@ class Scheduler(SchedulerInterface):
                             connector_prefix_cache_hits,
                         )
                     else:
+                        if same_step_load:
+                            self.connector.confirm_load_before_step(request)
+                            self._same_step_loads[request_id] = (
+                                num_computed_tokens - num_external_computed_tokens
+                            )
                         self.connector.update_state_after_alloc(
                             request,
                             self.kv_cache_manager.get_blocks(request_id),
@@ -2896,6 +2942,22 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        if self.connector is not None and self._same_step_loads:
+            # This step's same-step loads that did not fail have landed.
+            for req_id in [
+                r for r in self._same_step_loads if r in num_scheduled_tokens
+            ]:
+                del self._same_step_loads[req_id]
+                # The workers also list it in this output's finished_recving.
+                self._same_step_landed.add(req_id)
+                # Its blocks were allocated uncached (delay_cache_blocks): cache
+                # them now, as its next allocation would. A prefill-only request
+                # finishes in this step and never allocates again.
+                request = self.requests.get(req_id)
+                if request is not None and request.status == RequestStatus.RUNNING:
+                    self.kv_cache_manager.cache_blocks(
+                        request, min(request.num_computed_tokens, request.num_tokens)
+                    )
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -4195,6 +4257,9 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        if self._same_step_loads.pop(request.request_id, None) is not None:
+            # Its step's output still lists the load in finished_recving.
+            self._same_step_landed.add(request.request_id)
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
@@ -4815,6 +4880,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            if req_id in self._same_step_landed:
+                # A same-step load: its request already computed over it.
+                self._same_step_landed.discard(req_id)
+                continue
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
@@ -4936,7 +5005,25 @@ class Scheduler(SchedulerInterface):
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""
         affected_req_ids: set[str] = set()
+        # A request computed in its admission step over a load that failed: drop
+        # that step's output; with recompute, it computes the prompt again from
+        # its local hit in its own (uncached) blocks.
+        same_step_failed: set[str] = set()
         for req_id in failed_req_ids:
+            num_local = self._same_step_loads.pop(req_id, None)
+            request = self.requests.get(req_id)
+            if (
+                num_local is None
+                or request is None
+                or request.status != RequestStatus.RUNNING
+            ):
+                continue
+            same_step_failed.add(req_id)
+            self._same_step_landed.add(req_id)
+            if self.recompute_kv_load_failures:
+                request.num_computed_tokens = num_local
+                request.num_output_placeholders = 0
+        for req_id in failed_req_ids - same_step_failed:
             request = self.requests.get(req_id)
             if (
                 request is not None
@@ -4946,7 +5033,9 @@ class Scheduler(SchedulerInterface):
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
-        return set() if self.recompute_kv_load_failures else affected_req_ids
+        if self.recompute_kv_load_failures:
+            return same_step_failed
+        return affected_req_ids | same_step_failed
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
