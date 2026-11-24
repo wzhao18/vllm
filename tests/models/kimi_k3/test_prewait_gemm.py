@@ -55,3 +55,28 @@ def test_prewait_gemm_coresident_bitwise(t, ns, pace):
     pg.gemm(out, x, packed, n, (4, 1, ns, 2, 1, pace, 1))
     assert torch.equal(out, ref)
     torch.testing.assert_close(out, x.float() @ w.float().t(), atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("t", [33, 34, 40, 63, 65, 68, 70, 72, 95])
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_prewait_gemm_padded_tile_bitwise(t, out_dtype):
+    """t live tokens on the next tile (64 / 96): every live row has the bits of the
+    full tile run on the zero-padded input, and nothing is stored past row t."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode import prewait_gemm as pg
+
+    torch.manual_seed(t)
+    n, k = 4480, 7168
+    tile = pg.tile(t)
+    assert tile == (64 if t <= 64 else 96) and pg.supported(t, k)
+    x = torch.randn(t, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    packed = pg.pack_weight(w)
+    padded = torch.zeros(tile, k, device="cuda", dtype=torch.bfloat16)
+    padded[:t] = x
+    ref = torch.empty(tile, n, device="cuda", dtype=out_dtype)
+    pg.gemm(ref, padded, packed, n)
+    buf = torch.full((tile, n), float("nan"), device="cuda", dtype=out_dtype)
+    out = buf[:t]
+    pg.gemm(out, x, packed, n)
+    assert torch.equal(out, ref[:t])
+    assert torch.isnan(buf[t:]).all()

@@ -26,7 +26,7 @@ import torch
 _CPP_SRC = r"""
 #include <torch/extension.h>
 void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& wp, int64_t n, int64_t C, int64_t KB,
-                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr);
+                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr, int64_t tile);
 """
 
 _CUDA_SRC = r"""
@@ -38,6 +38,7 @@ _CUDA_SRC = r"""
 #include <cstdint>
 struct P {
   int N, K, T, C, KB, NS, NW, RT, nst, pdl, xlanes, out32;
+  int TL;  // live tokens (<= T): the TMA zero-fills the tile's rows past them and the epilogue stores none
   unsigned WB, XB, SB, recv_off, idesc, nm, tcols;
   long long pace;  // clocks between a weight warp's pre-wait stages (0: issue them at once)
 };
@@ -237,7 +238,8 @@ __global__ void __launch_bounds__(CR ? 256 : 512, CR ? 4 : 1) wsg_k(const __grid
         float v[8]; ld8(ta + c, v);
         if (row < p.N)
 #pragma unroll
-          for (int j = 0; j < 8; ++j) stout(yv, (size_t)(c + j) * p.N + row, v[j], p.out32);
+          for (int j = 0; j < 8; ++j)
+            if (c + j < p.TL) stout(yv, (size_t)(c + j) * p.N + row, v[j], p.out32);
       }
     } else if (CR) {
       // Stage the row in local shared memory (this CTA's MMAs are done, the ring is free), then ONE bulk
@@ -307,11 +309,12 @@ __global__ void __launch_bounds__(CR ? 256 : 512, CR ? 4 : 1) wsg_k(const __grid
           if (src == 0) a = b;
           else { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; }
         }
-        if (row < p.N) {
-          stout(yv, (size_t)(4 * g) * p.N + row, a.x, p.out32);
-          stout(yv, (size_t)(4 * g + 1) * p.N + row, a.y, p.out32);
-          stout(yv, (size_t)(4 * g + 2) * p.N + row, a.z, p.out32);
-          stout(yv, (size_t)(4 * g + 3) * p.N + row, a.w, p.out32);
+        if (row < p.N) {  // tokens 4 g .. 4 g + 3 (the tile's rows past TL are zero-filled, not stored)
+          const int t0 = 4 * g;
+          if (t0 < p.TL) stout(yv, (size_t)t0 * p.N + row, a.x, p.out32);
+          if (t0 + 1 < p.TL) stout(yv, (size_t)(t0 + 1) * p.N + row, a.y, p.out32);
+          if (t0 + 2 < p.TL) stout(yv, (size_t)(t0 + 2) * p.N + row, a.z, p.out32);
+          if (t0 + 3 < p.TL) stout(yv, (size_t)(t0 + 3) * p.N + row, a.w, p.out32);
         }
       }
     }
@@ -358,10 +361,12 @@ constexpr size_t kCoresSmem = 215 * 1024;
 
 // out[T, N] (bf16 or fp32) = x[T, K] (bf16) @ W[N, K]^T with W pre-packed by pack_weight (SW128 tile image).
 void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& wp, int64_t n, int64_t C, int64_t KB,
-                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr) {
-  const int T = (int)x.size(0), K = (int)x.size(1), N = (int)n;
+                  int64_t NS, int64_t NW, int64_t XL, int64_t pace, int64_t cr, int64_t tile) {
+  // ``tile``: the kernel's token tile T (a compiled instance); x holds TL <= T live tokens.
+  const int TL = (int)x.size(0), T = (int)tile, K = (int)x.size(1), N = (int)n;
+  TORCH_CHECK(TL >= 1 && TL <= T, "prewait_gemm: ", TL, " tokens exceed the tile ", T);
   TORCH_CHECK(x.is_contiguous() && x.scalar_type() == at::kBFloat16, "prewait_gemm: x bf16 contiguous");
-  TORCH_CHECK(out.is_contiguous() && out.size(0) == T && out.size(1) == N, "prewait_gemm: out shape");
+  TORCH_CHECK(out.is_contiguous() && out.size(0) == TL && out.size(1) == N, "prewait_gemm: out shape");
   const bool o32 = out.scalar_type() == at::kFloat;
   TORCH_CHECK(o32 || out.scalar_type() == at::kBFloat16, "prewait_gemm: out bf16/fp32");
   const int RT = (N + 127) / 128;
@@ -371,7 +376,7 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   TORCH_CHECK(kf, "prewait_gemm: no kernel for T=", T, " KB=", KB, " C=", C, " co-resident=", cr);
   TORCH_CHECK(pace >= 0, "prewait_gemm: pace");
   P p = {};
-  p.N = N; p.K = K; p.T = T; p.C = (int)C; p.KB = (int)KB; p.NS = (int)NS; p.NW = (int)NW; p.RT = RT;
+  p.N = N; p.K = K; p.T = T; p.TL = TL; p.C = (int)C; p.KB = (int)KB; p.NS = (int)NS; p.NW = (int)NW; p.RT = RT;
   p.nst = K / 64 / (int)C / (int)KB; p.pdl = 1; p.xlanes = (int)XL; p.out32 = o32; p.pace = pace;
   p.nm = (T + 255) / 256;
   p.WB = KB * 16384; p.XB = KB * T * 128; p.SB = p.WB + p.XB;
@@ -409,7 +414,9 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   CUtensorMap xm;
   {
     const int rows = T / p.nm;
-    cuuint64_t dims[3] = {64, (cuuint64_t)T, (cuuint64_t)K / 64}; cuuint64_t strides[2] = {(cuuint64_t)K * 2, 128};
+    // Global extent = the live tokens: the box (the tile's rows) past them is zero-filled and still counts
+    // its full bytes toward the stage's transaction, so the pipeline is the full tile's.
+    cuuint64_t dims[3] = {64, (cuuint64_t)TL, (cuuint64_t)K / 64}; cuuint64_t strides[2] = {(cuuint64_t)K * 2, 128};
     cuuint32_t box[3] = {64, (cuuint32_t)rows, (cuuint32_t)KB}; cuuint32_t es[3] = {1, 1, 1};
     TORCH_CHECK(encode_fn()(&xm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)x.data_ptr(), dims, strides, box, es,
                             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
@@ -476,9 +483,20 @@ def _module():
     return _mod
 
 
+def tile(n_tokens: int) -> int | None:
+    """The token tile (a ``CONFIGS`` key) a call of ``n_tokens`` live tokens runs: the
+    smallest one holding them. The tile's rows past the live tokens are zero-filled by
+    the activation TMA and never stored, so each live row's FP32 sums (and its one
+    rounding) are the tile's, bit for bit."""
+    return next((t for t in sorted(CONFIGS) if n_tokens <= t), None)
+
+
 def supported(n_tokens: int, k: int) -> bool:
-    cfg = CONFIGS.get(n_tokens)
-    return cfg is not None and k % (64 * cfg[0] * cfg[1]) == 0
+    t = tile(n_tokens)
+    if t is None:
+        return False
+    cfg = CONFIGS[t]
+    return k % (64 * cfg[0] * cfg[1]) == 0
 
 
 def pack_weight(w: torch.Tensor) -> torch.Tensor:
@@ -496,8 +514,12 @@ def pack_weight(w: torch.Tensor) -> torch.Tensor:
 
 
 def gemm(out: torch.Tensor, x: torch.Tensor, packed: torch.Tensor, n: int,
-         config: tuple | None = None) -> torch.Tensor:
-    """out[T, n] = x @ W^T for the W ``packed`` came from (``pack_weight``)."""
-    c, kb, ns, nw, xl, pace, cr = config or CONFIGS[x.shape[0]]
-    _module().prewait_gemm(out, x, packed, n, c, kb, ns, nw, xl, pace, cr)
+         config: tuple | None = None, tile_tokens: int | None = None) -> torch.Tensor:
+    """out[T, n] = x @ W^T for the W ``packed`` came from (``pack_weight``); ``x`` may
+    hold fewer tokens than the tile (``tile``) it runs on."""
+    t = tile_tokens or tile(x.shape[0])
+    if t is None:
+        raise ValueError(f"prewait_gemm: no tile for {x.shape[0]} tokens")
+    c, kb, ns, nw, xl, pace, cr = config or CONFIGS[t]
+    _module().prewait_gemm(out, x, packed, n, c, kb, ns, nw, xl, pace, cr, t)
     return out

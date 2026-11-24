@@ -88,7 +88,7 @@ def test_over_limit_split_k_refused():
 def test_tables_unchanged_at_or_below_64():
     new, old = batch_table(sp_mlp.ROUTER_LATENT["*"]), batch_table(OLD_ROUTER_LATENT)
     assert all(new.get(r) == old.get(r) for r in range(1, 65))
-    assert 64 in sp_mlp.PREWAIT_ROWS
+    assert sp_mlp.prewait_rows(64) and not sp_mlp.prewait_rows(32)
     for nk in ((12288, 7168), (7168, 6144)):
         new = batch_table(mxfp8.MX_TUNED[nk]["*"])
         assert all(new.get(r) == batch_table(OLD_MX_TUNED).get(r) for r in range(1, 65))

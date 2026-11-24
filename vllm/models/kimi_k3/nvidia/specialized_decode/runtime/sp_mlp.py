@@ -85,7 +85,16 @@ ROUTER_LATENT = {"*": "1-32:64.32.2.9,33-64:64.64.2.6,65-80:64.80.2.5,81-96:64.9
 # slice, split-K front vs prewait (fastab xy1/xy2/x96, Rhea): n32 split-K faster
 # (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step), n96 prewait
 # faster (r24 -9.3 +- 6.6 us/step, 3 rounds).
-PREWAIT_ROWS = (64, 96)
+# Rows between the tiles run the next tile (``prewait_gemm.tile``: 33-64 on the 64-token
+# tile, 65-96 on the 96-token one; the TMA zero-fills the tile's rows past n, so each
+# row's sums are the tile's bit for bit). Without it the shard rows just past 64 fell
+# to the split-K front (CUPTI DC k7 B32 -> B34, 64 -> 68 shard rows, frozen 928a:
+# wsg_k 17.7 -> SplitKGemm 64.80.2.5 19.8 us per call, +193 us per step).
+PREWAIT_ROWS = ((33, 96),)
+
+
+def prewait_rows(n: int) -> bool:
+    return any(lo <= n <= hi for lo, hi in PREWAIT_ROWS)
 # Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
 # token-wide 2-CTA GEMM (``gemm.wide``, ``partials``) with K split over the given
 # number of CTA pairs and leaves FP32 split partials: the next layer's SP all-gather
@@ -224,7 +233,7 @@ class SpMlp:
             # Pre-wait weight-streaming GEMM at the token counts it serves (its own
             # tile-image copy: the stock linears stay views of the row-major concat).
             if any(
-                r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
+                prewait_rows(r) and prewait_gemm.supported(r, k) for r in concat_rows
             ):
                 self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
@@ -372,7 +381,7 @@ class SpMlp:
             pw = self.prewait_router_latent
             if (
                 pw is not None
-                and n in PREWAIT_ROWS
+                and prewait_rows(n)
                 and prewait_gemm.supported(n, packed.shape[1])
             ):
                 prewait_gemm.gemm(y, h, pw, packed.shape[0])
