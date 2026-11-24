@@ -115,6 +115,38 @@ def make_logits(case: str, T: int, G: torch.Tensor, gen: torch.Generator, device
         x = torch.where(sampled[None, :], torch.exp2(u - 4), torch.exp2(u - 20))
         x = torch.where(mid, 16.0 * (1 + u), x)
         x = torch.where(hi[None, :], torch.exp2(20 + u), x)
+    elif case == "dense_overflow":
+        # served dense bins: ~5000 near-equal high keys per rank (8 key values) in groups
+        # topk_v2's 1/8 sample skips, so its theta admits them all: the candidate list
+        # overflows and the hot body re-thresholds (no saturated message, no complete body)
+        pos = torch.arange(Gmax, device=device)
+        il, w = INTERLEAVE_CUR[0], WORLD[0]
+        lpos = (pos // (il * w)) * il + pos % il
+        g = lpos // 8
+        unsampled = (g % 8) != ((g // 8) % 8)
+        dense = unsampled & ((lpos % 64) < 32) & (lpos < 12000)
+        x = torch.relu(x + 0.3) * 0.25
+        x = torch.where(dense[None, :], 3.0 + (lpos % 8)[None, :].float() / 64, x)
+    elif case in ("tie_cut", "bos64"):
+        # tau found in round 1 with > 256 ties at it on every rank: the id cut by radix over
+        # the candidate ties. tie_cut: 600 equal keys per rank under ~400 distinct higher
+        # keys per rank; bos64: one equal sink every ~64 positions (BOS-like)
+        pos = torch.arange(Gmax, device=device)
+        x = torch.relu(x + 0.3) * 0.25
+        if case == "tie_cut":
+            w = WORLD[0]
+            tie = (pos % 37 == 5) & (pos < 37 * 600 * w)
+            hi = (pos % 37 == 11) & (pos < 37 * 400 * w)
+            x = torch.where(tie[None, :], 5.0, x)
+            x = torch.where(hi[None, :], 6.0 + (pos % 997)[None, :].float() / 128, x)
+        else:
+            x = torch.where((pos % 61 == 0)[None, :], 8.0, x)  # spread over ranks at any IL
+    elif case == "allequal":
+        x = torch.ones_like(x)
+    elif case == "neginf_tail":  # -inf and NaN masked tails (keys 0 / never selected)
+        pos = torch.arange(Gmax, device=device)
+        x = torch.where((pos >= Gmax // 2)[None, :], float("-inf"), x)
+        x = torch.where((pos >= 3 * Gmax // 4)[None, :], float("nan"), x)
     elif case == "neg":
         x = -torch.abs(x) * 100
     else:
@@ -157,8 +189,10 @@ _SIX_MODES = ((True, "top"), (True, "top"), (True, "center"),
               (False, "top"), (True, "center"), (False, "top"))
 
 
-def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, il: int,
-               stats: torch.Tensor, stock: bool, modes=_SIX_MODES, before_call=None):
+def _topk_inputs(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, il: int,
+                 ctx_list=None):
+    """(T, G, Lr, local, full, Gmax, Lmax_all) of one top-k check: every rank's interleaved
+    shard of the same global bf16 logits (``ctx_list``: explicit request lengths)."""
     W, rank, dev = ex.W, ex.rank, ex.device
     T = B * q
     gen = torch.Generator(device=dev)
@@ -169,8 +203,11 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
     if case == "edge":
         ctxs = torch.full((B,), K + 1, device=dev)
     ctxs[0] = ctx
+    if ctx_list is not None:  # explicit request lengths (0: DP-pad rows)
+        ctxs = torch.tensor(ctx_list, device=dev)
     # spec rows: row j of request b sees ctx_b - q + 1 + j tokens
-    G = (ctxs[:, None] - q + 1 + torch.arange(q, device=dev)[None, :]).clamp(min=1).reshape(-1)
+    G = (ctxs[:, None] - q + 1 + torch.arange(q, device=dev)[None, :])
+    G = G.clamp(min=0 if ctx_list is not None else 1).reshape(-1)
     G = G.to(torch.int32)
     lcase = "normal" if case in ("short", "edge") else case
     INTERLEAVE_CUR[0], WORLD[0] = il, W
@@ -184,6 +221,37 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
     local = torch.full((T, stride), float("nan"), dtype=torch.bfloat16, device=dev)
     ok = gid < Gmax
     local[:, : Lmax_all][:, ok] = full[:, gid[ok]]
+    return T, G, Lr, local, full, Gmax, Lmax_all
+
+
+def stress_v2_delayed(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, il: int,
+                      reps: int = 52):
+    """topk_v2 with one DCP rank late (a spin kernel before the launch), each rank in turn:
+    every call must equal topk_merge bitwise (the new hot-body tiers exchange through the
+    radix mailboxes; a late peer must neither hang nor desynchronize them)."""
+    W, rank, dev = ex.W, ex.rank, ex.device
+    T, G, Lr, local, _, _, _ = _topk_inputs(ex, case, B, q, ctx, seed, il)
+    ref = torch.full((T, K + 64), -7, dtype=torch.int32, device=dev)
+    rc = torch.full((T,), -7, dtype=torch.int32, device=dev)
+    ex.topk_merge(local, Lr, G, ref, rc, max_local_len=int(Lr.max()), interleave=il)
+    out = torch.full((T, K + 64), -7, dtype=torch.int32, device=dev)
+    cnt = torch.full((T,), -7, dtype=torch.int32, device=dev)
+    bad = torch.zeros(1, dtype=torch.int32, device=dev)
+    for it in range(reps):
+        if rank == it % W:
+            torch.cuda._sleep(int(2_000_000 * (1 + it % 3)))  # ~1-3 ms late
+        ex.topk_v2(local, Lr, G, out, cnt, interleave=il)
+        bad += ((out[:, :K] != ref[:, :K]).any(1) | (cnt != rc)).sum().int()
+    torch.cuda.synchronize()
+    ex.check()
+    return [f"delayed-rank {case}: {int(bad)} rows differ over {reps} calls"] if int(bad) else []
+
+
+def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, il: int,
+               stats: torch.Tensor, stock: bool, modes=_SIX_MODES, before_call=None,
+               ctx_list=None):
+    W, rank, dev = ex.W, ex.rank, ex.device
+    T, G, Lr, local, full, Gmax, Lmax_all = _topk_inputs(ex, case, B, q, ctx, seed, il, ctx_list)
 
     # 1R (window at the local max, twice; centred at the local tau estimate,
     # twice) and 2R twice: all six outputs must be bitwise identical
@@ -215,6 +283,15 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
         if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"topk_v2 differs from topk_merge in {nd} rows")
+    d = (V2_STATS[0] - v2_before).tolist()
+    # rows of the new hot-body tiers stay out of the complete body (stat 0 counts every
+    # exchanged row once per body run: 2 calls x exchanged rows) and the radix tier
+    nex = 2 * int((G > K).sum())  # rows exchanged by the hot body over the 2 calls
+    hot_only = not d[3] and not d[5] and d[0] == nex
+    if ctx_list is None and case == "dense_overflow" and (d[6] == 0 or not hot_only):
+        errs.append(f"topk_v2 dense_overflow: retheta {d[6]} radix {d[3]} full-pass {d[5]}")
+    if ctx_list is None and case in ("tie_cut", "bos64") and (d[2] == 0 or not hot_only):
+        errs.append(f"topk_v2 {case}: tie {d[2]} radix {d[3]} full-pass {d[5]} rows {d[0]}")
     if case == "sample_high":
         d = (V2_STATS[0] - v2_before).tolist()
         # the hot path rebases (7) and stays on round 1: no radix (3), no full-pass message (5)
@@ -649,6 +726,12 @@ def main():
         # K < context < W * 896 at IL 896: ranks without keys, tau low in the context
         ("normal", 1, 8, 2600),
         ("relu", 1, 8, 3000),
+        # served-content robustness (hot-body re-theta, tie cut from the candidates)
+        ("dense_overflow", 4, 4, 120_000),
+        ("tie_cut", 4, 4, 120_000),
+        ("bos64", 2, 8, 200_000),
+        ("allequal", 2, 4, 60_000),
+        ("neginf_tail", 2, 4, 90_000),
     ]
     if os.environ.get("K31_DCPX_QUICK"):
         cases = cases[:3]
@@ -661,6 +744,31 @@ def main():
                 failures.append(tag + ": " + "; ".join(errs[:3]))
             if rank == 0:
                 print(("FAIL " if errs else "ok   ") + tag, flush=True)
+    # edge-row lengths: DP-pad rows (0), around K, around the SMEM row (kNR x 512 x 8 = 36,864
+    # local keys) and its chunk boundaries; 8 causal verify rows per request
+    W = ex.W
+    small = [0, 1, 7, K - 1, K, K + 1, K + 7, K + 8, W * K]
+    bounds = [W * b + d for b in (36_864, 73_728, 110_592) for d in (-8, -4, 0, 4, 8)]
+    for il in ils:
+        for case in ("normal", "relu", "allequal", "neginf_tail", "dense_overflow"):
+            for j, cl in enumerate((small, bounds)):
+                errs = check_topk(ex, case, len(cl), 8, max(cl), 3000 + j, il, stats,
+                                  stock=False, modes=_SIX_MODES[:2], ctx_list=cl)
+                tag = f"topk edge lengths {'small' if j == 0 else 'boundaries'} {case} IL{il}"
+                if errs:
+                    failures.append(tag + ": " + "; ".join(errs[:3]))
+                if rank == 0:
+                    print(("FAIL " if errs else "ok   ") + tag, flush=True)
+    # the new tiers with one DCP rank late, each rank in turn
+    for i, (case, B, q, ctx) in enumerate(
+        [("dense_overflow", 4, 4, 120_000), ("tie_cut", 4, 4, 120_000), ("bos64", 2, 8, 200_000)]
+    ):
+        errs = stress_v2_delayed(ex, case, B, q, ctx, 4000 + i, 1)
+        tag = f"topk_v2 delayed rank x52 {case}"
+        if errs:
+            failures.append(tag + ": " + "; ".join(errs[:3]))
+        if rank == 0:
+            print(("FAIL " if errs else "ok   ") + tag, flush=True)
     errs = check_stale_refine(ex, INTERLEAVE, stats)
     if errs:
         failures.append("stale refine / epoch wrap: " + "; ".join(errs[:3]))
