@@ -62,7 +62,7 @@ from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
 from .overlap import QueryWait, index_stream, side_stream
-from .query_stage import compile_norm
+from .query_stage import RUBIN_INDEX_TACTICS, compile_norm
 from .r1 import DsaBox
 
 logger = init_logger(__name__)
@@ -352,14 +352,18 @@ def check_proj_residency(compiled, heads, dcp, batch, sms, device):
     return grid
 
 
-def index_policies(batches):
+def index_policies(batches, sms=152):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9); wide
     rows up to 128 the in-projection's generic split-K tactic, above it none
-    (``WideDsa.run_index``: cuBLAS, as the stock ``wq_index``)."""
-    tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
-    tactics[64] = (64, 64, 1, 4)
-    tactics[128] = (64, 64, 2, 6)
+    (``WideDsa.run_index``: cuBLAS, as the stock ``wq_index``: 1 GPU chained, R256
+    4.63 us vs the best split-K 5.13). Rubin (``sms`` > 152): ``RUBIN_INDEX_TACTICS``."""
+    if sms > 152:
+        tactics = RUBIN_INDEX_TACTICS
+    else:
+        tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
+        tactics[64] = (64, 64, 1, 4)
+        tactics[128] = (64, 64, 2, 6)
     return {b: tactics[next(n for n in tactics if b <= n)] for b in batches if b <= 128}
 
 
@@ -491,7 +495,8 @@ class WideDsa:
         self.kernels = {}
         self.waits = {}  # QueryWait per batch (publish-only rows; else None)
         self.norms = {}  # QueryNorm per forked batch
-        policies = index_policies(sorted(pitches))
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        policies = index_policies(sorted(pitches), sms)
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
         self.k_cache_name = _encode_layer_name(self.indexer.k_cache.prefix)

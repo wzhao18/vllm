@@ -35,10 +35,27 @@ def gate_columns(heads):
     return 2112, 2112 + heads * 128
 
 
-def index_policies(batches):
+# Rubin (more SMs than GB300's 152) wq_b tactics by padded rows. 1 GPU, a graph of
+# 24 back-to-back calls over cold weight copies (> 3 x L2), us per call, GB300 table
+# -> this: R32 (64, 32, 1, 8) 3.34 -> 3.02, R64 (64, 64, 1, 4) 4.32 -> 3.60, R128
+# (64, 64, 2, 6) 7.46 -> 4.01 (one K pass per CTA, a deeper ring: the 64-row token
+# tiles re-read the 12.6 MB weight from L2, not HBM; cuBLAS 3.97, cuBLASLt 3.95).
+RUBIN_INDEX_TACTICS = {
+    8: (128, 8, 3, 4),
+    16: (64, 16, 2, 6),
+    32: (64, 32, 2, 6),
+    64: (64, 64, 1, 7),
+    128: (64, 64, 1, 7),
+}
+
+
+def index_policies(batches, sms=152):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9);
-    wider batches run 64-row N tiles."""
+    wider batches run 64-row N tiles. Rubin (``sms`` > 152): ``RUBIN_INDEX_TACTICS``."""
+    if sms > 152:
+        tactics = RUBIN_INDEX_TACTICS
+        return {b: tactics[next((n for n in tactics if b <= n), 128)] for b in batches}
     tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
     tactics[64] = (64, 64, 1, 4)
     return {b: tactics[next((n for n in tactics if b <= n), 64)] for b in batches}
@@ -240,7 +257,8 @@ class QueryStage:
             self.scales = q_scale_inv, self.unit if nvfp4 else k_scale
             shape = (max(pitches), self.heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=device)
-        policies = index_policies(sorted(pitches))
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        policies = index_policies(sorted(pitches), sms)
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
         self.wq_view = to_cute(wq)
