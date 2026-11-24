@@ -10,6 +10,7 @@ top-K of the union of all ranks' logits. Each world size spawns one group
 and runs every case inside it.
 """
 
+import functools
 import time
 
 import pytest
@@ -343,6 +344,118 @@ def _check_cuda_graph(group, ws, n: int) -> None:
         # Two merges per replay: each saturated row advances twice.
         assert torch.equal(ws.seq2[:num_rows], seq + 2 * triggered), i
         seq = ws.seq2[:num_rows].clone()
+
+
+@functools.cache
+def _pdl_copy_kernels():
+    """Two PDL consumers copying a buffer: ``early`` reads before its
+    griddepcontrol.wait (as FlashInfer's trtllm-gen reads its counts),
+    ``late`` after it (as the DSA sparse core)."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def early(src, dst, numel, BLOCK_N: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < numel
+        v = tl.load(src + offs, mask=mask, volatile=True)
+        tl.extra.cuda.gdc_wait()
+        tl.store(dst + offs, v, mask=mask)
+
+    @triton.jit
+    def late(src, dst, numel, BLOCK_N: tl.constexpr):
+        tl.extra.cuda.gdc_wait()
+        offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < numel
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+    return early, late
+
+
+def _pdl_copy(kernel, src: torch.Tensor, dst: torch.Tensor) -> None:
+    numel = src.numel()
+    kernel[(-(-numel // 1024),)](src, dst, numel, BLOCK_N=1024, launch_pdl=True)
+
+
+def _check_pdl_consumers(group, ws, n: int) -> None:
+    """The rescue's PDL release (``release``) in a CUDA graph: a consumer that
+    reads the rows and counts before its PDL wait right after a merge without
+    ``release`` (FlashInfer's trtllm-gen), and one that reads after its wait
+    right after a merge with ``release`` (the DSA sparse core), both see the
+    rescue's rewritten rows of saturated rows on every replay."""
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
+
+    if not current_platform.has_device_capability(90):
+        return
+    early, late = _pdl_copy_kernels()
+    world, rank = group.world_size, group.rank_in_group
+    lengths = [100_000, 40_000, 9_000, 70_123, 150_000, 6_000, 3_000, 220_000]
+    num_rows = len(lengths)
+    base, ends = _make_case(lengths, seed=31)
+    variants = [
+        _boost(base, [0], slice(None), world),
+        base,
+        _boost(base, list(range((TOPK - 1) // n)), slice(None), world),
+        _boost(base, [world - 1], slice(3, 5), world),
+    ]
+    shards = [_shard(v, ends, world, rank) for v in variants]
+    static = shards[0][0].clone()
+    local_end = shards[0][1]
+    req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+    block_table = _block_table(num_rows, int(local_end.max()))
+    outs = []
+    for _ in range(2):
+        ids = torch.empty((num_rows, TOPK), dtype=torch.int32, device="cuda")
+        rows_out = torch.empty_like(ids)
+        valid_out = torch.empty(num_rows, dtype=torch.int32, device="cuda")
+        seen = torch.empty_like(rows_out), torch.empty_like(valid_out)
+        outs.append((ids, rows_out, valid_out, seen))
+
+    def step() -> None:
+        for release, consumer, (ids, rows_out, valid_out, seen) in zip(
+            (False, True), (early, late), outs
+        ):
+            dcp_topk_merge_rows(
+                logits=static,
+                row_ends=local_end,
+                local_topk=n,
+                topk=TOPK,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=_BLOCK,
+                stride_rows=_BLOCK,
+                dcp_rank=rank,
+                rows_out=rows_out,
+                valid_out=valid_out,
+                ids_out=ids,
+                release=release,
+            )
+            _pdl_copy(consumer, valid_out, seen[1])
+            _pdl_copy(consumer, rows_out, seen[0])
+
+    step()  # compile outside capture
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with group.graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
+        step()
+    torch.accelerator.synchronize()
+    for i in range(3 * len(variants)):
+        v = i % len(variants)
+        static.copy_(shards[v][0])
+        for _, rows_out, valid_out, seen in outs:
+            # Stale rows a consumer would see before the merge writes them.
+            rows_out.fill_(-7)
+            valid_out.fill_(-7)
+            seen[0].fill_(-9)
+            seen[1].fill_(-9)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for release, (ids, rows_out, valid_out, seen) in zip((False, True), outs):
+            _assert_exact(ids, variants[v], ends)
+            _assert_rows(group, ids, rows_out, valid_out, req_id, block_table)
+            assert torch.equal(seen[1], valid_out), (i, release, "counts")
+            assert torch.equal(seen[0], rows_out), (i, release, "rows")
+        sat = [int(m != 0) for m in _sat_masks(ws, num_rows)]
+        assert any(sat) == (v != 1), (i, sat)
 
 
 def _check_late_peer(group, ws, n: int) -> None:
@@ -931,6 +1044,7 @@ def run_worker(
             _check_deterministic(group, ws, n)
             _check_nonfinite(group, n)
             _check_cuda_graph(group, ws, n)
+            _check_pdl_consumers(group, ws, n)
             _check_late_peer(group, ws, n)
         finally:
             cleanup_dist_env_and_memory()

@@ -142,7 +142,9 @@ class IndexerStage:
             return "merge", rows
         return None, 0
 
-    def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
+    def merge_rows(
+        self, q_fp8, head_w, metadata, stride_rows, batch, q=1, release=False
+    ):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
         row) and their counts, as ``dcp_stage.local_slots`` of the op's global
@@ -151,7 +153,9 @@ class IndexerStage:
         the DCP group, so every rank takes the same branch. The logits must hold
         no NaN: DeepSelect then returns out-of-range ids, on which the merge's
         pack faults; no per-step check here (finite query, head weights and
-        cached keys keep them finite)."""
+        cached keys keep them finite). ``release``: the consumer (the DSA sparse
+        core) reads the rows after its PDL wait, so the merge's rescue launches
+        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode."""
         from vllm.forward_context import get_forward_context
         from vllm.model_executor.layers.indexer_topk import (
             SparseIndexerTopk,
@@ -189,6 +193,7 @@ class IndexerStage:
             rows_out=slots[:rows],
             valid_out=valid[:rows],
             ids_out=ids,
+            release=release,
         )
         fused = self.fused
         if fused is not None and decode.seq_lens.numel() == rows:

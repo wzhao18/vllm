@@ -34,9 +34,11 @@ elsewhere (nvfp4_ds_mla, no DCP, SP) FlashInfer's chain, logged at startup.
 
 The core polls its q tiles before its PDL wait, which is safe because the kernel right
 before it releases its dependents only after its own PDL wait (the #63 merge's rescue
-kernel), or not early at all (DcpExchange's top-k, launched without PDL): the core's
-launch then implies every kernel before that one has completed (the mailbox re-arm of
-two DSA layers back included).
+kernel, ``release=True`` from ``MergeRows.rows`` only), or not early at all
+(DcpExchange's top-k, launched without PDL): the core's launch then implies every
+kernel before that one has completed (the mailbox re-arm of two DSA layers back
+included). FlashInfer's decode after the merge (``PreparedDsa.dcp_core``) reads its
+counts before its PDL wait (HELD_KERNELS), so there the rescue does not release early.
 """
 
 from __future__ import annotations
@@ -144,8 +146,9 @@ class MergeRows:
 
     def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
-        accepted."""
-        merged = self.stage.merge_rows(*args, q)
+        accepted. The core reads them after its PDL wait, so the merge's rescue
+        releases it early (``release``)."""
+        merged = self.stage.merge_rows(*args, q, release=True)
         assert merged is not None, "merge_rows declined a step fits accepted"
         return merged
 
