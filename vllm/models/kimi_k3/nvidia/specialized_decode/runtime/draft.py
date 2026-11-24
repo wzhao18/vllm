@@ -99,7 +99,12 @@ WIDE_LM_HEAD = {8: "17-32:1", 16: "17-32:1"}
 # shard), VR200 1 GPU, cold weights, us, wide_sk (two TMEM accumulators) vs the
 # pinned cuBLASLt algorithm: 96 rows 39.3 vs 47.0, 192 rows 46.2 vs 49.9, 288 rows
 # 65.3 vs 66.8 (bench_kimi_k3_sdec_wide_sk.py).
-GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
+GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1", 16: "1-:1"}
+# GQA_SK_LM_HEAD TPs whose kernel streams the LM-head shard where it lies (the shard
+# is the target's LM head, read die-obliviously by the verify LM head: no die-homed
+# copy). TP16 [10240, 7168] shard, the token rows zero-padded to 32 in the kernel's
+# activation loads (``wide_sk.PreparedWideSK`` ``pad``).
+SK_LM_HEAD_IN_PLACE = frozenset({16})
 # Batches whose Markov bias GEMM ([B, 512] x [vocab / TP, 512]^T, three per step) is
 # that kernel too, per TP. TP4 [40960, 512] shard, VR200 1 GPU, cold weights, us,
 # wide_sk vs F.linear: B32 6.4 vs 11.8 (B64 7.0 vs 7.1, B96 7.5 vs 7.0: cuBLAS).
@@ -474,6 +479,7 @@ class DraftFastPath:
         strict=False, rank=0,
     ):  # fmt: skip
         self.markov, self.batches, self.steps = markov, frozenset(batches), steps
+        self.tp = tp
         # NQ-NOFALLBACK: the target topology (``shapes.target_topology``) refuses
         # instead of drafting a captured graph on the stock loop.
         self.strict = strict
@@ -923,7 +929,11 @@ class DraftFastPath:
                 return False
         processor, lm_head = model.logits_processor, model.lm_head
         lm = self.lm_logits
-        rows = hidden if lm is None or lm.takes(hidden) else hidden.contiguous()
+        rows = (
+            hidden
+            if (lm is not None and lm.takes(hidden)) or hidden.is_contiguous()
+            else hidden.contiguous()
+        )
         wide = self.lm_wide
         if lm is not None and batch in self.lm_batches and lm.takes(rows):
             base = lm.run(rows)
@@ -939,8 +949,7 @@ class DraftFastPath:
         elif batch in self.sk_batches and self.lm_sk is not None and self.lm_sk.takes(rows):
             # The stock LM-head GEMM on the die-local stream-K kernel: FP32
             # accumulation (K order may differ), one BF16 rounding.
-            base = rows.new_empty((rows.shape[0], self.lm_sk.n))
-            self.lm_sk.run(rows, base)
+            base = self.lm_sk.run_rows(rows)
         elif self.strict and batch in self.sk_batches:
             # NQ-NOFALLBACK: a GQA_SK_LM_HEAD batch whose kernel is not prepared.
             refuse(
@@ -1009,6 +1018,7 @@ class DraftFastPath:
         from ..cutedsl.gemm import wide_sk
 
         rows = sorted(b * self.steps for b in self.sk_batches)
+        pad = lambda r: -(-r // 32) * 32  # noqa: E731  (PreparedWideSK ``pad``)
         ok = (
             weight is not None
             and weight.dim() == 2
@@ -1020,7 +1030,9 @@ class DraftFastPath:
         )
         if ok:
             _, pairs = wide_sk.die_pairs(weight.device)
-            ok = all(wide_sk.supports(r, vocab_rank, weight.shape[1], pairs) for r in rows)
+            ok = all(
+                wide_sk.supports(pad(r), vocab_rank, weight.shape[1], pairs) for r in rows
+            )
         if not ok:  # NQ-NOFALLBACK
             if self.strict:
                 refuse(
@@ -1030,7 +1042,9 @@ class DraftFastPath:
                 )
             self.sk_batches = frozenset()
             return
-        self.lm_sk = wide_sk.PreparedWideSK(weight[:vocab_rank], rows).prepare()
+        self.lm_sk = wide_sk.PreparedWideSK(
+            weight[:vocab_rank], rows, place=self.tp not in SK_LM_HEAD_IN_PLACE, pad=True
+        ).prepare()
         logger.info_once(
             "Kimi K3 DSpark drafter: die-local stream-K LM-head GEMM for draft rows %s",
             tuple(rows),
@@ -1242,8 +1256,9 @@ GQA_RING_PROJECTIONS = {
 # TP16 (the same kernels and rows).
 GQA_FUSED_MARKOV = dict(FUSED_MARKOV)
 GQA_SETTLED_MARKOV = dict(SETTLED_MARKOV)
-GQA_FAST_LM_HEAD = dict(FAST_LM_HEAD)
-GQA_WIDE_LM_HEAD = dict(WIDE_LM_HEAD)
+# TP16: every query row count's LM head is the stream-K kernel (GQA_SK_LM_HEAD).
+GQA_FAST_LM_HEAD = {tp: v for tp, v in FAST_LM_HEAD.items() if tp != 16}
+GQA_WIDE_LM_HEAD = {tp: v for tp, v in WIDE_LM_HEAD.items() if tp != 16}
 GQA_FAST_CONTEXT = dict(FAST_CONTEXT)
 GQA_FAST_AR = dict(FAST_AR)
 GQA_GATED_AR = dict(GATED_AR)

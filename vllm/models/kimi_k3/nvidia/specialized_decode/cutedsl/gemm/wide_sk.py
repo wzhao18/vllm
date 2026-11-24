@@ -298,13 +298,18 @@ class WideSK:
 
     def __init__(self, rows, n, k, pairs, ldo=None, w_issuers=3, x_issuers=2, debug=0,
                  x_stages=4, spread=False, silu=False, smem=None, packed=False,
-                 keep_w=False, nocopy=True):  # fmt: skip
+                 keep_w=False, nocopy=True, valid=None):  # fmt: skip
         """``smem``: the shared-memory budget (default: the sm_100 capacity);
         ``packed``: the weight halves are ``pack_tiles`` layouts; ``keep_w``: load the
         weight with the default L2 policy (it is read again soon), not evict-first;
-        ``nocopy`` (non-spread): two TMEM accumulators, see below."""
+        ``nocopy`` (non-spread): two TMEM accumulators, see below; ``valid``: the
+        activation rows x holds (default ``rows``): the activation tensor map ends
+        there, so the TMA zero-fills the padded token columns [valid, rows) (their
+        output rows are written, as zeros' products, and never read)."""
         assert supports(rows, n, k, pairs, spread, x_stages, smem), (rows, n, k, pairs)
         assert spread or not silu
+        self.valid = rows if valid is None else valid
+        assert 0 < self.valid <= rows, (self.valid, rows)
         self.packed, self.keep_w = packed, keep_w
         self.rows, self.n, self.k = rows, n, k
         self.p0, self.p1 = pairs
@@ -339,7 +344,8 @@ class WideSK:
         # contributor streams its FP32 partial out 16 columns at a time while the MMA
         # runs the next segment in the other buffer; whole / head tiles hold their
         # BF16 values packed in pairs. Same sums and roundings as the copy form.
-        self.nocopy = bool(nocopy) and not spread
+        # (two accumulators need 2 x rows <= 576 TMEM columns: above 288 rows one)
+        self.nocopy = bool(nocopy) and not spread and 2 * rows <= 576
         self.acc_bufs = 2 if self.nocopy else 1
         assert self.acc_bufs * rows <= 576
         # Separate rings: the weights stream from HBM (deep ring: the die-local rate
@@ -393,9 +399,10 @@ class WideSK:
             wdims, wstride = (k, half), (k * 2,)
         wmap0 = tensormap.encode_map(w0, bf16, wdims, wstride, (K_TILE, 128), sw128, l2)
         wmap1 = tensormap.encode_map(w1, bf16, wdims, wstride, (K_TILE, 128), sw128, l2)
-        xmap0 = tensormap.encode_map(x, bf16, (k, rows), (k * 2,), (K_TILE, rows // 2),
+        valid = self.valid  # x's rows: the box rows past them are zero-filled
+        xmap0 = tensormap.encode_map(x, bf16, (k, valid), (k * 2,), (K_TILE, rows // 2),
                                      sw128, l2)  # fmt: skip
-        xmap1 = tensormap.encode_map(x1, bf16, (k, rows), (k * 2,), (K_TILE, rows // 2),
+        xmap1 = tensormap.encode_map(x1, bf16, (k, valid), (k * 2,), (K_TILE, rows // 2),
                                      sw128, l2)  # fmt: skip
         self.tx_a = self.a_stage * 2
         self.tx_b = self.b_stage * 2
@@ -1013,8 +1020,12 @@ class PreparedWideSK:
 
     def __init__(self, weight, rows, ldo=None, place=True, w_issuers=3, x_issuers=2,
                  debug=0, x_stages=4, spread=False, silu=False, share=None, smem=None,
-                 packed=False, keep_w=False, nocopy=True):  # fmt: skip
-        """``share``: a prepared instance of the same shape and options whose workspace
+                 packed=False, keep_w=False, nocopy=True, pad=False):  # fmt: skip
+        """``pad``: ``rows`` are token counts of any size, each run as the next
+        multiple of 32 (``padded``) with the padded token columns zero-filled by the
+        TMA (``WideSK`` ``valid``); ``run`` then writes ``out`` [padded rows, N]
+        (``run_rows`` returns the [rows, N] view of a fresh buffer).
+        ``share``: a prepared instance of the same shape and options whose workspace
         and counters this one reuses (launches on one stream never overlap); ``smem``:
         the shared-memory budget (default: the 227 KiB opt-in; above it, in Rubin's
         oversized mode, the 288-row LM head measured 2x slower); ``packed``: stream the
@@ -1030,6 +1041,7 @@ class PreparedWideSK:
         self.weight = place_halves(weight) if place else weight.contiguous()
         self.out_n = self.n // 2 if silu else self.n
         self.rows = tuple(rows)
+        self.pad = pad
         self.ldo = ldo
         self.opts = (w_issuers, x_issuers, debug, x_stages, spread, silu, smem, packed,
                      keep_w, nocopy)
@@ -1042,14 +1054,16 @@ class PreparedWideSK:
         self.table = torch.tensor(self.doms, dtype=torch.int32, device=dev)
         self.table_c = from_dlpack(self.table, assumed_align=16)
         npairs = sum(self.pairs)
-        for rows in self.rows:
-            gemm = WideSK(rows, self.n, self.k, self.pairs, self.ldo, *self.opts)
-            x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
+        for valid in self.rows:
+            rows = self.padded(valid)
+            gemm = WideSK(rows, self.n, self.k, self.pairs, self.ldo, *self.opts,
+                          valid=valid)  # fmt: skip
+            x = torch.empty(valid, self.k, dtype=torch.bfloat16, device=dev)
             y = torch.empty(rows, self.ldo or self.out_n, dtype=torch.bfloat16, device=dev)
             if self.share is not None:
                 assert (self.share.n, self.share.k, self.share.opts) == (
                     self.n, self.k, self.opts)  # fmt: skip
-                ws, flags = self.share.state[rows][:2]
+                ws, flags = self.share.state[valid][:2]
             elif gemm.spread:  # each die's partials homed on that die
                 chunks = gemm.die_stride // (2 << 20)
                 ws = dies.localized_empty(2 * gemm.die_stride, [0] * chunks + [1] * chunks,
@@ -1067,13 +1081,17 @@ class PreparedWideSK:
                     Int64(x.data_ptr()), self._y(y[:, : self.out_n]),
                     from_dlpack(ws, assumed_align=16),
                     from_dlpack(flags, assumed_align=16), self.table_c)  # fmt: skip
-            key = (rows, self.n, self.k, self.pairs, self.ldo, self.opts)
+            key = (rows, valid, self.n, self.k, self.pairs, self.ldo, self.opts)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
-            self.kernels[rows] = _COMPILED[key]
-            self.state[rows] = (ws, flags, args[5], args[6])
+            self.kernels[valid] = _COMPILED[key]
+            self.state[valid] = (ws, flags, args[5], args[6])
         return self
+
+    def padded(self, rows):
+        """The kernel's token count for ``rows`` activation rows."""
+        return -(-rows // 32) * 32 if self.pad else rows
 
     @staticmethod
     def _k(t):
@@ -1095,7 +1113,7 @@ class PreparedWideSK:
     def takes(self, x):
         return (
             x.dim() == 2 and x.shape[0] in self.kernels and x.dtype == torch.bfloat16
-            and x.is_contiguous() and x.shape[1] == self.k
+            and x.is_contiguous() and x.shape[1] == self.k and x.data_ptr() % 16 == 0
         )  # fmt: skip
 
     def run(self, x, out, x1=None):
@@ -1103,8 +1121,17 @@ class PreparedWideSK:
         CTAs of both dies read x."""
         rows = x.shape[0]
         _, _, ws, flags = self.state[rows]
+        assert out.shape[0] == self.padded(rows), (tuple(out.shape), rows)
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         xa = x.data_ptr()
         self.kernels[rows](self.w0, self.w1, xa, xa if x1 is None else x1.data_ptr(),
                            self._y(out), ws, flags, self.table_c, stream)  # fmt: skip
         return out
+
+    def run_rows(self, x):
+        """[rows, N] (``out_n``) of x [rows, K]: the first rows of a fresh padded
+        output buffer (``pad``)."""
+        rows = x.shape[0]
+        out = x.new_empty((self.padded(rows), self.ldo or self.out_n))
+        self.run(x, out)
+        return out[:rows, : self.out_n]

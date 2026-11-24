@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--rows", default="7,14,28,56,112,224,448")
     ap.add_argument("--n", type=int, default=10240)
     ap.add_argument("--k", type=int, default=7168)
-    ap.add_argument("--arms", default="gemv,cublas,sk,skip,skst,sp,spip")
+    ap.add_argument("--arms", default="gemv,cublas,sk,skip,skst,sp,spip,spst")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.verify import lmhead
@@ -87,7 +87,7 @@ def main():
             res["gemv"] = time_graph(lambda i: lms[i].run(x, o), ncopy)
             del lms
         for arm, place in (("sk", "copy"), ("skip", "inplace"), ("skst", "none"),
-                           ("sp", "copy"), ("spip", "inplace")):
+                           ("sp", "copy"), ("spip", "inplace"), ("spst", "none")):
             if arm not in arms:
                 continue
             spread = arm.startswith("sp")
