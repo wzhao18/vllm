@@ -534,10 +534,23 @@ def _decode_topk_backend(topk_backend: str, dcp_world_size: int) -> str:
     rank (no fallback). The model checks its constraints at load
     (``warm_prefill_indexer``).
 
+    "trtllm_gvr2_nondet" ranks them with that GVR V2 decode engine (exact by
+    value, not bitwise reproducible); under DCP > 1, where it is not validated
+    with the DCP top-k merge, with DeepSelect.
+
     "balanced" becomes "auto" under DCP > 1: it is validated at DCP1 only, and
     its BF16 local logits would feed the DCP top-k merge untested."""
     if topk_backend == "trtllm_gvr2":
         return "deep_select"
+    if topk_backend == "trtllm_gvr2_nondet":
+        if dcp_world_size > 1:
+            logger.warning_once(
+                "sparse_indexer_topk_backend='trtllm_gvr2_nondet' ranks the decode "
+                "rows with DeepSelect under decode context parallelism (DCP=%d)",
+                dcp_world_size,
+            )
+            return "deep_select"
+        return "trtllm_gvr2"
     if topk_backend == "balanced" and dcp_world_size > 1:
         logger.warning_once(
             "sparse_indexer_topk_backend='%s' is not supported with decode "
@@ -591,6 +604,13 @@ def _prefill_topk(
     if _use_deep_select_prefill(logits, row_starts, topk_tokens, topk_backend):
         deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
         return
+    if topk_backend == "trtllm_gvr2_nondet":
+        # The 16-bit GVR V2 prefill engine (the FP32 kernels where it cannot
+        # launch).
+        get_indexer_topk(topk_backend).forward_prefill(
+            logits, row_starts, row_ends, topk_indices, topk_tokens
+        )
+        return
     if topk_backend == "trtllm_gvr2":
         # No silent fallback: its own prefill engine and the FP32 kernels are
         # not deterministic on tied BF16 logits. The model checks at load that
@@ -638,7 +658,7 @@ def prefill_logits_budget_elems(topk_backend: str) -> int:
     per_elem = logits_dtype.itemsize
     keeps_16bit = (
         logits_dtype != torch.float32
-        and topk_backend == "trtllm_gvr2"
+        and topk_backend in ("trtllm_gvr2", "trtllm_gvr2_nondet")
         and trtllm_gvr2_host() is not None
     )
     if logits_dtype != torch.float32 and not keeps_16bit:
@@ -854,11 +874,15 @@ def sparse_attn_indexer(
 
     decode_topk_backend = _decode_topk_backend(topk_backend, dcp_world_size)
 
-    # DeepSelect (also the decode top-k of "trtllm_gvr2") and the balanced
-    # top-k rank SM100's BF16 decode logits directly (DeepSelect also under
-    # DCP, whose merge reads them as well); the other top-k backends read an
-    # FP32 copy.
-    fp32_decode_logits = decode_topk_backend not in ("deep_select", "balanced")
+    # DeepSelect (also the decode top-k of "trtllm_gvr2"), the balanced top-k
+    # and the GVR V2 engine ("trtllm_gvr2_nondet") rank SM100's BF16 decode
+    # logits directly (DeepSelect also under DCP, whose merge reads them as
+    # well); the other top-k backends read an FP32 copy.
+    fp32_decode_logits = decode_topk_backend not in (
+        "deep_select",
+        "balanced",
+        "trtllm_gvr2",
+    )
 
     # assert isinstance(attn_metadata, dict)
     # kv_cache is an empty placeholder until bind_kv_cache runs after memory
@@ -1277,8 +1301,11 @@ def sparse_attn_indexer(
                     # DeepSelect ranks the bf16 logits in place of their exact fp32
                     # copy, also under DCP (whose merge below reads them as well);
                     # fp32 logits go to the selected top-k backend.
-                    # trtllm_gvr2 ranks the 16-bit logits natively as well.
-                    keeps_16bit = topk_backend == "trtllm_gvr2" or (
+                    # trtllm_gvr2(_nondet) rank the 16-bit logits natively too.
+                    keeps_16bit = topk_backend in (
+                        "trtllm_gvr2",
+                        "trtllm_gvr2_nondet",
+                    ) or (
                         _use_deep_select_prefill(
                             logits, row_starts, topk_tokens, topk_backend
                         )

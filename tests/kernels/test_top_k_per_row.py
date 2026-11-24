@@ -3019,6 +3019,96 @@ def test_sparse_indexer_prefill_topk_trtllm_gvr2_no_fallback() -> None:
         )
 
 
+def test_trtllm_gvr2_nondet_routing(monkeypatch) -> None:
+    """The DSA top-k: "trtllm_gvr2" keeps DeepSelect for decode and prefill;
+    "trtllm_gvr2_nondet" opts into the GVR V2 engines for both (decode at DCP1
+    only), on the 16-bit logits (no FP32 copy)."""
+    from vllm.model_executor.layers import sparse_attn_indexer as sai
+
+    assert sai._decode_topk_backend("trtllm_gvr2", 1) == "deep_select"
+    assert sai._decode_topk_backend("trtllm_gvr2", 8) == "deep_select"
+    assert sai._decode_topk_backend("trtllm_gvr2_nondet", 1) == "trtllm_gvr2"
+    assert sai._decode_topk_backend("trtllm_gvr2_nondet", 8) == "deep_select"
+
+    calls: list[tuple[str, torch.dtype]] = []
+
+    class _Recorder:
+        def __init__(self, backend: str) -> None:
+            self.backend = backend
+
+        def forward_prefill(self, logits, row_starts, row_ends, idx, k) -> None:
+            calls.append((self.backend, logits.dtype))
+
+    monkeypatch.setattr(sai, "get_indexer_topk", _Recorder)
+    monkeypatch.setattr(sai, "is_deep_select_available", lambda *a: True)
+    monkeypatch.setattr(
+        sai,
+        "deep_select_topk",
+        lambda logits, *a, **kw: calls.append(("deep_select", logits.dtype)),
+    )
+    logits = torch.zeros(4, 4096, dtype=torch.bfloat16)
+    row_ends = torch.full((4,), 4096, dtype=torch.int32)
+    idx = torch.empty(4, 2048, dtype=torch.int32)
+    for backend in ("trtllm_gvr2", "trtllm_gvr2_nondet"):
+        sai._prefill_topk(logits, None, row_ends, idx, 2048, backend)
+    assert calls == [
+        ("deep_select", torch.bfloat16),
+        ("trtllm_gvr2_nondet", torch.bfloat16),
+    ]
+
+
+@requires_trtllm_gvr2
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,row_relative",
+    [
+        ([96], [40000], True),
+        ([1024, 700, 300], [0, 33000, 1500], True),
+        ([1024, 700, 300], [0, 33000, 1500], False),
+    ],
+)
+@torch.inference_mode()
+def test_sparse_indexer_prefill_topk_trtllm_gvr2_nondet(
+    dtype: torch.dtype, q_lens: list[int], ctx_lens: list[int], row_relative: bool
+) -> None:
+    """trtllm_gvr2_nondet ranks 16-bit prefill logits with the GVR V2 engine
+    for every chunk (no FP32 copy, no row minimum, row-relative or per-row
+    starts), selecting logits[r, ks[r]:ke[r]] into indices relative to ks[r];
+    exact by value."""
+    from vllm.model_executor.layers.sparse_attn_indexer import _prefill_topk
+
+    set_random_seed(0)
+    top_k = 2048
+    ks, ke, k_off = [], [], 0
+    for q, c in zip(q_lens, ctx_lens):
+        for i in range(q):
+            ks.append(k_off)
+            ke.append(k_off + c + i + 1)
+        k_off += c + q
+    row_starts = torch.tensor(ks, dtype=torch.int32, device="cuda")
+    row_ends = torch.tensor(ke, dtype=torch.int32, device="cuda")
+    if row_relative:
+        row_ends -= row_starts
+        row_starts.zero_()
+    num_rows, width = len(ks), int(row_ends.max())
+    pitch = (width + 255) // 256 * 256
+    logits = torch.randn(num_rows, pitch, device="cuda", dtype=dtype)[:, :width]
+    cols = torch.arange(width, device="cuda")
+    outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
+    logits[outside] = torch.finfo(dtype).max
+    reference = logits.float().masked_fill(outside, float("-inf"))
+
+    starts = None if row_relative else row_starts
+    indices = torch.full((num_rows, top_k), 7, dtype=torch.int32, device="cuda")
+    _make_topk("trtllm_gvr2_nondet").forward_prefill(
+        logits, starts, row_ends, indices, top_k
+    )
+    _assert_topk_values(reference, indices, row_starts, row_ends, top_k)
+    indices.fill_(7)
+    _prefill_topk(logits, starts, row_ends, indices, top_k, "trtllm_gvr2_nondet")
+    _assert_topk_values(reference, indices, row_starts, row_ends, top_k)
+
+
 @requires_trtllm_gvr2
 @pytest.mark.parametrize("next_n", [1, 4])
 @torch.inference_mode()

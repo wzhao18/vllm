@@ -1536,7 +1536,10 @@ def warm_prefill_indexer(model: nn.Module) -> None:
     prefill and decode top-k are DeepSelect, the only exact and deterministic
     one (the 16-bit GVR V2 engines change cutoff ties and row order per call,
     BUG-DCP8-2 / BUG-STRESS-2). Raises instead of serving with a fallback; no
-    GVR V2 engine is compiled.
+    GVR V2 engine is compiled. Under "trtllm_gvr2_nondet" the prefill top-k is
+    the GVR V2 prefill engine instead: compile its engines at load, on every
+    rank (they never compile under CUDA graph capture, and a mid-serving JIT on
+    one DCP rank would stall its peers).
 
     Kimi K3's DSA indexer (KimiK3DSAIndexer) is not a SparseAttnIndexer, so
     both are matched by their topk_backend attribute."""
@@ -1551,7 +1554,7 @@ def warm_prefill_indexer(model: nn.Module) -> None:
             m
             for m in model.modules()
             if isinstance(m, (KimiK3DSAIndexer, SparseAttnIndexer))
-            and m.topk_backend == "trtllm_gvr2"
+            and m.topk_backend in ("trtllm_gvr2", "trtllm_gvr2_nondet")
         ),
         None,
     )
@@ -1559,7 +1562,12 @@ def warm_prefill_indexer(model: nn.Module) -> None:
         return
     from vllm.model_executor.layers.indexer_topk import (
         deep_select_prefill_unsupported,
+        warmup_trtllm_gvr2_prefill,
     )
+
+    if indexer.topk_backend == "trtllm_gvr2_nondet":
+        warmup_trtllm_gvr2_prefill(indexer.topk_tokens, indexer.max_model_len)
+        return
 
     why = deep_select_prefill_unsupported(indexer.topk_tokens, indexer.max_model_len)
     if why is not None:
@@ -3099,7 +3107,8 @@ class KimiLinearForCausalLM(
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
         self.dcpx = build_dcpx(self.model, self.vllm_config)
-        # trtllm_gvr2: DeepSelect must rank every prefill chunk (checked).
+        # trtllm_gvr2: DeepSelect must rank every prefill chunk (checked);
+        # trtllm_gvr2_nondet: its GVR V2 prefill engines, built before any forward.
         warm_prefill_indexer(self.model)
         # Non-expert DWDP: after the projections are packed, before the profile run.
         dense_dwdp.install(

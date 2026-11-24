@@ -193,6 +193,7 @@ SparseIndexerTopkBackend = Literal[
     "aiter",
     "balanced",
     "trtllm_gvr2",
+    "trtllm_gvr2_nondet",
 ]
 
 FlashInferSparseMLAKernel = Literal["auto", "trtllm", "prims_ts"]
@@ -433,6 +434,11 @@ class KernelConfig:
       unsupported layouts and uncompiled shapes under CUDA graph capture fall
       back to the FP32 kernels there. Like gvr_2, its latency depends on the
       logit distribution.
+    - "trtllm_gvr2_nondet": "trtllm_gvr2" with the GVR V2 engines in the DSA
+      indexer: the decode top-k (DeepSelect under DCP > 1) and every prefill
+      chunk (BF16, no FP32 copy, also under DCP; its engines are compiled at
+      model load). Exact by value and faster than DeepSelect, but not bitwise
+      reproducible: cutoff ties and the row order change per call.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"

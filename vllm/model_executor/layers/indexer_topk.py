@@ -18,6 +18,21 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# Grown int32 zero buffers (row starts of rows that start at column 0); kept
+# alive since CUDA graphs captured earlier may still read them.
+_zero_row_starts: dict[torch.device, list[torch.Tensor]] = {}
+
+
+def zero_row_starts(like: torch.Tensor) -> torch.Tensor:
+    """A zero tensor shaped and typed like the 1-D ``like`` without a memset
+    per call: a prefix of a grown, never-written device buffer."""
+    numel = like.numel()
+    bufs = _zero_row_starts.setdefault(like.device, [])
+    if not bufs or bufs[-1].numel() < numel or bufs[-1].dtype != like.dtype:
+        size = max(numel, 2 * bufs[-1].numel() if bufs else 0, 1024)
+        bufs.append(torch.zeros(size, dtype=like.dtype, device=like.device))
+    return bufs[-1][:numel].view(like.shape)
+
 # Prefill chunks with fewer rows run faster on top_k_per_row_prefill (GB300),
 # and their many distinct small shapes would JIT-compile gvr_2 mid-serving.
 GVR2_PREFILL_MIN_ROWS = 1024
@@ -204,6 +219,28 @@ def trtllm_gvr2_supported(logits: torch.Tensor, topk_tokens: int) -> bool:
     )
 
 
+def warmup_trtllm_gvr2_prefill(topk_tokens: int, max_cols: int) -> None:
+    """Compile every BF16 GVR V2 prefill engine ``run_prefill`` can pick for
+    rows of up to ``max_cols`` columns ("trtllm_gvr2_nondet"). The engine never
+    compiles under CUDA graph capture, and a mid-serving JIT on one DCP rank
+    stalls its peers, so models call this at load (warm_prefill_indexer)."""
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ):
+        return
+    host = trtllm_gvr2_host()
+    if host is None:
+        return
+    start = time.perf_counter()
+    host.warmup_prefill(top_k=topk_tokens, max_cols=max_cols, dtype=torch.bfloat16)
+    logger.info(
+        "Warmed up the BF16 GVR V2 prefill top-k (topk %d, up to %d columns) in %.1fs",
+        topk_tokens,
+        max_cols,
+        time.perf_counter() - start,
+    )
+
+
 def deep_select_prefill_unsupported(topk_tokens: int, max_cols: int) -> str | None:
     """Why DeepSelect cannot rank every prefill chunk of up to ``max_cols``
     columns of DeepGEMM's SM100 BF16 logits (None when it can). Its other input
@@ -239,6 +276,11 @@ class SparseIndexerTopk(torch.nn.Module):
             if vllm_config is None:
                 vllm_config = get_current_vllm_config()
             backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+        # "trtllm_gvr2_nondet": "trtllm_gvr2" that also has a prefill top-k,
+        # the 16-bit GVR V2 prefill engine.
+        self._trtllm_gvr2_prefill = backend == "trtllm_gvr2_nondet"
+        if self._trtllm_gvr2_prefill:
+            backend = "trtllm_gvr2"
         self._backend = backend
         # Decode rows per step (requests x tokens per request), used to warm
         # up gvr_2 for every row count before the first CUDA-graph capture.
@@ -528,13 +570,40 @@ class SparseIndexerTopk(torch.nn.Module):
         shorter than topk_tokens)."""
         num_rows = logits.shape[0]
         if self._backend == "trtllm_gvr2":
-            # Its 16-bit prefill engine is not deterministic (cutoff ties and
-            # row order change per call); DeepSelect ranks these prefill rows
-            # (sparse_attn_indexer._prefill_topk).
-            raise RuntimeError(
-                "sparse_indexer_topk_backend='trtllm_gvr2' has no prefill top-k; "
-                "DeepSelect ranks the prefill rows"
-            )
+            if not self._trtllm_gvr2_prefill:
+                # Its 16-bit prefill engine is not deterministic (cutoff ties
+                # and row order change per call); DeepSelect ranks these
+                # prefill rows (sparse_attn_indexer._prefill_topk).
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='trtllm_gvr2' has no prefill "
+                    "top-k; DeepSelect ranks the prefill rows"
+                )
+            if self._has_trtllm_gvr2 and trtllm_gvr2_supported(logits, topk_tokens):
+                host = trtllm_gvr2_host()
+                direct = (
+                    topk_indices.is_contiguous() and topk_indices.data_ptr() % 16 == 0
+                )
+                out = topk_indices if direct else torch.empty_like(topk_indices)
+                # Under capture only engines compiled at load can launch.
+                if not torch.cuda.is_current_stream_capturing() or host.prefill_ready(
+                    logits, out
+                ):
+                    logger.info_once(
+                        "Sparse indexer prefill top-k backend: trtllm_gvr2 (%s)",
+                        logits.dtype,
+                    )
+                    # Row r ranks logits[r, ks:ks + row_ends[r]) into the local
+                    # frame (column - ks), -1 padded; ks = row_starts or 0.
+                    host.run_prefill(
+                        logits,
+                        zero_row_starts(row_ends) if row_starts is None else row_starts,
+                        row_ends,
+                        out,
+                    )
+                    if not direct:
+                        topk_indices.copy_(out)
+                    return
+            logits = self._fp32(logits, row_ends)
         backend = self.resolve_prefill_backend(logits, topk_tokens, row_starts)
         if backend == "flashinfer_gvr2":
             logger.info_once("Sparse indexer prefill top-k backend: flashinfer_gvr2")
