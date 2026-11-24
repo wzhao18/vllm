@@ -52,7 +52,8 @@ class MoeFrontTmem64(SplitKTmemGemm64):
 
     def __init__(self, *, valid, split_rows, shard, hidden, stamps=True):
         super().__init__(
-            tactic=SplitKTactic(128, 64, 8, 14), k=7168, stamps=stamps, owners=8
+            tactic=SplitKTactic(128, 64, 8, 14), k=7168, stamps=stamps, owners=8,
+            issuers=2,
         )
         self.valid, self.split_rows, self.shard, self.hidden = (
             valid, split_rows, shard, hidden,
@@ -178,7 +179,9 @@ class MoeFrontRows(MoeFrontTmem64):
 
     def __init__(self, *, valid, split_rows, shard, hidden=0, n=64):
         tactic = SplitKTactic(128, n, 8, 14 if n == 64 else 8)  # N96 / N128 / N160: 8 x slots
-        SplitKTmemGemm64.__init__(self, tactic=tactic, k=7168, owners=8, stamps=True)
+        SplitKTmemGemm64.__init__(
+            self, tactic=tactic, k=7168, owners=8, stamps=True, issuers=2
+        )
         self.valid, self.split_rows, self.shard, self.hidden = (
             valid, split_rows, shard, hidden,
         )  # fmt: skip
