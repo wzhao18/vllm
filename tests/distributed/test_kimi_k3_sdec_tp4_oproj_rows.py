@@ -16,6 +16,12 @@ the default lanes:
 - vs the reference (each rank's BF16 partial, summed over the ranks in FP32, one BF16
   rounding) within the MMA's FP32 accumulation order (a few BF16 ulp).
 
+Each form is also replayed REPS times (gather re-armed between launches, ranks
+released by a barrier, CUDA events around the launch on every rank); rank 0 prints the
+min and median over the replays of the slowest rank's time (one issuing lane vs the
+default) so the issuing-lane change is measured at kernel level. Timing is reported,
+not asserted.
+
 Run on a node with 4 Rubin (SM107) GPUs and multicast memory; skipped elsewhere."""
 
 import os
@@ -30,6 +36,7 @@ H, K, CAP = 7168, 768, 512
 CASES = ((72, 80), (128, 64), (256, 96), (512, 64))
 SMALL = (32, 64)  # OprojUmma (resident, xmc 4) rows
 TIMEOUT = 600
+REPS = 20
 SENTINEL = -0x80000000
 
 
@@ -95,6 +102,26 @@ def _compile_small(batch, x_lanes):
     return cute.compile(kernel, x, w, *tail, make_fake_stream())
 
 
+def _timed(code, args, gather, dev):
+    """min / median over REPS launches of the slowest rank's event time (us)."""
+    times = []
+    for _ in range(REPS):
+        gather.view(torch.int32).fill_(SENTINEL)
+        torch.accelerator.synchronize()
+        dist.barrier()
+        begin = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        begin.record()
+        code(*args)
+        end.record()
+        torch.accelerator.synchronize()
+        slowest = torch.tensor([begin.elapsed_time(end) * 1e3], device=dev)
+        dist.all_reduce(slowest, op=dist.ReduceOp.MAX)
+        times.append(slowest.item())
+    times.sort()
+    return times[0], times[len(times) // 2]
+
+
 def _worker(rank, port, result):
     import cutlass
 
@@ -142,7 +169,7 @@ def _worker(rank, port, result):
             to_cute(recv), to_cute(peers), cutlass.Int32(rank), to_cute(gather),
             cutlass.Int64(gather_mc), cutlass.Int64(tma.data_ptr()),
         )  # fmt: skip
-        outs = []
+        outs, timing = [], {}
         for issuers in (1, None):
             code = _compile(batch, chunk, issuers)
             gather.view(torch.int32).fill_(SENTINEL)
@@ -152,6 +179,8 @@ def _worker(rank, port, result):
             torch.accelerator.synchronize()
             dist.barrier()
             outs.append(gather[0, :batch].clone())
+            args = (to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
+            timing[issuers] = _timed(code, args, gather, dev)
         single, lanes = outs
         assert torch.equal(single.view(torch.int16), lanes.view(torch.int16)), batch
         ref = torch.zeros(batch, H, dtype=torch.float32, device=dev)
@@ -162,14 +191,16 @@ def _worker(rank, port, result):
         del tma
         if rank == 0:
             print(f"TP4 oproj rows M{batch} chunk {chunk}: ok "
-                  f"{time.monotonic() - start:.1f} s")  # fmt: skip
+                  f"{time.monotonic() - start:.1f} s; us min/median issuers=1 "
+                  f"{timing[1][0]:.2f}/{timing[1][1]:.2f} default "
+                  f"{timing[None][0]:.2f}/{timing[None][1]:.2f}")  # fmt: skip
     for batch in SMALL:
         tma = weight_map(x_buffer[:batch], (batch + 7) // 8 * 8 // 4)
         head = (
             to_cute(recv), to_cute(peers), cutlass.Int32(rank), to_cute(gather),
             cutlass.Int64(gather_mc), cutlass.Int64(tma.data_ptr()),
         )  # fmt: skip
-        outs = []
+        outs, timing = [], {}
         for lanes in (1, None):
             code = _compile_small(batch, lanes)
             gather.view(torch.int32).fill_(SENTINEL)
@@ -179,6 +210,8 @@ def _worker(rank, port, result):
             torch.accelerator.synchronize()
             dist.barrier()
             outs.append(gather[0, :batch].clone())
+            args = (to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
+            timing[lanes] = _timed(code, args, gather, dev)
         assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
         ref = torch.zeros(batch, H, dtype=torch.float32, device=dev)
         for xr, wr in zip(xs, ws):
@@ -187,7 +220,9 @@ def _worker(rank, port, result):
         torch.testing.assert_close(outs[1].float(), ref, atol=2e-2, rtol=2e-2)
         del tma
         if rank == 0:
-            print(f"TP4 oproj umma M{batch} xmc 4: ok")
+            print(f"TP4 oproj umma M{batch} xmc 4: ok; us min/median x_lanes=1 "
+                  f"{timing[1][0]:.2f}/{timing[1][1]:.2f} default "
+                  f"{timing[None][0]:.2f}/{timing[None][1]:.2f}")  # fmt: skip
     dist.barrier()
     dist.destroy_process_group()
     result.put((rank, "ok"))
