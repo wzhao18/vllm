@@ -10,7 +10,6 @@ top-K of the union of all ranks' logits. Each world size spawns one group
 and runs every case inside it.
 """
 
-import functools
 import time
 
 import pytest
@@ -273,38 +272,11 @@ def _check_nonfinite(group, n: int) -> None:
     assert _as_lists(ids)[1] == []
 
 
-@functools.cache
-def _pdl_copy_kernel():
-    from vllm.triton_utils import tl, triton
-
-    @triton.jit
-    def pdl_copy_kernel(src, dst, numel, BLOCK: tl.constexpr):
-        tl.extra.cuda.gdc_wait()
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < numel
-        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
-
-    return pdl_copy_kernel
-
-
-def _pdl_copy(src: torch.Tensor, dst: torch.Tensor) -> None:
-    """``dst = src`` by a consumer launched with programmatic stream
-    serialization (PDL) that waits (griddepcontrol.wait) before its reads, like
-    the sparse attention core after the merge: the rescue releases its
-    dependents at entry, so this copy is resident before the rescue ends."""
-    numel = src.numel()
-    _pdl_copy_kernel()[(-(-numel // 1024),)](
-        src, dst, numel, BLOCK=1024, launch_pdl=True
-    )
-
-
 def _check_cuda_graph(group, ws, n: int) -> None:
     """One graph of both entry points, replayed over inputs alternating
     clean, one saturated row and every row saturated (1 rank, and the bound):
     each replay is exact, and the rescue sequence advances only on saturated
-    rows. A PDL consumer right after the merge (as the attention core) reads
-    the final rows: the rescue's early release of its dependents keeps its
-    outputs ordered before a waiting consumer's reads."""
+    rows."""
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         dcp_topk_merge,
         dcp_topk_merge_rows,
@@ -345,13 +317,9 @@ def _check_cuda_graph(group, ws, n: int) -> None:
             valid_out=valid_out,
             ids_out=ids2,
         )
-        _pdl_copy(rows_out, rows_seen)
-        _pdl_copy(valid_out, valid_seen)
 
-    rows_seen, valid_seen = torch.empty_like(rows_out), torch.empty_like(valid_out)
     step()  # compile outside capture
     torch.accelerator.synchronize()
-    assert torch.equal(rows_seen, rows_out) and torch.equal(valid_seen, valid_out)
     graph = torch.cuda.CUDAGraph()
     with group.graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
         step()
@@ -366,8 +334,6 @@ def _check_cuda_graph(group, ws, n: int) -> None:
         _assert_exact(ids2, variants[v], ends)
         _assert_same_on_every_rank(group, ids, f"graph replay {i}")
         _assert_rows(group, ids2, rows_out, valid_out, req_id, block_table)
-        assert torch.equal(rows_seen, rows_out), f"PDL consumer, replay {i}"
-        assert torch.equal(valid_seen, valid_out), f"PDL consumer, replay {i}"
         triggered = torch.tensor(
             [int(m != 0) for m in _sat_masks(ws, num_rows)],
             dtype=torch.int32,

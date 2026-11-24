@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The DCP decode index remap (``triton_filter_and_convert_dcp_index``) releases
-its PDL dependents at entry: a consumer launched with programmatic stream
-serialization that waits before its reads (as the K3.1 sparse decode's QueryWait
-and attention core) still sees the final rows, eagerly and in a CUDA graph, and
-the rows match a plain PyTorch reference of the remap."""
+"""The DCP decode index remap (``triton_filter_and_convert_dcp_index``) with
+``release_dependents`` releases its PDL dependents at entry: a consumer launched
+with programmatic stream serialization that waits before its reads (as the K3.1
+DCP decode's QueryWait) still sees the final rows, eagerly and in a CUDA graph,
+and the rows match a plain PyTorch reference of the remap. Without the flag the
+compiled remap carries no early release."""
 
 import functools
 
@@ -60,12 +61,10 @@ def _reference(req_id, block_table, ids, dcp, rank):
 @pytest.mark.parametrize("rows", [8, 128, 512])
 def test_dcp_remap_pdl_consumer(rows):
     from vllm.v1.attention.backends.mla.sparse_utils import (
-        _remap_launch_dependents,
         triton_filter_and_convert_dcp_index,
     )
 
     dcp, rank = 16, 3
-    assert _remap_launch_dependents(dcp) and not _remap_launch_dependents(1)
     gen = torch.Generator(device="cuda").manual_seed(rows)
     reqs = max(1, rows // 8)
     max_local = 135_176 // dcp + 1
@@ -89,6 +88,7 @@ def test_dcp_remap_pdl_consumer(rows):
             BLOCK_STRIDE_ROWS=BLOCK,
             NUM_TOPK_TOKENS=TOPK,
             return_valid_counts=True,
+            release_dependents=True,
         )
         _pdl_copy(slots, slots_seen)
         _pdl_copy(valid, valid_seen)
@@ -128,34 +128,29 @@ def _compiled_ptx(jit_fn) -> list[str]:
     return [k.asm["ptx"] for k in kernels if "ptx" in getattr(k, "asm", {})]
 
 
-def test_dcp_remap_emits_launch_dependents():
-    """The DCP remap's compiled kernel carries the early PDL release (the
-    consumer tests above pass with or without it), and the DCP-1 remap does not."""
+@pytest.mark.parametrize("release", [True, False])
+def test_dcp_remap_emits_launch_dependents(release):
+    """The compiled remap carries the early PDL release exactly when asked (the
+    consumer test above passes with or without it)."""
     from vllm.v1.attention.backends.mla import sparse_utils
 
     jit_fn = sparse_utils.ConvertReqIndexToGlobalIndexKernel.sparse_mla_index_remap_kernel
-    rows, dcp, rank = 8, 16, 0
+    rows, dcp = 8, 16
     req_id = torch.zeros(rows, device="cuda", dtype=torch.int32)
     block_table = torch.arange(64, device="cuda", dtype=torch.int32).view(1, 64)
-    ids = torch.randint(0, 64 * BLOCK * dcp, (rows, TOPK), device="cuda",
-                        dtype=torch.int32)
-
-    def remap(dcp_size):
-        before = set(_compiled_ptx(jit_fn))
-        sparse_utils.triton_filter_and_convert_dcp_index(
-            req_id, block_table, ids, dcp_size=dcp_size, dcp_rank=0,
-            BLOCK_SIZE=BLOCK, BLOCK_STRIDE_ROWS=BLOCK, NUM_TOPK_TOKENS=TOPK,
-            return_valid_counts=True,
-        ) if dcp_size > 1 else sparse_utils.triton_convert_req_index_to_global_index(
-            req_id, block_table, ids, BLOCK_SIZE=BLOCK, BLOCK_STRIDE_ROWS=BLOCK,
-            NUM_TOPK_TOKENS=TOPK, return_valid_counts=True,
-        )
-        torch.accelerator.synchronize()
-        return [p for p in _compiled_ptx(jit_fn) if p not in before]
-
-    new = remap(dcp)
-    ptx = new or _compiled_ptx(jit_fn)
-    assert ptx, "no compiled remap kernel found"
-    assert any("griddepcontrol.launch_dependents" in p for p in ptx)
-    plain = remap(1)
-    assert all("griddepcontrol.launch_dependents" not in p for p in plain)
+    ids = torch.randint(
+        0, 64 * BLOCK * dcp, (rows, TOPK), device="cuda", dtype=torch.int32
+    )
+    before = set(_compiled_ptx(jit_fn))
+    # a TOPK this file uses nowhere else, so this call compiles its own variant
+    topk = TOPK // 2
+    sparse_utils.triton_filter_and_convert_dcp_index(
+        req_id, block_table, ids[:, :topk].contiguous(), dcp_size=dcp,
+        dcp_rank=1 if release else 2, BLOCK_SIZE=BLOCK, BLOCK_STRIDE_ROWS=BLOCK,
+        NUM_TOPK_TOKENS=topk, return_valid_counts=True,
+        release_dependents=release,
+    )
+    torch.accelerator.synchronize()
+    new = [p for p in _compiled_ptx(jit_fn) if p not in before]
+    assert len(new) == 1, f"expected one new remap compile, got {len(new)}"
+    assert ("griddepcontrol.launch_dependents" in new[0]) == release

@@ -671,6 +671,10 @@ class WideDsa:
                 BLOCK_STRIDE_ROWS=stride_rows,
                 NUM_TOPK_TOKENS=topk.shape[1],
                 return_valid_counts=True,
+                # QueryWait (next) waits before it reads anything: let it become
+                # resident under the remap. Without it the decode itself is next,
+                # and FlashInfer's sparse decodes read the counts before their wait.
+                release_dependents=wait is not None,
             )
         if wait is not None:
             wait()

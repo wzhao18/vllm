@@ -91,6 +91,7 @@ class ConvertReqIndexToGlobalIndexKernel(
         dcp_size: int
         dcp_rank: int
         dcp_interleave: int
+        launch_dependents: bool
         num_warps: int
         num_topk_tokens: int
         block_table_stride: int
@@ -135,7 +136,8 @@ class ConvertReqIndexToGlobalIndexKernel(
         DCP_SIZE: tl.constexpr,
         DCP_RANK: tl.constexpr,
         DCP_INTERLEAVE: tl.constexpr,
-        # Release a PDL-launched consumer at entry (``_remap_launch_dependents``).
+        # Release the PDL-launched consumer at entry: only for a consumer that
+        # reads these rows after its griddepcontrol.wait (``release_dependents``).
         LAUNCH_DEPENDENTS: tl.constexpr,
         # strides (in elements)
         bt_stride0,
@@ -145,9 +147,8 @@ class ConvertReqIndexToGlobalIndexKernel(
         out_stride0,
         out_stride1,
     ):
-        # The DCP decode's consumer of these rows is a PDL kernel: it becomes
-        # resident and runs its prologue under this grid; its griddepcontrol.wait
-        # still orders its reads after this grid completes.
+        # The consumer becomes resident and runs its prologue under this grid;
+        # its griddepcontrol.wait still orders its reads after this grid completes.
         if LAUNCH_DEPENDENTS:
             tl.extra.cuda.gdc_launch_dependents()
 
@@ -267,6 +268,7 @@ class ConvertReqIndexToGlobalIndexKernel(
         DCP_RANK: int,
         DCP_INTERLEAVE: int,
         max_num_blocks_per_req: int,
+        LAUNCH_DEPENDENTS: bool = False,
     ) -> CompileKey:
         tiling = _remap_tiling(NUM_TOPK_TOKENS, BLOCK_N, COUNT_VALID)
         return self.CompileKey(
@@ -281,6 +283,7 @@ class ConvertReqIndexToGlobalIndexKernel(
             dcp_size=DCP_SIZE,
             dcp_rank=DCP_RANK,
             dcp_interleave=DCP_INTERLEAVE,
+            launch_dependents=LAUNCH_DEPENDENTS,
             num_warps=tiling[3],
             num_topk_tokens=NUM_TOPK_TOKENS,
             block_table_stride=triton_scalar_specialization_rep(max_num_blocks_per_req),
@@ -313,9 +316,23 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=1,
                     DCP_RANK=0,
                     DCP_INTERLEAVE=1,
+                    LAUNCH_DEPENDENTS=False,
                 )
                 for count_valid in (False, True)
             )
+        # The K3.1 specialized DCP decode's remap, followed by QueryWait.
+        release_combos = [
+            dict(
+                HAS_PREFILL_WORKSPACE=False,
+                HAS_IDX_MAPPING=False,
+                COUNT_VALID=True,
+                COMPACT_TO_FRONT=True,
+                DCP_SIZE=dcp_size,
+                DCP_RANK=dcp_rank,
+                DCP_INTERLEAVE=dcp_interleave,
+                LAUNCH_DEPENDENTS=True,
+            )
+        ] if dcp_size > 1 and _pdl_capable() else []
         pcp_dcp_combos = []
         if (
             vllm_config.parallel_config.prefill_context_parallel_size > 1
@@ -331,6 +348,7 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=dcp_size,
                     DCP_RANK=dcp_rank,
                     DCP_INTERLEAVE=dcp_interleave,
+                    LAUNCH_DEPENDENTS=False,
                 )
             )
         return self._trace_dispatch(self.dispatch)(
@@ -343,6 +361,7 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=1,
                     DCP_RANK=0,
                     DCP_INTERLEAVE=1,
+                    LAUNCH_DEPENDENTS=False,
                 ),
                 dict(
                     HAS_PREFILL_WORKSPACE=False,
@@ -352,6 +371,7 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=1,
                     DCP_RANK=0,
                     DCP_INTERLEAVE=1,
+                    LAUNCH_DEPENDENTS=False,
                 ),
                 dict(
                     HAS_PREFILL_WORKSPACE=True,
@@ -361,6 +381,7 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=1,
                     DCP_RANK=0,
                     DCP_INTERLEAVE=1,
+                    LAUNCH_DEPENDENTS=False,
                 ),
                 dict(
                     HAS_PREFILL_WORKSPACE=False,
@@ -370,6 +391,7 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=dcp_size,
                     DCP_RANK=dcp_rank,
                     DCP_INTERLEAVE=dcp_interleave,
+                    LAUNCH_DEPENDENTS=False,
                 ),
                 dict(
                     HAS_PREFILL_WORKSPACE=False,
@@ -379,7 +401,9 @@ class ConvertReqIndexToGlobalIndexKernel(
                     DCP_SIZE=dcp_size,
                     DCP_RANK=dcp_rank,
                     DCP_INTERLEAVE=dcp_interleave,
+                    LAUNCH_DEPENDENTS=False,
                 ),
+                *release_combos,
                 *pcp_dcp_combos,
                 *hisparse_combos,
             ),
@@ -431,7 +455,7 @@ class ConvertReqIndexToGlobalIndexKernel(
             DCP_SIZE=compile_key.dcp_size,
             DCP_RANK=compile_key.dcp_rank,
             DCP_INTERLEAVE=compile_key.dcp_interleave,
-            LAUNCH_DEPENDENTS=_remap_launch_dependents(compile_key.dcp_size),
+            LAUNCH_DEPENDENTS=compile_key.launch_dependents,
         )
 
     @kernel_launcher
@@ -459,6 +483,7 @@ class ConvertReqIndexToGlobalIndexKernel(
         DCP_SIZE: int,
         DCP_RANK: int,
         DCP_INTERLEAVE: int,
+        LAUNCH_DEPENDENTS: bool = False,
     ) -> LaunchSpec:
         single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
             NUM_TOPK_TOKENS, BLOCK_N, COUNT_VALID
@@ -479,23 +504,14 @@ class ConvertReqIndexToGlobalIndexKernel(
             ti_stride1=token_indices.stride(1),
             out_stride0=out.stride(0),
             out_stride1=out.stride(1),
-            LAUNCH_DEPENDENTS=_remap_launch_dependents(DCP_SIZE),
             num_warps=num_warps,
         )
 
 
 @functools.cache
-def _remap_launch_dependents(dcp_size: int) -> bool:
-    """Whether the remap releases its dependents (PDL) at entry: on the DCP
-    decode path (``dcp_size > 1``), whose sparse attention consumers launch with
-    programmatic stream serialization and wait before reading the rows. Without
-    the early release such a consumer launches only after the remap's grid has
-    drained. CUDA sm_90+ only (griddepcontrol)."""
-    return (
-        dcp_size > 1
-        and current_platform.is_cuda()
-        and current_platform.has_device_capability(90)
-    )
+def _pdl_capable() -> bool:
+    """griddepcontrol (PDL) needs CUDA sm_90+."""
+    return current_platform.is_cuda() and current_platform.has_device_capability(90)
 
 
 def _remap_tiling(
@@ -682,8 +698,15 @@ def triton_filter_and_convert_dcp_index(
     BLOCK_N: int = 128,
     return_valid_counts: bool = False,
     compact_valid_to_front: bool = True,
+    release_dependents: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Filter global per-request indices to this DCP rank's local slots.
+
+    ``release_dependents``: the kernel releases its PDL dependents at entry, so
+    the next kernel becomes resident while this one runs. Only for a next kernel
+    that reads nothing this one writes before its griddepcontrol.wait (the K3.1
+    DCP decode's QueryWait); FlashInfer's trtllm-gen and prims_ts sparse decodes
+    read their counts / rows before their wait and must not follow it directly.
 
     With ``compact_valid_to_front`` (default), the conversion kernel scatters
     this rank's owned slots to a contiguous prefix ``[0, valid_count)`` and
@@ -712,6 +735,8 @@ def triton_filter_and_convert_dcp_index(
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
+    if release_dependents and not _pdl_capable():
+        raise ValueError("release_dependents needs griddepcontrol (CUDA sm_90+)")
 
     if dcp_size == 1:
         return triton_convert_req_index_to_global_index(
@@ -775,6 +800,7 @@ def triton_filter_and_convert_dcp_index(
         DCP_SIZE=dcp_size,
         DCP_RANK=dcp_rank,
         DCP_INTERLEAVE=cp_kv_cache_interleave_size,
+        LAUNCH_DEPENDENTS=release_dependents,
     )
 
     if return_valid_counts:
