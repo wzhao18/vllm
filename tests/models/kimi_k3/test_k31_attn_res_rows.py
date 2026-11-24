@@ -14,7 +14,7 @@ HIDDEN = 7168
 MAX_BLOCKS = 8
 EPS = 1e-6
 
-pytestmark = pytest.mark.skipif(
+gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] != 10
     or torch.cuda.get_device_properties(0).multi_processor_count <= 152,
@@ -76,6 +76,23 @@ CASES = [
 ]
 
 
+def test_rows_tokens_policy():
+    """Two tokens per cluster at 193-384 rows; at 385-512 rows only from 6 saved
+    blocks; one token elsewhere; every picked count has a compiled variant."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
+        rows_tokens,
+        token_counts,
+    )
+
+    for nb in range(MAX_BLOCKS + 1):
+        assert rows_tokens(128, nb) == 1 and rows_tokens(192, nb) == 1
+        assert rows_tokens(256, nb) == 2 and rows_tokens(384, nb) == 2
+        assert rows_tokens(512, nb) == (2 if nb >= 6 else 1)
+        assert rows_tokens(1024, nb) == 1
+        assert token_counts(nb) == {2}
+
+
+@gpu
 @pytest.mark.parametrize("final", [False, True], ids=["mix", "final"])
 @pytest.mark.parametrize("nb,tokens", CASES)
 def test_rows_bitwise_vs_one_token(nb, tokens, final):
@@ -90,7 +107,8 @@ def test_rows_bitwise_vs_one_token(nb, tokens, final):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16)), what
 
 
-@pytest.mark.parametrize("nb,tokens", [(4, 4), (6, 3), (8, 4)])
+@gpu
+@pytest.mark.parametrize("nb,tokens", [(4, 4), (6, 2), (6, 3), (8, 2), (8, 4)])
 def test_rows_vs_stock(nb, tokens):
     from vllm.models.kimi_k3.nvidia.ops.attn_res import attn_res
 
@@ -98,11 +116,12 @@ def test_rows_vs_stock(nb, tokens):
         pytest.skip("stock NVIDIA AttnRes: SM100 family")
     rows = 512
     x = _inputs(rows, seed=nb)
-    out, prefix, blocks = _run(nb, nb, False, tokens, x)
+    write = nb if nb < MAX_BLOCKS else -1
+    out, prefix, blocks = _run(nb, write, False, tokens, x)
     s_prefix, s_blocks = x["prefix"].clone(), x["blocks"].clone()
     expected = attn_res(
         s_prefix, x["delta"], s_blocks, x["norm"], x["query"], x["out_norm"],
-        nb, nb, EPS, EPS,
+        nb, write, EPS, EPS,
     )  # fmt: skip
     torch.testing.assert_close(out, expected, atol=8e-2, rtol=3e-2)
     torch.testing.assert_close(prefix, s_prefix, atol=0, rtol=0)
