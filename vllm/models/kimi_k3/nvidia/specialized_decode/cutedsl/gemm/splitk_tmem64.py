@@ -103,6 +103,10 @@ ALONE_SMEM = 170 * 1024
 STAMPS = 13
 
 
+# named barrier of the two pre-wait weight issuers, warps 0 and 3 (id 3: the epilogue)
+ISSUERS_BARRIER = 4
+
+
 @asm()
 def _tma_box(dst, barrier, tensor_map, k0, row0):
     """One {64, 128} box of A at (k0, row0) to shared address ``dst``, L2
@@ -354,7 +358,8 @@ class SplitKTmemGemm64(SplitKGemm):
             if cutlass.const_expr(self.stamps):
                 _smid_store(self.stamp_base + 12 * 8, cute.arch.lane_idx() == 0)
 
-        # Warp 3 is idle; warps 4-7 run the epilogue. One more cluster barrier phase:
+        # Warp 3 is idle (issuers 2: the second pre-wait weight issuer); warps 4-7
+        # run the epilogue. One more cluster barrier phase:
         # the mailboxes are free (the epilogue's arrival follows its CTA's MMAs);
         # warps 0-3 pass it after their roles.
         if warp_idx == 0:
@@ -383,6 +388,7 @@ class SplitKTmemGemm64(SplitKGemm):
                 self.weight_issuer(
                     bar_full, bar_empty, ring, a_map, bidx * self.cta_m, first, 1
                 )
+                named_barrier(ISSUERS_BARRIER, 64, arrive=True)  # my tiles requested
             _cluster_phases()
         else:
             self.reduce_scatter64(
@@ -418,6 +424,12 @@ class SplitKTmemGemm64(SplitKGemm):
             self.weight_issuer(
                 bar_full, bar_empty, ring, a_map, row0, first, 0, a_full, data
             )
+            # Both issuers' tiles requested: only then the dependents' trigger (as
+            # with one issuer) and the drain. Each tile of a stage is issued only
+            # after that stage's previous tile was copied out, so past this barrier
+            # every stage's last round is its only pending phase and the parity
+            # wait below cannot pass on an older phase, for any rounds per stage.
+            named_barrier(ISSUERS_BARRIER, 64)
             self.stamp(1, cute.arch.lane_idx() == 0)
             cute.arch.griddepcontrol_launch_dependents()
             for s in cutlass.range_constexpr(min(stages, self.tmem_tiles)):
