@@ -33,7 +33,7 @@ from ...mxfp8 import is_mxfp8_linear
 from .. import prewait_gemm
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
-from ..cutedsl.gemm.sp_policy import sp_projection_tactics
+from ..cutedsl.gemm.sp_policy import die_local_tactics, sp_projection_tactics
 from ..cutedsl.moe.route_stage import RouteStage, route_stage_cause
 from ..shapes import Choice, Path, Shape, Unsupported, rows_policy
 from .providers import bf16_weight
@@ -267,6 +267,7 @@ class SpMlp:
                 n, k = weight.shape
                 table = f"{family}_side" if side and family in SHARED else family
                 tactics = sp_projection_tactics(table, n, k, self.rows, ctx)
+                tactics = die_local_tactics(table, weight, tactics)
                 self.gemms[family] = DecodeProjection(
                     weight, self.rows, tactics, family=table
                 )

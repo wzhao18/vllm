@@ -85,8 +85,9 @@ from ..cutedsl.common.sp_comm import SpComm, SpFinalGather
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
 from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.die_local import attach_die_local_method, two_dies
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
-from ..cutedsl.gemm.sp_policy import sp_projection_tactics
+from ..cutedsl.gemm.sp_policy import die_local_tactics, sp_projection_tactics
 from ..cutedsl.kda.sp import SpKdaCore
 from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
@@ -227,6 +228,7 @@ class SpAttentionBlock:
             else:
                 pitch, k = weight.shape
                 tactics = sp_projection_tactics(family, pitch, k, rows, ctx)
+                tactics = die_local_tactics(family, weight, tactics)
                 self.projection = DecodeProjection(
                     weight, rows, tactics, family=family
                 )
@@ -472,11 +474,23 @@ class SpStep:
                 "dsa_dp", None,
                 "a DSA first layer (the embedding scatter feeds an SP block)",
             )  # fmt: skip
+        dsa_die_local = 0
         for d in layers:
             if d.layer_idx in self.stock_dsa:
                 # As the stock load (KimiLinearForCausalLM.load_weights without the
                 # specialized decode): the fused DSA forward where it applies.
                 d.self_attn.pack_projections()
+                # Two-die parts: the all-head o_proj / g_proj (placed on the dies at
+                # construction) on the die-local GEMM for the owner segment's rows.
+                attn = d.self_attn
+                for linear in (attn.o_proj, getattr(attn, "g_proj", None)):
+                    if linear is not None and two_dies(self.device.index):
+                        dsa_die_local += attach_die_local_method(linear, self.shard_cap)
+        if dsa_die_local:
+            logger.info_once(
+                "SP decode DSA-DP: %d DSA o_proj / g_proj linears die-local",
+                dsa_die_local, scope="global",
+            )
         blocks = [d for d in layers if d.layer_idx not in self.stock_dsa]
         # The release (GQA) drafter's pieces are its own strict build's; the preview
         # (MLA) drafter is the declared stock module but for its attention.

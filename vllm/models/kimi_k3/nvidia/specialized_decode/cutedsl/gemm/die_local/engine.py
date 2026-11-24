@@ -8,6 +8,8 @@ by every layer of one shape."""
 
 import torch
 
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
 from ...common import dies
 from .placement import relocate_parameter_
 from .primitives import CTA_K, EPI_N, OUT_BF16, OUT_F32
@@ -84,6 +86,30 @@ def attach_die_local(linear, max_rows: int, out_mode: int = OUT_BF16) -> bool:
     return True
 
 
+def attach_die_local_method(linear, max_rows: int) -> bool:
+    """``attach_die_local`` for a linear the stock module calls (``linear(x)``): its
+    method runs the die-local engine on the rows it serves and the stock GEMM
+    otherwise (prefill, rows past ``max_rows``)."""
+    if not attach_die_local(linear, max_rows):
+        return False
+    if not isinstance(linear.quant_method, DieLocalLinearMethod):
+        linear.quant_method = DieLocalLinearMethod(linear.die_local)
+    return True
+
+
+class DieLocalLinearMethod(UnquantizedLinearMethod):
+    """A placed BF16 linear's method (``attach_die_local_method``)."""
+
+    def __init__(self, engine: DieLocalEngine):
+        super().__init__()
+        self.engine = engine
+
+    def apply(self, layer, x, bias=None):
+        if bias is None and self.engine.serves(x):
+            return self.engine(x, x.new_empty((x.shape[0], self.engine.n)))
+        return super().apply(layer, x, bias)
+
+
 def die_local_problem(weight: torch.Tensor, rows: int) -> str | None:
     """Why the die-local GEMM cannot serve ``rows`` of ``weight`` (None: it can)."""
     if not weight.is_cuda or not two_dies(weight.device.index):
@@ -132,8 +158,6 @@ def _mlp_targets(mlp):
 
 
 def _plain_bf16(linear) -> bool:
-    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
     method = getattr(linear, "quant_method", None)
     weight = getattr(linear, "weight", None)
     return (

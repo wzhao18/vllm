@@ -261,6 +261,17 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     )
 
 
+def decode_weights_on_dies(vllm_config: VllmConfig) -> bool:
+    """The SP specialized decode on a two-die part (VR200): its die-local GEMMs' BF16
+    weights are placed on the dies as each decoder layer is built."""
+    if specialized_decode_config(vllm_config) is None:
+        return False
+    from .specialized_decode.cutedsl.gemm.die_local import two_dies
+    from .specialized_decode.runtime import sp_topology
+
+    return sp_topology(vllm_config) and two_dies(torch.cuda.current_device())
+
+
 def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
     """Whether this instance is the prefill side of a P/D deployment: a KV producer
     (kv_producer, or kv_both) that is not a decode instance. A kv_both instance on the
@@ -1766,6 +1777,10 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+        if decode_weights_on_dies(vllm_config):
+            from .specialized_decode.cutedsl.gemm.die_local import place_layer_on_dies
+
+            place_layer_on_dies(self)
 
     def _dsa_scatter_rows(
         self, positions: torch.Tensor, hidden_states: torch.Tensor

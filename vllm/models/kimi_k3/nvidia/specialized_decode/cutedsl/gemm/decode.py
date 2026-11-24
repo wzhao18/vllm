@@ -37,6 +37,7 @@ from typing import Any
 import torch
 
 from ...shapes import Choice, Path, Unsupported
+from .die_local import DieLocalEngine, die_local_problem
 from .projection import PreparedProjection
 from .splitk import CTA_K, splitk_smem_bytes, splitk_smem_capacity
 from .warp_splitk import (
@@ -54,12 +55,14 @@ WARP_ROWS = 16  # warp split-K up to here
 SPLIT_K_ROWS = 64  # cluster split-K up to here; cuBLAS past it
 
 # ("warp", WarpSplitKTactic) | ("split_k", (M tile, N tile, split, stages[, Rubin
-# tensor-memory fields])) | ("cublas", None) | ("lt", None)
+# tensor-memory fields])) | ("cublas", None) | ("lt", None) | ("die_local", None)
 ProjectionTactic = tuple[str, Any]
 # "cublas": torch.mm, the stock linear's GEMM; "lt": the same torch.mm with torch's
 # cuBLASLt preference (``blas_library``), whose heuristic picks another nvjet kernel at
 # some SP shapes (no split-K reduce launch there). Both sum K in FP32 and round once.
-KINDS = ("warp", "split_k", "cublas", "lt")
+# "die_local": the die-local GEMM over a weight placed on the two dies by halves
+# (two-die parts, ``die_local``).
+KINDS = ("warp", "split_k", "cublas", "lt", "die_local")
 # The torch matmul kinds (no compiled code; ``check_operands`` needs no alignment).
 TORCH_KINDS = ("cublas", "lt")
 
@@ -178,6 +181,7 @@ class DecodeProjection:
         self.kinds: dict[int, str] = {}
         warp: dict[int, WarpSplitKTactic] = {}
         split: dict[int, tuple] = {}
+        die: list[int] = []
         cta_smem = smem_limits(weight.device.index).cta
         for r, entry in self.tactics.items():
             self.kinds[r] = kind = self._check(r, entry, n, k, cta_smem)
@@ -185,10 +189,13 @@ class DecodeProjection:
                 warp[r] = entry[1]
             elif kind == "split_k":
                 split[r] = entry[1]
+            elif kind == "die_local":
+                die.append(r)
         # Compiled before capture; codes are shared by (N, K, tactic) across layers.
         self.warp = PreparedWarpSplitK(weight, warp) if warp else None
         self.split = PreparedProjection(weight, split).prepare() if split else None
-        prepared = {"warp": self.warp, "split_k": self.split}
+        self.die = DieLocalEngine(weight, max(die)) if die else None
+        prepared = {"warp": self.warp, "split_k": self.split, "die_local": self.die}
         prepared |= dict.fromkeys(TORCH_KINDS, self)
         self.engines = {r: prepared[kind] for r, kind in self.kinds.items()}
 
@@ -212,6 +219,10 @@ class DecodeProjection:
                 raise Unsupported(self.family, r, f"warp {tactic}: {e}") from e
         elif kind == "split_k":
             problem = split_k_problem(tactic, k)
+            if problem is not None:
+                raise Unsupported(self.family, r, problem)
+        elif kind == "die_local":
+            problem = die_local_problem(self.weight, r)
             if problem is not None:
                 raise Unsupported(self.family, r, problem)
         elif tactic is not None:
@@ -239,7 +250,7 @@ class DecodeProjection:
         if rows not in self.kinds and rows < self.rows[-1]:
             problems.append(f"{rows} rows: neither prepared nor >= {self.rows[-1]}")
         kinds = set(self.kinds.values())
-        align = 32 if "warp" in kinds else 16 if "split_k" in kinds else 0  # torch: 0
+        align = 32 if "warp" in kinds else 16 if kinds & {"split_k", "die_local"} else 0
         for name, t in (("x", x), ("out", out)):
             if align and t.data_ptr() % align:
                 problems.append(f"{name} at 0x{t.data_ptr():x}: {align} B aligned")

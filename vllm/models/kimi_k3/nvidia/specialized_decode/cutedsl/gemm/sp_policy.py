@@ -46,6 +46,7 @@ from .decode import (
     warp_eligible,
     warp_tactic,
 )
+from .die_local import MAX_ROWS as DIE_LOCAL_MAX_ROWS
 from .warp_splitk import WarpSplitKTactic, smem_limits
 
 # Families: the attention block's projections over the TP group's R gathered rows
@@ -71,6 +72,12 @@ TORCH_ONLY = RESIDUAL | {"shared_gu_side", "shared_down_side"}
 SIDE = {"shared_gu_side": "side", "shared_down_side": "side"}
 # The TP size these tables are for (the SP decode role).
 SP_TP = 4
+# A weight placed on the two dies by halves (two-die parts, VR200: the KDA
+# in-projection and the shared expert, ``die_local.place_layer_on_dies``): the
+# die-local GEMM at every R up to its MAX_ROWS, on the side stream too.
+DIE_LOCAL_KINDS = frozenset(
+    {"kda_in", "shared_gu", "shared_down", "shared_gu_side", "shared_down_side"}
+)
 
 # GENERIC: the kind per R, then the split-K tactic (M tile, N tile, split, stages) per
 # R: VR's TP16 bins (``providers.projection_policies``: 32 rows (64, 32, 2, 8), 64 rows
@@ -205,6 +212,20 @@ def _generic(kind, n, k, shape, ctx, sm_bytes):
             raise Unsupported(kind, shape, problem)
         return "split_k", tactic
     return "cublas", None
+
+
+def die_local_tactics(
+    kind: str, weight: torch.Tensor, tactics: dict[int, ProjectionTactic]
+) -> dict[int, ProjectionTactic]:
+    """``tactics`` with the die-local GEMM at every R up to its MAX_ROWS where
+    ``weight`` is placed on the dies (``on_dies``) and ``kind`` is one of
+    ``DIE_LOCAL_KINDS``; unchanged otherwise."""
+    if kind not in DIE_LOCAL_KINDS or not getattr(weight, "on_dies", False):
+        return tactics
+    return {
+        r: ("die_local", None) if r <= DIE_LOCAL_MAX_ROWS else tactic
+        for r, tactic in tactics.items()
+    }
 
 
 def sp_projection_tactics(
