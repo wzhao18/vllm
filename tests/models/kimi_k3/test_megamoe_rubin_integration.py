@@ -915,6 +915,55 @@ def test_nvfp4_refuses_math_it_cannot_run(monkeypatch, ep, small_bucket, case):
     assert reduced == [0] and module.kernel_weights is None
 
 
+def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
+    """additional_config megamoe_compact_scales: an NVFP4 export with paired per-16
+    scales loads, compacts every layer (prepare_rubin_megamoe's install), launches
+    each layer on its own expanded planes and hands EPLB the compact planes."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import scale_staging as S
+
+    ep.world_size, ep.rank_in_group = 2, 1
+    cfg = _vllm_config()
+    cfg.additional_config = {"megamoe_compact_scales": True}
+    seen = []
+
+    class Runtime:
+        def prepare_nvfp4_checkpoint_weights(self, *tensors):
+            return W.prepare_nvfp4_checkpoint_weights(
+                *tensors, hidden=128, intermediate=128
+            )
+
+        def forward(self, hidden, ids, weights, kw, **_):
+            seen.append(planes(kw).clone())
+            return torch.zeros(hidden.shape[0], hidden.shape[1], dtype=torch.bfloat16)
+
+    def planes(w):
+        return torch.cat([w.fc1[1].view(torch.uint8), w.fc2[1].view(torch.uint8)], 1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op, group: None)
+    modules, want = [], []
+    for layer in (3, 5):
+        module = _nvfp4_experts(cfg, ep=ep, prefix=f"model.layers.{layer}.mlp.experts")
+        assert module.compact_scales
+        shards = _nvfp4_shards(torch.Generator().manual_seed(layer))
+        for key, t in shards.items():
+            if key[2] == "weight_scale":  # an MXFP4 cast: equal per-16 pairs
+                pairs = t.view(torch.uint8).view(t.shape[0], -1, 2)
+                pairs[..., 1] = pairs[..., 0]
+        _load_through_mapping(module, shards, f"model.layers.{layer}.mlp")
+        monkeypatch.setattr(module, "get_runtime", lambda: Runtime())
+        module.process_weights_after_loading()
+        want.append(planes(module.kernel_weights))
+        modules.append(module)
+    assert S.install(modules, None) is modules[0].scale_staging is not None
+    for module in modules:
+        module(torch.zeros(3, 128, dtype=torch.bfloat16), torch.rand(3, 2),
+               torch.zeros(3, 2, dtype=torch.int32))  # fmt: skip
+    assert len(seen) == 2 and all(torch.equal(s, w) for s, w in zip(seen, want))
+    views = modules[1].get_expert_weights()
+    # (4 experts, half of the 256 x 8 FC1 / 128 x 8 FC2 per-16 planes)
+    assert len(views) == 7 and (views[1].shape, views[3].shape) == ((4, 1024), (4, 512))
+
+
 def test_mxfp4_layer_refuses_nvfp4_scales(ep, small_bucket):
     ep.world_size, ep.rank_in_group = 2, 1
     module = _experts(_vllm_config(), ep=ep, **SMALL)
