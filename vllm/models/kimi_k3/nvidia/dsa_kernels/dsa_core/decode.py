@@ -33,8 +33,10 @@ per-tensor FP8 MLA cache on an SM100-family GPU, at the verify lengths of ``VARI
 elsewhere (nvfp4_ds_mla, no DCP, SP) FlashInfer's chain, logged at startup.
 
 The core polls its q tiles before its PDL wait, which is safe because the kernel right
-before it never releases its dependents early: the #63 merge's rescue kernel, or
-DcpExchange's top-k (launched without PDL).
+before it releases its dependents only after its own PDL wait (the #63 merge's rescue
+kernel), or not early at all (DcpExchange's top-k, launched without PDL): the core's
+launch then implies every kernel before that one has completed (the mailbox re-arm of
+two DSA layers back included).
 """
 
 from __future__ import annotations

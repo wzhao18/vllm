@@ -1127,6 +1127,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
                 cute.arch.griddepcontrol_wait()
+                # The rescue (PDL) becomes resident now and waits for this grid.
+                cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1148,6 +1150,9 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         )
                     keys[i] = key
             else:
+                # Launched in stream order (no PDL): the rescue (PDL) may become
+                # resident at once; it waits for this grid before reading it.
+                cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1623,6 +1628,14 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             owner = storage.owner.get_tensor(cute.make_layout((16,)))
             prefix_ptr = storage.prefix.data_ptr()
             num_rows = gathered.shape[1]
+            # PDL: resident during the select, which it waits for here; its own
+            # dependent (the sparse core / decode) then becomes resident while this
+            # grid runs and waits for it in turn. Triggering only after this wait
+            # keeps the chain's guarantee that a dependent's launch implies every
+            # kernel before this one has completed (the sparse core polls its q
+            # mailbox before its own wait, dsa_core.cu).
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
             for row in cutlass.range(cta, num_rows, num_ctas, unroll=1):
                 word = recast_val(sat_word[row], Uint32)
@@ -1765,6 +1778,7 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
                 grid=(num_ctas, 1, 1),
                 block=(tb_size, 1, 1),
                 stream=stream,
+                use_pdl=True,
             )
 
         return host_entrypoint
