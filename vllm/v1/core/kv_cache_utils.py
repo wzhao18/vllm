@@ -1245,10 +1245,21 @@ def get_max_concurrency_for_kv_cache_config(
     call sites agree.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
+
+    DSA-DP regions (``dsa_dp_regions.py``): a request's DSA blocks come from
+    its owner card's region (``dsa_dp_num_regions`` of ``dsa_dp_region_blocks``)
+    and its other blocks from the shared region, whose block 0 is the null
+    block; the smaller limit applies.
     """
+    dsa_ids = (
+        set(kv_cache_config.dsa_dp_group_ids)
+        if kv_cache_config.dsa_dp_num_regions
+        else set()
+    )
     num_blocks_per_request = 0
+    dsa_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
+    for i, group in enumerate(kv_cache_config.kv_cache_groups):
         required = cdiv(
             cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
@@ -1258,9 +1269,22 @@ def get_max_concurrency_for_kv_cache_config(
         )
         if group.host_resident:
             host_blocks_per_request += required
+        elif i in dsa_ids:
+            dsa_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    if dsa_ids:
+        limits = [
+            kv_cache_config.dsa_dp_num_regions
+            * kv_cache_config.dsa_dp_region_blocks
+            / dsa_blocks_per_request
+        ]
+        if num_blocks_per_request:
+            limits.append(
+                (kv_cache_config.dsa_dp_shared_blocks - 1) / num_blocks_per_request
+            )
+    else:
+        limits = [kv_cache_config.num_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(

@@ -22,6 +22,8 @@ from vllm.v1.core.dsa_dp_regions import DSARegionPools, region_sizes
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlockCopy,
+    get_kv_cache_capacity,
+    get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
 )
@@ -752,8 +754,11 @@ def test_owner_decode_cap(prefix_owner):
         sched.add_request(r)
         reqs.append(r)
     remote = _turn("rd", _toks(9000, BS))
-    remote.kv_transfer_params = {"remote_dsa_owner": 0, "tp_size": TP,
-                                 "do_remote_decode": True}
+    remote.kv_transfer_params = {
+        "remote_dsa_owner": 0,
+        "tp_size": TP,
+        "do_remote_decode": True,
+    }
     sched.add_request(remote)
     out = sched.schedule()
     assert [r.dsa_owner for r in reqs] == [0, 0, 0]
@@ -781,7 +786,10 @@ def test_apply_regions_slot_packed_draft(monkeypatch, per_page):
 
     _dsa_dp_layout(monkeypatch)
     swa = SlidingWindowSpec(
-        block_size=BS, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
+        block_size=BS,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
         sliding_window=16 * BS,
     )
     groups = [
@@ -834,3 +842,138 @@ def test_apply_regions_caps_the_state_reserve(monkeypatch):
     )
     # 32 x 6 = 192 state pages > (241 - 1) // 2 = 120: reserve 120, D = 120.
     assert (cfg.dsa_dp_shared_blocks, cfg.dsa_dp_region_blocks) == (121, 120)
+
+
+K31_BS = 4096  # K3.1 decode: DSA pages unified with the FP32 KDA state
+
+
+def _k31_vllm_config(max_model_len: int, max_num_seqs: int = 32):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4, decode_context_parallel_size=1
+        ),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        max_in_flight_tokens=8192,
+    )
+
+
+def test_k31_decode_capacity_counts_dsa_regions(monkeypatch):
+    """K3.1 full-model TP4 decode (1423 pages per card, max_num_seqs 32): two
+    KDA groups (align, one prefill checkpoint), the DSA group and the slot-packed
+    release drafter. The reported capacity is the owner regions' DSA KV, not the
+    shared region (KDA state, drafter) divided by a request's DSA blocks."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    _dsa_dp_layout(monkeypatch)
+    kda = MambaSpec(
+        block_size=K31_BS,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=K31_BS,
+    )
+    draft = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    groups = [
+        KVCacheGroupSpec(["kda0"], kda),
+        KVCacheGroupSpec(["kda1"], kda),
+        KVCacheGroupSpec(["dsa.attn"], replace(_mla(), block_size=K31_BS)),
+        KVCacheGroupSpec(["draft.swa"], draft),
+    ]
+    groups[3].blocks_per_pool_block = 64
+    layer_specs = {g.layer_names[0]: g.kv_cache_spec for g in groups}
+    cfg = KVCacheConfig(num_blocks=1423, kv_cache_tensors=[], kv_cache_groups=groups)
+    sched = replace(cfg)
+    dsa_dp_regions.apply_dsa_dp_regions(
+        _k31_vllm_config(1 << 20), [layer_specs], [cfg], sched
+    )
+    # 32 requests x (2 KDA groups x 3 + 2 drafter pages) = 256 state pages.
+    assert (sched.dsa_dp_shared_blocks, sched.dsa_dp_region_blocks) == (257, 1166)
+    assert sched.num_blocks == 257
+
+    # 1M-token requests: 256 DSA pages each from 4 x 1166 region pages (the
+    # shared region alone gave 257 / 264 x 1M = 1,020,772 tokens, 0.97x).
+    assert get_kv_cache_capacity(_k31_vllm_config(1 << 20), sched) == (
+        4 * 1166 * K31_BS,
+        4 * 1166 / 256,
+    )
+    for num_tokens in (100_000, 185_000):
+        # The shared region holds the state of max_num_seqs requests.
+        concurrency = get_max_concurrency_for_kv_cache_config(
+            _k31_vllm_config(num_tokens), sched
+        )
+        assert concurrency == 32
+        # Worker configs (num_blocks = S + D) report the same.
+        assert concurrency == get_max_concurrency_for_kv_cache_config(
+            _k31_vllm_config(num_tokens), cfg
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [100_000, 185_000])
+def test_dsa_dp_capacity_matches_region_allocation(num_tokens):
+    """K3.1 decode pages (4096 tokens, 1166-page DSA region per card, TP4): a
+    P/D request loaded through the connector takes cdiv(L, 4096) DSA pages, all
+    in its owner card's region, and a KDA state page in the shared region. One
+    card admits 1166 // cdiv(L, 4096) requests; the reported concurrency is the
+    TP group's, within one request per card of rounding."""
+    tp, d, s = 4, 1166, 1 + 200 * 3
+    kda = MambaSpec(
+        block_size=K31_BS,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=K31_BS,
+    )
+    cfg = KVCacheConfig(
+        num_blocks=s,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["dsa.attn"], replace(_mla(), block_size=K31_BS)),
+            KVCacheGroupSpec(["kda"], kda),
+        ],
+        dsa_dp_group_ids=(DSA_GROUP,),
+        dsa_dp_shared_blocks=s,
+        dsa_dp_region_blocks=d,
+        dsa_dp_num_regions=tp,
+    )
+    manager = make_kv_cache_manager(
+        cfg, max_model_len=1 << 20, enable_caching=True, hash_block_size=K31_BS
+    )
+    regions = manager.coordinator.dsa_regions
+    pages = -(-num_tokens // K31_BS)
+    admitted = 0
+    while True:
+        req = make_request(
+            f"r{admitted}", [0] * num_tokens, K31_BS, sha256, cache_salt=str(admitted)
+        )
+        req.dsa_owner = 0
+        if (
+            manager.allocate_slots(
+                req,
+                num_new_tokens=0,
+                num_external_computed_tokens=num_tokens,
+                delay_cache_blocks=True,
+            )
+            is None
+        ):
+            break
+        dsa_ids, kda_ids = manager.get_block_ids(req.request_id)
+        assert len(dsa_ids) == pages
+        assert {regions.region_of(i) for i in dsa_ids} == {0}
+        assert 0 < sum(i != 0 for i in kda_ids) <= 3
+        admitted += 1
+    assert admitted == d // pages  # 46 (100k) / 25 (185k) per card
+    assert [regions.get_num_free_blocks_of(o) for o in range(1, tp)] == [d] * 3
+    reported = get_max_concurrency_for_kv_cache_config(
+        _k31_vllm_config(num_tokens), cfg
+    )
+    assert tp * admitted <= reported < tp * (admitted + 1)

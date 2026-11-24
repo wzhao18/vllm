@@ -384,7 +384,7 @@ def apply_dsa_dp_regions(
     init_logger(__name__).info(
         "DSA-DP KV regions: %d pages/card = shared %d + DSA region %d (tp %d, "
         "DSA groups %s, shared token groups %.2f, Mamba state pages/seq %d, "
-        "reserve %d). "
+        "reserve %d = %d requests x %d pages). "
         "Per card: DSA KV %d tokens (owned requests), shared-group KV %d tokens "
         "(all requests); TP group DSA KV %d tokens. Without regions: %d tokens "
         "of every group per card.",
@@ -396,6 +396,8 @@ def apply_dsa_dp_regions(
         shared_tok,
         mamba,
         reserve,
+        reserve // max(per_seq, 1),
+        per_seq,
         d * bs,
         max(s - 1 - reserve, 0) * bs,
         tp * d * bs,
