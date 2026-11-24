@@ -39,6 +39,10 @@ def main():
     parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--iters", type=int, default=60)
     parser.add_argument(
+        "--width", type=int, default=0,
+        help="wide rows: stream width (8 / 16 / 32) instead of experts_runtime.WIDE's",
+    )  # fmt: skip
+    parser.add_argument(
         "--trace", action="store_true",
         help="grouped kernel phase stamps (us from the first CTA's entry, median / max "
         "over CTAs) of the last timed call",
@@ -55,6 +59,8 @@ def main():
         experts_runtime as er,
     )
 
+    if args.width:
+        er.WIDE[16] = f"65-:{args.width}"
     t = load(args.test)
     dev = torch.device("cuda", 0)
     torch.accelerator.set_device_index(dev)
@@ -68,7 +74,8 @@ def main():
         init = r64.RubinGroupedExpertsKernel.__init__
 
         def traced(self, *a, **k):
-            k.setdefault("trace", trace.data_ptr())
+            if type(self) is r64.RubinGroupedExpertsKernel:  # (subclasses pass trace)
+                k.setdefault("trace", trace.data_ptr())
             init(self, *a, **k)
 
         r64.RubinGroupedExpertsKernel.__init__ = traced
@@ -88,7 +95,8 @@ def main():
             partial = torch.empty(rows, t.H_LATENT, dtype=torch.bfloat16, device=dev)
             wide = er.WideExperts(experts, buffers, {rows: partial}, planned=True)
             writer = er.compile_wide_plan(rows, dev.index)
-            kernel = "RubinVWExpertsKernel" if experts.wide[rows] > 8 else "Wide"
+            width = experts.wide[rows]
+            kernel = f"RubinVWExpertsKernel w{width}" if width > 8 else "RubinWide w8"
         else:
             experts.prepare(rows, buffers, out, (), True, False, False)
             rubin = rows in experts.rubin
