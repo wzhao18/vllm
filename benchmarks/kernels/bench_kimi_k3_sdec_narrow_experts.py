@@ -66,6 +66,33 @@ def main():
         )
 
         experts_rubin.DIAG.update(a for a in args.diag.split(",") if a)
+        depth = [int(a[1:]) for a in experts_rubin.DIAG if a[:1] == "s" and a[1:].isdigit()]
+        if depth:  # ring depth arm: the grouped kernel's (and subclasses') stages
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+                experts_rubin64 as r64s,
+            )
+
+            init0 = r64s.RubinGroupedExpertsKernel.__init__
+
+            def staged(self, *a, **k):
+                if type(self) is r64s.RubinGroupedExpertsKernel:
+                    k["stages"] = depth[0]
+                init0(self, *a, **k)
+
+            r64s.RubinGroupedExpertsKernel.__init__ = staged
+        vdepth = [int(a[1:]) for a in experts_rubin.DIAG if a[:1] == "v" and a[1:].isdigit()]
+        if vdepth:  # ring depth arm of the VW engine
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+                experts_vw as vws,
+            )
+
+            vinit = vws.RubinVWExpertsKernel.__init__
+
+            def vstaged(self, *a, **k):
+                k["stages"] = vdepth[0]
+                vinit(self, *a, **k)
+
+            vws.RubinVWExpertsKernel.__init__ = vstaged
         print(f"DIAG arms {sorted(experts_rubin.DIAG)}", flush=True)
     t = load(args.test)
     dev = torch.device("cuda", 0)

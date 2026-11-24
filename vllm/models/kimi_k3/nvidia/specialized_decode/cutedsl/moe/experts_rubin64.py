@@ -886,12 +886,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             for s in cutlass.range(lo, hi, unroll=1):
                 if issued >= stages:
                     self.sync(empty.iterator + slot, phase ^ 1)
-                for j in cutlass.range_constexpr(4):
-                    src = sources[j] + ks * 256 + chunk * 16
-                    copy_g2s(sm.iterator + image[j] + slot * 2048, ws + src)
-                if lane < 16:
-                    src = PLAN_XSF + sources[4] + (2 * ks + lane // 8) * 16
-                    copy_g2s(sm.iterator + scale + slot * 256, ws + src)
+                if cutlass.const_expr("nogather" not in DIAG):
+                    for j in cutlass.range_constexpr(4):
+                        src = sources[j] + ks * 256 + chunk * 16
+                        copy_g2s(sm.iterator + image[j] + slot * 2048, ws + src)
+                    if lane < 16:
+                        src = PLAN_XSF + sources[4] + (2 * ks + lane // 8) * 16
+                        copy_g2s(sm.iterator + scale + slot * 256, ws + src)
                 cute.arch.cp_async_mbarrier_arrive_noinc(full.iterator + slot)
                 slot, issued = (slot + 1, issued + 1)
                 if slot == stages:

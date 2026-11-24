@@ -424,7 +424,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             for st in cutlass.range(lo, hi, unroll=1):
                 if issued >= stages:
                     self.sync(empty.iterator + slot, phase ^ 1)
-                for s in cutlass.range(k, unroll=1):
+                for s in cutlass.range(k if "nogather" not in DIAG else 0, unroll=1):
                     self.sub_sources(rows, first + s, sources)
                     dst = slot * self.xslot + s * 2048
                     for j in cutlass.range_constexpr(4):
