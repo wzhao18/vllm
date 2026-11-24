@@ -98,7 +98,9 @@ def _packed_causal_conv1d_fwd_kernel(
     search_stride,
     num_col_blocks,
     part_dim,
-    stride_x_token,
+    # Row offsets r * stride pass 2^31 elements on long steps (3 x 96 x 128
+    # channels from row 58,255): keep the token strides 64-bit.
+    stride_x_token: tl.int64,
     stride_w_dim,
     stride_w_width,
     stride_state_seq,
@@ -106,7 +108,7 @@ def _packed_causal_conv1d_fwd_kernel(
     stride_state_token,
     stride_cache_indices,
     stride_out_part,
-    stride_out_token,
+    stride_out_token: tl.int64,
     null_block_id,
     HAS_BIAS: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,

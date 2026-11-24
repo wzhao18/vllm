@@ -215,3 +215,33 @@ def test_packed_causal_conv1d_empty_sequences():
     for got, want in zip(out.unbind(0), ref):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
     torch.testing.assert_close(new_state, ref_state, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_packed_causal_conv1d_row_offsets_past_int32():
+    """A 60,000-token sequence of 96 heads (TP1): its row offsets pass 2^31
+    elements from row 58,255; the rows there match the same conv run in
+    8192-token pieces, which never leave the int32 range."""
+    device = "cuda"
+    part, num_tokens, piece = 96 * 128, 60000, 8192
+    dim = 3 * part
+    assert (num_tokens - 1) * dim >= 2**31
+    if torch.cuda.mem_get_info()[0] < 12 * 2**30:
+        pytest.skip("needs ~10 GiB of free device memory")
+    torch.manual_seed(13)
+    x = torch.randn(num_tokens, dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(dim, 4, device=device) * 0.5
+    state = torch.zeros(2, dim, 3, device=device)
+    line = torch.ones(1, dtype=torch.int32, device=device)
+
+    def conv(rows, has_init):
+        qsl = torch.tensor([0, rows.shape[0]], dtype=torch.int32, device=device)
+        init = torch.tensor([has_init], device=device)
+        return packed_causal_conv1d_fn(rows, weight, None, state, qsl, line, init, part)
+
+    # The last piece, rows 57,344..59,999, holds the first rows past int32.
+    out = conv(x, False)[:, num_tokens // piece * piece :].clone()
+    state.zero_()
+    for start in range(0, num_tokens, piece):
+        ref = conv(x[start : start + piece], start > 0)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
