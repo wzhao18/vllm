@@ -103,10 +103,6 @@ ALONE_SMEM = 170 * 1024
 STAMPS = 13
 
 
-# named barrier of the two pre-wait weight issuers, warps 0 and 3 (id 3: the epilogue)
-ISSUERS_BARRIER = 4
-
-
 @asm()
 def _tma_box(dst, barrier, tensor_map, k0, row0):
     """One {64, 128} box of A at (k0, row0) to shared address ``dst``, L2
@@ -210,13 +206,9 @@ class SplitKTmemGemm64(SplitKGemm):
 
     def __init__(
         self, *, tactic: SplitKTactic, k: int, stamps: bool = False, alone: bool = True,
-        owners: int = OWNERS, issuers: int = 1,
+        owners: int = OWNERS,
     ):  # fmt: skip
         super().__init__(tactic=tactic)
-        # issuers 2: warps 0 and 3 each issue every other pre-wait weight tile (one
-        # TMA issuing thread completes ~one stage per 0.25 us whatever the ring depth).
-        assert issuers in (1, 2)
-        self.issuers = issuers
         assert tactic.mma_m == 128 and tactic.mma_n in N_TILES, "M128 N64-N128"
         # the owners' sums read whole quads: N x share / 128 tokens per thread, a
         # multiple of 4 (N80 needs share 32, i.e. 4 owners)
@@ -358,8 +350,7 @@ class SplitKTmemGemm64(SplitKGemm):
             if cutlass.const_expr(self.stamps):
                 _smid_store(self.stamp_base + 12 * 8, cute.arch.lane_idx() == 0)
 
-        # Warp 3 is idle (issuers 2: the second pre-wait weight issuer); warps 4-7
-        # run the epilogue. One more cluster barrier phase:
+        # Warp 3 is idle; warps 4-7 run the epilogue. One more cluster barrier phase:
         # the mailboxes are free (the epilogue's arrival follows its CTA's MMAs);
         # warps 0-3 pass it after their roles.
         if warp_idx == 0:
@@ -384,11 +375,6 @@ class SplitKTmemGemm64(SplitKGemm):
             )  # fmt: skip
             _cluster_phases()
         elif warp_idx == 3:
-            if cutlass.const_expr(self.issuers == 2):
-                self.weight_issuer(
-                    bar_full, bar_empty, ring, a_map, bidx * self.cta_m, first, 1
-                )
-                named_barrier(ISSUERS_BARRIER, 64, arrive=True)  # my tiles requested
             _cluster_phases()
         else:
             self.reduce_scatter64(
@@ -420,23 +406,6 @@ class SplitKTmemGemm64(SplitKGemm):
         dependents' trigger once every tile is requested; then the ring's drain
         (every ring tile copied to tensor memory)."""
         stages = self.num_ab_stage
-        if cutlass.const_expr(self.issuers == 2):
-            self.weight_issuer(
-                bar_full, bar_empty, ring, a_map, row0, first, 0, a_full, data
-            )
-            # Both issuers' tiles requested: only then the dependents' trigger (as
-            # with one issuer) and the drain. Each tile of a stage is issued only
-            # after that stage's previous tile was copied out, so past this barrier
-            # every stage's last round is its only pending phase and the parity
-            # wait below cannot pass on an older phase, for any rounds per stage.
-            named_barrier(ISSUERS_BARRIER, 64)
-            self.stamp(1, cute.arch.lane_idx() == 0)
-            cute.arch.griddepcontrol_launch_dependents()
-            for s in cutlass.range_constexpr(min(stages, self.tmem_tiles)):
-                last_round = (self.tmem_tiles - 1 - s) // stages
-                cute.arch.mbarrier_wait(bar_empty + s, last_round % 2)
-            self.stamp(2, cute.arch.lane_idx() == 0)
-            return
         _acquire_tensor_map(a_map)
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(self.tmem_tiles, unroll=1):
@@ -460,30 +429,6 @@ class SplitKTmemGemm64(SplitKGemm):
         cute.arch.griddepcontrol_launch_dependents()
         self.drain(bar_empty, empty_phase, self.tmem_tiles)
         self.stamp(2, cute.arch.lane_idx() == 0)
-
-    @cute.experimental.jit
-    def weight_issuer(
-        self, bar_full, bar_empty, ring: Int32, a_map: cutlass.Int64,
-        row0: cutlass.Int32, first: cutlass.Int32, issuer: cutlass.Constexpr[int],
-        a_full=None, data=None,
-    ):  # fmt: skip
-        """``issuers`` 2: TMEM-bound tiles ``issuer``, ``issuer`` + 2, .. into ring stage
-        k % stages, each after the stage's previous tile was copied out; issuer 0 also
-        the A slots' tiles right behind its first tile."""
-        stages = self.num_ab_stage
-        _acquire_tensor_map(a_map)
-        for k in cutlass.range_constexpr(issuer, self.tmem_tiles, 2):
-            stage = k % stages
-            cute.arch.mbarrier_wait(bar_empty + stage, (k // stages + 1) % 2)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, A_STAGE)
-                k0 = (first + k) * self.cta_k
-                self.issue_a(ring + stage * A_STAGE, bar_full + stage, a_map, k0, row0)
-                if cutlass.const_expr(k == 0 and self.smem_tiles > 0):
-                    for s in cutlass.range_constexpr(self.smem_tiles):
-                        k_a = (first + self.tmem_tiles + s) * self.cta_k
-                        cute.arch.mbarrier_arrive_and_expect_tx(a_full + s, A_STAGE)
-                        self.issue_a(data + s * A_STAGE, a_full + s, a_map, k_a, row0)
 
     @cute.experimental.jit
     def x_warp64(
