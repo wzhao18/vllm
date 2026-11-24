@@ -72,7 +72,8 @@ def test_wide_sk_padded_rows(rows):
         pytest.skip("die-local GEMM needs a two-die device")
     n, k = 10240, 1024
     padded = -(-rows // 32) * 32
-    if not wide_sk.supports(padded, n, k, pairs):
+    spread = not wide_sk.supports(padded, n, k, pairs)  # as the drafter picks
+    if not wide_sk.supports(padded, n, k, pairs, spread=spread):
         pytest.skip(f"shape not supported at {pairs} pairs per die")
     torch.manual_seed(rows)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
@@ -80,7 +81,7 @@ def test_wide_sk_padded_rows(rows):
     buf = torch.full((padded + 32, k), float("nan"), device="cuda", dtype=torch.bfloat16)
     x = buf[:rows]
     x.normal_()
-    gemm = wide_sk.PreparedWideSK(w, [rows], place=False, pad=True).prepare()
+    gemm = wide_sk.PreparedWideSK(w, [rows], place=False, spread=spread, pad=True).prepare()
     assert gemm.takes(x)
     ref = (x.float() @ w.float().t()).bfloat16()
     first = None

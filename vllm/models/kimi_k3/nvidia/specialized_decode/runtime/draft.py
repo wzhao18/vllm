@@ -1028,11 +1028,17 @@ class DraftFastPath:
             and model.logits_processor.scale == 1.0
             and model.logits_processor.soft_cap is None
         )
+        spread = False
         if ok:
             _, pairs = wide_sk.die_pairs(weight.device)
-            ok = all(
-                wide_sk.supports(pad(r), vocab_rank, weight.shape[1], pairs) for r in rows
+            fits = lambda spread: all(  # noqa: E731
+                wide_sk.supports(pad(r), vocab_rank, weight.shape[1], pairs, spread)
+                for r in rows
             )
+            # More ranges than one partner per tile (the TP16 shard: 20 tiles per
+            # die over ~53 CTA pairs): the any-ranges-per-tile reduction.
+            spread = not fits(False)
+            ok = fits(spread)
         if not ok:  # NQ-NOFALLBACK
             if self.strict:
                 refuse(
@@ -1043,7 +1049,11 @@ class DraftFastPath:
             self.sk_batches = frozenset()
             return
         self.lm_sk = wide_sk.PreparedWideSK(
-            weight[:vocab_rank], rows, place=self.tp not in SK_LM_HEAD_IN_PLACE, pad=True
+            weight[:vocab_rank],
+            rows,
+            place=self.tp not in SK_LM_HEAD_IN_PLACE,
+            spread=spread,
+            pad=True,
         ).prepare()
         logger.info_once(
             "Kimi K3 DSpark drafter: die-local stream-K LM-head GEMM for draft rows %s",
