@@ -390,6 +390,7 @@ class _Rank:
         draft_window: int | None = None,
         decoder: bool | None = None,
         draft_hit_unit: int | None = None,
+        dcp: int | None = None,
     ):
         # KDA layers first: the KV cache groups are then KDA, KDA, DSA, so the
         # attention group is not group 0. With ``draft_window``, the release
@@ -458,6 +459,7 @@ class _Rank:
         }
 
         self.tp, self.rank, self.block_size = tp, rank, block_size
+        self.dcp = tp if dcp is None else dcp
         self.worker = self._start_worker(
             fabric, layers, {"kv_lease_check": False, **(extra_config or {})}
         )
@@ -512,12 +514,13 @@ class _Rank:
             cache_config=SimpleNamespace(
                 block_size=self.block_size,
                 get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
+                enable_prefix_caching=True,
             ),
             scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=tp,
                 prefill_context_parallel_size=1,
-                decode_context_parallel_size=tp,
+                decode_context_parallel_size=self.dcp,
                 pipeline_parallel_size=1,
                 cp_kv_cache_interleave_size=1,
             ),
