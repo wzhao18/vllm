@@ -306,8 +306,11 @@ def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
     TOKEN_SHARD_GEMM_AR_MIN_TOKENS tokens on.
     """
     parallel_config = vllm_config.parallel_config
+    # PASP measurement arm: the P/D prefill worker runs full sequence parallelism
+    # (GEMM-RS + SP all-gather) instead of the MoE token shard.
     return (
-        pd_prefill_worker(vllm_config)
+        False
+        and pd_prefill_worker(vllm_config)
         and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         and parallel_config.enable_expert_parallel
         and parallel_config.pipeline_parallel_size == 1
