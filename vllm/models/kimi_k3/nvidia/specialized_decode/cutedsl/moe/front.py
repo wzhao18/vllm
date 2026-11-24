@@ -547,6 +547,11 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # TP8 (DFn on Rubin): the TP16 verify entries (the shared expert's down rows are 2x
 # the TP16 shard, so SharedDown on GB300's 3-6 SMs outlasts the experts there too).
 SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
+# Rubin TP16 verify batches of at most 8 rows whose shared down rows run ``SharedDown``
+# on this many SMs beside the routed experts, behind the gate/up GEMM's SiTU epilogue
+# (``SITU_FUSED_WIDE``), instead of a split-K down GEMM the routed experts wait for
+# (they then pushed the shared rows themselves: ``tail_runtime.RUBIN_EXPERTS_PUSH``).
+SITU_SPLIT_WIDE = {16: ("", "8:12")}
 
 
 def split_table(tp, verify, wide):
@@ -737,9 +742,16 @@ class SharedFront:
         verify = q > 1
         split = split_table(tp, verify, wide)
         self.split = {b: split[b] for b in fused if split.get(b)}  # down SMs
-        if fused:  # TMA maps and counters of the fused kernel
+        # SiTU-epilogue batches whose down rows run SharedDown beside the experts.
+        situ_split = batch_table(SITU_SPLIT_WIDE.get(tp, ("", ""))[verify] if wide else "")
+        self.situ_down: dict[int, object] = {}
+        for b in batches:
+            if situ_split.get(b) and b in fuse:
+                self.split[b] = situ_split[b]
+                self.situ_down[b] = compile_down(tp, b, dev, situ_split[b])
+        if fused or self.situ_down:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
-            self.fused = to_cute(self.maps, 64), to_cute(counters)
+            self.fused = to_cute(self.maps, 64), to_cute(counters) if fused else None
         merged_spec = MERGED[tp]
         if wide and tp in MERGED_WIDE:
             merged_spec = f"{merged_spec},{MERGED_WIDE[tp]}"
@@ -810,7 +822,7 @@ class SharedFront:
             if b in self.merged:
                 gate = compile_shared(tp, b, dev, True, geometry)
                 code = gate, compile_down(tp, b, dev, self.split[b])
-            elif b in self.split:
+            elif b in self.split and b not in self.situ_down:
                 gate = compile_shared(tp, b, dev, gate=True)
                 code = gate, compile_down(tp, b, dev, self.split[b])
             elif b in fused:
@@ -891,6 +903,10 @@ class SharedFront:
             return views[5], lambda: down(args[7], maps, *mailbox, stream(self.device))
         if self.gate_situ is not None and x.shape[0] in self.gate_situ.kernels:
             self.gate_situ.run(x, views[4])  # h straight from the gate/up GEMM
+            if (down := self.situ_down.get(x.shape[0])) is not None:
+                mailbox = (tail.peers, *tail.ring, Int32(CAP))
+                maps = self.fused[0]
+                return views[5], lambda: down(args[7], maps, *mailbox, stream(self.device))
         else:
             self.gate_up.run(x, views[1])
             situ(*args, s)

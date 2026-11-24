@@ -76,8 +76,9 @@ class MoEScratch:
             )
 
 
-# TP8 B16: the experts start beside the split gate/up half (+1% E2E).
-JOIN = {8: "9-16:0", 16: ""}
+# TP8 B16: the experts start beside the split gate/up half (+1% E2E). TP16 8 rows
+# (``front.SITU_SPLIT_WIDE``): the experts no longer wait for the shared expert.
+JOIN = {8: "9-16:0", 16: "8:0"}
 # Rubin-class TP16 batches whose routing releases the experts early
 # (``SharedFront.release_early``; ``front.RELEASE_AFTER_FRONT_WIDE`` picks the release
 # once the front kernel completed). M64 (B8 verify; SharedDown on its split SMs): the
@@ -144,7 +145,8 @@ class PreparedMoE:
         for b in (b for b in state.batches if b <= CAP):
             _, expanded, buffers = state.views[b]
             publish, planned = tail.publish.get(b, ()), front.planned(b)
-            if publish and experts_push(state.tp, b, state.device):
+            beside = b in getattr(front, "situ_down", {})  # SharedDown pushes them
+            if publish and not beside and experts_push(state.tp, b, state.device):
                 # The experts push the shared rows; they must launch after the shared
                 # expert completed, i.e. join the side stream before (``run``): their
                 # grid spans every SM (``experts_push`` keys on it).
