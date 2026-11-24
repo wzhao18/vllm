@@ -165,6 +165,12 @@ def candidates(shape, rows):
                 out.append((64, n, split, stages))
     if k == HIDDEN and 33 <= rows <= 64:
         out += list(TMEM)
+    if k == HIDDEN and 65 <= rows <= 128:
+        # SplitKTmemGemm64's wider N tiles (80 / 96 / 128 activation rows)
+        n = next(t for t in (80, 96, 128) if rows <= t)
+        tiles = {80: 13, 96: 13, 128: 12}[n]
+        out += [(128, n, split, slots, tiles) for split in (4, 6, 7, 8)
+                for slots in (8, 12, 16)]  # fmt: skip
     return list(dict.fromkeys(out))
 
 
