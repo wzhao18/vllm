@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3 specialized decode: per-call time of the small-batch routed experts
-(TP16 per-rank shapes, M8 ``RubinExpertsKernel`` / M16-64 ``RubinGroupedExpertsKernel``)
+(TP16 per-rank shapes, M8 ``RubinExpertsKernel`` / M16-64 ``RubinGroupedExpertsKernel`` /
+M65+ the wide engines through ``WideExperts``)
 on one Rubin GPU, cold weights (L2 flushed before every call), verify-like routes.
 
 Builds the production weights and launches exactly as
@@ -74,17 +75,26 @@ def main():
     built = t.production_experts(t.logical_weights(dev), dev)
     flush = torch.empty(1 << 29, dtype=torch.uint8, device=dev)
     for rows in args.rows:
-        ids, _, latent = t.verify_routes(rows, dev, q=args.q)
+        ids, topk_w, latent = t.verify_routes(rows, dev, q=args.q)
         latent, ids = latent.contiguous(), ids.contiguous()
-        buffers = er.scratch(16, dev)
+        buffers = er.scratch(16, dev, rows=max(rows, 64))
         experts = er.PersistentExperts(
             *built["weights"], beta=t.BETA, linear_beta=t.LINEAR_BETA,
             dies=built["dies"], q=4,
         )  # fmt: skip
         out = torch.empty(rows * t.TOPK, t.H_LATENT, dtype=torch.bfloat16, device=dev)
-        experts.prepare(rows, buffers, out, (), True, False, False)
-        rubin = rows in experts.rubin
-        if rubin:
+        wide, rubin = None, False
+        if rows > 64:  # the wide engines (``WideExperts``, plan written in front)
+            partial = torch.empty(rows, t.H_LATENT, dtype=torch.bfloat16, device=dev)
+            wide = er.WideExperts(experts, buffers, {rows: partial}, planned=True)
+            writer = er.compile_wide_plan(rows, dev.index)
+            kernel = "RubinVWExpertsKernel" if experts.wide[rows] > 8 else "Wide"
+        else:
+            experts.prepare(rows, buffers, out, (), True, False, False)
+            rubin = rows in experts.rubin
+        if wide is not None:
+            pass
+        elif rubin:
             writer = er.compile_image_plan(rows, dev.index)
             kernel = "RubinExpertsKernel"
         else:
@@ -92,6 +102,8 @@ def main():
             writer = er.compile_plan(rows, dev.index)
             kernel = "RubinGroupedExpertsKernel"
         mailbox = rubin and er.polled(16, rows, dev)
+        if wide is not None:
+            out = partial
         if mailbox:  # the routing kernel's ids and copy-CTA count
             box = torch.full((er.ROUTE_WORDS,), -1, dtype=torch.int32, device=dev)
             box[: rows * t.TOPK] = ids.reshape(-1)
@@ -103,7 +115,10 @@ def main():
                 er.route_mailbox(buffers["workspace"]).copy_(box)
             flush.zero_()
             start.record()
-            experts.run(latent, ids)
+            if wide is not None:
+                wide.run(latent, topk_w, ids)
+            else:
+                experts.run(latent, ids)
             end.record()
 
         start = torch.cuda.Event(enable_timing=True)
@@ -128,7 +143,7 @@ def main():
             f"out {digest.hexdigest()[:16]}",
             flush=True,
         )
-        if trace is not None and not rubin:
+        if trace is not None and not rubin and wide is None:
             trace.zero_()
             call()
             torch.cuda.synchronize()
