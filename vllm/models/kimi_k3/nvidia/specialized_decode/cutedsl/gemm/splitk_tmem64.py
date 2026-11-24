@@ -377,10 +377,15 @@ class SplitKTmemGemm64(SplitKGemm):
         elif warp_idx == 3:
             _cluster_phases()
         else:
+            # The N tile's real token columns (2-D x: past the last token only the
+            # TMA's zero fill; the 3-D request map keeps the whole tile).
+            live = Int32(self.n)
+            if cutlass.const_expr(x_map is None):
+                live = cutlass.min(live, Int32(mB.layout.shape[0]) - n_idx * self.n)
             self.reduce_scatter64(
                 cute.arch.thread_idx()[0] - 128, bar_mma_epilog, bar_tmem_alloc,
                 tmem_base_ptr, data, bar_reduce, split_rank, out,
-                bidx * self.cta_m, n_idx * self.cta_n, l_idx,
+                bidx * self.cta_m, n_idx * self.cta_n, l_idx, live,
             )  # fmt: skip
 
     def issue_a(self, dst, barrier, a_map, k0, row0):
@@ -548,11 +553,14 @@ class SplitKTmemGemm64(SplitKGemm):
         self, epi_tid: cutlass.Int32, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr,
         data: Int32, bar_reduce, split_rank: cutlass.Int32, out,
         row0: cutlass.Int32, col0: cutlass.Int32, l_idx: cutlass.Int32,
+        live: cutlass.Int32,
     ):  # fmt: skip
         """Accumulator row ``epi_tid`` (64 FP32 token columns) -> slot
         ``split_rank`` of its owner's mailbox [split][16 quads][SHARE rows][4]
         (``st.async`` after the cluster barrier); owners sum the slots in rank order
-        and ``finish``."""
+        and ``finish``. Only the quads holding the tile's ``live`` real tokens cross
+        DSMEM (the rest are never stored by ``finish``; per token the sum is
+        unchanged)."""
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         _fence_tcgen05()
@@ -567,7 +575,8 @@ class SplitKTmemGemm64(SplitKGemm):
 
         split, share = self.split_k, self.share
         quads: cutlass.Constexpr = self.n // 4  # a row's token quads
-        slot_bytes = quads * share * 16
+        live_quads = cutlass.min(Int32(quads), (live + 3) // 4)
+        slot_bytes = live_quads * share * 16
         if (epi_tid == 0) & (split_rank < self.owners):
             expected = (split - 1) * slot_bytes
             cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
@@ -588,7 +597,8 @@ class SplitKTmemGemm64(SplitKGemm):
         else:
             for i in cutlass.range_constexpr(quads):
                 quad = tuple(values[4 * i + j] for j in range(4))
-                push_float(mailbox + i * share * 4, quad, bar_reduce, owner)
+                when = live_quads > i
+                push_float(mailbox + i * share * 4, quad, bar_reduce, owner, when)
         if split_rank < self.owners:
             named_barrier(3, 128)  # this CTA's own slot
             _wait_cluster(bar_reduce, Int32(0))
