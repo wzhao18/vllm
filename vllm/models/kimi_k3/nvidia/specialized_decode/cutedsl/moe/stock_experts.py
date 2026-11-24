@@ -66,6 +66,9 @@ class StockExperts:
         [M, top_k] and ``topk_ids`` [M, top_k] from the stock router; returns the
         partial (copied into ``out`` [M, hidden] when given)."""
         routed = self.routed
+        from . import route_census  # MEASUREMENT BUILD ONLY
+
+        route_census.record(self, topk_ids, routed.global_num_experts)
         partial = self.kernel.apply(
             hidden_states=latent,
             w1=routed.w13_weight,

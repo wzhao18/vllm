@@ -751,6 +751,13 @@ class PersistentExperts:
         return bool(self.rows64.get(batch)) and rubin64(self.tp, 64, self.device)
 
     def run(self, x, ids, weights=None):
+        out = self._run(x, ids, weights)
+        from . import route_census  # MEASUREMENT BUILD ONLY
+
+        route_census.record(self, ids, self.experts)
+        return out
+
+    def _run(self, x, ids, weights=None):
         batch = x.shape[0]
         if batch not in self.chunks:
             return self.launch(batch, x, ids, weights)

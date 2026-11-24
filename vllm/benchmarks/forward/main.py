@@ -221,6 +221,18 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         result = bench.run()
         if fixture is not None:
             fixture.check_applied()
+        # MEASUREMENT BUILD ONLY (L6 route census): report-only routed-expert stats
+        from vllm.distributed.parallel_state import get_world_group
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+            route_census,
+        )
+
+        torch.cuda.synchronize()
+        if get_world_group().rank in (0, 1, 4, 15):
+            route_census.report(
+                case.name, batch.num_tokens, args.profile_dir,
+                get_world_group().rank,
+            )  # fmt: skip
     finally:
         runner.execute_model(batch.finish())
         if fixture is not None:
