@@ -133,15 +133,17 @@ ROUTE_CARVEOUT_ROWS = {"*": ""}
 
 
 @functools.cache
-def compile_front_rows(valid, split, shard, hidden, rows, device, n=64):
+def compile_front_rows(valid, split, shard, hidden, rows, device, n=64, issuers=2):
     """``MoeFrontRows`` over the packed front rows (router ``valid`` padded to
     ``split``, then the latent shard) and ``hidden`` gate/up pairs (0: none) into a
-    front box of ``rows`` rows, ``n``-token tiles; any tokens."""
+    front box of ``rows`` rows, ``n``-token tiles; any tokens; ``issuers``: the
+    pre-wait weight stream's TMA issuing warps."""
     from .front_tmem import MoeFrontRows
 
     kernel = MoeFrontRows(
-        valid=valid, split_rows=split, shard=shard, hidden=hidden, n=n
-    )
+        valid=valid, split_rows=split, shard=shard, hidden=hidden, n=n,
+        issuers=issuers,
+    )  # fmt: skip
 
     def matrix(rank=3):
         shape = tuple(cute.sym_int() for _ in range(rank))

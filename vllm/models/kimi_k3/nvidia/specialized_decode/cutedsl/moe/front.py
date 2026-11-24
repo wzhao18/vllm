@@ -655,12 +655,15 @@ def compile_route(
 
 
 @functools.cache
-def compile_front_tmem(split, valid, shard, hidden, device):
+def compile_front_tmem(split, valid, shard, hidden, device, issuers=2):
     """``MoeFrontTmem64``: the packed front rows (router ``valid`` padded to
-    ``split``, then the latent shard) and ``hidden`` gate/up pairs."""
+    ``split``, then the latent shard) and ``hidden`` gate/up pairs; ``issuers``: the
+    pre-wait weight stream's TMA issuing warps."""
     from .front_tmem import MoeFrontTmem64
 
-    kernel = MoeFrontTmem64(valid=valid, split_rows=split, shard=shard, hidden=hidden)
+    kernel = MoeFrontTmem64(
+        valid=valid, split_rows=split, shard=shard, hidden=hidden, issuers=issuers
+    )
 
     def matrix():
         shape = tuple(cute.sym_int() for _ in range(3))
