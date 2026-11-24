@@ -49,7 +49,7 @@ from ..common.host import (
     stream,
     to_cute,
 )
-from ..common.mailbox import fetch, poll, rearm
+from ..common.mailbox import poll, rearm
 from ..common.policy import batch_table
 from ..common.primitives import (
     add_rn,
@@ -132,22 +132,6 @@ def norm_polled(tp, rows):
     return bool(batch_table(NORM_POLLED.get(tp, "")).get(rows))
 
 
-# Rows whose LatentRows also runs NormRows' work (``LatentRows(norm=True)``, 448
-# threads: thread t is the row's 8-column cell t, as in NormRows): once a CTA's owner
-# reduces are issued it polls the gathered rows c, c + grid, ... (every row's fragment
-# at once), RMS-normalizes them and sums their shared RS slots, so the separate
-# NormRows launch, its PDL release behind LatentRows' grid end and the stream join
-# before it leave the tail. Same words and the same FP32 operation order as NormRows:
-# bitwise. Open-ended: LatentRows' fixed grid (112 CTAs) is co-resident once the
-# experts' grid drains, its rows' owner reduces precede every poll, and the shared
-# rows' push needs one SM beside it.
-LATENT_NORM = {16: "65-:1"}
-
-
-def latent_norm(tp, rows):
-    return bool(batch_table(LATENT_NORM.get(tp, "")).get(rows))
-
-
 class TailRowsBox:
     """The wide tail's mailboxes and scratch at ``cap`` rows: latent two-shot (3
     parities, width 3584), shared RS slots [3, TP, cap, H / TP] with the owners'
@@ -200,30 +184,19 @@ class LatentRows:
     the partial arrives unfinalized (``UnfinalizedMoEOutput``: permuted unweighted rows
     [P, 3584], routing weights [M, topk], permute map [M, topk], -1 = not local) and
     each pushed chunk is its top-k sum: FP32 fused multiply-adds in k order, rounded
-    once to BF16 (a stated FP32 reorder vs the experts' own finalize).
+    once to BF16 (a stated FP32 reorder vs the experts' own finalize)."""
 
-    ``norm`` (``LATENT_NORM``, ``rows`` static): NormRows' work in the same grid
-    (448 threads, thread t on the 8-column cell t of a row): after its items' owner
-    reduces, CTA c sums the shared RS slots of its rows c, c + grid, ... into
-    ``shared`` and RMS-normalizes their gathered latent rows into ``xnorm`` (extra
-    arguments xnorm, gamma, rs, shared, eps as NormRows takes them)."""
-
-    def __init__(self, tp, grid=112, chunk=2, topk=0, pushed=False, norm=False, rows=0):
+    def __init__(self, tp, grid=112, chunk=2, topk=0, pushed=False):
         self.tp, self.grid, self.width, self.chunk = tp, grid, LATENT // tp, chunk
         self.topk = topk
         # ``pushed``: the experts pushed every row's chunks already (EXPERTS_PUSH):
         # reduce only (the partial argument is not read).
         self.pushed = pushed
         assert not (pushed and topk)
-        self.norm, self.shard = norm, H // tp
-        self.threads = LATENT // 8 if norm else 256
-        # rows per CTA in the norm phase (CTA c: rows c, c + grid, ...)
-        self.per_cta = -(-rows // grid) if norm else 0
-        assert not norm or rows > 0
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.grid, self.threads)
+        launch(self.kernel, args, self.grid, 256)
 
     @cute.jit
     def finalize(self, rows, weights, index, token, column):
@@ -250,9 +223,6 @@ class LatentRows:
 
     @cute.kernel
     def kernel(self, args):
-        if cutlass.const_expr(self.norm):
-            xnorm, gamma, rs, shared, eps = args[-5:]
-            args = args[:-5]
         if cutlass.const_expr(self.topk > 0):
             rows, weights, index = args[:3]
             slots, peers, slot, recv, gather, gather_mc, rank = args[3:]
@@ -261,10 +231,7 @@ class LatentRows:
             partial, slots, peers, slot, recv, gather, gather_mc, rank = args
             M = partial.shape[0]
         tid, _, _, cta = thread()
-        threads: cutlass.Constexpr = self.threads
         per: cutlass.Constexpr = self.width // 8  # 8-column chunks per owner row
-        if cutlass.const_expr(self.norm):  # static: before the wait
-            gw = load_words(gamma.iterator + tid * 8, count=4)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         chunk: cutlass.Constexpr = self.chunk
@@ -272,7 +239,7 @@ class LatentRows:
         for c in cutlass.range(cta, chunks, self.grid, unroll=1):
             row0 = c * chunk
             pushes = 0 if self.pushed else chunk * (LATENT // 8)
-            for v in cutlass.range(tid, pushes, threads, unroll=1):
+            for v in cutlass.range(tid, pushes, 256, unroll=1):
                 token, column = row0 + v // (LATENT // 8), v % (LATENT // 8) * 8
                 if token < M:
                     if cutlass.const_expr(self.topk > 0):
@@ -286,84 +253,11 @@ class LatentRows:
             # (a thread per owned 8-column cell; more cells than threads (TP < 16:
             # chunk x width / 8 > 256) loop, else every row past 256 / per of an
             # item was never reduced and NormRows polled its gather row forever)
-            for v in cutlass.range(tid, chunk * per, threads, unroll=1):
+            for v in cutlass.range(tid, chunk * per, 256, unroll=1):
                 token = row0 + v // per
                 if token < M:
                     column = rank * self.width + v % per * 8
                     reduce(recv, gather, gather_mc, rank, token, column, True)
-        if cutlass.const_expr(self.norm):
-            self.norm_rows(xnorm, gather, gw, rs, shared, eps, M)
-
-    @cute.jit
-    def norm_rows(self, xnorm, gather, gw, rs, shared, eps, M):
-        """NormRows on rows cta + i grid (i < per_cta): the shared RS slots first
-        (one thread per (row, 8-column cell)), then every row's gathered fragment
-        polled at once and normalized: per row the same squares, warp butterfly,
-        14-warp sum and scaling as NormRows (bitwise)."""
-        tid, warp, lane, cta = thread()
-        R: cutlass.Constexpr = self.per_cta
-        threads: cutlass.Constexpr = self.threads
-        cells: cutlass.Constexpr = self.shard // 8
-        smem = cutlass.utils.SmemAllocator()
-        partials = smem.allocate_tensor(Float32, cute.make_layout(16 * R), 16)
-        stride = rs.shape[1] * self.shard  # RS slot stride
-        for v in cutlass.range(tid, R * cells, threads, unroll=1):
-            token = cta + v // cells * self.grid
-            cell = v % cells
-            if token < M:
-                base = rs.iterator + token * self.shard + cell * 8
-                slots = poll(base, stride, self.tp)
-                acc = zeros(8, Float32)
-                for s in cutlass.range_constexpr(self.tp):
-                    rearm(base + s * stride)
-                    for k in cutlass.range_constexpr(8):
-                        acc[k] = acc[k] + bf16(slots[s, k // 2], k % 2)
-                for k in cutlass.range_constexpr(8):
-                    shared[token, cell * 8 + k] = acc[k]
-        got = cute.make_rmem_tensor((R, 4), Uint32)
-        pending = Uint32(0)
-        for i in cutlass.range_constexpr(R):
-            for k in cutlass.range_constexpr(4):
-                got[i, k] = Uint32(0)
-            if cta + i * self.grid < M:
-                cell = at(gather, 0, cta + i * self.grid, tid * 8)
-                pending = pending | fetch(got, i, cell)
-        while pending != 0:
-            again = Uint32(0)
-            for i in cutlass.range_constexpr(R):
-                if (pending >> i) & 1:
-                    cell = at(gather, 0, cta + i * self.grid, tid * 8)
-                    again = again | fetch(got, i, cell)
-            pending = again
-        x = cute.make_rmem_tensor((R, 8), Float32)
-        for i in cutlass.range_constexpr(R):
-            if cta + i * self.grid < M:
-                rearm(at(gather, 0, cta + i * self.grid, tid * 8))
-            for k in cutlass.range_constexpr(8):
-                x[i, k] = bf16(got[i, k // 2], k % 2)
-            square = x[i, 0] * x[i, 0]
-            for k in cutlass.range_constexpr(1, 8):
-                square = square + x[i, k] * x[i, k]
-            for shift in cutlass.range_constexpr(4, -1, -1):
-                square = add_rn(square, cute.arch.shuffle_sync_bfly(square, 1 << shift))
-            if lane == 0:
-                partials[16 * i + warp] = square
-        named_barrier(1, threads)
-        for i in cutlass.range_constexpr(R):
-            token = cta + i * self.grid
-            if token < M:
-                total = partials[16 * i]
-                for w in cutlass.range_constexpr(1, threads // 32):
-                    total = add_rn(total, partials[16 * i + w])
-                inverse = inv_rms(total, eps, m8=True)
-                words = tuple(
-                    pack_pair(
-                        (x[i, 2 * j] * inverse) * bf16(gw[j]),
-                        (x[i, 2 * j + 1] * inverse) * bf16(gw[j], True),
-                    )
-                    for j in range(4)
-                )
-                store_words(at(xnorm, token, tid * 8), words)
 
 
 class NormRows:
@@ -492,15 +386,10 @@ def _compile_rows(kind, tp, rows, cap, device, chunk=None, deferred=None):
             args = (fake((rows, H), (H, 1)), fake((tp,), None, torch.int64))
             args += (Int32(0), Int32(0), Int32(cap))
             return cute.compile(PushShared(tp), *args, s)
-        if kind.startswith("latent"):  # latent[_pushed][_norm]
-            norm = kind.endswith("_norm")
+        if kind in ("latent", "latent_pushed"):
             args = (fake((rows, LATENT), (LATENT, 1)), fake((3 * tp, cap, width)))
             args += (fake((tp,), None, torch.int64), Int32(0), fake((tp, cap, width)))
             args += (fake((1, cap, LATENT)), Int64(0), Int32(0))
-            if norm:  # NormRows' arguments (``LatentRows(norm=True)``)
-                args += (fake((rows, LATENT), (LATENT, 1)), fake((LATENT,), (1,)))
-                args += (fake((tp, cap, shard)),)
-                args += (fake((rows, shard), (shard, 1), torch.float32), Float32(1e-6))
             chunk = chunk or latent_chunk(rows)
             topk = 0
             if deferred is not None:  # (top-k, routing weights dtype): unfinalized
@@ -509,10 +398,8 @@ def _compile_rows(kind, tp, rows, cap, device, chunk=None, deferred=None):
                 routing = (fake((rows, topk), (topk, 1), dtype),)
                 routing += (fake((rows, topk), (topk, 1), torch.int32),)
                 args = (permuted, *routing, *args[1:])
-            pushed = kind.startswith("latent_pushed")
-            kernel = LatentRows(
-                tp, chunk=chunk, topk=topk, pushed=pushed, norm=norm, rows=rows
-            )
+            pushed = kind == "latent_pushed"
+            kernel = LatentRows(tp, chunk=chunk, topk=topk, pushed=pushed)
             return cute.compile(kernel, *args, s)
         if kind == "norm":
             args = (fake((rows, LATENT), (LATENT, 1)), fake((1, cap, LATENT)))
@@ -537,7 +424,7 @@ class PreparedTailRows:
 
     def __init__(
         self, tp, rank, up, gamma, eps, batches, box, ordinal, *, chunk=None,
-        gemm=UP_GEMM, sharded=None, deferred=None, experts_push=(), norm_rows=None,
+        gemm=UP_GEMM, sharded=None, deferred=None, experts_push=(),
     ):  # fmt: skip
         if max(batches) > box.cap:
             raise ValueError(f"wide MoE tail batches {batches} exceed {box.cap} rows")
@@ -586,21 +473,16 @@ class PreparedTailRows:
             for b in experts_push
             if table.get(b) and b in batches and b <= WIDE_MAX  # (one launch)
         }
-        # ``norm_rows``: batches whose LatentRows runs NormRows' work (default
-        # LATENT_NORM).
-        if norm_rows is None:
-            norm_rows = {b for b in batches if latent_norm(tp, b)}
-        self.norm_rows = set(norm_rows) & set(batches)
-
-        def kind(k, b):
-            if k != "latent":
-                return k
-            k += "_pushed" if b in self.experts_push else ""
-            return k + ("_norm" if b in self.norm_rows else "")
-
         self.codes = {
             b: tuple(
-                compile_rows(kind(k, b), tp, b, box.cap, device, chunk)
+                compile_rows(
+                    "latent_pushed" if k == "latent" and b in self.experts_push else k,
+                    tp,
+                    b,
+                    box.cap,
+                    device,
+                    chunk,
+                )  # fmt: skip
                 for k in ("push", "latent", "norm", "out")
             )
             for b in batches
@@ -614,9 +496,8 @@ class PreparedTailRows:
             for b in set(batches) & set(deferred[0]):
                 self.deferred[b] = {
                     dtype: compile_rows(
-                        kind("latent", b) if b not in self.experts_push else "latent",
-                        tp, b, box.cap, device, chunk, (topk, dtype),
-                    )  # fmt: skip
+                        "latent", tp, b, box.cap, device, chunk, (topk, dtype)
+                    )
                     for dtype in (torch.bfloat16, torch.float32)
                 }
         recv, peers, gather, gather_mc = box.latent.views(parity)
@@ -660,32 +541,30 @@ class PreparedTailRows:
         _, latent, norm, out = self.codes[b]
         if b in self.experts_push and isinstance(partial, UnfinalizedMoEOutput):
             raise RuntimeError(f"B{b}: the wide tail expects the experts' push")
-        box = self.box
-        xnorm, up, shared = box.xnorm[:b], box.up[:b], box.shared[:b]
-        norm_args = (to_cute(xnorm), self.gamma, self.rs, to_cute(shared), self.eps)
-        # LatentRows with NormRows' work (``LATENT_NORM``): no NormRows, no join
-        # (its CTAs poll the RS slots the push fills; the caller joins at the end).
-        fused = b in self.norm_rows
-        extra = norm_args if fused else ()
         if isinstance(partial, UnfinalizedMoEOutput):
-            s = stream(partial.gemm2_permuted.device)
+            box, s = self.box, stream(partial.gemm2_permuted.device)
             weights, index = (
                 partial.expert_weights,
                 partial.expanded_idx_to_permuted_idx,
             )
             code = self.deferred[b][weights.dtype]
             routing = (to_cute(weights[:b]), to_cute(index[:b]))
-            code(
-                dynamic_view(partial.gemm2_permuted), *routing, *self.latent_args,
-                *extra, s,
-            )  # fmt: skip
+            code(dynamic_view(partial.gemm2_permuted), *routing, *self.latent_args, s)
         else:
-            s = stream(partial.device)
-            latent(to_cute(partial[:b]), *self.latent_args, *extra, s)
-        if not fused:
-            if join is not None:
-                join()
-            norm(*norm_args[:1], self.gather, *norm_args[1:], s)
+            box, s = self.box, stream(partial.device)
+            latent(to_cute(partial[:b]), *self.latent_args, s)
+        if join is not None:
+            join()
+        xnorm, up, shared = box.xnorm[:b], box.up[:b], box.shared[:b]
+        norm(
+            to_cute(xnorm),
+            self.gather,
+            self.gamma,
+            self.rs,
+            to_cute(shared),
+            self.eps,
+            s,
+        )
         if b in self.fused_rows and b not in self.owners:
             from ..gemm.projection import matrix_view
 
