@@ -499,6 +499,18 @@ class SpStep:
         self.draft_tables = () if self.gqa_drafter else check_stock_drafter(ctx.tp)
         self.aux_layers = tuple(backbone.aux_hidden_state_layers)
         self.buffers: dict[str, torch.Tensor] = {}
+        # The stock DSA-DP layers' attention on the owner segment: the stock forward
+        # with packed projections (``dep_dsa.DepDsa``), segments of R / TP rows.
+        self.dep_dsa = {}
+        if self.stock_dsa:
+            from .dep_dsa import DepDsa
+
+            segments = tuple(sorted({r // ctx.tp for r in rows}))
+            for d in layers:
+                if d.layer_idx in self.stock_dsa:
+                    self.dep_dsa[d.layer_idx] = DepDsa(
+                        d.self_attn, rows=segments, ctx=ctx, scratch=self.scratch
+                    )
         owner = runtime.group, self.device, ctx.tp, ctx.rank
         self.comm = SpComm(*owner, width=WIDTH, rows_cap=rows[-1])
         # [hidden | aux...] rows of the final all-gather (every aux layer is this
@@ -652,8 +664,9 @@ class SpStep:
         if self.stock_dsa:
             declared["dsa_dp"] = (
                 f"{len(self.stock_dsa)} DSA layers: stock DSA-DP owner segment "
-                "(pre-AttnRes, dsa_dp.run_segment push in / all heads / push out, "
-                "post-AttnRes); their MLPs: moe_dense"
+                "(pre-AttnRes, dsa_dp.run_segment push in / all heads with packed "
+                "projections (dep_dsa.DepDsa) / push out, post-AttnRes); their MLPs: "
+                "moe_dense"
             )
         return declared
 
@@ -880,7 +893,8 @@ class SpStep:
         from ...ops import dsa_dp
 
         x, prefix_sum, residual = layer._pre_attn_norm(hidden, residual, prefix_sum)
-        x = dsa_dp.run_segment(layer.self_attn, step.positions, x)
+        attention = self.dep_dsa.get(layer.layer_idx, layer.self_attn)
+        x = dsa_dp.run_segment(attention, step.positions, x)
         return layer._post_attn_norm(x, residual, prefix_sum)
 
     def prepare_kv(self):
