@@ -435,7 +435,7 @@ class OprojUmma(OprojProducer):
 
     def __init__(
         self, k, *, twoshot=False, budget=184 * 1024, reduce=False, resident=False,
-        xmc=1,
+        xmc=1, x_lanes=None,
     ):  # fmt: skip
         # resident: every K block gets its own ring stage (12 x 16 KB at k 768, b<=64),
         # so all weights load before the PDL wait and x streams with no stage reuse.
@@ -457,6 +457,11 @@ class OprojUmma(OprojProducer):
         # argument (box {64, N / xmc}).
         self.xmc = xmc
         assert xmc == 1 or resident
+        # x_lanes (xmc): K block kb's multicast tile is issued by lane kb mod x_lanes
+        # of warp 0 (default one lane per block): a TMA issuing thread completes a
+        # bounded number of operations per unit time, so one thread issuing every
+        # block serialized the x stream. Same tiles: bitwise.
+        self.x_lanes = min(self.blocks, 32) if x_lanes is None else x_lanes
 
     def geometry(self, batches):
         """(N, ring stage bytes, stages, TMEM columns)."""
@@ -585,7 +590,7 @@ class OprojUmma(OprojProducer):
                     self.load(weight, tile, 64, -1, row0, kb * 64)
                     cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + slot)
                 if cutlass.const_expr(self.xmc > 1):
-                    if tid == 0:
+                    if tid == kb % self.x_lanes:
                         self.multicast_x(args, tile + 8192, bars.iterator + slot, n, kb)
                 else:
                     self.load(x, tile + 8192, n, x.shape[0], 0, kb * 64)
@@ -606,7 +611,7 @@ class OprojUmma(OprojProducer):
 
     @cute.jit
     def multicast_x(self, args, tile, barrier, n: Constexpr, kb: Constexpr):
-        """Thread 0: expect the whole x tile of K block ``kb``, then TMA-load this
+        """The issuing lane: expect the whole x tile of K block ``kb``, then TMA-load this
         cluster rank's 1 / xmc of its rows into every cluster CTA."""
         x_map = args[-1]
         rank = cute.arch.block_idx_in_cluster()

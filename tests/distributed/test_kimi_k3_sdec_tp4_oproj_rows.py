@@ -4,7 +4,10 @@
 weight-stationary tcgen05 over token chunks, two-shot reduce-scatter into the
 column owners, owner reduce and multicast gather) over 4 ranks of one node.
 
-x's tiles stream from one issuing lane per ring stage (``OprojUmmaRows.issuers``).
+x's tiles stream from one issuing lane per ring stage (``OprojUmmaRows.issuers``);
+the <= 64-row producer (``OprojUmma``, resident, x multicast over 4-CTA clusters)
+issues K block kb's multicast tile from lane kb (``OprojUmma.x_lanes``), checked the
+same way at rows 32 / 64.
 Per case (rows 72 / 128 / 256 / 512, chunks 64 / 80 / 96) every rank's x [M, 768] and
 weight [7168, 768] (BF16, random) through the producer with one issuing lane and with
 the default lanes:
@@ -25,6 +28,7 @@ import torch.distributed as dist
 WORLD = 4
 H, K, CAP = 7168, 768, 512
 CASES = ((72, 80), (128, 64), (256, 96), (512, 64))
+SMALL = (32, 64)  # OprojUmma (resident, xmc 4) rows
 TIMEOUT = 600
 SENTINEL = -0x80000000
 
@@ -68,6 +72,27 @@ def _compile(batch, chunk, issuers):
     kernel = OprojUmmaRows(K, chunk=chunk, issuers=issuers)
     assert kernel.issuers == (kernel.stages if issuers is None else issuers)
     return cute.compile(kernel, x, w, recv, peers, slot, box, mc, mc, make_fake_stream())
+
+
+def _compile_small(batch, x_lanes):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.producer import (
+        OprojUmma,
+    )
+
+    x, w = fake((batch, K), (K, 1)), fake((H, K), (K, 1))
+    recv, peers = fake((WORLD, CAP, H // WORLD)), fake((WORLD,), None, torch.int64)
+    box = fake((1, CAP, H), (CAP * H, H, 1))
+    mc, slot = cutlass.Int64(0), cutlass.Int32(0)
+    kernel = OprojUmma(
+        K, twoshot=True, reduce=True, resident=True, xmc=4, x_lanes=x_lanes
+    )
+    tail = (recv, peers, slot, box, mc, mc)
+    return cute.compile(kernel, x, w, *tail, make_fake_stream())
 
 
 def _worker(rank, port, result):
@@ -138,6 +163,31 @@ def _worker(rank, port, result):
         if rank == 0:
             print(f"TP4 oproj rows M{batch} chunk {chunk}: ok "
                   f"{time.monotonic() - start:.1f} s")  # fmt: skip
+    for batch in SMALL:
+        tma = weight_map(x_buffer[:batch], (batch + 7) // 8 * 8 // 4)
+        head = (
+            to_cute(recv), to_cute(peers), cutlass.Int32(rank), to_cute(gather),
+            cutlass.Int64(gather_mc), cutlass.Int64(tma.data_ptr()),
+        )  # fmt: skip
+        outs = []
+        for lanes in (1, None):
+            code = _compile_small(batch, lanes)
+            gather.view(torch.int32).fill_(SENTINEL)
+            torch.accelerator.synchronize()
+            dist.barrier()
+            code(to_cute(x_buffer[:batch]), to_cute(weight), *head, stream(dev))
+            torch.accelerator.synchronize()
+            dist.barrier()
+            outs.append(gather[0, :batch].clone())
+        assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+        ref = torch.zeros(batch, H, dtype=torch.float32, device=dev)
+        for xr, wr in zip(xs, ws):
+            part = torch.mm(xr[:batch].float(), wr.float().t()).to(torch.bfloat16)
+            ref = ref + part.float()
+        torch.testing.assert_close(outs[1].float(), ref, atol=2e-2, rtol=2e-2)
+        del tma
+        if rank == 0:
+            print(f"TP4 oproj umma M{batch} xmc 4: ok")
     dist.barrier()
     dist.destroy_process_group()
     result.put((rank, "ok"))
