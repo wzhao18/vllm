@@ -222,7 +222,6 @@ roles:
       VLLM_MM_EMBEDS_ON_CONSUMERS: '0'
       VLLM_USE_NCCL_SYMM_MEM: '0'
       NCCL_ALGO: allgather:nvls
-      VLLM_DSA_BPRIME_MAILBOX: '1'
       K31_DCPX_BUILD_DIR: /raid/scratch/k31nq-jitcache/integ-af10ccc2c4/dcpx
       K31_DSAC_BUILD_DIR: /raid/scratch/k31nq-jitcache/integ-af10ccc2c4/dsac
     args:

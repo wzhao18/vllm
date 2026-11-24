@@ -38,9 +38,10 @@ rank must call every merge, the merges of a step must be stream-ordered, and
 no rank may start the round-1 exchange of call ``n + 1`` before its rescue of
 call ``n`` has finished (true for the all-gather here).
 
-With a round-1 mailbox (``VLLM_DSA_BPRIME_MAILBOX``, ``init_dcp_topk_mailbox``)
-the all-gather goes away: the pack multicasts its row into slot ``[parity,
-row, rank]`` of every rank's symmetric mailbox, and the select polls its
+With the round-1 mailbox (``init_dcp_topk_mailbox``, built on every decode
+instance with multicast memory) the all-gather goes away: the pack
+multicasts its row into slot ``[parity, row, rank]`` of every rank's
+symmetric mailbox, and the select polls its
 row's ``W`` slots, copies them to shared memory and re-arms them (Lamport:
 ``0xFFFFFFFF`` marks an empty word; no candidate word takes that value, and
 the bit plane travels as half-words ``0x1xxxx``). A row's ``n``-th merge uses
@@ -2008,9 +2009,11 @@ def init_dcp_topk_mailbox(topk: int, local_topk: int, group: Any) -> bool:
 _EXCHANGE: list[str] = ["auto"]
 
 
-def set_dcp_topk_merge_exchange(exchange: str) -> None:
+def set_dcp_topk_merge_exchange(exchange: str) -> str:
+    """Set the round-1 exchange; returns the previous one."""
     assert exchange in ("auto", "all_gather"), exchange
-    _EXCHANGE[0] = exchange
+    previous, _EXCHANGE[0] = _EXCHANGE[0], exchange
+    return previous
 
 
 def _mailbox_for(topk: int, local_topk: int) -> _Mailbox | None:
