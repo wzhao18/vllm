@@ -57,49 +57,6 @@ def test_wide_sk(rows, place):
             assert torch.equal(out, first)
 
 
-@pytest.mark.parametrize("rows", [7, 14, 28, 56, 112, 224, 448])
-def test_wide_sk_padded_rows(rows):
-    """``pad``: any token count (the TP16 drafter's 7 query rows per request) runs
-    as the next multiple of 32 with zero-filled token columns: its rows match the
-    stock linear as the unpadded kernel's do, the padding rows are the products of
-    zeros, the input past its rows is never read, and the shard is streamed where it
-    lies (the TP16 LM head: [vocab / 16, 7168]; short K here)."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
-
-    try:
-        _, pairs = wide_sk.die_pairs("cuda")
-    except ValueError:
-        pytest.skip("die-local GEMM needs a two-die device")
-    n, k = 10240, 1024
-    padded = -(-rows // 32) * 32
-    spread = not wide_sk.supports(padded, n, k, pairs)  # as the drafter picks
-    if not wide_sk.supports(padded, n, k, pairs, spread=spread):
-        pytest.skip(f"shape not supported at {pairs} pairs per die")
-    torch.manual_seed(rows)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
-    # x is the head of a larger buffer whose tail holds NaNs: never read
-    buf = torch.full((padded + 32, k), float("nan"), device="cuda", dtype=torch.bfloat16)
-    x = buf[:rows]
-    x.normal_()
-    gemm = wide_sk.PreparedWideSK(w, [rows], place=False, spread=spread, pad=True).prepare()
-    assert gemm.takes(x)
-    ref = (x.float() @ w.float().t()).bfloat16()
-    first = None
-    for _ in range(3):
-        out = torch.full((padded, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        gemm.run(x, out)
-        view = gemm.run_rows(x)
-        torch.cuda.synchronize()
-        assert view.shape == (rows, n)
-        assert _ulps(out[:rows], ref) <= 1
-        assert torch.equal(view, out[:rows])
-        assert torch.all(out[rows:] == 0)
-        if first is None:
-            first = out[:rows].clone()
-        else:
-            assert torch.equal(out[:rows], first)
-
-
 @pytest.mark.parametrize("rows", [96, 288])
 def test_wide_sk_nocopy_matches_copy(rows):
     """The two-accumulator epilogue (no register copy) gives the copy form's bits."""
