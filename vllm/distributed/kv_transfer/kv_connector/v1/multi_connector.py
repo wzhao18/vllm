@@ -459,6 +459,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         connector = self._connectors[self._requests_to_connector[request.request_id]]
         return connector.get_loaded_kv_cache_group_ids(request)
 
+    def peek_external_hit(self, request: "Request") -> int | None:
+        hits = [h for c in self._connectors if (h := c.peek_external_hit(request))]
+        return max(hits) if hits else None
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

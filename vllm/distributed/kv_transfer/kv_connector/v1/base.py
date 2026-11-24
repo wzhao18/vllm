@@ -548,6 +548,11 @@ class KVConnectorBase_V1(ABC):
         """
         return self._kv_cache_config.prefix_cacheable_group_ids
 
+    def peek_external_hit(self, request: "Request") -> int | None:
+        """External-hit tokens of ``request``'s finished lookup, if one is at
+        hand; never starts, consumes or drops a lookup (a scheduling hint)."""
+        return None
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

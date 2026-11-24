@@ -3256,6 +3256,18 @@ class LookupKeyClient:
         result.known_prefix_tokens = known_prefix_tokens
         return result
 
+    def peek_hit(self, req_id: str) -> int | None:
+        """Hit length of ``req_id``'s finished lookup, without starting,
+        consuming, counting or dropping anything; None if there is none."""
+        with self._lock:
+            future = self.futures.get(req_id)
+            if future is None or not future.done() or future.cancelled():
+                return None
+        try:
+            return future.result().hit_length
+        except Exception:
+            return None
+
     def prefetch(
         self,
         req_id: str,

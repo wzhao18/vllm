@@ -246,6 +246,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_request_arrival_handled(request)
 
+    def peek_external_hit(self, request: Request) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.peek_external_hit(request)
+
     def get_num_new_matched_tokens(
         self,
         request: Request,

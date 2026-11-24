@@ -90,6 +90,8 @@ def create_scheduler(
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
     prefill_schedule_interval: int = 1,
+    prefill_hrrn: bool = False,
+    prefill_hrrn_max_wait_s: float = 30.0,
     scheduling_policy: SchedulerPolicy = "fcfs",
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
@@ -144,6 +146,8 @@ def create_scheduler(
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         prefill_schedule_interval=prefill_schedule_interval,
+        prefill_hrrn=prefill_hrrn,
+        prefill_hrrn_max_wait_s=prefill_hrrn_max_wait_s,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,

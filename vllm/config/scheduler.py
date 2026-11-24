@@ -224,6 +224,16 @@ class SchedulerConfig:
     of requests when GPU memory is scarce. Must be in the range [0.0, 1.0); 0.0
     (the default) disables the watermark."""
 
+    prefill_hrrn: bool = False
+    """Admit waiting requests by highest response ratio (wait + service) /
+    service instead of arrival order, with service the uncached prompt tokens
+    left (the KV connector's finished lookup gives the external hit), so short
+    prefills are not stuck behind long ones. FCFS policy only."""
+
+    prefill_hrrn_max_wait_s: float = Field(default=30.0, gt=0)
+    """With ``prefill_hrrn``: a request waiting this long is admitted first,
+    in arrival order, which bounds the wait of long prefills."""
+
     prefill_schedule_interval: int = Field(default=1, ge=1)
     """Only admit prefill once every N engine steps, leaving the steps in
     between to decode alone. 1 (the default) admits prefill on every step.

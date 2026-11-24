@@ -723,6 +723,8 @@ class EngineArgs:
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
+    prefill_hrrn: bool = SchedulerConfig.prefill_hrrn
+    prefill_hrrn_max_wait_s: float = SchedulerConfig.prefill_hrrn_max_wait_s
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
 
     watermark: float = SchedulerConfig.watermark
@@ -1870,6 +1872,12 @@ class EngineArgs:
         )
         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
         scheduler_group.add_argument(
+            "--prefill-hrrn", **scheduler_kwargs["prefill_hrrn"]
+        )
+        scheduler_group.add_argument(
+            "--prefill-hrrn-max-wait-s", **scheduler_kwargs["prefill_hrrn_max_wait_s"]
+        )
+        scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
@@ -2763,6 +2771,8 @@ class EngineArgs:
             prefill_context_cost_ref_len=self.prefill_context_cost_ref_len,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
+            prefill_hrrn=self.prefill_hrrn,
+            prefill_hrrn_max_wait_s=self.prefill_hrrn_max_wait_s,
             prefill_schedule_interval=self.prefill_schedule_interval,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

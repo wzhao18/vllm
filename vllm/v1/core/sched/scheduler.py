@@ -58,6 +58,7 @@ from vllm.v1.core.sched.output import (
     trim_new_request_data,
 )
 from vllm.v1.core.sched.request_queue import (
+    FCFSRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -672,6 +673,9 @@ class Scheduler(SchedulerInterface):
         # Load-ahead: fresh waiting requests whose async KV load was started
         # while the step's token budget was used up (see the waiting loop).
         self._load_ahead: set[Request] = set()
+        # SchedulerConfig.prefill_hrrn: request id -> external hit last seen
+        # (kept when its lookup result is dropped before admission).
+        self._hrrn_hits: dict[str, int] = {}
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
@@ -1429,6 +1433,8 @@ class Scheduler(SchedulerInterface):
             num_kv_pulls = 0
             max_kv_pulls = self.scheduler_config.max_async_kv_loads_per_step
             owner_decodes = self._dsa_owner_decodes()
+            if self.scheduler_config.prefill_hrrn:
+                self._hrrn_order_waiting()
             load_ahead = False
             load_ahead_left = LOAD_AHEAD_MAX_REQS - len(self._load_ahead)
             while True:
@@ -4145,6 +4151,46 @@ class Scheduler(SchedulerInterface):
 
         return valid_requests
 
+    # Service floor of the HRRN ratio: any admission costs about one chunk.
+    _HRRN_MIN_SERVICE_TOKENS = 512
+
+    def _hrrn_order_waiting(self) -> None:
+        """Order the waiting queue by HRRN (SchedulerConfig.prefill_hrrn):
+        highest wait / uncached work first (the response ratio
+        (wait + service) / service is monotonic in it), arrival order among
+        ties; requests past ``prefill_hrrn_max_wait_s`` lead in arrival order,
+        which bounds the wait of long prefills."""
+        waiting = self.waiting
+        if len(waiting) < 2 or not isinstance(waiting, FCFSRequestQueue):
+            return
+        now = time.time()
+        max_wait = self.scheduler_config.prefill_hrrn_max_wait_s
+        hits = self._hrrn_hits
+
+        def key(r: Request) -> tuple[int, float, float]:
+            wait = max(0.0, now - r.arrival_time)
+            if wait >= max_wait:
+                return (0, r.arrival_time, 0.0)
+            hit = (
+                self.connector.peek_external_hit(r)
+                if self.connector is not None
+                else None
+            )
+            if hit is not None:
+                hits[r.request_id] = hit
+            else:
+                hit = hits.get(r.request_id, 0)
+            left = r.num_tokens - max(r.num_computed_tokens, hit)
+            return (
+                1,
+                -wait / max(left, self._HRRN_MIN_SERVICE_TOKENS),
+                r.arrival_time,
+            )
+
+        ordered = sorted(waiting, key=key)
+        waiting.clear()
+        waiting.extend(ordered)
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -4159,6 +4205,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.finish_conversation_turn(request)
         self._connector_lookup_pending_since.pop(request.request_id, None)
         self._connector_lookup_timed_out.discard(request.request_id)
+        self._hrrn_hits.pop(request.request_id, None)
         self._remote_kv_wait_since.pop(request.request_id, None)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

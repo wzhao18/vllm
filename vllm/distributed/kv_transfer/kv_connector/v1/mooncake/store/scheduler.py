@@ -424,6 +424,11 @@ class MooncakeStoreScheduler:
         """Drop the arrival lookup of a request the scheduler did not take in."""
         self.client.release_unadopted(request.request_id, request)
 
+    def peek_external_hit(self, request: Request) -> int | None:
+        if not self.lookup_async or not self._looks_up(request):
+            return None
+        return self.client.peek_hit(request.request_id)
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
