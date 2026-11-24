@@ -32,9 +32,12 @@ DCP > 1, not the sequence-parallel decode, which runs its own DSA path) over a
 per-tensor FP8 MLA cache on an SM100-family GPU, at the verify lengths of ``VARIANT``;
 elsewhere (nvfp4_ds_mla, no DCP, SP) FlashInfer's chain, logged at startup.
 
-The core polls its q tiles before its PDL wait, which is safe because the kernel right
-before it never releases its dependents early: the #63 merge's rescue kernel, or
-DcpExchange's top-k (launched without PDL).
+The core polls its q tiles before its PDL wait. That is safe because the kernel right
+before it, the #63 merge's rescue kernel or DcpExchange's top-k, is launched without
+PDL: it starts only once every earlier kernel (the DcpValue that re-armed this
+parity's q mailbox included) has completed. The rescue releases the core at its
+entry, so the core's q poll overlaps the rescue; the core's slot and count reads stay
+after its griddepcontrol.wait.
 """
 
 from __future__ import annotations

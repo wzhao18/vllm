@@ -116,3 +116,46 @@ def test_dcp_remap_pdl_consumer(rows):
         torch.accelerator.synchronize()
         assert torch.equal(slots_seen, g_slots), f"replay {i}"
         assert torch.equal(valid_seen, g_valid), f"replay {i}"
+
+
+def _compiled_ptx(jit_fn) -> list[str]:
+    """PTX of every compiled specialization of a triton JIT function."""
+    caches = getattr(jit_fn, "device_caches", None)
+    if caches is not None:
+        kernels = [k for cache in caches.values() for k in cache[0].values()]
+    else:  # older triton
+        kernels = [k for cache in jit_fn.cache.values() for k in cache.values()]
+    return [k.asm["ptx"] for k in kernels if "ptx" in getattr(k, "asm", {})]
+
+
+def test_dcp_remap_emits_launch_dependents():
+    """The DCP remap's compiled kernel carries the early PDL release (the
+    consumer tests above pass with or without it), and the DCP-1 remap does not."""
+    from vllm.v1.attention.backends.mla import sparse_utils
+
+    jit_fn = sparse_utils.ConvertReqIndexToGlobalIndexKernel.sparse_mla_index_remap_kernel
+    rows, dcp, rank = 8, 16, 0
+    req_id = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    block_table = torch.arange(64, device="cuda", dtype=torch.int32).view(1, 64)
+    ids = torch.randint(0, 64 * BLOCK * dcp, (rows, TOPK), device="cuda",
+                        dtype=torch.int32)
+
+    def remap(dcp_size):
+        before = set(_compiled_ptx(jit_fn))
+        sparse_utils.triton_filter_and_convert_dcp_index(
+            req_id, block_table, ids, dcp_size=dcp_size, dcp_rank=0,
+            BLOCK_SIZE=BLOCK, BLOCK_STRIDE_ROWS=BLOCK, NUM_TOPK_TOKENS=TOPK,
+            return_valid_counts=True,
+        ) if dcp_size > 1 else sparse_utils.triton_convert_req_index_to_global_index(
+            req_id, block_table, ids, BLOCK_SIZE=BLOCK, BLOCK_STRIDE_ROWS=BLOCK,
+            NUM_TOPK_TOKENS=TOPK, return_valid_counts=True,
+        )
+        torch.accelerator.synchronize()
+        return [p for p in _compiled_ptx(jit_fn) if p not in before]
+
+    new = remap(dcp)
+    ptx = new or _compiled_ptx(jit_fn)
+    assert ptx, "no compiled remap kernel found"
+    assert any("griddepcontrol.launch_dependents" in p for p in ptx)
+    plain = remap(1)
+    assert all("griddepcontrol.launch_dependents" not in p for p in plain)
