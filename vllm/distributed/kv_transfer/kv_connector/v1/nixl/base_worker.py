@@ -3383,23 +3383,14 @@ class NixlBaseConnectorWorker:
             num_rows = region_num_blocks[i] // split
             c = chunks[i] if chunks is not None else 1
             s = region_splits[i] if region_splits is not None else split
-            if s < split:
-                # Never addressed (no kernel id reaches past num_rows * s): any
-                # valid range of the region keeps the descriptor count uniform.
-                padding = np.array(
-                    [
-                        [
-                            base_addr,
-                            unit_len // c,
-                            device_id,
-                            0,
-                            num_rows * (split - s) * c,
-                        ]
-                    ],
-                    dtype=np.uint64,
-                )
-            else:
-                padding = None
+            # Kernel ids past num_rows * s are never addressed: padding repeats
+            # unit 0 of each row (same in-row range, explicit count-1 or
+            # chunked rows, never a zero stride) to keep ``split`` per row.
+            pad_rows = (
+                np.arange(num_rows, dtype=np.uint64).repeat(split - s)
+                if s < split
+                else None
+            )
             if i not in self._head_sharded_draft_regions:
                 # MLA target pages are token-major and replicated; SSM regions'
                 # attention descriptors are never addressed.
@@ -3413,7 +3404,13 @@ class NixlBaseConnectorWorker:
                         base_addr, unit_len, row_stride, num_rows, s, device_id
                     )
                 )
-                if padding is not None:
+                if pad_rows is not None:
+                    padding = np.empty((len(pad_rows), 5), dtype=np.uint64)
+                    padding[:, 0] = base_addr + pad_rows * row_stride
+                    padding[:, 1] = unit_len
+                    padding[:, 2] = device_id
+                    padding[:, 3] = unit_len
+                    padding[:, 4] = 1
                     parts.append(padding)
                 continue
             heads = self._head_sharded_draft_kv_heads
@@ -3444,9 +3441,63 @@ class NixlBaseConnectorWorker:
             descs[:, 3] = head_page
             descs[:, 4] = c
             parts.append(descs)
-            if padding is not None:
+            if pad_rows is not None:
+                padding = np.empty((len(pad_rows), 5), dtype=np.uint64)
+                padding[:, 0] = (
+                    base_addr + first_head * head_page + pad_rows * row_stride
+                )
+                padding[:, 1] = head_unit
+                padding[:, 2] = device_id
+                padding[:, 3] = head_page
+                padding[:, 4] = c
                 parts.append(padding)
         return np.concatenate(parts)
+
+    @staticmethod
+    def _check_remote_rows_in_pages(
+        strided_descs: np.ndarray,
+        bases: list[int],
+        row_strides: list[int],
+        pages: list[int],
+        num_rows: list[int],
+        descs_per_region: list[int],
+    ) -> None:
+        """Raise unless every remote FA descriptor of padded rows lies inside
+        its region's page of its row, ``[base + r * row_stride, + page)``
+        (NIXL rejects ranges outside the peer's registered memory with
+        NIXL_ERR_NOT_FOUND). Rows of ``strided_descs`` are (addr, len, dev,
+        stride, count); a repeated row needs stride >= len."""
+        d = np.asarray(strided_descs, dtype=np.uint64).reshape(-1, 5)
+        bad = (d[:, 4] > 1) & (d[:, 3] < d[:, 1])
+        if bad.any():
+            raise RuntimeError(
+                f"Remote descriptor rows with stride < length: {d[bad][:4].tolist()}"
+            )
+        counts = d[:, 4].astype(np.intp)
+        starts = np.cumsum(counts) - counts
+        flat = np.repeat(d[:, :2], counts, axis=0).astype(np.int64)
+        offsets = np.arange(len(flat), dtype=np.int64) - np.repeat(starts, counts)
+        flat[:, 0] += offsets * np.repeat(d[:, 3].astype(np.int64), counts)
+        if len(flat) != sum(descs_per_region):
+            raise RuntimeError(
+                f"{len(flat)} remote descriptors, expected {sum(descs_per_region)} "
+                f"({descs_per_region} per region)"
+            )
+        pos = 0
+        for i, n in enumerate(descs_per_region):
+            addr, length = flat[pos : pos + n, 0], flat[pos : pos + n, 1]
+            pos += n
+            off = addr - bases[i]
+            row, in_row = np.divmod(off, row_strides[i])
+            outside = (off < 0) | (row >= num_rows[i]) | (in_row + length > pages[i])
+            if outside.any():
+                k = int(np.flatnonzero(outside)[0])
+                raise RuntimeError(
+                    f"Remote region {i}: descriptor {k} [{int(addr[k]):#x}, +"
+                    f"{int(length[k])}) is outside its row page (base "
+                    f"{bases[i]:#x}, row stride {row_strides[i]}, page {pages[i]}, "
+                    f"{num_rows[i]} rows)"
+                )
 
     def _register_chunked_local_xfer_handler(self, chunks: tuple[int, ...]) -> int:
         """Local handle whose region ``i`` has ``chunks[i]`` descriptors per
@@ -4105,11 +4156,29 @@ class NixlBaseConnectorWorker:
         split, padded = self._remote_block_split.get(engine_id, (1, False))
         if padded:
             chunks = self._padded_split_chunks(tp_ratio)
+            region_splits = self._remote_region_split.get(engine_id)
             blocks_data = self._build_fa_remote_rows(
-                nixl_agent_meta,
-                split,
-                chunks,
-                self._remote_region_split.get(engine_id),
+                nixl_agent_meta, split, chunks, region_splits
+            )
+            meta = nixl_agent_meta
+            rows = [
+                n // split
+                for n in (
+                    meta.region_num_blocks
+                    or [meta.num_blocks] * len(meta.kv_caches_base_addr)
+                )
+            ]
+            region_s = region_splits or (split,) * len(rows)
+            self._check_remote_rows_in_pages(
+                blocks_data,
+                list(meta.kv_caches_base_addr),
+                list(meta.block_strides),
+                [n * s for n, s in zip(meta.block_lens, region_s, strict=True)],
+                rows,
+                [
+                    r * split * (chunks[i] if chunks is not None else 1)
+                    for i, r in enumerate(rows)
+                ],
             )
             if chunks is not None:
                 self._remote_region_chunks = {

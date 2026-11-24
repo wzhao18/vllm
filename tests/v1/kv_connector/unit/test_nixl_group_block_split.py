@@ -68,16 +68,22 @@ def _worker(local_rank: int = 1) -> NixlBaseConnectorWorker:
 
 
 def _remote_meta(draft_block_tokens: int) -> NixlAgentMetadata:
-    """P (TP1): 16384-token target pages, draft pages at all 16 heads, padded
-    rows (row stride larger than each page)."""
+    """P (TP1), packed rows of one pool: each group's layers sit side by side in
+    a row (16384-token target pages, draft pages at all 16 heads), the row as
+    large as the largest group's, so every region's page is padded."""
     draft = draft_block_tokens * DRAFT_HEADS * HEAD_TOKEN
-    lens = [4 * t for t in TARGET] + [draft, draft]
-    row = 2 * sum(lens)
+    target = [4 * t for t in TARGET]
+    lens = target + [draft, draft]
+    row = max(sum(target), 2 * draft) + 4096
+    storage = 0x1_0000_0000
+    bases = [storage + sum(target[:k]) for k in range(len(target))] + [
+        storage + k * draft for k in range(2)
+    ]
     return NixlAgentMetadata(
         engine_id="remote",
         agent_metadata=b"",
         device_id=0,
-        kv_caches_base_addr=[0x1_0000_0000 * (i + 1) for i in range(len(lens))],
+        kv_caches_base_addr=bases,
         num_blocks=ROWS,
         block_lens=lens,
         block_strides=[row] * len(lens),
@@ -201,3 +207,52 @@ def test_sliding_window_units_align_per_group():
     )
     assert aligned_local == [[1, 2, 3, 4], [21, 22]]
     assert aligned_remote == [[20, 21, 22, 23], [14, 15]]
+
+
+def _rows_check_args(meta: NixlAgentMetadata, w, chunks):
+    splits = w._remote_region_split.get("remote") or (4,) * len(meta.block_lens)
+    return (
+        list(meta.kv_caches_base_addr),
+        list(meta.block_strides),
+        [n * k for n, k in zip(meta.block_lens, splits)],
+        [ROWS] * len(meta.block_lens),
+        [ROWS * 4 * c for c in chunks],
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft_block_tokens", [8192, 4096, 16384])
+def test_remote_descriptors_stay_inside_their_row_pages(draft_block_tokens):
+    """Every expanded remote descriptor (real units and padding) lies inside its
+    region's page of its row: NIXL rejects any range outside the peer's
+    registered memory (NIXL_ERR_NOT_FOUND)."""
+    w = _worker(local_rank=3)
+    meta = _remote_meta(draft_block_tokens)
+    w._split_remote_blocks(meta, remote_tp_size=1)
+    chunks = (1, 1, 1, 4, 4)
+    descs = w._build_fa_remote_rows(
+        meta, 4, chunks, w._remote_region_split.get("remote")
+    )
+    assert not ((descs[:, 4] > 1) & (descs[:, 3] < descs[:, 1])).any()
+    w._check_remote_rows_in_pages(descs, *_rows_check_args(meta, w, chunks))
+
+
+@pytest.mark.cpu_test
+def test_row_page_check_rejects_out_of_page_and_zero_stride_rows():
+    w = _worker()
+    meta = _remote_meta(draft_block_tokens=8192)
+    w._split_remote_blocks(meta, remote_tp_size=1)
+    chunks = (1, 1, 1, 4, 4)
+    args = _rows_check_args(meta, w, chunks)
+    descs = w._build_fa_remote_rows(meta, 4, chunks, w._remote_region_split["remote"])
+    # A draft unit one head past this rank's last head of the 16-head page.
+    shifted = descs.copy()
+    last = len(shifted) - 1
+    shifted[last, 0] += 16 * 8192 * HEAD_TOKEN
+    with pytest.raises(RuntimeError, match="outside its row page"):
+        w._check_remote_rows_in_pages(shifted, *args)
+    # The zero-stride repeated padding row of the first version.
+    zero = descs.copy()
+    zero[last, 3] = 0
+    with pytest.raises(RuntimeError, match="stride < length"):
+        w._check_remote_rows_in_pages(zero, *args)
