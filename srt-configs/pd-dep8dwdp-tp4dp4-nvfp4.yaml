@@ -272,16 +272,16 @@ roles:
       moe-backend: kimi_k3_mega_moe
       no-enable-flashinfer-autotune: true
       attention-backend: FLASHINFER_MLA_SPARSE
-      sparse-indexer-topk-backend: trtllm_gvr2_nondet
+      sparse-indexer-topk-backend: balanced
       additional-config: '{"decode_backend":"latency_specialized","megamoe_compact_scales":false}'
-      kernel-config: '{"enable_jit_warmup":false,"flashinfer_sparse_mla_kernel":"trtllm","sparse_indexer_topk_backend":"trtllm_gvr2_nondet"}'
+      kernel-config: '{"enable_jit_warmup":false,"flashinfer_sparse_mla_kernel":"trtllm","sparse_indexer_topk_backend":"balanced"}'
       attention-config: '{"indexer_kv_dtype":"mxfp4"}'
       enable-prefix-caching: true
       prefix-match-unit: 128
       use-replayssm: true
       max-model-len: 1048576
       max-num-batched-tokens: 8192
-      max-num-seqs: 32
+      max-num-seqs: 28
       watermark: 0.05
       max-cudagraph-capture-size: 192
       # Rows = requests x (k + 1) = 6 per request at k5.

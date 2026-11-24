@@ -78,7 +78,36 @@ MLA / DSA, router, layer-0 MLP and LM head). Only these differ:
 | decode `additional-config` | `decode_backend latency_specialized` | `+ megamoe_compact_scales false` (compact NVFP4 scales stay on prefill only) |
 | store `cache_prefix` | `k31pd-dep8dwdp-...` | `k31pd-nvfp4-dep8dwdp-...` |
 
-Code on top of the stack above: the refreshed-kernel prefill MegaMoE buckets and the NVFP4 per-route prefill combine
-(`juntianl/k31vr-megamoe-refreshed-prefill`), the compact NVFP4 expert scales (agentx #44, prefill only by default),
-and the full-model `--dwdp dense` for the NVFP4 checkpoint's MXFP8 linears (in progress). Status: L48 P/D smoke and AgentX
-on our VR200 nodes running (11-24); full model pending the DWDP change.
+Decode differs from the BF16 configs in two more settings, both measured on the full model:
+
+| decode setting | value | why |
+|---|---|---|
+| `sparse-indexer-topk-backend` (and `kernel-config`) | `balanced` | **Known perf issue, do not use `trtllm_gvr2_nondet` on decode.** GVR V2's self-sampling `main` kernel (the route every 48-row x 64k+ decode batch takes, also on SM107) degenerates to one CTA scanning the whole row when a row has no usable threshold: rows that are entirely NaN / constant (seen in real traffic on long requests), or with fewer than k positive logits. Real decode logits (16 cards, 42 rows, median 81k-195k, max 730k, k 2048): GVR 13-25 us/call on clean cards but 107-750 us on cards holding such a row, i.e. up to 18 ms per step for the whole lockstepped decode group; `balanced` 21-29 us/call on every card (0.69 ms/step worst card); `deep_select` also degrades on NaN rows (up to 587 us/call). Prefill keeps `trtllm_gvr2_nondet`. |
+| `max-num-seqs` | 28 | Decode step vs per-engine batch is flat up to ~28 (18.4-19.8 ms) and jumps at 30-32 (22.5-28+ ms): capping at 28 keeps TPS p10 above 170 while the decode tier still has headroom (median running 17-25 per engine at c370). |
+
+Load: AgentX concurrency 370 (one P DEP8 instance + one TP4 x DP4 decode instance, 24 GPUs).
+
+Node placement on our VR200 nodes: keep `vr-r41-cn04` as the frontend / infra node only (etcd, Mooncake master, Dynamo
+frontend, AgentX client). Its GPU0 runs BF16 GEMMs ~9% slower than its peers, and every decode or prefill engine is a
+lockstepped EP group, so one slow GPU sets the step time of the whole group.
+
+Code: this branch with agentx #25-#42, #44 and #45 merged (the refreshed-kernel prefill MegaMoE buckets and the NVFP4
+per-route prefill combine, compact NVFP4 expert scales #44, full-model `--dwdp dense` for the checkpoint's MXFP8 linears
+#42).
+
+Measured on our VR200 nodes (11-24, full model, P DEP8 on 2 nodes + D TP4 x DP4 on 4 nodes, AgentX c370 3600 s,
+DSpark k5 synthetic AL 3.81):
+
+| | this config | same, D `trtllm_gvr2_nondet` + `max-num-seqs` 32 at c380 |
+|---|---|---|
+| requests/s | 15.14 | 14.91 |
+| (input + output) tok/s/GPU | 90.3k | 88.2k |
+| TPS p10 / p50 | 178 / 204 | 131 / 178 |
+| ITL p50 / p90 | 4.91 / 5.60 ms | 5.61 / 7.63 ms |
+| TTFT p50 / p90 / p99 | 2.5 / 6.7 / 18.3 s | 2.3 / 6.1 / 15.7 s |
+| NIXL failed transfers | 0 | 0 |
+
+GSM8K (gsm8k twin, block rejection, full model): strict 0.9788 / flexible 0.9780 (±0.004; the GVR decode config scored 0.9795 / 0.9788).
+
+Open: the NaN indexer-logit rows above (whole valid length NaN on some long requests in decode) point at an indexer
+K-cache / scale problem or unwritten rows; `balanced` only removes their cost. Under investigation.
