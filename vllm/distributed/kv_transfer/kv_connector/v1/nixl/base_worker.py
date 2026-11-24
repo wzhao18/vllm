@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -419,6 +419,12 @@ class NixlBaseConnectorWorker:
     # Set in __init__ (see there); read-only defaults for workers built without
     # it (tests).
     _remote_block_split: Mapping[EngineId, tuple[int, bool]] = MappingProxyType({})
+    # Remote engines whose regions split into different unit counts (e.g. a
+    # packed draft group with a smaller block than the target's): units per
+    # remote block of each region / of each transfer group. Absent when every
+    # region splits like ``_remote_block_split``.
+    _remote_region_split: Mapping[EngineId, tuple[int, ...]] = MappingProxyType({})
+    _remote_group_split: Mapping[EngineId, tuple[int, ...]] = MappingProxyType({})
     _remote_region_chunks: Mapping[EngineId, tuple[int, ...]] = MappingProxyType({})
 
     def _compute_desc_ids(
@@ -1360,6 +1366,8 @@ class NixlBaseConnectorWorker:
         # Remote engines whose blocks _split_remote_blocks cut into smaller
         # transfer units: engine_id -> (units per remote block, padded rows).
         self._remote_block_split = {}
+        self._remote_region_split = {}
+        self._remote_group_split = {}
         # Descriptors per block of each region for a remote engine, when some
         # region needs several (head-sharded draft pages cut into units), and
         # the local handles laid out the same way, by chunks.
@@ -3351,12 +3359,18 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         split: int,
         chunks: tuple[int, ...] | None,
+        region_splits: tuple[int, ...] | None = None,
     ) -> np.ndarray:
         """Remote FA descriptors of padded rows that _split_remote_blocks cut
         into ``split`` local-block units: unit ``j`` of row ``r`` starts at
         ``r * row_stride + j * unit_len``. A head-sharded draft page is
         head-major ``[heads, tokens, C]``: its unit is this rank's
-        ``chunks[i]`` heads, each the unit's token range of one head."""
+        ``chunks[i]`` heads, each the unit's token range of one head.
+
+        A region with ``region_splits[i] < split`` units per row (a smaller
+        group block, see _split_remote_blocks) gets its real units first, unit
+        ``j`` of row ``r`` at index ``r * region_splits[i] + j``, then padding up
+        to ``split`` descriptors per row so every region has the same count."""
         meta = nixl_agent_meta
         region_num_blocks = meta.region_num_blocks or [meta.num_blocks] * len(
             meta.kv_caches_base_addr
@@ -3368,6 +3382,24 @@ class NixlBaseConnectorWorker:
             row_stride = meta.block_strides[i]
             num_rows = region_num_blocks[i] // split
             c = chunks[i] if chunks is not None else 1
+            s = region_splits[i] if region_splits is not None else split
+            if s < split:
+                # Never addressed (no kernel id reaches past num_rows * s): any
+                # valid range of the region keeps the descriptor count uniform.
+                padding = np.array(
+                    [
+                        [
+                            base_addr,
+                            unit_len // c,
+                            device_id,
+                            0,
+                            num_rows * (split - s) * c,
+                        ]
+                    ],
+                    dtype=np.uint64,
+                )
+            else:
+                padding = None
             if i not in self._head_sharded_draft_regions:
                 # MLA target pages are token-major and replicated; SSM regions'
                 # attention descriptors are never addressed.
@@ -3378,9 +3410,11 @@ class NixlBaseConnectorWorker:
                     )
                 parts.append(
                     self._block_strided_descs(
-                        base_addr, unit_len, row_stride, num_rows, split, device_id
+                        base_addr, unit_len, row_stride, num_rows, s, device_id
                     )
                 )
+                if padding is not None:
+                    parts.append(padding)
                 continue
             heads = self._head_sharded_draft_kv_heads
             assert heads is not None and self.transfer_topo is not None
@@ -3389,16 +3423,16 @@ class NixlBaseConnectorWorker:
                 heads
                 // self.transfer_topo.get_engine_info(meta.engine_id).remote_tp_size,
             )
-            head_page = unit_len * split // remote_heads
-            head_unit = head_page // split
+            head_page = unit_len * s // remote_heads
+            head_unit = head_page // s
             assert head_unit * c == self.block_len_per_layer[i], (
                 f"Draft region {i}: remote head unit {head_unit} x {c} local heads "
                 f"!= local block {self.block_len_per_layer[i]}"
             )
             first_head = self.draft_tp_mappings[meta.engine_id].rank_offset_factor * c
-            rows = np.arange(num_rows, dtype=np.uint64).repeat(split)
-            units = np.tile(np.arange(split, dtype=np.uint64), num_rows)
-            descs = np.empty((num_rows * split, 5), dtype=np.uint64)
+            rows = np.arange(num_rows, dtype=np.uint64).repeat(s)
+            units = np.tile(np.arange(s, dtype=np.uint64), num_rows)
+            descs = np.empty((num_rows * s, 5), dtype=np.uint64)
             descs[:, 0] = (
                 base_addr
                 + first_head * head_page
@@ -3410,6 +3444,8 @@ class NixlBaseConnectorWorker:
             descs[:, 3] = head_page
             descs[:, 4] = c
             parts.append(descs)
+            if padding is not None:
+                parts.append(padding)
         return np.concatenate(parts)
 
     def _register_chunked_local_xfer_handler(self, chunks: tuple[int, ...]) -> int:
@@ -3612,7 +3648,9 @@ class NixlBaseConnectorWorker:
         )
         return sub_blocks
 
-    def _split_remote_blocks(self, meta: NixlAgentMetadata) -> None:
+    def _split_remote_blocks(
+        self, meta: NixlAgentMetadata, remote_tp_size: int = 1
+    ) -> None:
         """View remote blocks as gcd-sized kernel blocks when the local block
         size is not a multiple of the remote one.
 
@@ -3641,10 +3679,16 @@ class NixlBaseConnectorWorker:
             )
             return
         padded = meta.block_strides != meta.block_lens
+        region_splits = self._remote_region_splits(meta, split, remote_tp_size)
         if (
             meta.ple_block_len is not None
-            or any(block_len % split for block_len in meta.block_lens)
+            or region_splits is None
+            or any(
+                block_len % s
+                for block_len, s in zip(meta.block_lens, region_splits, strict=True)
+            )
             or (padded and self._transfer_layer_region_indices)
+            or (not padded and any(s != split for s in region_splits))
         ):
             logger.warning(
                 "Not pairing remote %d-token blocks with local %d-token blocks: "
@@ -3664,7 +3708,16 @@ class NixlBaseConnectorWorker:
         meta.block_size //= split
         meta.physical_blocks_per_logical_kv_block *= split
         meta.num_blocks *= split
-        meta.block_lens = [block_len // split for block_len in meta.block_lens]
+        # A region whose remote block holds fewer local blocks (e.g. a packed
+        # draft group: P 8192 vs D 4096 tokens while the target is 16384 vs
+        # 4096) is cut into its own unit count. Every region still exposes
+        # ``split`` descriptors per remote row (the real units first, then
+        # padding that no block id addresses), so descriptor ids stay
+        # ``region * num_blocks + kernel id`` for all regions.
+        meta.block_lens = [
+            block_len // s
+            for block_len, s in zip(meta.block_lens, region_splits, strict=True)
+        ]
         if not padded:
             meta.block_strides = list(meta.block_lens)
         if meta.region_num_blocks is not None:
@@ -3673,6 +3726,76 @@ class NixlBaseConnectorWorker:
             **self._remote_block_split,
             meta.engine_id: (split, padded),
         }
+        if any(s != split for s in region_splits):
+            group_splits = self._group_splits(region_splits, split)
+            logger.info_once(
+                "Remote %d-token blocks split per KV group into %s local "
+                "%d-token blocks.",
+                meta.block_size * split,
+                group_splits,
+                self.block_size,
+            )
+            self._remote_region_split = {
+                **self._remote_region_split,
+                meta.engine_id: region_splits,
+            }
+            self._remote_group_split = {
+                **self._remote_group_split,
+                meta.engine_id: group_splits,
+            }
+
+    def _remote_region_splits(
+        self, meta: NixlAgentMetadata, split: int, remote_tp_size: int
+    ) -> tuple[int, ...] | None:
+        """Local blocks per remote block of each region, or None when a region
+        cannot be paired. A token-major region holds ``remote_len / local_len``
+        local blocks; a head-sharded draft region on D holds only this rank's
+        heads of each token, so its ratio also takes the heads per rank of each
+        side. SSM regions keep ``split`` (state slots, row geometry only)."""
+        ssm = set(self._ssm_region_indices or ())
+        heads = self._head_sharded_draft_kv_heads
+        splits = []
+        for i, remote_len in enumerate(meta.block_lens):
+            if i in ssm or i >= len(self.block_len_per_layer):
+                splits.append(split)
+                continue
+            num, den = remote_len, self.block_len_per_layer[i]
+            if i in self._head_sharded_draft_regions and heads:
+                assert self.transfer_topo is not None
+                num *= max(1, heads // self.transfer_topo.tp_size)
+                den *= max(1, heads // remote_tp_size)
+            if den == 0 or num % den or not 1 <= num // den <= split:
+                return None
+            splits.append(num // den)
+        return tuple(splits)
+
+    def _group_splits(
+        self, region_splits: tuple[int, ...], split: int
+    ) -> tuple[int, ...]:
+        """Local blocks per remote block of each transfer group, from its
+        attention regions (SSM groups keep ``split``; their ids never expand)."""
+        ssm = set(self._ssm_region_indices or ())
+        group_splits = []
+        for g, spec_type in enumerate(self._group_spec_types):
+            regions = (
+                self._group_region_indices[g] if self._group_region_indices else None
+            )
+            if not _is_attention_spec(spec_type):
+                group_splits.append(split)
+                continue
+            values = {
+                region_splits[r]
+                for r in (regions if regions is not None else range(len(region_splits)))
+                if r not in ssm
+            }
+            if len(values) != 1:
+                raise ValueError(
+                    f"KV group {g}: its regions split remote blocks into different "
+                    f"unit counts {sorted(values)}; cannot pair them with local "
+                    f"{self.block_size}-token blocks."
+                )
+            group_splits.append(values.pop())
+        return tuple(group_splits)
 
     def add_remote_agent(
         self,
@@ -3802,7 +3925,7 @@ class NixlBaseConnectorWorker:
             )
         # The push WRITE path is not validated with split remote blocks.
         if self._has_mamba and self.use_mla and self._TRANSFER_MODE == "pull":
-            self._split_remote_blocks(nixl_agent_meta)
+            self._split_remote_blocks(nixl_agent_meta, remote_tp_size)
 
         if (
             self._packed_member_layouts
@@ -3982,7 +4105,12 @@ class NixlBaseConnectorWorker:
         split, padded = self._remote_block_split.get(engine_id, (1, False))
         if padded:
             chunks = self._padded_split_chunks(tp_ratio)
-            blocks_data = self._build_fa_remote_rows(nixl_agent_meta, split, chunks)
+            blocks_data = self._build_fa_remote_rows(
+                nixl_agent_meta,
+                split,
+                chunks,
+                self._remote_region_split.get(engine_id),
+            )
             if chunks is not None:
                 self._remote_region_chunks = {
                     **self._remote_region_chunks,
@@ -6091,10 +6219,11 @@ class NixlBaseConnectorWorker:
         remote_block_ids: BlockIds,
         local_num_computed_blocks: tuple[int, ...],
         num_tokens: int | None,
-        split: int,
+        split: int | Sequence[int],
     ) -> tuple[BlockIds, BlockIds]:
         """Pair attention units by token position when _split_remote_blocks cut
-        each remote block into ``split`` units of the local kernel block.
+        each remote block into ``split`` units of the local kernel block
+        (a sequence: per transfer group, see ``_remote_group_split``).
 
         Inputs are kernel ids (remote ones expanded per unit). A full-attention
         remote list starts at token 0 and the local one after its prefix-cache
@@ -6119,8 +6248,11 @@ class NixlBaseConnectorWorker:
                 aligned_remote.append(list(remote))
                 continue
             if issubclass(spec_type, SlidingWindowSpec):
+                group_split = split if isinstance(split, int) else split[g]
                 local_start = last_unit - len(local) + 1
-                remote_start = (last_unit // split + 1) * split - len(remote)
+                remote_start = (last_unit // group_split + 1) * group_split - len(
+                    remote
+                )
             else:
                 hits = (
                     local_num_computed_blocks[transfer_groups[g]]
@@ -6177,7 +6309,24 @@ class NixlBaseConnectorWorker:
             for g, ids in enumerate(block_ids)
         ]
 
-    def _logical_to_kernel_block_ids(self, block_ids: BlockIds, ratio: int) -> BlockIds:
+    def _remote_kernel_block_ids(
+        self, engine_id: EngineId, block_ids: BlockIds, ratio: int
+    ) -> BlockIds:
+        """Expand a remote engine's logical block ids into the kernel ids of its
+        descriptors: ``ratio`` per block, or per group when its groups split
+        into different unit counts (``_remote_group_split``)."""
+        group_splits = self._remote_group_split.get(engine_id)
+        if group_splits is None:
+            return self._logical_to_kernel_block_ids(block_ids, ratio)
+        split, _ = self._remote_block_split[engine_id]
+        base = ratio // split
+        return self._logical_to_kernel_block_ids(
+            block_ids, [base * s for s in group_splits]
+        )
+
+    def _logical_to_kernel_block_ids(
+        self, block_ids: BlockIds, ratio: int | Sequence[int]
+    ) -> BlockIds:
         """Convert block ids to kernel physical block ids.
         This is required when the logical block size (the one set by the user)
         does not match the one required by the attn backend.
@@ -6186,19 +6335,22 @@ class NixlBaseConnectorWorker:
         logical block ids: [(SW-clipped) [1], (FA) [2, 3]], ratio=2
         physical block ids: [(SW-clipped) [2, 3], (FA) [4, 5, 6, 7]]
         """
-        if ratio == 1:
+        if isinstance(ratio, int) and ratio == 1:
             # Noop when physical and logical block sizes are the same
             return block_ids
-        block_arange = np.arange(0, ratio).reshape(1, -1)
         # Mamba blocks have no logical<>physical discrepancy (block-size=1)
         physical_block_ids = []
         for i, group in enumerate(block_ids):
             spec = self.kv_cache_config.transfer_groups[i].kv_cache_spec
-            if _is_ssm_spec(get_representative_spec_type(spec)):
+            group_ratio = ratio if isinstance(ratio, int) else ratio[i]
+            if _is_ssm_spec(get_representative_spec_type(spec)) or group_ratio == 1:
                 physical_block_ids.append(group)
             else:
                 physical_block_ids.append(
-                    (np.array(group)[:, None] * ratio + block_arange)
+                    (
+                        np.array(group)[:, None] * group_ratio
+                        + np.arange(group_ratio).reshape(1, -1)
+                    )
                     .reshape(-1)
                     .tolist()
                 )

@@ -264,7 +264,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
                 )
-            remote_physical_block_ids = self._logical_to_kernel_block_ids(
+            remote_physical_block_ids = self._remote_kernel_block_ids(
+                engine_id,
                 meta.remote.block_ids,
                 remote_info.remote_physical_blocks_per_logical,
             )
@@ -329,7 +330,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 source_ranks = dsa_source_ranks
             written = [set() for _ in local_block_ids]
             remote_logical_block_ids = meta.remote.block_ids
-            meta.remote.block_ids = self._logical_to_kernel_block_ids(
+            meta.remote.block_ids = self._remote_kernel_block_ids(
+                engine_id,
                 remote_logical_block_ids,
                 remote_info.remote_physical_blocks_per_logical,
             )
@@ -347,7 +349,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     aligned_remote,
                     meta.local_num_computed_blocks,
                     meta.remote.num_tokens,
-                    split,
+                    self._remote_group_split.get(engine_id) or split,
                 )
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
@@ -404,7 +406,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     local_physical_ids = self._logical_to_kernel_block_ids(
                         local_ids, self._physical_blocks_per_logical_kv_block
                     )
-                    remote_physical_ids = self._logical_to_kernel_block_ids(
+                    remote_physical_ids = self._remote_kernel_block_ids(
+                        engine_id,
                         remote_ids,
                         remote_info.remote_physical_blocks_per_logical,
                     )
