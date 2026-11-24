@@ -109,6 +109,17 @@ def test_tp16_lm_head_policy(steps):
         assert bool(wide) == (17 <= rows <= 32), rows
 
 
+def test_tp16_gqa_lm_head_no_gemv():
+    """The release (GQA) drafter at TP16 runs no BF16 GEMV LM head: in the 16-rank
+    step it ran 2x its 1-GPU time on most ranks (the Markov kernel waits for the
+    slowest), so its 7-row LM head is the stock cuBLAS shard GEMM; the evict-first
+    GEMM rows stay as the preview drafter's, and the preview's tables are unchanged."""
+    assert 16 not in draft.GQA_FAST_LM_HEAD
+    assert draft.GQA_WIDE_LM_HEAD[16] == draft.WIDE_LM_HEAD[16]
+    assert draft.FAST_LM_HEAD[16] == "1-7:1"
+    assert draft.GQA_FAST_LM_HEAD.get(8) == draft.FAST_LM_HEAD[8]
+
+
 def test_tp16_lm_head_slower_rows_run_cublas():
     """Every row count the bench measured the evict-first GEMM slower than cuBLAS at
     (12-15 rows 1.016-1.021x, 35-63 rows 1.099-1.115x) runs the stock cuBLAS GEMM."""
