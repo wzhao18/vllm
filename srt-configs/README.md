@@ -63,3 +63,22 @@ Notes:
 - Status: not launched on Hecate yet. On our VR200 nodes, the integration tree (this branch + agentx #25-#39) scores
   GSM8K strict 0.9810 aggregated (TP4 x DP4); the full-model P/D run of this exact layout on this branch is pending
   agentx #42 (dense DWDP at construction: without it, full-model prefill runs out of memory while it is built).
+
+## 2026-11-24: the same P/D deployment on the NVIDIA NVFP4 checkpoint
+
+`pd-dep8dwdp-tp4dp4-nvfp4.yaml` and `gsm8k/pd-dep8dwdp-tp4dp4-nvfp4.yaml` are `pd-dep8dwdp-tp4dp4.yaml` and its gsm8k twin
+on `nvidia/Kimi-K3.1-Pro-NVFP4` (ModelOpt mixed: NVFP4 routed experts, MXFP8 KDA and shared-expert projections, BF16
+MLA / DSA, router, layer-0 MLP and LM head). Only these differ:
+
+| | BF16 checkpoint configs | NVFP4 checkpoint configs |
+|---|---|---|
+| model | `moonshotai/Kimi-K3` | `nvidia/Kimi-K3.1-Pro-NVFP4` |
+| `--quantization-config` | `{"moe":{"activation":"mxfp8"}}` on both roles | none (the checkpoint's NVFP4 W4A4 experts) |
+| prefill `additional-config` | `decode_backend auto`, `megamoe_quant mxfp4_mxfp4` | `decode_backend auto` (NVFP4 kernel; NVFP4 prefill uses the per-route combine, `megamoe_prefill_combine` `dedup` selects the old one) |
+| decode `additional-config` | `decode_backend latency_specialized` | `+ megamoe_compact_scales false` (compact NVFP4 scales stay on prefill only) |
+| store `cache_prefix` | `k31pd-dep8dwdp-...` | `k31pd-nvfp4-dep8dwdp-...` |
+
+Code on top of the stack above: the refreshed-kernel prefill MegaMoE buckets and the NVFP4 per-route prefill combine
+(`juntianl/k31vr-megamoe-refreshed-prefill`), the compact NVFP4 expert scales (agentx #44, prefill only by default),
+and the full-model `--dwdp dense` for the NVFP4 checkpoint's MXFP8 linears (in progress). Status: L48 P/D smoke and AgentX
+on our VR200 nodes running (11-24); full model pending the DWDP change.
