@@ -93,6 +93,10 @@ def create(nbytes: int, device: int, die: int | None = None):
     return dies._checked(cuda.cuMemCreate(nbytes, prop, 0), "DWDP create")
 
 
+def release(handle) -> None:
+    _dies()._checked(cuda.cuMemRelease(handle), "DWDP release")
+
+
 def export(handle) -> bytes:
     result = cuda.cuMemExportToShareableHandle(handle, _FABRIC, 0)
     return bytes(_dies()._checked(result, "DWDP export").data)
@@ -126,6 +130,9 @@ class VaRange:
         checked(
             cuda.cuMemSetAccess(self.base + offset, size, [access], 1), "DWDP access"
         )
+
+    def unmap(self, offset: int, size: int) -> None:
+        _dies()._checked(cuda.cuMemUnmap(self.base + offset, size), "DWDP unmap")
 
     def map_imported(self, offset: int, size: int, data: bytes) -> None:
         """Map (read-only) the partner memory whose fabric handle is ``data``."""
@@ -161,11 +168,14 @@ class Store:
         self.store = torch.distributed.FileStore(os.path.join(DIR, name), members)
         self.members, self.me = members, me
 
-    def exchange(self, mine: dict[str, bytes]) -> list[dict[str, bytes]]:
-        """Publish this member's fabric handles; returns every member's."""
+    def exchange(
+        self, mine: dict[str, bytes], tag: str = "handles"
+    ) -> list[dict[str, bytes]]:
+        """Publish this member's fabric handles under ``tag`` (one exchange per tag);
+        returns every member's."""
         payload = json.dumps({k: v.hex() for k, v in mine.items()})
-        self.store.set(f"handles/{self.me}", payload)
-        keys = [f"handles/{m}" for m in range(self.members)]
+        self.store.set(f"{tag}/{self.me}", payload)
+        keys = [f"{tag}/{m}" for m in range(self.members)]
         self.store.wait(keys, _TIMEOUT)
         return [
             {k: bytes.fromhex(v) for k, v in json.loads(self.store.get(key)).items()}
@@ -183,7 +193,10 @@ class GroupStore:
     def __init__(self, group):
         self.group = group
 
-    def exchange(self, mine: dict[str, bytes]) -> list[dict[str, bytes]]:
+    def exchange(
+        self, mine: dict[str, bytes], tag: str = "handles"
+    ) -> list[dict[str, bytes]]:
+        del tag  # a collective: calls pair up in order
         out: list = [None] * self.group.world_size
         torch.distributed.all_gather_object(out, mine, group=self.group.cpu_group)
         return out

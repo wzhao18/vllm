@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense DWDP moves whole weight storages, including packed projections and every
-view of them, and re-points the views in place (dense_dwdp._plan_layers /
+view of them, and re-points the views in place (dense_dwdp._plan_layer /
 _repoint)."""
 
 import pytest
@@ -47,10 +47,21 @@ def _layers(n=3):
     return [_Layer(i) for i in range(n)]
 
 
+def _plans(layers):
+    """Per layer after the first: its load-time plan, and the shared storages."""
+    stops = dense_dwdp._layer_stops(layers)
+    shared = dense_dwdp._shared_storages(layers, stops)
+    plans = [
+        dense_dwdp._plan_layer(layer, stop, set(), shared)
+        for layer, stop in zip(layers[1:], stops[1:])
+    ]
+    return plans, sum(st.nbytes() for st in shared.values())
+
+
 def test_plan_groups_storages_with_all_views(monkeypatch):
     monkeypatch.setattr(dense_dwdp, "MIN_BYTES", 1)
     layers = _layers()
-    plans, resident = dense_dwdp._plan_layers(layers)
+    plans, resident = _plans(layers)
     assert len(plans) == 2 and resident == 0
     for (items, total), layer in zip(plans, layers[1:]):
         by_ptr = {st.data_ptr(): views for st, views, _ in items}
@@ -68,7 +79,7 @@ def test_storage_shared_by_two_layers_stays_resident(monkeypatch):
     monkeypatch.setattr(dense_dwdp, "MIN_BYTES", 1)
     layers = _layers()
     layers[2].own = layers[1].own  # tied across layers
-    plans, resident = dense_dwdp._plan_layers(layers)
+    plans, resident = _plans(layers)
     ptr = layers[1].own.untyped_storage().data_ptr()
     for items, _ in plans:
         assert all(st.data_ptr() != ptr for st, _, _ in items)
@@ -84,7 +95,7 @@ def test_repoint_keeps_values_and_frees_old_storage(monkeypatch):
         "gemm": layer._gemm.weight.clone(),
         "packed": layer._packed[0].weight.clone(),
     }
-    plans, _ = dense_dwdp._plan_layers([_layers(1)[0], layer])
+    plans, _ = _plans([_layers(1)[0], layer])
     ((items, total),) = plans
     del plans
     blob = torch.zeros(total + 4096, dtype=torch.uint8, device="cuda")[4096:]

@@ -155,6 +155,8 @@ def process_weights_after_loading(
     maybe_retie_word_embeddings(model, model_config)
 
     for name, module in model.named_modules():
+        if getattr(module, "defer_weight_processing", False):
+            continue  # the model processes it itself (e.g. Kimi K3 dense DWDP)
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             if (
@@ -199,6 +201,8 @@ def process_weights_after_loading(
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
     for _, module in model.named_modules():
+        if getattr(module, "defer_weight_processing", False):
+            continue
         if is_deferred_attention_layer(module):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading

@@ -781,6 +781,20 @@ class KimiK3DSAAttention(nn.Module):
         # (input shared by the packed projection and g_proj, fused output gate)
         self._mxfp8_acts: tuple[bool, bool] | None = None
 
+    def dwdp_resident_linears(self) -> list[nn.Module]:
+        """The linears post-load processing reads whole (``pack_projections``'
+        groups, MLA's ``kv_b_proj`` absorption): construction-time non-expert DWDP
+        keeps them resident (``dense_dwdp.install`` shards them after packing)."""
+        indexer = cast(Any, self.dsa_indexer)
+        linears = (
+            getattr(self, "fused_qkv_a_proj", None),
+            indexer.wkv_index,
+            getattr(self, "q_b_proj", None),
+            indexer.wq_index,
+            self.kv_b_proj,
+        )
+        return [linear for linear in linears if linear is not None]
+
     def pack_projections(self) -> None:
         """Enable the fused forward (as DeepseekV32Attention): pack
         ``[q_a | kv_a | wk | weights_proj]`` and ``[q_b | wq_index]`` into one

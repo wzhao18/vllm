@@ -98,6 +98,7 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    extract_layer_index,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -2240,6 +2241,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            dense_dwdp.shard_table(self.embed_tokens.weight)
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -2274,7 +2276,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
 
         def get_layer(prefix: str):
-            return KimiDecoderLayer(
+            layer = KimiDecoderLayer(
                 config,
                 vllm_config,
                 prefix,
@@ -2282,6 +2284,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 run_gemm_rs_ar=self.run_gemm_rs_ar,
                 topk_indices_buffer=self.topk_indices_buffer,
             )
+            # Non-expert DWDP shards each layer's linear weights once it exists.
+            dense_dwdp.shard_layer(layer, extract_layer_index(prefix))
+            return layer
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -2869,6 +2874,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        dense_dwdp.loaded()
         return loaded_params
 
 
@@ -2924,8 +2930,10 @@ class KimiLinearForCausalLM(
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            dense_dwdp.shard_table(self.lm_head.weight)
         else:
             self.lm_head = PPMissingLayer()
+        dense_dwdp.log_construction()
         log_kimi_k3_quant_kinds(self)
         enable_kimi_k3_low_latency_gemm(self, self.model_config.dtype)
         logit_scale = getattr(self.config, "logit_scale", 1.0)
@@ -3027,82 +3035,53 @@ class KimiLinearForCausalLM(
             # Rubin MegaMoE: kernel-layout experts + the collective warmup, before
             # any forward (profile run, CUDA graph capture).
             prepare_rubin_megamoe(self.model)
-        packed_moe = 0
-        for module in self.model.modules():
-            if isinstance(module, KimiMoE):
-                module.pack_projections()
-                packed_moe += module._packed_moe is not None
-        if packed_moe:
-            logger.info_once(
-                "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
-                packed_moe,
-            )
-        # P/D prefill workers: shared gate_up GEMM with the SiTU + MXFP8
-        # epilogue. Not beside a concurrent SM-capped MegaMoE (SP
-        # _shared_overlap: the persistent full-grid GEMM is not capped to the
-        # reserved SMs) or on the token-shard GEMM-AR path (it reads the
-        # un-interleaved gate_up rows).
-        from .specialized_prefill import shared_situ
+        # P/D prefill workers: the shared gate_up GEMM with the SiTU + MXFP8
+        # epilogue (not beside a concurrent SM-capped MegaMoE (SP _shared_overlap:
+        # the persistent full-grid GEMM is not capped to the reserved SMs) or on the
+        # token-shard GEMM-AR path (it reads the un-interleaved gate_up rows)), and
+        # the KDA q|k|v in_proj GEMM with the conv + SiLU in its epilogue, at every
+        # layout whose shape the kernel supports (kda_conv_in_proj.unsupported_reason).
+        from .specialized_prefill import kda_conv_in_proj, shared_situ
 
         prefill_worker = pd_prefill_worker(self.vllm_config)
-        fused_situ = 0
-        for module in self.model.modules() if prefill_worker else ():
-            if (
-                isinstance(module, KimiMoE)
-                and not module._shared_overlap
-                and not module.moe_token_shard
-                and getattr(module, "_packed_moe", None) is None
-                and isinstance(module.shared_experts, KimiMLP)
-                and not module.shared_experts.shard_sequence_parallel
-                and shared_situ.supported(module.shared_experts)
-            ):
-                situ = shared_situ.PrefillSharedSitu(module.shared_experts)
-                situ.prepare()
-                module.shared_experts._prefill_situ = situ
-                fused_situ += 1
-        if fused_situ:
-            logger.info_once(
-                "Kimi K3: %d prefill shared experts run the gate_up GEMM with the "
-                "SiTU + MXFP8 epilogue (sm_107).",
-                fused_situ,
-            )
-        if not fused_situ:
-            logger.info_once(
-                "Kimi K3: prefill shared experts keep the separate SiTU: %s",
-                "not a P/D prefill worker"
-                if not prefill_worker
-                else "unsupported layout or weights",
-            )
-        # P/D prefill workers: KDA q|k|v in_proj GEMM with the conv + SiLU in
-        # its epilogue, at every layout whose shape the kernel supports
-        # (kda_conv_in_proj.unsupported_reason).
-        from .specialized_prefill import kda_conv_in_proj
+        counts = {"packed_moe": 0, "fused_situ": 0, "fused_conv": 0}
 
-        if not prefill_worker:
-            logger.info_once(
-                "Kimi K3: prefill KDA in_proj keeps the separate conv: "
-                "not a P/D prefill worker"
-            )
-        fused_conv = 0
-        for module in self.model.modules() if prefill_worker else ():
-            if not isinstance(module, KimiK3DeltaAttention):
-                continue
-            reason = kda_conv_in_proj.unsupported_reason(module)
-            if reason is not None:
-                logger.info_once(
-                    "Kimi K3: prefill KDA in_proj keeps the separate conv: %s", reason
-                )
-                continue
-            conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
-            conv_in_proj.prepare(self.vllm_config.scheduler_config.max_num_seqs)
-            module._prefill_conv_in_proj = conv_in_proj
-            fused_conv += 1
-        if fused_conv:
-            logger.info_once(
-                "Kimi K3: %d prefill KDA layers run the q|k|v in_proj GEMM with the "
-                "conv + SiLU epilogue (sm_107).",
-                fused_conv,
-            )
+        def prepare_layer(layer: nn.Module) -> None:
+            """One decoder layer's weight transforms (under the non-expert DWDP, in
+            the layer's load window: dense_dwdp.install)."""
+            for module in layer.modules():
+                if isinstance(module, KimiMoE):
+                    module.pack_projections()
+                    counts["packed_moe"] += module._packed_moe is not None
+            for module in layer.modules() if prefill_worker else ():
+                if (
+                    isinstance(module, KimiMoE)
+                    and not module._shared_overlap
+                    and not module.moe_token_shard
+                    and getattr(module, "_packed_moe", None) is None
+                    and isinstance(module.shared_experts, KimiMLP)
+                    and not module.shared_experts.shard_sequence_parallel
+                    and shared_situ.supported(module.shared_experts)
+                ):
+                    situ = shared_situ.PrefillSharedSitu(module.shared_experts)
+                    situ.prepare()
+                    module.shared_experts._prefill_situ = situ
+                    counts["fused_situ"] += 1
+            for module in layer.modules() if prefill_worker else ():
+                if not isinstance(module, KimiK3DeltaAttention):
+                    continue
+                reason = kda_conv_in_proj.unsupported_reason(module)
+                if reason is not None:
+                    logger.info_once(
+                        "Kimi K3: prefill KDA in_proj keeps the separate conv: %s",
+                        reason,
+                    )
+                    continue
+                conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
+                conv_in_proj.prepare(self.vllm_config.scheduler_config.max_num_seqs)
+                module._prefill_conv_in_proj = conv_in_proj
+                counts["fused_conv"] += 1
+
         # K3.1 DSA decode under DCP: the NCCL-free top-k exchange (on by policy).
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
@@ -3110,10 +3089,44 @@ class KimiLinearForCausalLM(
         # trtllm_gvr2: DeepSelect must rank every prefill chunk (checked);
         # trtllm_gvr2_nondet: its GVR V2 prefill engines, built before any forward.
         warm_prefill_indexer(self.model)
-        # Non-expert DWDP: after the projections are packed, before the profile run.
+        # The per-layer transforms, under the non-expert DWDP each in its layer's
+        # load window; after the DSA projections are packed, before the profile run.
         dense_dwdp.install(
-            self.model.layers, self.model.start_layer, self.model.end_layer
+            self.model.layers,
+            self.model.start_layer,
+            self.model.end_layer,
+            prepare_layer,
+            self.model_config.dtype,
         )
+        if counts["packed_moe"]:
+            logger.info_once(
+                "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
+                counts["packed_moe"],
+            )
+        if counts["fused_situ"]:
+            logger.info_once(
+                "Kimi K3: %d prefill shared experts run the gate_up GEMM with the "
+                "SiTU + MXFP8 epilogue (sm_107).",
+                counts["fused_situ"],
+            )
+        else:
+            logger.info_once(
+                "Kimi K3: prefill shared experts keep the separate SiTU: %s",
+                "not a P/D prefill worker"
+                if not prefill_worker
+                else "unsupported layout or weights",
+            )
+        if not prefill_worker:
+            logger.info_once(
+                "Kimi K3: prefill KDA in_proj keeps the separate conv: "
+                "not a P/D prefill worker"
+            )
+        if counts["fused_conv"]:
+            logger.info_once(
+                "Kimi K3: %d prefill KDA layers run the q|k|v in_proj GEMM with the "
+                "conv + SiLU epilogue (sm_107).",
+                counts["fused_conv"],
+            )
         if experts_late:
             prepare_megamoe(self.model, self.vllm_config)
             prepare_rubin_megamoe(self.model)

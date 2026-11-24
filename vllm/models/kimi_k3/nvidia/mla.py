@@ -448,6 +448,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
+    def dwdp_resident_linears(self) -> list[nn.Module]:
+        """``process_weights_after_loading`` reads ``kv_b_proj`` whole: construction-
+        time non-expert DWDP keeps it resident."""
+        return [self.kv_b_proj]
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Absorb ``kv_b_proj`` into decode-time ``W_UK_T`` / ``W_UV`` bmm weights.
 
