@@ -98,11 +98,9 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         # TailRowsBox at the deployment's capacity), as the 64-row engine's "twoshot"
         # does into the tuned tail's; the wide tail then only reduces.
         assert publish in (False, "local", "twoshot"), publish
-        # The 65-768-row engines keep one barrier per slot (their own ring code).
         super().__init__(
-            experts, grid, slots, publish, stages, trace, pool, dies, static_groups,
-            pair=False,
-        )  # fmt: skip
+            experts, grid, slots, publish, stages, trace, pool, dies, static_groups
+        )
         self.capacity, self.blocks = (capacity, capacity // 64)
         self.words = capacity // 32  # token mask words per expert
         # Each expert's masks (and running counts) one word (count) apart beyond its

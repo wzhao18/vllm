@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3 specialized decode: per-call time of the small-batch routed experts
 (TP16 per-rank shapes, M8 ``RubinExpertsKernel`` / M16-64 ``RubinGroupedExpertsKernel``)
-on one Rubin GPU, cold weights (L2 flushed before every call), q8 verify-like routes.
+on one Rubin GPU, cold weights (L2 flushed before every call), verify-like routes.
 
 Builds the production weights and launches exactly as
 ``tests/models/kimi_k3/test_specialized_decode_wide_experts_gpu.py`` (``run_narrow``)
@@ -35,8 +35,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[8, 16, 32, 64])
-    parser.add_argument("--q", type=int, default=8)
+    parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--iters", type=int, default=60)
+    parser.add_argument(
+        "--trace", action="store_true",
+        help="grouped kernel phase stamps (us from the first CTA's entry, median / max "
+        "over CTAs) of the last timed call",
+    )  # fmt: skip
     args = parser.parse_args()
 
     import torch
@@ -52,6 +57,20 @@ def main():
     t = load(args.test)
     dev = torch.device("cuda", 0)
     torch.accelerator.set_device_index(dev)
+    trace = None
+    if args.trace:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+            experts_rubin64 as r64,
+        )
+
+        trace = torch.zeros(256 * 512 + 512, dtype=torch.uint8, device=dev)
+        init = r64.RubinGroupedExpertsKernel.__init__
+
+        def traced(self, *a, **k):
+            k.setdefault("trace", trace.data_ptr())
+            init(self, *a, **k)
+
+        r64.RubinGroupedExpertsKernel.__init__ = traced
     built = t.production_experts(t.logical_weights(dev), dev)
     flush = torch.empty(1 << 29, dtype=torch.uint8, device=dev)
     for rows in args.rows:
@@ -73,9 +92,10 @@ def main():
             writer = er.compile_plan(rows, dev.index)
             kernel = "RubinGroupedExpertsKernel"
         mailbox = rubin and er.polled(16, rows, dev)
-        box = torch.full((er.ROUTE_WORDS,), -1, dtype=torch.int32, device=dev)
-        box[: rows * t.TOPK] = ids.reshape(-1)
-        box[rows * t.TOPK] = 2 * rows - 1
+        if mailbox:  # the routing kernel's ids and copy-CTA count
+            box = torch.full((er.ROUTE_WORDS,), -1, dtype=torch.int32, device=dev)
+            box[: rows * t.TOPK] = ids.reshape(-1)
+            box[rows * t.TOPK] = 2 * rows - 1
 
         def call():
             writer(to_cute(latent, 16), to_cute(buffers["plan"], 16), stream(dev))
@@ -108,6 +128,38 @@ def main():
             f"out {digest.hexdigest()[:16]}",
             flush=True,
         )
+        if trace is not None and not rubin:
+            trace.zero_()
+            call()
+            torch.cuda.synchronize()
+            phases(trace, rows)
+
+
+# Stamp slots (``RubinGroupedExpertsKernel.body`` / ``stream`` / ``consume``).
+PHASES = (
+    (0, "entry"), (1, "dep wait done"), (2, "grouped"), (11, "partitioned"),
+    (3, "1st issue"), (6, "1st MMA"), (4, "FC1 issued"), (7, "1st h wait"),
+    (8, "1st h ready"), (5, "end issued"), (14, "gather done"), (9, "MMAs done"),
+    (12, "h loader done"), (10, "epilogue done"), (13, "CTA end"),
+)  # fmt: skip
+
+
+def phases(trace, rows):
+    import torch
+
+    words = trace[: 256 * 512].view(torch.int64).view(256, 32, 2).cpu()
+    stamps = words[:, :16, 0]
+    used = stamps[:, 13] > 0
+    stamps = stamps[used]
+    t0 = stamps[:, 0].min()
+    cells = []
+    for slot, name in PHASES:
+        col = stamps[:, slot]
+        col = (col[col > 0] - t0).double() / 1000.0
+        if col.numel():
+            cells.append(f"{name} {col.median():.1f}/{col.max():.1f}")
+    head = f"  M{rows} CTAs {int(used.sum())} phases us (median/max): "
+    print(head + "; ".join(cells))
 
 
 if __name__ == "__main__":
