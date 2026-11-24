@@ -44,8 +44,11 @@ from .kernel import (
     unpack,
 )
 
-# Values per DSMEM round (one per lane after the warp butterflies).
-ROUND = 32
+# Values per warp-reduce chunk (one per lane after the warp butterflies).
+CHUNK = 32
+# Values per DSMEM round: up to two warp-reduce chunks (e.g. 4 tokens x 16 pre-phase
+# values at 8 saved blocks).
+ROUND = 2 * CHUNK
 
 
 def rows_tokens(nb, final=False):
@@ -64,6 +67,9 @@ class ClusterAttnResRows(ClusterAttnRes):
         self.tokens = tokens or rows_tokens(nb, self.final)
         T = self.tokens
         assert T * max(self.npre, self.npost) <= ROUND, (nb, T)
+        # Shared-memory row length of the exchanges: one chunk when every round fits
+        # (the variants up to 2 tokens at 8 blocks keep their layout), else two.
+        self.round = CHUNK if T * max(self.npre, self.npost) <= CHUNK else ROUND
         pad = lambda n: 1 << max(n - 1, 0).bit_length()  # noqa: E731
         self.kpre_t, self.kpost_t, self.kfin_t = (
             pad(T * self.npre),
@@ -88,9 +94,10 @@ class ClusterAttnResRows(ClusterAttnRes):
 
     @cute.jit
     def setup(self, smem):
-        warp_buf = alloc(smem, Float32, 4 * ROUND)
-        peer_buf = alloc(smem, Float32, (3, 7 * ROUND))
-        total = alloc(smem, Float32, (3, ROUND))
+        R: cutlass.Constexpr = self.round
+        warp_buf = alloc(smem, Float32, 4 * R)
+        peer_buf = alloc(smem, Float32, (3, 7 * R))
+        total = alloc(smem, Float32, (3, R))
         bars = alloc(smem, cutlass.Uint64, 3, 8)
         T = self.tokens
         arm_exchanges(bars, (T * self.npre, T * self.npost, T * int(self.final)))
@@ -100,25 +107,38 @@ class ClusterAttnResRows(ClusterAttnRes):
     def exchange(
         self, values, count: cutlass.Constexpr, kpad: cutlass.Constexpr, bufs, r, ids
     ):
-        """``ClusterAttnRes.exchange`` with ``count`` <= 32 values (warp rows of 32,
-        peer rows of 32; every (value, peer) push from its own thread)."""
+        """``ClusterAttnRes.exchange`` with ``count`` <= ``self.round`` values (warp
+        rows and peer rows of ``self.round``; every (value, peer) push from its own
+        thread). Above 32 values the warp reduce runs per chunk of 32: a value's
+        butterfly tree is the same whatever shares the warp, so the sums are
+        bitwise those of one chunk."""
         wb, peer_buf, total, bars = bufs
         peer_buf, total, bar = peer_buf[r, None], total[r, None], bars.iterator + r
         rank, _, tid = ids
         lane, warp = tid % 32, tid // 32
-        reduced, index = scatter_reduce(values, lane, kpad)
-        if (lane & (32 // kpad - 1)) == 0 and index < count:
-            wb[warp * ROUND + index] = reduced
+        R: cutlass.Constexpr = self.round
+        if cutlass.const_expr(kpad <= CHUNK):
+            reduced, index = scatter_reduce(values, lane, kpad)
+            if (lane & (32 // kpad - 1)) == 0 and index < count:
+                wb[warp * R + index] = reduced
+        else:
+            for c in cutlass.range_constexpr(kpad // CHUNK):
+                part = cute.make_rmem_tensor(CHUNK, Float32)
+                for i in cutlass.range_constexpr(CHUNK):
+                    part[i] = values[c * CHUNK + i]
+                reduced, index = scatter_reduce(part, lane, CHUNK)
+                if c * CHUNK + index < count:
+                    wb[warp * R + c * CHUNK + index] = reduced
         group_barrier(0)
         for j in cutlass.range(tid, 7 * count, 128, unroll=1):
             i, peer = j % count, j // count
-            value = (wb[i] + wb[ROUND + i]) + (wb[2 * ROUND + i] + wb[3 * ROUND + i])
-            push_float(peer_buf.iterator + rank * ROUND + i, value, bar, peer)
+            value = (wb[i] + wb[R + i]) + (wb[2 * R + i] + wb[3 * R + i])
+            push_float(peer_buf.iterator + rank * R + i, value, bar, peer)
         wait(bar)
         if tid < count:
             sums = [Float32(0), Float32(0)]
             for peer in cutlass.range_constexpr(7):
-                sums[peer % 2] += peer_buf[peer * ROUND + tid]
+                sums[peer % 2] += peer_buf[peer * R + tid]
             total[tid] = sums[0] + sums[1]
         group_barrier(0)
 
