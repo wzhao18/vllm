@@ -1610,6 +1610,14 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             flags: Int64,
             max_rows: Int32,
         ):
+            # The consumer of the merged rows (the sparse attention core, PDL)
+            # becomes resident now and runs its own prologue (q mailbox poll)
+            # under this kernel; its griddepcontrol.wait still orders its reads
+            # of our outputs after this grid completes. The grid is at most one
+            # CTA per SM, so no CTA of ours waits behind an early dependent.
+            # This launch itself stays non-PDL: the select before it does not
+            # release its dependents early.
+            cute.arch.griddepcontrol_launch_dependents()
             cta, _, _ = cute.arch.block_idx()
             num_ctas, _, _ = cute.arch.grid_dim()
             tid, _, _ = cute.arch.thread_idx()

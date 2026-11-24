@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility functions for sparse MLA backends."""
 
+import functools
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -20,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     VllmTritonJitKernel,
     triton_scalar_specialization_rep,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import dcp_global_to_local_index
@@ -133,6 +135,8 @@ class ConvertReqIndexToGlobalIndexKernel(
         DCP_SIZE: tl.constexpr,
         DCP_RANK: tl.constexpr,
         DCP_INTERLEAVE: tl.constexpr,
+        # Release a PDL-launched consumer at entry (``_remap_launch_dependents``).
+        LAUNCH_DEPENDENTS: tl.constexpr,
         # strides (in elements)
         bt_stride0,
         bt_stride1,
@@ -141,6 +145,12 @@ class ConvertReqIndexToGlobalIndexKernel(
         out_stride0,
         out_stride1,
     ):
+        # The DCP decode's consumer of these rows is a PDL kernel: it becomes
+        # resident and runs its prologue under this grid; its griddepcontrol.wait
+        # still orders its reads after this grid completes.
+        if LAUNCH_DEPENDENTS:
+            tl.extra.cuda.gdc_launch_dependents()
+
         # program_id(0) -> token_id (row)
         # program_id(1) -> tile index along columns
         token_id = tl.program_id(0)
@@ -421,6 +431,7 @@ class ConvertReqIndexToGlobalIndexKernel(
             DCP_SIZE=compile_key.dcp_size,
             DCP_RANK=compile_key.dcp_rank,
             DCP_INTERLEAVE=compile_key.dcp_interleave,
+            LAUNCH_DEPENDENTS=_remap_launch_dependents(compile_key.dcp_size),
         )
 
     @kernel_launcher
@@ -468,8 +479,23 @@ class ConvertReqIndexToGlobalIndexKernel(
             ti_stride1=token_indices.stride(1),
             out_stride0=out.stride(0),
             out_stride1=out.stride(1),
+            LAUNCH_DEPENDENTS=_remap_launch_dependents(DCP_SIZE),
             num_warps=num_warps,
         )
+
+
+@functools.cache
+def _remap_launch_dependents(dcp_size: int) -> bool:
+    """Whether the remap releases its dependents (PDL) at entry: on the DCP
+    decode path (``dcp_size > 1``), whose sparse attention consumers launch with
+    programmatic stream serialization and wait before reading the rows. Without
+    the early release such a consumer launches only after the remap's grid has
+    drained. CUDA sm_90+ only (griddepcontrol)."""
+    return (
+        dcp_size > 1
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+    )
 
 
 def _remap_tiling(
