@@ -52,7 +52,14 @@ the embedding scatter and the final gather are the SP step's as above. The runne
 keeps the DSA-DP DEP order (``DEP_PERM``, refreshed before every replay) and builds
 the DSA metadata per segment; captured rows are whole requests per TP rank (q x TP).
 Steps whose owners do not fit a captured graph run eager (``dep_eager``): the stock
-forward, counted by ``StockSteps``.
+forward, counted by ``StockSteps``. The residual stream runs in that DEP order
+(``DepLayout``): card r's SP shard is its DEP segment (its owned requests, then padding
+requests up to the busiest owner's count), so a DSA layer runs on the shard with no
+exchange (no ``run_segment`` push in / push out). The row-independent stages (AttnRes,
+MegaMoE, the KDA blocks' all-gather / in-projection / o_proj / reduce-scatter) do not
+care about the row order; the embedding scatter reads the input ids in DEP order, the
+MegaMoE padding mask and the KDA cores' per-request metadata are permuted into it once
+per step, and the final gather is put back into the batch order.
 
 Mailbox parities: ``SpComm`` alternates by SP block ordinal (DSA and KDA together),
 the DSA DcpBox by DSA-layer ordinal. With an odd block count the last block of a step
@@ -401,6 +408,74 @@ def sp_embedding(embedding, ctx):
     return weight.detach(), shards.org_vocab_start_index, embedding.org_vocab_size
 
 
+class _DepDeferred:
+    """A step's deferred RecoverSSM (``recoverssm_deferred``) with its per-request
+    record rows in the DEP request order; the pending counts are per record slot and
+    ``flush`` folds by request, so neither depends on the order."""
+
+    def __init__(self, deferred, requests):
+        self.base = deferred
+        self.record_rows = deferred.record_rows.index_select(0, requests)
+        self.pending = deferred.pending
+
+    def flush(self):
+        self.base.flush()
+
+
+class _DepKdaMetadata:
+    """The per-request fields ``SpKdaCore.run`` reads, in the DEP request order."""
+
+    def __init__(self, md, requests):
+        self.spec_state_indices_tensor = md.spec_state_indices_tensor.index_select(
+            0, requests
+        )
+        self.num_accepted_tokens = md.num_accepted_tokens.index_select(0, requests)
+        deferred = getattr(md, "recoverssm_deferred", None)
+        self.recoverssm_deferred = (
+            None if deferred is None else _DepDeferred(deferred, requests)
+        )
+
+
+class DepLayout:
+    """The DEP row order of a captured DSA-DP step of ``rows`` rows: views of the
+    runner's persistent ``dsa_dp.DEP_PERM`` buffers, refreshed before every replay
+    (``DepPerm.set``), so a graph captured with them follows each step's owners.
+
+    ``rows``: DEP position -> batch row; ``segment``: this card's rows (its SP shard);
+    ``requests``: DEP request position -> batch request; ``inverse``: batch row ->
+    DEP position. Per step it also permutes the KDA metadata (once per metadata
+    object, i.e. per KDA cache group) and holds the segment's positions."""
+
+    def __init__(self, rows, q, tp, rank, positions):
+        from ...ops import dsa_dp as dsa_dp_ops
+
+        perm = dsa_dp_ops.DEP_PERM
+        if perm.buf is None or perm.q != q:
+            raise Unsupported(
+                "dsa_dp", Shape(rows, q),
+                f"no DEP order for q{q} (DEP_PERM q{perm.q}, built "
+                f"{perm.buf is not None})",
+            )  # fmt: skip
+        if rows % (tp * q) or rows > perm.capacity:
+            raise Unsupported(
+                "dsa_dp", Shape(rows, q),
+                f"not whole DEP segments of TP{tp} x q{q} (capacity {perm.capacity})",
+            )  # fmt: skip
+        c, n = perm.capacity, rows // tp
+        self.rows = perm.buf[:rows]
+        self.segment = perm.buf[rank * n : (rank + 1) * n]
+        self.requests = perm.buf[c : c + rows // q]
+        self.inverse = perm.buf[2 * c : 2 * c + rows]
+        self.positions = positions.index_select(0, self.segment)
+        self.kda: dict[int, _DepKdaMetadata] = {}
+
+    def kda_metadata(self, md):
+        found = self.kda.get(id(md))
+        if found is None:
+            found = self.kda[id(md)] = _DepKdaMetadata(md, self.requests)
+        return found
+
+
 class SpStep:
     """Builds the SP blocks on a ``SpecializedDecode`` (``runtime``, built with
     ``sequence_parallel``) and runs its captured steps (module docstring). All
@@ -664,9 +739,9 @@ class SpStep:
         if self.stock_dsa:
             declared["dsa_dp"] = (
                 f"{len(self.stock_dsa)} DSA layers: stock DSA-DP owner segment "
-                "(pre-AttnRes, dsa_dp.run_segment push in / all heads with packed "
-                "projections (dep_dsa.DepDsa) / push out, post-AttnRes); their MLPs: "
-                "moe_dense"
+                "(pre-AttnRes, all heads with packed projections (dep_dsa.DepDsa) on "
+                "the shard, which is the card's DEP segment: no exchange, "
+                "post-AttnRes); their MLPs: moe_dense"
             )
         return declared
 
@@ -768,7 +843,10 @@ class SpStep:
                 f"layers {missing[:4]} ({len(missing)}) lack uniform q{q} verify "
                 "metadata",
             )  # fmt: skip
-        return Step(q, metadata, context.slot_mapping, positions)
+        dep = None
+        if self.stock_dsa:
+            dep = DepLayout(b, q, self.ctx.tp, self.ctx.rank, positions)
+        return Step(q, metadata, context.slot_mapping, positions, dep)
 
     def run(self, step, input_ids, inputs_embeds):
         """Normalized hidden states (and the aux streams) of a planned step: the stock
@@ -777,6 +855,12 @@ class SpStep:
 
         runtime = self.runtime
         backbone = runtime.backbone
+        dep = step.dep  # DSA-DP: the residual stream in the DEP row order
+        if dep is not None:
+            if input_ids is not None:
+                input_ids = input_ids.index_select(0, dep.rows)
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds.index_select(0, dep.rows)
         x = inputs_embeds
         if x is None and self.embedding is None:
             x = backbone.embed_input_ids(input_ids)
@@ -790,7 +874,10 @@ class SpStep:
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             context = get_forward_context()
             rows_like = x if x is not None else input_ids
-            context.is_padding = sp_padding_mask(context.is_padding, rows_like)
+            is_padding = context.is_padding
+            if dep is not None and is_padding is not None:
+                is_padding = is_padding.index_select(0, dep.rows)
+            context.is_padding = sp_padding_mask(is_padding, rows_like)
         if x is None:
             # This rank's shard rows of the embedding, straight from the vocabulary
             # shards (SpEmbedScatter, the reduce-scatter parity of block 1: block 0
@@ -828,6 +915,8 @@ class SpStep:
                     self.side.wait_stream(main)
                     with torch.cuda.stream(self.side):
                         self.final_gather.push(prefix_sum, col)
+                if dep is not None and md is not None:
+                    md = dep.kda_metadata(md)
                 partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
                 if col is not None:  # the reduce updates prefix_sum in place
                     main.wait_stream(self.side)
@@ -875,13 +964,19 @@ class SpStep:
             width = hidden.shape[-1]
             sources = tuple(zip((hidden, *aux), self.tail_cols))
             packed = self.final_gather.run(None, cols=sources)[:rows]
+            if dep is not None:  # back to the batch order
+                packed = packed.index_select(0, dep.inverse)
             hidden, *aux = packed.split(width, dim=-1)
         elif aux:
             width = hidden.shape[-1]
             packed = self.final_gather.run(torch.cat([hidden, *aux], dim=-1))[:rows]
+            if dep is not None:
+                packed = packed.index_select(0, dep.inverse)
             hidden, *aux = packed.split(width, dim=-1)
         else:
             hidden = self.final_gather.run(hidden.contiguous())[:rows]
+            if dep is not None:
+                hidden = hidden.index_select(0, dep.inverse)
         aux = remote + aux
         return (hidden, aux) if aux else hidden
 
@@ -894,7 +989,10 @@ class SpStep:
 
         x, prefix_sum, residual = layer._pre_attn_norm(hidden, residual, prefix_sum)
         attention = self.dep_dsa.get(layer.layer_idx, layer.self_attn)
-        x = dsa_dp.run_segment(attention, step.positions, x)
+        if step.dep is not None:  # the shard is this card's DEP segment: no exchange
+            x = attention(hidden_states=x, positions=step.dep.positions)
+        else:
+            x = dsa_dp.run_segment(attention, step.positions, x)
         return layer._post_attn_norm(x, residual, prefix_sum)
 
     def prepare_kv(self):

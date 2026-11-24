@@ -167,6 +167,8 @@ class Step(NamedTuple):
     metadata: list  # per layer
     slot_mapping: Any
     positions: Any = None  # the step's token positions (the stock seams read them)
+    # DSA-DP: the step's DEP row order (``sp_attention.DepLayout``), None elsewhere.
+    dep: Any = None
 
 
 def attention_layer(module):

@@ -160,6 +160,9 @@ def dsa_dp_planner(monkeypatch, mode):
         "decode_metadata",
         lambda attention, context, q, b: "md" if attention.prefix == "kda0" else None,
     )
+    # The DEP row order itself is covered in test_k31_dsadp_zero_comm.py.
+    step.ctx = SimpleNamespace(ep=16, tp=4, rank=0)
+    monkeypatch.setattr(sp_attention, "DepLayout", lambda *args: ("dep", args[:4]))
     return step
 
 
@@ -167,6 +170,7 @@ def test_dsa_dp_plan_skips_the_stock_dsa_metadata(monkeypatch):
     step = dsa_dp_planner(monkeypatch, CUDAGraphMode.FULL)
     plan = step.plan(positions(16), None)
     assert plan.metadata == ["md", None]
+    assert plan.dep == ("dep", (16, 4, 4, 0))  # rows, q, TP, rank
 
 
 def test_dsa_dp_plan_raises_without_the_dep_order(monkeypatch):
