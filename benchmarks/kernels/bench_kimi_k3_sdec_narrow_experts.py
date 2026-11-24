@@ -39,6 +39,11 @@ def main():
     parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--iters", type=int, default=60)
     parser.add_argument(
+        "--diag", default="",
+        help="DIAGNOSTIC BUILD ONLY: comma list of consumer arms (nocp, nomma, nofence); "
+        "outputs are garbage, times only",
+    )  # fmt: skip
+    parser.add_argument(
         "--trace", action="store_true",
         help="grouped kernel phase stamps (us from the first CTA's entry, median / max "
         "over CTAs) of the last timed call",
@@ -55,6 +60,13 @@ def main():
         experts_runtime as er,
     )
 
+    if args.diag:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+            experts_rubin,
+        )
+
+        experts_rubin.DIAG.update(a for a in args.diag.split(",") if a)
+        print(f"DIAG arms {sorted(experts_rubin.DIAG)}", flush=True)
     t = load(args.test)
     dev = torch.device("cuda", 0)
     torch.accelerator.set_device_index(dev)
@@ -68,7 +80,8 @@ def main():
         init = r64.RubinGroupedExpertsKernel.__init__
 
         def traced(self, *a, **k):
-            k.setdefault("trace", trace.data_ptr())
+            if type(self) is r64.RubinGroupedExpertsKernel:
+                k.setdefault("trace", trace.data_ptr())
             init(self, *a, **k)
 
         r64.RubinGroupedExpertsKernel.__init__ = traced

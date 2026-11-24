@@ -44,7 +44,7 @@ from ..common.primitives import (
     view,
 )
 from .experts import PLAN_XSF, has_ff_byte, swizzled
-from .experts_rubin import DESCRIPTOR_LIMIT
+from .experts_rubin import DESCRIPTOR_LIMIT, DIAG
 from .experts_wide import RubinWideExpertsKernel
 
 
@@ -74,13 +74,14 @@ def stage_vw(mma, weight_scales, activation_scales, release, done, n8, *, kind, 
         code.append(f"add.u32 i{k},i{k},nw;")
     code.append(f"add.s64 as1,$4,32; add.s64 bs1,$6,{half};")
     code.append("add.u32 af1,$3,4; add.u32 bf1,$5,4;")
-    code += [f"@pc {cp} [$5],$6;", f"@pc {cp} [bf1],bs1;"]
-    code += [f"@e {cp} [$3],$4;", f"@e {cp} [af1],as1;"]
+    if "nocp" not in DIAG:
+        code += [f"@pc {cp} [$5],$6;", f"@pc {cp} [bf1],bs1;"]
+        code += [f"@e {cp} [$3],$4;", f"@e {cp} [af1],as1;"]
     for k in ks:
         code.append(
             f"add.s64 xa{k},$1,{k}; add.s64 xb{k},$2,{k // 4 * 64 + k % 4 * 2};"
         )
-    for k in ks:
+    for k in ks if "nomma" not in DIAG else ():
         af, bf = ("$3", "$5") if k < 4 else ("af1", "bf1")
         code.append(
             "@e tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
@@ -487,7 +488,8 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 b = uses % self.big
                 if first:
                     self.acquire_big(accempty, b, uses)
-                cute.arch.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr("nofence" not in DIAG):
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 completion = Uint32(0)
                 if last:
                     completion = shared_address(accfull.iterator + b)

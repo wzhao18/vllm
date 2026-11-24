@@ -157,6 +157,10 @@ ROUTED = 2
 # Descriptor start addresses are 18 bits: every MMA / tcgen05.cp operand must sit in
 # the first 256 KiB of the shared window (the dynamic base is 1 KiB in).
 DESCRIPTOR_LIMIT = 262144 - 1024
+# DIAGNOSTIC BUILD ONLY (lane L6, never merged): consumer-side arms of the weight ring,
+# set by the benchmark before compiling: "nocp" (no per-stage scale copies), "nomma"
+# (no MMAs; the commits still release the slots), "nofence" (no per-stage proxy fence).
+DIAG: set = set()
 
 
 @asm(Uint32)
@@ -356,8 +360,9 @@ def stage16(
     code += [f"mov.b32 i{k},{142738048 | k64 | k << 29 | k << 4:#x};" for k in range(4)]
     code.append("add.s64 as1,$4,32; add.s64 bs1,$6,8;")
     code.append("add.u32 af1,$3,4; add.u32 bf1,$5,4;")
-    code += [(f"@pc {cp} [$5],$6;", f"@pc {cp} [bf1],bs1;")[h] for h in halves]
-    code += [(f"@e {cp} [$3],$4;", f"@e {cp} [af1],as1;")[h] for h in halves]
+    if "nocp" not in DIAG:
+        code += [(f"@pc {cp} [$5],$6;", f"@pc {cp} [bf1],bs1;")[h] for h in halves]
+        code += [(f"@e {cp} [$3],$4;", f"@e {cp} [af1],as1;")[h] for h in halves]
     for k in ks:
         a = k // 4 * 1024 + k % 4 * 2 + (4 if kind == "fc2" and k >= 4 else 0)
         if packed:
@@ -366,7 +371,7 @@ def stage16(
         code.append(f"add.s64 xa{k},$1,{a}; add.s64 xb{k},$2,{b};")
     # Packed: each K64 MMA sums two 32-element blocks the K32 path summed in two MMAs
     # (an accumulation-grouping reorder inside the MMA; same inputs, FP32 accumulator).
-    for k in ks:
+    for k in ks if "nomma" not in DIAG else ():
         af, bf = ("$3", "$5") if k < 4 else ("af1", "bf1")
         code.append(
             "@e tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "

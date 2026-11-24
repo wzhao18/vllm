@@ -54,6 +54,7 @@ from ..common.primitives import (
 from ..common.tensormap import GridMap, map_address, prefetch_map
 from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
+    DIAG,
     DESCRIPTOR_LIMIT,
     RubinExpertsKernel,
     die_words,
@@ -549,7 +550,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if first:
                     self.acquire(accempty, acc, uses)
                 # The slot's own activation slice (its cp.async completed full[slot]).
-                cute.arch.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr("nofence" not in DIAG):
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 completion = Uint32(0)
                 if last:
                     completion = shared_address(accfull.iterator + acc)
