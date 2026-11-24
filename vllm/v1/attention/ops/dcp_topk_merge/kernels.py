@@ -612,7 +612,20 @@ def _make_radix_select(
     num_warps = tb_size // _WARP
     gid_bits = _gid_bits(world_size)
     gid_mask = (1 << gid_bits) - 1
-    num_passes = -(-(16 + gid_bits) // radix_bits)
+    # Radix passes (shift, bits), most significant first, aligned to the score /
+    # gid boundary: the 16 score bits in two passes (9 + 7), then the gid bits
+    # only while the K-th key's score is tied (9-bit passes from the top). The
+    # unaligned schedule (5 x 9 bits from bit 0) spent its first pass on one bit
+    # and mixed score and gid bits in its third, so a typical row took 4-5
+    # passes; this one resolves a tie-free cut in 2 and a short tie in 3. Same
+    # total order, so the same selected set and outputs.
+    passes = [(gid_bits + 16 - radix_bits, radix_bits), (gid_bits, 16 - radix_bits)]
+    low = gid_bits
+    while low > 0:
+        width = min(radix_bits, low)
+        low -= width
+        passes.append((low, width))
+    num_passes = len(passes)
 
     @cute.jit
     def radix_select(
@@ -651,7 +664,7 @@ def _make_radix_select(
         cute.arch.sync_threads()
 
         for p in cutlass.range_constexpr(num_passes):
-            shift = (num_passes - 1 - p) * radix_bits
+            shift, pbits = passes[p]
             if scalars[3] == Int32(0):
                 prefix = prefix_ptr.load()
                 hist[tid] = Int32(0)
@@ -660,9 +673,9 @@ def _make_radix_select(
                     key = keys[i]
                     if (
                         key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
+                        and (key >> Uint64(shift + pbits)) == prefix
                     ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
+                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
                         cute.arch.atomic_add(
                             hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
                         )
@@ -696,9 +709,9 @@ def _make_radix_select(
                     selected = False
                     if (
                         key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
+                        and (key >> Uint64(shift + pbits)) == prefix
                     ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
+                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
                         selected = b > thr or (done and b == thr)
                     if selected:
                         score = Int32(key >> Uint64(gid_bits))
@@ -707,7 +720,7 @@ def _make_radix_select(
                         sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
                 cute.arch.sync_threads()
                 if tid == Int32(0) and not done:
-                    prefix_ptr.store((prefix << Uint64(radix_bits)) | Uint64(thr))
+                    prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
                 cute.arch.sync_threads()
 
         if cutlass.const_expr(emit_ids):
