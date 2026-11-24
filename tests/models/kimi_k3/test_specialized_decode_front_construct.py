@@ -85,7 +85,12 @@ def test_shared_front_constructs(monkeypatch, tp, q, wide):
     )  # fmt: skip
     assert set(built.plans) == set(BATCHES)
     split = front.split_table(tp, q > 1, wide)
-    assert built.split == {b: split[b] for b in BATCHES if b > 8 and split.get(b)}
+    expect = {b: split[b] for b in BATCHES if b > 8 and split.get(b)}
+    if wide and tp == 16:  # SiTU-epilogue rows with SharedDown beside the experts
+        situ = front.batch_table(front.SITU_SPLIT_WIDE[tp][q > 1])
+        expect.update({b: n for b, n in situ.items() if b in BATCHES})
+    assert built.split == expect
+    assert set(built.situ_down) == {b for b in expect if b <= 8}
     if wide and q > 1:
         assert all(built.split[b] == 8 for b in (16, 32, 48)), built.split
     assert built.merged <= set(built.split)
