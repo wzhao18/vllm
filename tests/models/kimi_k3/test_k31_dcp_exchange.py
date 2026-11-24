@@ -129,14 +129,14 @@ def make_logits(case: str, T: int, G: torch.Tensor, gen: torch.Generator, device
         x = torch.where(dense[None, :], 3.0 + (lpos % 8)[None, :].float() / 64, x)
     elif case in ("tie_cut", "bos64"):
         # tau found in round 1 with > 256 ties at it on every rank: the id cut by radix over
-        # the candidate ties. tie_cut: 600 equal keys per rank under ~400 distinct higher
-        # keys per rank; bos64: one equal sink every ~64 positions (BOS-like)
+        # the candidate ties. tie_cut: 600 equal keys per rank under 1200 higher keys in all
+        # (K inside the ties at any DCP size); bos64: one equal sink every ~64 positions
         pos = torch.arange(Gmax, device=device)
         x = torch.relu(x + 0.3) * 0.25
         if case == "tie_cut":
             w = WORLD[0]
             tie = (pos % 37 == 5) & (pos < 37 * 600 * w)
-            hi = (pos % 37 == 11) & (pos < 37 * 400 * w)
+            hi = (pos % 37 == 11) & (pos < 37 * 1200)
             x = torch.where(tie[None, :], 5.0, x)
             x = torch.where(hi[None, :], 6.0 + (pos % 997)[None, :].float() / 128, x)
         else:
