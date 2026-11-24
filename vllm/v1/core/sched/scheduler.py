@@ -345,11 +345,14 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids: set[str] = set()
         # Requests computing in their admission step over a connector load that
         # lands before the forward (load_lands_before_step), until that step's
-        # output: req id -> num_computed_tokens without the loaded tokens.
-        self._same_step_loads: dict[str, int] = {}
+        # output.
+        self._same_step_loads: set[str] = set()
         # Same-step loads whose step output arrived or whose request finished:
         # the workers also list them in finished_recving, which skips them.
         self._same_step_landed: set[str] = set()
+        # Requests preempted by a failed same-step load since the last
+        # schedule(): admitted again only after their workers drop them.
+        self._same_step_preempted: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1507,6 +1510,12 @@ class Scheduler(SchedulerInterface):
                     skip_request(request_queue)
                     continue
 
+                if request_id in self._same_step_preempted:
+                    # This step's preempted_req_ids drops it from the workers,
+                    # as after a preemption in schedule().
+                    skip_request(request_queue)
+                    continue
+
                 # Check that adding the request still respects the max_loras constraint.
                 if (
                     self.lora_config
@@ -2039,9 +2048,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         if same_step_load:
                             self.connector.confirm_load_before_step(request)
-                            self._same_step_loads[request_id] = (
-                                num_computed_tokens - num_external_computed_tokens
-                            )
+                            self._same_step_loads.add(request_id)
                         self.connector.update_state_after_alloc(
                             request,
                             self.kv_cache_manager.get_blocks(request_id),
@@ -2513,6 +2520,7 @@ class Scheduler(SchedulerInterface):
         # the scheduler output.
         self.finished_req_ids = set()
         self.reset_preempted_req_ids = set()
+        self._same_step_preempted.clear()
 
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
@@ -2947,7 +2955,7 @@ class Scheduler(SchedulerInterface):
             for req_id in [
                 r for r in self._same_step_loads if r in num_scheduled_tokens
             ]:
-                del self._same_step_loads[req_id]
+                self._same_step_loads.discard(req_id)
                 # The workers also list it in this output's finished_recving.
                 self._same_step_landed.add(req_id)
                 # Its blocks were allocated uncached (delay_cache_blocks): cache
@@ -4257,7 +4265,8 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
-        if self._same_step_loads.pop(request.request_id, None) is not None:
+        if request.request_id in self._same_step_loads:
+            self._same_step_loads.discard(request.request_id)
             # Its step's output still lists the load in finished_recving.
             self._same_step_landed.add(request.request_id)
 
@@ -5006,23 +5015,28 @@ class Scheduler(SchedulerInterface):
         """Fail closed for layouts whose block IDs are not globally unique."""
         affected_req_ids: set[str] = set()
         # A request computed in its admission step over a load that failed: drop
-        # that step's output; with recompute, it computes the prompt again from
-        # its local hit in its own (uncached) blocks.
+        # that step's output; with recompute, preempt it. Its workers already
+        # hold it at the end of its prompt (their num_computed_tokens, Mamba
+        # running state and token ids from the hit on), so it cannot continue
+        # from its local hit as a running request: like a failed async load, it
+        # is admitted again, as a new request.
         same_step_failed: set[str] = set()
-        for req_id in failed_req_ids:
-            num_local = self._same_step_loads.pop(req_id, None)
+        for req_id in failed_req_ids & self._same_step_loads:
+            self._same_step_loads.discard(req_id)
             request = self.requests.get(req_id)
-            if (
-                num_local is None
-                or request is None
-                or request.status != RequestStatus.RUNNING
-            ):
+            if request is None or request.status != RequestStatus.RUNNING:
                 continue
             same_step_failed.add(req_id)
             self._same_step_landed.add(req_id)
             if self.recompute_kv_load_failures:
-                request.num_computed_tokens = num_local
-                request.num_output_placeholders = 0
+                logger.warning(
+                    "Same-step KV load of request %s failed: preempting it to "
+                    "recompute",
+                    req_id,
+                )
+                self.running.remove(request)
+                self._preempt_request(request, time.monotonic(), drop_stale_output=True)
+                self._same_step_preempted.add(req_id)
         for req_id in failed_req_ids - same_step_failed:
             request = self.requests.get(req_id)
             if (

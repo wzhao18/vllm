@@ -117,26 +117,72 @@ def test_aborted_same_step_load_skips_its_finished_report():
     assert not scheduler._same_step_landed
 
 
-def test_failed_same_step_load_recomputes():
+class _V2WorkerView:
+    """A v2 model runner's view of each request: its device num_computed_tokens
+    is set when the request is added and then only advances by the request's
+    scheduled tokens (a running request's scheduler num_computed_tokens updates
+    the host mirror only), and the step's positions index its block table."""
+
+    def __init__(self) -> None:
+        self.num_computed: dict[str, int] = {}
+        self.num_blocks: dict[str, int] = {}
+
+    def step(self, out: SchedulerOutput) -> None:
+        for req_id in out.preempted_req_ids | out.finished_req_ids:
+            self.num_computed.pop(req_id, None)
+            self.num_blocks.pop(req_id, None)
+        for new in out.scheduled_new_reqs:
+            self.num_computed[new.req_id] = new.num_computed_tokens
+            self.num_blocks[new.req_id] = len(new.block_ids[0])
+        cached = out.scheduled_cached_reqs
+        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_block_ids is not None:
+                self.num_blocks[req_id] += len(new_block_ids[0])
+        for req_id, num_tokens in out.num_scheduled_tokens.items():
+            start = self.num_computed[req_id]
+            assert start + num_tokens <= self.num_blocks[req_id] * BLOCK, (
+                f"{req_id} computes positions [{start}, {start + num_tokens}) "
+                f"on {self.num_blocks[req_id]} blocks of {BLOCK}"
+            )
+            self.num_computed[req_id] = start + num_tokens
+
+
+def test_failed_same_step_load_preempts():
     """A failed same-step load drops its step's output; with the recompute
-    policy the request computes its whole prompt again."""
-    scheduler = _scheduler()
+    policy the request is preempted and admitted again as a new request. Its
+    workers computed it to the end of its prompt: continuing it from its local
+    hit as a running request regressed its num_computed_tokens under them, and
+    the next step computed positions past its blocks (an illegal memory access
+    in a P/D prefill, two steps after a Mooncake get failed)."""
+    scheduler = _scheduler(use_v2_model_runner=True)
     scheduler.recompute_kv_load_failures = True
+    worker = _V2WorkerView()
+    num_free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     (r0,) = _requests(["r0"])
     scheduler.add_request(r0)
     out = scheduler.schedule()
+    worker.step(out)
 
     outputs = _step(scheduler, out, finished_recving={"r0"}, failed_recving={"r0"})
     assert not any(
         o.request_id == "r0" for outs in outputs.values() for o in outs.outputs
     )
-    assert r0.status == RequestStatus.RUNNING
-    assert r0.num_computed_tokens == 0
+    out = scheduler.schedule()
+    worker.step(out)
+    # The workers drop it before it is admitted again.
+    assert r0.status == RequestStatus.PREEMPTED
+    assert out.preempted_req_ids == {"r0"}
+    assert out.num_scheduled_tokens == {}
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == num_free
     assert not scheduler._same_step_landed
+    _step(scheduler, out)
 
     out = scheduler.schedule()
-    assert out.num_scheduled_tokens == {"r0": PROMPT}
-    assert not out.has_sync_kv_loads
+    worker.step(out)
+    assert [new.req_id for new in out.scheduled_new_reqs] == ["r0"]
+    assert out.num_scheduled_tokens == {"r0": PROMPT - HIT}
+    _step(scheduler, out, finished_recving={"r0"})
+    assert r0.is_finished()
 
 
 def test_same_step_load_caches_its_blocks_when_it_finishes():
