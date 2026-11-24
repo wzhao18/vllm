@@ -288,7 +288,9 @@ FP32_FEED_KIND = 8
 # 1.8.0.2 (two runs, two nodes): B16 13.14 / 11.50 and 12.52 / 11.53, B17 12.58 /
 # 11.70. From B18 the 2-CTA clusters need a second wave (B18 19.20 vs LoopStock
 # 13.58), and B32 / B64 stay LoopStock (best KdaSplitStock 1.8.2.2: 17.66 / 33.86 vs
-# 15.37 / 30.15).
+# 15.37 / 30.15). The table is not keyed on the conv dtype, so a BF16 conv state takes
+# 1.8.0.2 at B16-17 too; the older BF16-conv sweep above had LoopStock 11.33 vs
+# 11.44 there, a ~1 % sub-op slowdown that this accepts.
 FP32_SPLIT_Q: dict = {
     (10, 7): {
         4: {6: "41-42:1.8.3.4"},
