@@ -85,12 +85,13 @@ ROUTER_LATENT = {"*": "1-32:64.32.2.9,33-64:64.64.2.6,65-80:64.80.2.5,81-96:64.9
 # slice, split-K front vs prewait (fastab xy1/xy2/x96, Rhea): n32 split-K faster
 # (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step), n96 prewait
 # faster (r24 -9.3 +- 6.6 us/step, 3 rounds).
-# Rows between the tiles run the next tile (``prewait_gemm.tile``: 33-64 on the 64-token
-# tile, 65-96 on the 96-token one; the TMA zero-fills the tile's rows past n, so each
-# row's sums are the tile's bit for bit). Without it the shard rows just past 64 fell
-# to the split-K front (CUPTI DC k7 B32 -> B34, 64 -> 68 shard rows, frozen 928a:
-# wsg_k 17.7 -> SplitKGemm 64.80.2.5 19.8 us per call, +193 us per step).
-PREWAIT_ROWS = ((33, 96),)
+# 65-96 rows run the 96-token tile (``prewait_gemm.tile``; the TMA zero-fills the tile's
+# rows past n, so each row's sums are the tile's bit for bit) instead of the split-K
+# front (64.80.2.5 / 64.96.2.5). 33-63 rows keep the split-K 64.64.2.6: the 64-token
+# pre-wait tile there was slower in-step (DEDGE, DC k7 dev 7f3b, CUPTI rank 0, router |
+# latent us per step vs the same run's B32: B17 split-K +147, pre-wait T64 +207; B34
+# split-K +295, pre-wait T96 +275).
+PREWAIT_ROWS = ((64, 64), (65, 96))
 
 
 def prewait_rows(n: int) -> bool:
