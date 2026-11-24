@@ -145,10 +145,29 @@ def test_index_policies_wide_rows():
     assert policies[72] == policies[96] == policies[128] == (64, 64, 2, 6)
     assert 256 not in policies and 768 not in policies
     # Rubin: one K pass per CTA from 33 rows on (measured table), still none above 128
-    rubin = index_policies([8, 32, 64, 72, 128, 256], sms=212)
+    rubin = index_policies([8, 32, 64, 72, 128, 256], rubin=True)
     assert rubin[8] == (128, 8, 3, 4) and rubin[32] == (64, 32, 2, 6)
     assert rubin[64] == rubin[72] == rubin[128] == (64, 64, 1, 7)
     assert 256 not in rubin
+
+
+def test_query_stage_index_policies():
+    """QueryStage's wq_b table: GB300 maps every row count to a split-K tactic (64-row
+    N tiles above 64); Rubin uses the same table as WideDsa and none above 128 rows
+    (``QueryStage.run_index``: cuBLAS there)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import query_stage
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        index_policies,
+    )
+
+    rows = [8, 16, 32, 64, 72, 128, 256, 512]
+    gb300 = query_stage.index_policies(rows)
+    assert gb300[32] == (64, 32, 1, 8)
+    assert gb300[72] == gb300[256] == gb300[512] == (64, 64, 1, 4)
+    rubin = query_stage.index_policies(rows, rubin=True)
+    assert rubin == index_policies(rows, rubin=True)
+    assert sorted(rubin) == [8, 16, 32, 64, 72, 128]
+    assert rubin[128] == (64, 64, 1, 7)
 
 
 def dcp16_core_specs(heads=6):
@@ -510,8 +529,8 @@ def test_index_projection_rows(batch):
     bf, dev = torch.bfloat16, "cuda"
     wq = (torch.randn(32 * 128, 1536, device=dev) / 1536**0.5).to(bf)
     q_c = torch.randn(batch, 1536, device=dev).to(bf)
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    projection = PreparedProjection(wq, index_policies([batch], sms)).prepare()
+    rubin = torch.cuda.get_device_capability(dev) == (10, 7)
+    projection = PreparedProjection(wq, index_policies([batch], rubin)).prepare()
     out = torch.full((batch, 32 * 128), float("nan"), device=dev, dtype=bf)
     projection.run(q_c, out)
     ref = q_c.float() @ wq.float().t()

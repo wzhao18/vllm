@@ -35,11 +35,10 @@ def gate_columns(heads):
     return 2112, 2112 + heads * 128
 
 
-# Rubin (more SMs than GB300's 152) wq_b tactics by padded rows. 1 GPU, a graph of
-# 24 back-to-back calls over cold weight copies (> 3 x L2), us per call, GB300 table
-# -> this: R32 (64, 32, 1, 8) 3.34 -> 3.02, R64 (64, 64, 1, 4) 4.32 -> 3.60, R128
-# (64, 64, 2, 6) 7.46 -> 4.01 (one K pass per CTA, a deeper ring: the 64-row token
-# tiles re-read the 12.6 MB weight from L2, not HBM; cuBLAS 3.97, cuBLASLt 3.95).
+# Rubin (sm_107) wq_b tactics by padded rows, measured per row bin (1 GPU, chained
+# calls over cold weight copies): one K pass per CTA and a deeper ring from 33 rows
+# (the 64-row token tiles re-read the weight from L2, not HBM). Above 128 rows no
+# split-K tactic beats cuBLAS: those rows run torch.mm, as the stock ``wq_index``.
 RUBIN_INDEX_TACTICS = {
     8: (128, 8, 3, 4),
     16: (64, 16, 2, 6),
@@ -49,13 +48,20 @@ RUBIN_INDEX_TACTICS = {
 }
 
 
-def index_policies(batches, sms=152):
+def is_rubin(device):
+    return torch.cuda.get_device_capability(device) == (10, 7)
+
+
+def index_policies(batches, rubin=False):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9);
-    wider batches run 64-row N tiles. Rubin (``sms`` > 152): ``RUBIN_INDEX_TACTICS``."""
-    if sms > 152:
+    wider batches run 64-row N tiles. Rubin: ``RUBIN_INDEX_TACTICS`` up to 128 rows,
+    none above (``run_index``: cuBLAS)."""
+    if rubin:
         tactics = RUBIN_INDEX_TACTICS
-        return {b: tactics[next((n for n in tactics if b <= n), 128)] for b in batches}
+        return {
+            b: tactics[next(n for n in tactics if b <= n)] for b in batches if b <= 128
+        }
     tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
     tactics[64] = (64, 64, 1, 4)
     return {b: tactics[next((n for n in tactics if b <= n), 64)] for b in batches}
@@ -257,8 +263,7 @@ class QueryStage:
             self.scales = q_scale_inv, self.unit if nvfp4 else k_scale
             shape = (max(pitches), self.heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=device)
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        policies = index_policies(sorted(pitches), sms)
+        policies = index_policies(sorted(pitches), is_rubin(device))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
         self.wq_view = to_cute(wq)
@@ -303,7 +308,13 @@ class QueryStage:
         """wq_b, then the FP8 indexer query and head weights and the key into the
         indexer cache."""
         batch = projected.shape[0]
-        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
+        proj = self.index_projection  # (the SP decode swaps in a DecodeProjection)
+        if isinstance(proj, PreparedProjection) and batch not in proj.kernels:
+            # no split-K tactic at these rows (Rubin > 128): cuBLAS, as stock
+            wq = self.indexer.wq_index.weight
+            iq = torch.mm(self.qc[:batch], wq.t(), out=self.iq[:batch])
+        else:
+            iq = proj.run(self.qc[:batch], self.iq[:batch])
         rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
         key = to_cute(self.indexer.k_cache.kv_cache), to_cute(index_slots[:batch], 8)
         s = stream(self.device)
