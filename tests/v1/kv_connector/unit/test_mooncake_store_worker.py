@@ -1800,6 +1800,28 @@ def test_store_recving_thread_reports_failed_block_ids():
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
 
 
+def test_store_recving_thread_debug_fails_same_step_loads():
+    """Test-only fault injection (debug_fail_same_step_loads) fails a key of a
+    same-step load, never one of an async load."""
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = [[256, 256, 256], [256]]
+    thread = _make_store_recving_thread(store)
+    thread.debug_fail_same_step_loads = 1.0
+    landed: dict[str, bool] = {}
+    thread.report_same_step_done = landed.__setitem__
+
+    same_step = _make_load_req("req-a", [b"a0", b"a1", b"a2"], token_len=48)
+    assert same_step.load_spec is not None
+    same_step.load_spec.same_step = True
+    thread._handle_request(same_step)
+    assert landed == {"req-a": True}
+    assert thread.get_and_clear_failed_requests() == {"req-a"}
+
+    thread._handle_request(_make_load_req("req-b", [b"b0"], token_len=16))
+    assert thread.get_and_clear_finished_requests() == {"req-a", "req-b"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+
+
 def test_store_recving_thread_reports_failed_block_ids_after_rotation():
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, -5, 256]

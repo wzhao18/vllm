@@ -18,6 +18,7 @@ import math
 import os
 import pickle
 import queue
+import random
 import socket
 import threading
 import struct
@@ -1348,6 +1349,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
 class KVCacheStoreRecvingThread(KVTransferThread):
     """Background thread for loading KV cache blocks from the store."""
 
+    # Test only: see MooncakeStoreWorker._debug_fail_same_step_loads.
+    debug_fail_same_step_loads: float = 0.0
+
     def __init__(
         self,
         store: Any,
@@ -1652,6 +1656,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
         load_failed = False
+        inject_failure = (
+            self._same_step and random.random() < self.debug_fail_same_step_loads
+        )
         try:
             for (
                 batch_keys,
@@ -1675,6 +1682,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     batch_sizes,
                     keys=batch_keys,
                 )
+                if inject_failure:
+                    inject_failure = False
+                    logger.warning(
+                        "Failing a key of the same-step load of request %s "
+                        "(debug_fail_same_step_loads)",
+                        req_id,
+                    )
+                    res = [*res[:-1], MOONCAKE_OBJECT_NOT_FOUND]
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1736,6 +1751,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
+
+    # Test only (fault injection, kv_connector_extra_config
+    # "debug_fail_same_step_loads"): the fraction of same-step loads whose last
+    # fetched key reads as missing, as when a pruned state goes between the
+    # lookup and the load.
+    _debug_fail_same_step_loads: float = 0.0
 
     @staticmethod
     def _create_mem_pool(
@@ -1825,6 +1846,15 @@ class MooncakeStoreWorker:
         self._store_op_timeout_s = float(
             extra_config.get("store_op_timeout_s", DEFAULT_STORE_OP_TIMEOUT_S)
         )
+        self._debug_fail_same_step_loads = float(
+            extra_config.get("debug_fail_same_step_loads", 0.0)
+        )
+        if self._debug_fail_same_step_loads > 0:
+            logger.warning(
+                "Mooncake test fault injection on: failing %.3f of same-step "
+                "loads (debug_fail_same_step_loads)",
+                self._debug_fail_same_step_loads,
+            )
         if self._store_op_failover:
             logger.info(
                 "Mooncake store failover on: store get / put bounded at %.1f s "
@@ -2508,6 +2538,7 @@ class MooncakeStoreWorker:
             recv_thread._dsa_dp_owner = self._dsa_dp_owner
             recv_thread._dsa_dp_block_ids = self._dsa_dp_block_ids
             recv_thread.report_same_step_done = self._report_same_step_done
+            recv_thread.debug_fail_same_step_loads = self._debug_fail_same_step_loads
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)
