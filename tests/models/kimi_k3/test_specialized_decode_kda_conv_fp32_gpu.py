@@ -29,6 +29,7 @@ from tests.models.kimi_k3.test_specialized_decode_kda_fp32_gpu import (  # noqa:
 )
 from tests.models.kimi_k3.test_specialized_decode_kda_loop_gpu import (  # noqa: F401
     test_feed_equals_loopstock,
+    test_fp32_split_geometry_equals_loopstock,
     test_fp32_verify_rows_match_stock,
     test_loop_padding_requests,
     test_packed_and_loop_equal_wide,

@@ -16,6 +16,9 @@
 * ``KdaVerifyPacked`` and ``KdaVerifyLoop`` (``KdaVerifyWide``'s math: KdaSplit's;
   LoopStock's bases, never selected for an FP32 state) equal ``KdaVerifyWide`` bit
   for bit;
+* ``KdaSplitStock`` at every ``FP32_SPLIT_Q`` geometry equals ``KdaVerifyLoopStock``
+  bit for bit (the geometry spreads an item over a cluster; the 8 lanes per row fix
+  the reduction order), with and without padding requests;
 * ``KdaVerifyFeed`` (LoopStock with feed warps: per-item prologue and gated norm
   beside the recurrence warps, operands staged in shared memory) equals
   ``KdaVerifyLoopStock`` bit for bit, with and without padding requests, and
@@ -77,7 +80,7 @@ LOOP_SHAPES = [
 STOCK_SHAPES = [
     *(pytest.param(q, b, HEADS, False, id=f"q{q}-B{b}") for q, b in (
         (4, 1), (4, 4), (4, 8), (4, 14), (4, 36), (4, 40),
-        (8, 1), (8, 4), (8, 8), (8, 14),
+        (8, 1), (8, 4), (8, 8), (8, 14), (8, 16), (8, 17),
     )),
     *(pytest.param(*p.values, HEADS, False, id=p.id) for p in LOOP_SHAPES),
     pytest.param(4, 8, HEADS, True, id="q4-B8-bias"),
@@ -293,6 +296,43 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
     projected = projected_rows(requests * q)
     got = run(
         core_of(attention, requests, q, "feed", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    want = run(
+        core_of(attention, requests, q, "loopstock", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    assert_bitwise("output", got[0], want[0])
+    assert_bitwise("recurrent state", got[1][1], want[1][1])
+    assert_bitwise("conv state", got[1][0], want[1][0])
+
+
+# FP32_SPLIT_Q rows (q, requests): the 2-CTA clusters of q8 B16-17, the 4-CTA ones
+# around them and q4's.
+SPLIT_SHAPES = [(8, 12), (8, 15), (8, 16), (8, 17), (8, 18), (4, 41)]
+
+
+@pytest.mark.parametrize("q,requests", SPLIT_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
+def test_fp32_split_geometry_equals_loopstock(monkeypatch, q, requests, pad):
+    """The FP32_SPLIT_Q rows run KdaSplitStock at their geometry, bitwise the
+    LoopStock kernel they replace (outputs, checkpoints, conv window)."""
+    assert prepared.verify_kernel(requests, q, RUBIN, False, 0, HEADS) == "kdasplit"
+    split = prepared.fp32_split_table(RUBIN, q, HEADS)
+    assert requests in split, (q, requests)
+    schedule = prepared.schedule_of(HEADS, requests, 0, q, RUBIN, False)
+    assert tuple(schedule[:4]) == tuple(split[requests][:4]), schedule
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    if pad:  # every third request is padding
+        padded = torch.arange(requests, device=DEVICE) % 3 == 1
+        table[padded] = -1
+        accepted[padded] = 1
+    projected = projected_rows(requests * q)
+    got = run(
+        core_of(attention, requests, q, "kdasplit", base, monkeypatch),
         projected, base, table, accepted,
     )  # fmt: skip
     want = run(
