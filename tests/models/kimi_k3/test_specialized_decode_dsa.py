@@ -3847,9 +3847,12 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     keys = (
         select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
         rescue.dispatch(**key, block_size=1024),
+        # The variant that releases the DSA sparse core early (MergeRows.rows).
+        rescue.dispatch(**key, block_size=1024, release=True),
     )
     stage.warm(1024)
-    assert keys[0] in select._compiled_cache and keys[1] in rescue._compiled_cache
+    assert keys[0] in select._compiled_cache
+    assert keys[1] in rescue._compiled_cache and keys[2] in rescue._compiled_cache
     warm = MagicMock()
     monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
     stage.warm(1024)

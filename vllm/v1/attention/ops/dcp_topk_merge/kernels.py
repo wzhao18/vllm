@@ -2065,7 +2065,7 @@ def register_dcp_topk_merge_warmup(
     mailbox: bool | None = None,
 ) -> None:
     """Compile the pack kernel and one select (+ rescue) variant at JIT
-    warmup.
+    warmup (with ``block_size``, both rescue ``release`` variants).
 
     The stock indexer uses the defaults (global ids); a caller of
     ``dcp_topk_merge_rows`` passes its ``block_size`` and whether it also
@@ -2092,13 +2092,17 @@ def register_dcp_topk_merge_warmup(
         mailbox=mailbox and exact,
     )
     if exact:
-        _DCP_TOPK_RESCUE_KERNEL.register_warmup(
-            topk=topk,
-            local_topk=local_topk,
-            world_size=world_size,
-            emit_ids=emit_ids,
-            block_size=block_size,
-        )
+        # Physical rows (``dcp_topk_merge_rows``): also the variant that releases
+        # the DSA sparse core early (``release``).
+        for release in (False, True) if block_size else (False,):
+            _DCP_TOPK_RESCUE_KERNEL.register_warmup(
+                topk=topk,
+                local_topk=local_topk,
+                world_size=world_size,
+                emit_ids=emit_ids,
+                block_size=block_size,
+                release=release,
+            )
 
 
 def dcp_topk_pack_indices(
