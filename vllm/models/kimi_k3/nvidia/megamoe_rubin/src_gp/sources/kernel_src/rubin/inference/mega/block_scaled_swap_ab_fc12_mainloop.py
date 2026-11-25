@@ -19,6 +19,7 @@ from ......common.ptx_helpers import (
     mbarrier_arrive_release_cluster_on_cta,
     mbarrier_wait_acquire_cluster,
     sts128_byte_doubled,
+    store_i32_to_peer_cluster_smem_async,
     tcgen05_fence_after_thread_sync,
     tma_load_1d,
 )
@@ -308,6 +309,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         smem_workspace.register_mbarrier(self.ab_pipeline_mbarriers_region, self.num_ab_pipeline_stages * 2)
         if self.compact_weight_sf:
             smem_workspace.register_mbarrier(self.compact_sfa_mbarriers_region, self.num_ab_pipeline_stages)
+            smem_workspace.register_tensor("rubin.p8x.peer_signal", cutlass.Int32, (self.num_ab_pipeline_stages,), byte_alignment=16)
         # Register the 4 B holding word before the 128 B-aligned stage tensors so it lands in the alignment gap.
         smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
 
@@ -891,6 +893,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.compact_sfa_mbarriers = None
         if cutlass.const_expr(self.compact_weight_sf):
             self.compact_sfa_mbarriers = smem_workspace.ptr(self.compact_sfa_mbarriers_region, smem_base)
+            self.p8x_signal = smem_workspace.ptr("rubin.p8x.peer_signal", smem_base)
             # The pair's leader holds the AB barriers the peer's expanded SFA arrives on.
             self.leader_cta_rank = cta_coord_in_cluster[0] - self.mma_cta_index
         self.main_vmnk_coord = (
@@ -920,7 +923,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         producers = 2
         if cutlass.const_expr(self.compact_weight_sf):
             import os as _os
-            if cutlass.const_expr("nopeer" not in _os.environ.get("P8X", "")):
+            if cutlass.const_expr("nopeer" not in _os.environ.get("P8X", "") and "stasync" not in _os.environ.get("P8X", "")):
                 producers += self.mma_cta_count - 1
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
@@ -932,7 +935,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             num_stages=self.num_ab_pipeline_stages,
             producer_group=producer_group,
             num_mma_consumer_warps=1,
-            tx_count=self.num_tma_load_bytes // 2,
+            tx_count=(self.num_tma_load_bytes + (4 * (self.mma_cta_count - 1) if self.compact_weight_sf and "stasync" in __import__("os").environ.get("P8X", "") else 0)) // 2,
             preferred_cta_layout_vmnk=self.cluster_layout_vmnk,
             fallback_cta_layout_vmnk=self.fallback_cluster_layout_vmnk,
             cta_coord_vmnk=self.main_vmnk_coord,
@@ -1850,7 +1853,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             if cutlass.const_expr("peerfast" not in _x and "peernowait" not in _x):
                 self._expand_compact_sfa_stage(stage_index)
             with cute.arch.elect_one():
-                mbarrier_arrive_release_cluster_on_cta(self.ab_full_mbarriers + stage_index, self.leader_cta_rank)
+                if cutlass.const_expr("stasync" in _x):
+                    store_i32_to_peer_cluster_smem_async(
+                        self.p8x_signal + stage_index, Int32(0), self.ab_full_mbarriers + stage_index, self.leader_cta_rank
+                    )
+                else:
+                    mbarrier_arrive_release_cluster_on_cta(self.ab_full_mbarriers + stage_index, self.leader_cta_rank)
             ab_pipeline_state.advance()
         return ab_pipeline_state
 
