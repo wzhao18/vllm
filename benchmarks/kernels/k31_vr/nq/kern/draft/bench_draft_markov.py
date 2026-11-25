@@ -417,6 +417,75 @@ def main():
                     report("prod", mrank, steps, batch, False, v,
                            chosen_name(mrank, batch, False, v),
                            plan=prod_plan16(mrank, batch, False))  # fmt: skip
+    if "stamps" in parts:
+        # MarkovGreedy phase stamps (CTA 0 %globaltimer, slots per markov.py): 0 entry,
+        # 1 re-arm, 2 PDL wait, 3 setup; per position i: 4+6i markov_w1 row loaded,
+        # 5+6i MMA, 6+6i CTA keys, 7+6i published, 8+6i every rank's keys polled,
+        # 9+6i winner. Eager launches (barrier + flush between): per-rank medians of the
+        # phase deltas, and the poll wait split from the local work.
+        names = ["w1", "mma", "keys", "pub", "poll", "win"]
+        for steps in steps_list:
+            for mrank in ranks:
+                g = torch.Generator(device=dev).manual_seed(1234 + mrank)
+                shape = (vocab, mrank)
+                w1, w2 = (
+                    (torch.randn(shape, device=dev, generator=g) * 0.05).bfloat16()
+                    for _ in range(2)
+                )
+                for batch in [b for b in batches if b <= 8]:
+                    v = VARIANTS[prod_variant(draft, batch)]
+                    small = range(1, 9)
+                    p = markov.PreparedMarkov(
+                        w1, w2, world, rank, group, steps, stamps=True,
+                        gated=small if v["gated"] else (),
+                        staged=small if v["staged"] else (),
+                        settled=small if v["settled"] else (),
+                    )  # fmt: skip
+                    base_full, anchors, smp = inputs(batch, steps, vocab, True, vocab)
+                    lo = rank * VOCAB_RANK
+                    base = base_full.view(batch, steps, vocab)[:, :, lo : lo + VOCAB_RANK]
+                    base = base.reshape(batch * steps, VOCAB_RANK).contiguous()
+                    out = torch.zeros((batch, steps), dtype=torch.int64, device=dev)
+                    sampling = p.sampling_args(*smp)
+                    row = p.stats.shape[0] - 1
+                    rec = []
+                    for it in range(48):
+                        sep()
+                        dist.barrier()
+                        torch.cuda.synchronize()
+                        p.run(base, anchors, out, sampling)
+                        torch.cuda.synchronize()
+                        if it >= 8:
+                            rec.append(p.stats[row, : 10 + 6 * (steps - 1)].clone())
+                    t = torch.stack(rec).double()
+                    d = (t[:, 1:] - t[:, :-1]).median(dim=0).values / 1000.0  # us
+                    total = ((t[:, 9 + 6 * (steps - 1)] - t[:, 0]).median() / 1000.0)
+                    allv = [torch.zeros_like(d) for _ in range(world)]
+                    dist.all_gather(allv, d)
+                    tot = [torch.zeros_like(total) for _ in range(world)]
+                    dist.all_gather(tot, total)
+                    if lead:
+                        for r_, dv in enumerate(allv):
+                            head = " ".join(f"{x:.2f}" for x in dv[:3].tolist())
+                            per = []
+                            for i in range(steps):
+                                # slot 4+6i - (3 if i==0 else 9+6(i-1)) .. 9+6i
+                                seg = dv[3 + 6 * i : 9 + 6 * i].tolist()
+                                per.append("/".join(f"{x:.2f}" for x in seg))
+                            say(f"stamps r{mrank} K{steps} B{batch} rank{r_} total "
+                                f"{tot[r_].item():.2f} us; entry->rearm/pdl/setup {head}; "
+                                f"per position {'/'.join(names)}: " + " | ".join(per))
+                        loc = torch.stack(allv)
+                        poll = sum(loc[:, 3 + 6 * i + 4] for i in range(steps)) / steps
+                        work = sum(loc[:, 3 + 6 * i : 3 + 6 * i + 6].sum(dim=1)
+                                   for i in range(steps)) / steps  # fmt: skip
+                        say(f"stamps-summary r{mrank} K{steps} B{batch}: per position "
+                            f"{work.mean().item():.2f} us, poll wait "
+                            f"{poll.mean().item():.2f} (max rank "
+                            f"{poll.max().item():.2f}), local "
+                            f"{(work - poll).mean().item():.2f}")  # fmt: skip
+                    del p
+                    dist.barrier()
     if lead:
         tab.finish("markov fused vs stock loop + all-gather")
     dist.barrier()
