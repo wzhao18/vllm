@@ -732,6 +732,11 @@ def _make_radix_select(
                 if tid == Int32(0) and not done:
                     prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
                 cute.arch.sync_threads()
+                if cutlass.const_expr(stamps):
+                    if tid == Int32(0):
+                        _st_i64(
+                            dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1)
+                        )
 
         if cutlass.const_expr(stamps):
             if tid == Int32(0):
@@ -1519,10 +1524,6 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         peer_flags,
                         max_rows,
                     )
-            if cutlass.const_expr(stamps):
-                cute.arch.sync_threads()
-                if tid == Int32(0):
-                    _st_i64(dbg_row + Int64(48), _globaltimer())
             if cutlass.const_expr(mailbox):  # noqa: SIM102
                 if tid == Int32(0):
                     ordinals[row] = ordinal + Int32(1)

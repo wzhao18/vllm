@@ -23,13 +23,21 @@ def _ord16(x: torch.Tensor) -> torch.Tensor:
     return torch.where(neg, (~bits) & 0xFFFF, bits | 0x8000)
 
 
-def case(w, n, rows, levels, seed):
-    """Gathered [W, rows, N + N/32] int32 B' words of distinct local ids."""
+def case(w, n, rows, levels, seed, dist="relu"):
+    """Gathered [W, rows, N + N/32] int32 B' words of distinct local ids.
+    ``dist``: relu (relu(randn + 0.3): ~38% exact zeros, a tie-heavy cut) or
+    tail (each rank's top-N of 8250 randn logits, as DeepSelect sends them)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    score = torch.randn((w, rows, n), generator=gen, device="cuda")
+    if dist == "tail":
+        score = torch.randn((w, rows, 8250), generator=gen, device="cuda")
+        score = score.to(torch.bfloat16).float().topk(n, dim=2).values
+    else:
+        score = torch.randn((w, rows, n), generator=gen, device="cuda")
     if levels:
         score = torch.floor(score * levels) / levels
-    score = torch.relu(score + 0.3).to(torch.bfloat16)
+    if dist != "tail":
+        score = torch.relu(score + 0.3)
+    score = score.to(torch.bfloat16)
     base = torch.randint(0, 1 << 17, (w, rows, 1), generator=gen, device="cuda")
     local = (base + torch.arange(n, device="cuda") * 641) % (1 << 17)
     words = (_ord16(score) << 16) | (0xFFFF - (local & 0xFFFF))
@@ -61,6 +69,7 @@ def main():
     ap.add_argument("--rows", default="8,16,32,64,128,256,512")
     ap.add_argument("--shapes", default="4x192x512,16x192x2048", help="WxNxK,...")
     ap.add_argument("--levels", default="0,4", help="score quantization (0: none)")
+    ap.add_argument("--dist", default="relu", help="relu | tail (see case())")
     ap.add_argument("--calls", type=int, default=20)
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument(
@@ -79,7 +88,7 @@ def main():
         w, n, k = map(int, shape.split("x"))
         for levels in map(int, args.levels.split(",")):
             for rows in map(int, args.rows.split(",")):
-                packed = case(w, n, rows, levels, seed=rows + levels)
+                packed = case(w, n, rows, levels, seed=rows + levels, dist=args.dist)
                 blocks = (1 << 17) // BLOCK + 1
                 table = torch.randint(
                     0, 1 << 20, (rows, blocks), device="cuda", dtype=torch.int32
@@ -131,6 +140,7 @@ def main():
                         "passes": t[..., 4] - t[..., 3],
                         "rows": t[..., 5] - t[..., 4],
                         "tail": t[..., 7] - t[..., 5],
+                        "npasses": t[..., 6] * 1000.0,
                         "total": t[..., 7] - t0,
                         "cta_start_spread": t0 - t0.min(dim=1, keepdim=True).values,
                     }
