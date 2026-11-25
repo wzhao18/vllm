@@ -274,7 +274,7 @@ def supports(rows, n, k, split, silu=False, out_f32=False):
         and n_mma % 16 == 0
         and n_mma <= 256
         and chunks > 0
-        and n % (256 if silu else 128) == 0
+        and n % (256 if silu else 8) == 0  # plain: the last 128-row tile may be partial
         and not (silu and out_f32)
         and k % K_TILE == 0
         and 1 <= split <= k // K_TILE
@@ -305,6 +305,10 @@ class WideGemm:
         # partial in rows [s T, (s + 1) T) (the consumer sums them in split order).
         self.partials = partials
         assert not (partials and (silu or direct)), (partials, silu, direct)
+        # A partial last 128-row tile (n % 128 != 0, e.g. the KDA in-projection's 3216
+        # rows): TMA zero-fills the weight rows past n; only the split-exchange
+        # epilogue masks its stores at n.
+        assert n % 128 == 0 or not (partials or direct), (n, partials, direct)
         self.weight_warps = tuple(sorted(weight_warps))
         assert self.weight_warps[:2] == (0, 3) and set(weight_warps) <= set(WEIGHT_WARPS)
         assert not set(self.weight_warps) & set(self.act_warps), (weight_warps, act_warps)
@@ -828,11 +832,15 @@ class WideGemm:
         t = lo + tok
         if cutlass.const_expr(self.out_f32):
             dst = y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 4
-            _st_v4(dst, *total[:4])
-            _st_v4(dst + 16, *total[4:])
+            if tile * 128 + (e % 16) * 8 < self.n:
+                _st_v4(dst, *total[:4])
+                _st_v4(dst + 16, *total[4:])
         else:
             w = [_pack_bf16(total[2 * q], total[2 * q + 1]) for q in range(4)]
-            _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
+            if cutlass.const_expr(self.n % 128 == 0):
+                _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
+            elif tile * 128 + (e % 16) * 8 < self.n:
+                _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
 
     @cute.jit
     def store_silu(self, recv, rstride, mine, split_rank, lo, y, tile, e):
