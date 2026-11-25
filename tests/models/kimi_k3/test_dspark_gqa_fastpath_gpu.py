@@ -113,7 +113,9 @@ def test_combine_normalizes_as_stock():
         ),
     )
     inner.fc.params_dtype = torch.bfloat16
-    inner.normalize = lambda rows: K3GqaDSparkModel.normalize(inner, rows)
+    inner.normalize = lambda rows, out=None: K3GqaDSparkModel.normalize(
+        inner, rows, out=out
+    )
     for rows in (8, 56, 640):
         aux = torch.randn((rows, 5 * HIDDEN), generator=gen, device=device)
         aux = aux.bfloat16()
