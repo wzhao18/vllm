@@ -462,6 +462,13 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
+    _asm_void(
+        [Int64(addr), Int64(v)], "st.global.u64 [$0], $1;", "l,l", loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
 def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
     i32 = T.i32()
     value = llvm.inline_asm(
@@ -601,6 +608,7 @@ def _make_radix_select(
     emit_ids: bool,
     block_size: int,
     table_cache: int = 0,
+    stamps: bool = False,
 ) -> Any:
     """Top-``topk`` of the CTA's register keys ``(ord16 << gid_bits) | ~gid``
     (0 = empty) under (score desc, global id asc): writes the ids and/or this
@@ -652,6 +660,7 @@ def _make_radix_select(
         dcp_rank: Int32,
         stride_rows: Int32,
         tab: cute.Tensor = None,
+        dbg: Int64 = None,
     ) -> Int32:
         # scalars: [committed, owned, threshold, take_all]
         sel_min = Int32(0x10000)
@@ -724,6 +733,9 @@ def _make_radix_select(
                     prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
                 cute.arch.sync_threads()
 
+        if cutlass.const_expr(stamps):
+            if tid == Int32(0):
+                _st_i64(dbg + Int64(row) * Int64(64) + Int64(32), _globaltimer())
         if cutlass.const_expr(emit_ids):
             count = Int32(0)
             for w in cutlass.range_constexpr(num_sel_words):
@@ -862,9 +874,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         # (fold) dependents launch at this grid's completion: a consumer that
         # reads the rows before its PDL wait (FlashInfer's trtllm-gen counts).
         hold: bool = False
+        # Debug: per-CTA %globaltimer phase stamps to ``dbg`` (int64 [T, 8]).
+        stamps: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
+        stamps = compile_key.stamps
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
         exact = compile_key.exact
@@ -904,6 +919,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             emit_ids=emit_ids,
             block_size=block_size,
             table_cache=table_cache,
+            stamps=stamps,
         )
         num_r1 = world_size * local_topk
         rescue_keys = num_r1 + num_slots * topk
@@ -1284,11 +1300,16 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
         ):
             row, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
             lane = cute.arch.lane_idx()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            dbg_row = dbg + Int64(row) * Int64(64)
+            if cutlass.const_expr(stamps):
+                if tid == Int32(0):
+                    _st_i64(dbg_row, _globaltimer())
             smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage, 16)
             hist = storage.hist.get_tensor(cute.make_layout((num_bins,)))
@@ -1313,7 +1334,13 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 ordinal = ordinals[row]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
+                if cutlass.const_expr(stamps):
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(8), _globaltimer())
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(stamps):
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(16), _globaltimer())
                 if cutlass.const_expr(early or (fold and not hold)):
                     # The rescue (PDL, ``early``) becomes resident now and waits
                     # for this grid; folded (no rescue), the consumer when it
@@ -1369,6 +1396,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             if cutlass.const_expr(exact):  # noqa: SIM102
                 if tid < Int32(16):
                     notsat[tid] = Int32(0)
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(24), _globaltimer())
 
             sel_min = radix_select(
                 keys,
@@ -1388,7 +1419,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 dcp_rank,
                 stride_rows,
                 tab,
+                dbg,
             )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(40), _globaltimer())
 
             if cutlass.const_expr(exact):
                 # tau16: the K-th selected key's ord16 (0 below K selected).
@@ -1483,6 +1519,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         peer_flags,
                         max_rows,
                     )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(48), _globaltimer())
             if cutlass.const_expr(mailbox):  # noqa: SIM102
                 if tid == Int32(0):
                     ordinals[row] = ordinal + Int32(1)
@@ -1516,6 +1556,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         max_rows,
                         tab,
                     )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(56), _globaltimer())
 
         @cute.jit
         def host_entrypoint(
@@ -1536,6 +1580,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
             stream,
         ):
             # Unused outputs / exact-only and mailbox inputs are placeholders.
@@ -1557,6 +1602,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 max_rows,
                 box,
                 ordinals,
+                dbg,
             ).launch(
                 grid=(gathered.shape[1], 1, 1),
                 block=(tb_size, 1, 1),
@@ -1579,6 +1625,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         early: bool = False,
         fold: bool = False,
         hold: bool = False,
+        stamps: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1591,6 +1638,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             early=early and exact,
             fold=fold,
             hold=hold,
+            stamps=stamps,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1606,6 +1654,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             ),
             Int64(0),
             make_fake_tensor(Int32, (cute.sym_int(),)),
+            Int64(0),
         )
 
     @kernel_launcher
@@ -1622,6 +1671,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         early: bool = False,
         fold: bool = False,
         hold: bool = False,
+        stamps: torch.Tensor | None = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1634,6 +1684,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             early=early,
             fold=fold,
             hold=hold,
+            stamps=stamps is not None,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
@@ -1643,6 +1694,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             *_select_args(gathered, out, rows, 0 if exact is None else exact.rank),
             *_exact_args(exact, gathered.device),
             *mailbox_args,
+            0 if stamps is None else stamps.data_ptr(),
         )
 
 

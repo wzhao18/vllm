@@ -63,6 +63,12 @@ def main():
     ap.add_argument("--levels", default="0,4", help="score quantization (0: none)")
     ap.add_argument("--calls", type=int, default=20)
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument(
+        "--stamps",
+        action="store_true",
+        help="also run the stamped select (%globaltimer per CTA phase) and print "
+        "the phase deltas: start->keys, passes, row emission, tail",
+    )
     args = ap.parse_args()
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         _DCP_TOPK_SELECT_KERNEL,
@@ -108,6 +114,34 @@ def main():
                 ts.sort()
                 med = ts[len(ts) // 2]
                 dur, cnt = cupti_us(lambda g=g: [g.replay() for _ in range(3)])
+                if args.stamps:
+                    st = torch.zeros((rows, 8), dtype=torch.int64, device="cuda")
+                    acc = []
+                    for _ in range(20):
+                        st.zero_()
+                        _DCP_TOPK_SELECT_KERNEL(
+                            packed, None, local_topk=n, topk=k, rows=ro, stamps=st
+                        )
+                        torch.cuda.synchronize()
+                        acc.append(st.clone())
+                    t = torch.stack(acc[5:]).double() / 1000.0
+                    t0 = t[..., 0]
+                    ph = {
+                        "keys": t[..., 3] - t0,
+                        "passes": t[..., 4] - t[..., 3],
+                        "rows": t[..., 5] - t[..., 4],
+                        "tail": t[..., 7] - t[..., 5],
+                        "total": t[..., 7] - t0,
+                        "cta_start_spread": t0 - t0.min(dim=1, keepdim=True).values,
+                    }
+                    print(
+                        f"STAMP W{w} N{n} K{k} rows {rows:4d} levels {levels}: "
+                        + " ".join(
+                            f"{name} {v.mean():.2f} [{v.max():.2f}]"
+                            for name, v in ph.items()
+                        ),
+                        flush=True,
+                    )
                 print(
                     f"REC select W{w} N{n} K{k} rows {rows:4d} levels {levels}: "
                     f"{med:7.2f} us/call (min {ts[0]:.2f}) kernel {dur:6.2f} us "
