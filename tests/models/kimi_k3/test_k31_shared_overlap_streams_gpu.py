@@ -5,10 +5,10 @@ replicated shared expert concurrent with the routed experts, on the stock method
 bound to a stand-in layer (BF16 linears, deterministic router / experts stand-ins:
 the real MegaMoE needs the EP group).
 
-* SM-capped bucket (decode; P/D prefill steps of at most 1024 rows per rank): the
-  routing chain on the current stream, the shared expert on the side stream.
-* Full-grid bucket (larger P/D prefill steps): the routing chain on the
-  high-priority stream, the shared expert on the current stream.
+* SM-capped layer (decode, unified serving): the routing chain on the current
+  stream, the shared expert on the side stream.
+* Full-grid layer (P/D prefill workers): the routing chain on the high-priority
+  stream, the shared expert on the current stream.
 * Both: bitwise equal to the serial order, eagerly, inside a whole-step CUDA graph
   and inside a breakable CUDA graph with eager breaks before and after the layer
   (the fork and join stay in one segment), over repeated replays.
@@ -30,7 +30,6 @@ from vllm.models.kimi_k3.nvidia import model as kimi  # noqa: E402
 
 DEVICE = torch.device("cuda", 0)
 HIDDEN, LATENT, INTER = 1024, 512, 768
-CAPPED_UP_TO = 64  # rows per rank on the SM-capped bucket in this stand-in
 
 
 class Linear:
@@ -73,8 +72,7 @@ class Shared(types.SimpleNamespace):
 
 
 class Experts:
-    """Routed experts stand-in (a deterministic latent map, long enough to overlap)
-    on an SM-capped bucket up to CAPPED_UP_TO rows, full grid above."""
+    """Routed experts stand-in (a deterministic latent map, long enough to overlap)."""
 
     def __init__(self):
         self.streams = []
@@ -86,11 +84,8 @@ class Experts:
             out = (out.float() * 0.5 + routed.float().flip(0) * 0.5).to(routed.dtype)
         return out * weights[:, :1].to(out.dtype)
 
-    def shared_overlap(self, num_tokens):
-        return num_tokens <= CAPPED_UP_TO
 
-
-def layer(seed=0):
+def layer(full_grid, seed=0):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     shared = Shared(
         gate_up_proj=Linear(2 * INTER, HIDDEN, g),
@@ -121,6 +116,7 @@ def layer(seed=0):
         _shared_stream=torch.cuda.Stream(),
         _shared_events=(torch.cuda.Event(), torch.cuda.Event()),
         _routed_stream=kimi.routed_priority_stream(),
+        _shared_full_grid=full_grid, _shared_kernels_checked=False,
         _prefill_subcalls=None,
     )  # fmt: skip
     for name in ("forward", "_maybe_overlap_router_and_down_proj",
@@ -150,10 +146,11 @@ def test_priority_stream_is_above_default():
     assert s.priority < torch.cuda.Stream().priority
 
 
-@pytest.mark.parametrize("n", [16, CAPPED_UP_TO, CAPPED_UP_TO + 1, 512])
-def test_eager_streams_and_bitwise(n):
+@pytest.mark.parametrize("full_grid", [False, True])
+@pytest.mark.parametrize("n", [16, 512])
+def test_eager_streams_and_bitwise(full_grid, n):
     torch.cuda.set_device(DEVICE)
-    mlp = layer()
+    mlp = layer(full_grid)
     h = inputs(n, n)
     want = serial(mlp, h)
     mlp.experts.streams.clear()
@@ -162,7 +159,7 @@ def test_eager_streams_and_bitwise(n):
     got = mlp.forward(h)
     assert torch.cuda.current_stream() == main
     assert torch.equal(got, want)
-    if n <= CAPPED_UP_TO:
+    if not full_grid:
         assert mlp.experts.streams == [main]
         assert mlp.shared_experts.streams == [mlp._shared_stream]
     else:
@@ -170,10 +167,10 @@ def test_eager_streams_and_bitwise(n):
         assert mlp.shared_experts.streams == [main]
 
 
-@pytest.mark.parametrize("n", [CAPPED_UP_TO, 512])
-def test_cuda_graph_replays_bitwise(n):
+@pytest.mark.parametrize("full_grid", [False, True])
+def test_cuda_graph_replays_bitwise(full_grid, n=256):
     torch.cuda.set_device(DEVICE)
-    mlp = layer(seed=1)
+    mlp = layer(full_grid, seed=1)
     static = inputs(n, 7)
     want = serial(mlp, static).clone()
     stream = torch.cuda.Stream()
@@ -193,13 +190,13 @@ def test_cuda_graph_replays_bitwise(n):
     assert torch.equal(out, want)
 
 
-@pytest.mark.parametrize("n", [CAPPED_UP_TO, 512])
-def test_breakable_graph_keeps_overlap_bitwise(n):
+@pytest.mark.parametrize("full_grid", [False, True])
+def test_breakable_graph_keeps_overlap_bitwise(full_grid, n=256):
     """Production prefill steps of <= 2048 instance tokens run in breakable CUDA
     graphs (a segment ends at each eager attention op): the layer forks and joins
     inside one segment, with eager breaks before and after it."""
     torch.cuda.set_device(DEVICE)
-    mlp = layer(seed=2)
+    mlp = layer(full_grid, seed=2)
     static = inputs(n, 3)
     pre = torch.empty_like(static)
     stream = torch.cuda.Stream()
@@ -223,11 +220,11 @@ def test_breakable_graph_keeps_overlap_bitwise(n):
 
 
 def test_persistent_shared_kernel_raises():
-    mlp = layer()
+    mlp = layer(True)
     mlp.shared_experts.gemm_rs_ar = object()
     with pytest.raises(RuntimeError, match="persistent"):
         mlp.forward(inputs(512, 0))
-    mlp = layer()
+    mlp = layer(False)
     mlp.shared_experts._prefill_situ = object()
     with pytest.raises(RuntimeError, match="persistent"):
         mlp.forward(inputs(16, 0))
