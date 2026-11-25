@@ -44,6 +44,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from ..common.primitives import (
     alloc,
     at,
+    copy_g2s,
     fma,
     fma2,
     load_f32x4,
@@ -64,7 +65,7 @@ from .recover import (
     triton_exp,
     triton_sigmoid,
 )
-from .verify_loop import K, KdaVerifyLoopStock
+from .verify_loop import COPY_BYTES, PAGE_BYTES, K, KdaVerifyLoopStock
 from .verify_packed import CHUNKS
 from .wide import rsqrt_ftz
 from .window import conv_put, conv_tap
@@ -83,7 +84,7 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
     def kernel(self, args):
         slots, state, output, gate, norm_weight = (args[i] for i in (8, 9, 10, 11, 12))
         lower_bound, eps, accepted = args[13], args[15], args[17]
-        correction, key_gate, record_rows, pending = (args[i] for i in (18, 19, 20, 21))
+        correction, record_rows, pending = (args[i] for i in (18, 20, 21))
         a_log, dt_bias = args[6], args[7]
         T: cutlass.Constexpr = self.tokens
         H: cutlass.Constexpr = self.heads
@@ -107,6 +108,9 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
         fold_suffix = alloc(smem, Float32, 128 * RQ)  # P_t
         fold_decay = alloc(smem, Float32, 128)  # D_n
         fold_sums = alloc(smem, Float32, 4 * RQ)  # recorded key squares per warp
+        # the item's old records, bulk-copied with its state page
+        staged_u = alloc(smem, Float32, RQ * 128, align=128)
+        staged_kg = alloc(smem, BFloat16, RQ * 256, align=128)
         # per item of the CTA: [slot, conv offset, live index, record row, pending]
         meta = alloc(smem, Int32, (M, 5))
         live_items = alloc(smem, Int32, M + 1)  # [n]: the n-th live item; [M]: count
@@ -151,7 +155,8 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                     live_items[live] = i
                     live += 1
             live_items[M] = live
-            self.stage_records(state, page, state_full, meta, live_items, first, 0)
+            self.stage_records(args, page, staged_u, staged_kg, state_full, meta,
+                               live_items, first, 0)  # fmt: skip
         cute.arch.sync_threads()
         nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
         row0 = 8 * warp + group
@@ -178,37 +183,31 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                         values = load_f32x4(pointer, shared=True)
                         for e in cutlass.range_constexpr(4):
                             history[r, c, e] = values[e]
-                # The old records (read before this step writes any of them).
+                # The old records (staged with the page; read before this step
+                # writes any of them).
                 u_old = zeros((2, RQ), Float32)
                 old_keys = zeros(RQ, Float32)
                 old_gates = zeros(RQ, Float32)
                 if n > 0:
                     for r in cutlass.range_constexpr(2):
                         for t in cutlass.range_constexpr(RQ):
-                            u_old[r, t] = correction[rec, head, t, row0 + 4 * r]
+                            u_old[r, t] = staged_u[128 * t + row0 + 4 * r]
                     if warp >= FOLD_WARP:
                         for t in cutlass.range_constexpr(RQ):
-                            old_keys[t] = Float32(key_gate[rec, head, t, channel])
-                            old_gates[t] = Float32(
-                                key_gate[rec, head, t, 128 + channel]
-                            )
+                            old_keys[t] = Float32(staged_kg[256 * t + channel])
+                            old_gates[t] = Float32(staged_kg[256 * t + 128 + channel])
                 cute.arch.sync_threads()  # every thread holds the page and old records
                 if thread == 0:  # the next live item's page into the freed page
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    self.stage_records(state, page, state_full, meta, live_items,
-                                       first, live + 1)  # fmt: skip
-                own_gates = zeros(2, gate.element_type)
-                if thread < 128:
-                    self.record_prologue(args, thread, token, head, offset, slot,
-                                         shared_q, shared_k, shared_v, reductions,
-                                         shared_beta, own_gates, ready, rec)  # fmt: skip
-                elif thread < 128 + 32 * 8:
-                    self.record_gate(args, thread // 32 - 4, lane, head, token,
-                                     shared_decay, own_gates, rec)  # fmt: skip
-                    for p in cutlass.range_constexpr(pairs):
-                        cute.arch.mbarrier_arrive(ready + p)
-                else:
-                    if n > 0:  # the stock commit's per-key operands (wide.KdaWide)
+                    self.stage_records(args, page, staged_u, staged_kg, state_full,
+                                       meta, live_items, first, live + 1)  # fmt: skip
+
+                # The pending commit before the PDL wait (it reads only the last
+                # step's records and this layer's checkpoint): the fold warps build
+                # the stock commit's per-key operands (wide.KdaWide), every thread
+                # folds its elements, the folded checkpoint is written back once.
+                if warp >= FOLD_WARP:
+                    if n > 0:
                         dtc = Float32(dt_bias[head * 128 + channel])
                         a = Float32(a_log[head])
                         old_decays = zeros(RQ, Float32)
@@ -233,12 +232,6 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                                 final_decay = mul_rn(final_decay, old_decays[t])
                         fold_decay[channel] = final_decay
                     cute.arch.mbarrier_arrive(fold_ready)
-                    cute.arch.griddepcontrol_wait()
-                    self.loop_own_gates(args, token, head, thread // 64, thread % 64,
-                                        own_gates)  # fmt: skip
-                cute.arch.griddepcontrol_launch_dependents()
-
-                # The pending commit, then the folded checkpoint written back once.
                 cute.arch.mbarrier_wait(fold_ready, phase)
                 if n > 0:
                     self.fold_rows(history, u_old, n, RQ, j,
@@ -251,6 +244,22 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                                 destination, head, row0 + 4 * r, 4 * (j + 8 * c)
                             )
                             store_f32x4(target, values4)
+
+                own_gates = zeros(2, gate.element_type)
+                if thread < 128:
+                    self.record_prologue(args, thread, token, head, offset, slot,
+                                         shared_q, shared_k, shared_v, reductions,
+                                         shared_beta, own_gates, ready, rec)  # fmt: skip
+                elif thread < 128 + 32 * 8:
+                    self.record_gate(args, thread // 32 - 4, lane, head, token,
+                                     shared_decay, own_gates, rec)  # fmt: skip
+                    for p in cutlass.range_constexpr(pairs):
+                        cute.arch.mbarrier_arrive(ready + p)
+                else:
+                    cute.arch.griddepcontrol_wait()
+                    self.loop_own_gates(args, token, head, thread // 64, thread % 64,
+                                        own_gates)  # fmt: skip
+                cute.arch.griddepcontrol_launch_dependents()
 
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
@@ -280,9 +289,40 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
         cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def stage_records(self, state, page, state_full, meta, live_items, first, n):
-        """``stage`` with the item's slot in meta column 0 (the one checkpoint)."""
-        self.stage(state, page, state_full, meta, live_items, first, n)
+    def stage_records(self, args, page, staged_u, staged_kg, state_full, meta,
+                      live_items, first, n):  # fmt: skip
+        """Thread 0: bulk-copy the ``n``-th live item's state page (if there is one)
+        and, with a pending commit, its old records (corrections, keys / raw gates of
+        its record slot and head) on ``state_full``."""
+        state, correction, key_gate = args[9], args[18], args[19]
+        H: cutlass.Constexpr = self.heads
+        M: cutlass.Constexpr = self.most
+        RQ: cutlass.Constexpr = correction.shape[2]
+        u_bytes: cutlass.Constexpr = RQ * 128 * 4
+        kg_bytes: cutlass.Constexpr = RQ * 256 * 2
+        if n < live_items[M]:
+            index = live_items[n]
+            slot, head = meta[index, 0], (first + index) % H
+            rec, pending = meta[index, 3], meta[index, 4]
+            source = state[Int64(slot), None, None, None]
+            if pending > 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    state_full, PAGE_BYTES + u_bytes + kg_bytes
+                )
+                copy_g2s(staged_u.iterator, at(correction, rec, head, 0, 0), u_bytes,
+                         state_full)  # fmt: skip
+                copy_g2s(staged_kg.iterator, at(key_gate, rec, head, 0, 0), kg_bytes,
+                         state_full)  # fmt: skip
+            else:
+                cute.arch.mbarrier_arrive_and_expect_tx(state_full, PAGE_BYTES)
+            rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
+            for i in cutlass.range_constexpr(PAGE_BYTES // COPY_BYTES):
+                copy_g2s(
+                    page.iterator + i * rows * K,
+                    at(source, head, i * rows, 0),
+                    COPY_BYTES,
+                    state_full,
+                )
 
     @cute.jit
     def fold_rows(self, history, u_old, n, RQ: cutlass.Constexpr, j, operands):
