@@ -35,7 +35,7 @@ from .experts_rubin import (
     peers_bytes,
     peers_offset,
 )
-from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
+from .experts_rubin64 import CENSUS_BYTES, ROUTED_WORDS, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
 from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
@@ -153,6 +153,33 @@ def polled(tp, batch, device):
     if not rubin(tp, batch, device):
         return False
     return bool(batch_table(POLLED.get(tp, "")).get(batch, 0))
+
+
+# Verify steps (q > 1), by TP: rows on ``RubinGroupedExpertsKernel`` (placed weights)
+# whose experts start on the routing kernel's route-done count instead of their
+# dependency wait (``RubinGroupedExpertsKernel.routed``, ``RouteSitu`` routed), so they
+# no longer wait for the merged front GEMM's shared gate/up tiles to complete.
+ROUTED = {16: "9-63:1"}
+
+
+def routed(tp, batch, device, q):
+    """Verify rows (``q`` > 1) whose grouped experts poll the route-done count (the
+    routing kernel must count)."""
+    if torch.cuda.get_device_capability(device) != (10, 7) or q <= 1:
+        return False
+    return bool(batch_table(ROUTED.get(tp, "")).get(batch, 0))
+
+
+def census_offset(device):
+    """``RubinGroupedExpertsKernel.ws_census`` in a ``scratch`` workspace."""
+    size = ExpertsGeometry(16, slots=workspace_slots(device)).workspace_bytes
+    return (size + 15) // 16 * 16
+
+
+def route_done(workspace):
+    """The route-done words (int32 [2]) of a ``scratch`` workspace."""
+    start = census_offset(workspace.device) + ROUTED_WORDS
+    return workspace[start : start + 8].view(torch.int32)
 
 
 def route_mailbox(workspace):
@@ -384,7 +411,8 @@ def place(routed):
 
 @functools.cache
 def compile_rubin64(
-    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
+    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12,
+    routed=False,
 ):  # fmt: skip
     """``compile_experts``' arguments (plan, publish modes incl. two-shot) for
     ``RubinGroupedExpertsKernel``, then the w13 / w2 addresses; ``dies``: the SMs'
@@ -393,8 +421,11 @@ def compile_rubin64(
     (``POOL_ZONE``)."""
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static,
+        static_groups=static, routed=routed,
     )  # fmt: skip
+    if routed:  # the words ``route_done`` hands the routing kernel
+        size = ExpertsGeometry(16, slots=slots).workspace_bytes
+        assert moe.ws_census == (size + 15) // 16 * 16
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
     if publish == "push":  # + shared rows, the RS mailbox bases, capacity
@@ -539,6 +570,8 @@ class PersistentExperts:
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
         self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
+        self.q = q
+        self.routed_rows: set[int] = set()  # ``prepare``d with ``routed``
         self.slots = workspace_slots(self.device)
         self.weights = (w13, s13, w2, s2)
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
@@ -590,13 +623,17 @@ class PersistentExperts:
         return buffers["kernel_workspace"]
 
     def prepare(
-        self, batch, buffers, out, publish=(), planned=False, twoshot=False, early=False
+        self, batch, buffers, out, publish=(), planned=False, twoshot=False, early=False,
+        routed=False,
     ):
         """``publish``: (multicast, parity, rank) of the WaveMoeTail latent slot to
         publish (``twoshot``: the ``common.twoshot`` push box); ``planned``: calls find
         the plan written by the routing kernel (B>8, and ``rubin`` batches, which then
         run ``RubinExpertsKernel``), else B>8 run writes it from x first;
-        ``early``: the caller runs ``group`` (pregrouped batches) before ``run``."""
+        ``early``: the caller runs ``group`` (pregrouped batches) before ``run``;
+        ``routed``: the routing kernel in front counts into ``route_done`` (``ROUTED``
+        rows on the grouped kernel with placed weights then start on that count; see
+        ``routed_rows``)."""
         if batch > 64:
             self.prepare_wide(batch, buffers, out, publish, planned)
             return
@@ -623,9 +660,13 @@ class PersistentExperts:
             return
         if planned and batch > 8 and self.grouped64(batch):
             grid = self.grid_for(batch)
+            done = routed and bool(self.dies)
+            if done:
+                self.routed_rows.add(batch)
             code = compile_rubin64(
                 self.experts, batch, grid, self.device.index, mode, self.slots,
                 self.dies, bool(self.static.get(batch)), self.zones.get(batch, 12),
+                done,
             )  # fmt: skip
             check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
             ws = tensor(buffers["workspace"])

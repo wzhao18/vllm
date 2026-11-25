@@ -14,7 +14,7 @@ from ..common.policy import batch_table
 from ..oproj.prepared import OprojMailbox
 from .experts_runtime import scratch as expert_scratch
 from .experts_runtime import WIDE as WIDE_ENGINES
-from .experts_runtime import wide_chunks
+from .experts_runtime import route_done, routed, wide_chunks
 from .shared import scratch as shared_scratch
 from .tail_rows import TailRowsBox
 from .tail_runtime import CAP, experts_push, flat
@@ -155,7 +155,12 @@ class PreparedMoE:
                 shared = state.front[5][:b]
                 publish = (*publish, flat(shared), tail.peers, Int32(CAP))
             twoshot = b in tail.twoshots
-            experts.prepare(b, buffers, expanded, publish, planned, twoshot, True)
+            counted = planned and routed(state.tp, b, state.device, experts.q)
+            experts.prepare(
+                b, buffers, expanded, publish, planned, twoshot, True, counted
+            )
+            if b in experts.routed_rows:  # the grouped experts poll routing's count
+                front.count_routes(b, route_done(buffers["workspace"]))
 
     def run(self, x, out, *, consume=None):
         state, b = self.state, x.shape[0]

@@ -33,6 +33,7 @@ from ..gemm.splitk_situ import PreparedSitu
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .experts_rubin import ROUTE_WORDS, count_image, image_chunk
+from .experts_rubin64 import ROUTED_TOTAL
 from .experts_runtime import polled, rubin
 from .shared import compile_down, compile_shared, situ, weight_maps
 from .tail_runtime import CAP
@@ -52,10 +53,18 @@ def ordered(score):
     return key if score == score else Uint32(0)
 
 
+@asm()
+def count_routed(pointer, value):
+    """Routing CTA, one thread after a CTA barrier that follows its last store: its
+    share of the route-done count (the release is cumulative over the barrier)."""
+    return "red.release.gpu.global.add.u32 [$0],$1;", "l,r,~{memory}", (pointer, value)
+
+
 class RouteSitu:
     def __init__(
         self, batch, shared, renorm, early, roles, polled, plan=False, lean=None,
         rcp=False, halves=False, signal=False, sync_copy=False, early_ids=False,
+        routed=False,
     ):  # fmt: skip
         # Lean (B>8 by default): few registers, so routing CTAs co-reside with the front
         # and the fused shared expert, polled logits skip the front's completion wait,
@@ -91,6 +100,11 @@ class RouteSitu:
         # its id into the experts' route mailbox (each word is valid on its own), so
         # the experts read the ids before select's last barrier and warp 0's publish.
         self.early_ids = early_ids and signal and self.lean
+        # routed: every CTA, after a barrier past its last store, adds its share of
+        # ROUTED_TOTAL to the experts' route-done word (``RubinGroupedExpertsKernel``
+        # routed: the experts acquire it instead of their dependency wait).
+        self.routed = routed
+        assert not routed or (self.lean and polled and early == "poll")
 
     @cute.jit
     def __call__(self, *args):
@@ -103,6 +117,7 @@ class RouteSitu:
         scale, beta, linear_beta = args[8:11]
         plan = args[11] if self.plan else None
         signal = args[11 + bool(self.plan)] if self.signal else None
+        done = args[11 + bool(self.plan) + self.signal] if self.routed else None
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         token, role = cta % self.batch, cta // self.batch
@@ -113,6 +128,12 @@ class RouteSitu:
             # launch then never overlaps it (they still wait for this kernel's end).
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
+        elif c.const_expr(self.early == "poll"):
+            # Copy CTAs trigger at entry; route CTAs trigger once every thread has
+            # its logits (``route``): the experts launch when the last route CTA saw
+            # this layer's logits from every rank, not at this kernel's exit.
+            if role != Int32(0):
+                cute.arch.griddepcontrol_launch_dependents()
         elif c.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
         for r in c.range_constexpr(len(self.roles)):
@@ -156,6 +177,16 @@ class RouteSitu:
         # Late release: the persistent experts must not take SMs from the down GEMM.
         if c.const_expr(not self.early):
             cute.arch.griddepcontrol_launch_dependents()
+        if c.const_expr(self.routed):
+            # Every role's stores (ids, weights, latent, plan) precede the barrier;
+            # CTA 0 adds the rest of ROUTED_TOTAL, so the full count is one value.
+            cute.arch.sync_threads()
+            if tid == 0:
+                ctas: c.Constexpr = (len(self.roles) + self.halves) * self.batch
+                share = Uint32(1)
+                if cta == 0:
+                    share = Uint32(ROUTED_TOTAL - (ctas - 1))
+                count_routed(done.iterator, share)
 
     @cute.jit
     def select(self, key, threshold, buffers, signal=None, token=None):
@@ -361,6 +392,15 @@ class RouteSitu:
             if tid == 0:
                 found[0] = Int32(0)
         cute.arch.sync_threads()
+        if c.const_expr(self.early == "poll"):
+            # Every thread's logit poll returned (barrier above). Safe against the MoE
+            # tail's reloading polls (``SharedFront.release_early``) by the after-front
+            # release's argument: that release needs this rank's front GEMM to have
+            # passed its dependency wait (completion follows it); the polled words
+            # include this rank's own front outputs, stored only after that wait. So
+            # whatever the after-front release orders before the experts' launch (the
+            # previous layer's tail lanes done), this one does too.
+            cute.arch.griddepcontrol_launch_dependents()
         if warp == 0:
             group = km[0, lane]
             for w in c.range_constexpr(1, 8):
@@ -636,14 +676,14 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None, wide=False)
 def compile_route(
     batch, shared, renorm, roles, device, polled=False, plan=False, lean=None,
     early=None, rcp=False, halves=False, signal=False, sync_copy=False,
-    early_ids=False, box_rows=64,
+    early_ids=False, box_rows=64, routed=False,
 ):  # fmt: skip
     """``box_rows``: the front mailbox's rows (``FrontRows``: its capacity); above 64
     tokens the plan is 64-row blocks of PLAN_BYTES."""
     early = batch <= 2 if early is None else early
     kernel = RouteSitu(
         batch, shared, renorm, early, roles, polled, plan, lean, rcp, halves, signal,
-        sync_copy, early_ids,
+        sync_copy, early_ids, routed,
     )  # fmt: skip
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
@@ -653,7 +693,8 @@ def compile_route(
     args += (fake((batch, shared)), *(f32(v) for v in (1, 4, 25)))
     blocks = -(-batch // 64)
     args += (fake((blocks * PLAN_BYTES,), None, c.Uint8),) * bool(plan)
-    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal + (make_fake_stream(),)
+    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal
+    args += (fake((2,), None, c.Int32),) * routed + (make_fake_stream(),)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
@@ -863,6 +904,19 @@ class SharedFront:
                 b, compile_route(*self.route_keys[b], early=early, **opts)
             )
             self.plans[b] = (*plan[:2], route, *plan[3:])
+
+    def count_routes(self, batch, done):
+        """``batch``'s grouped experts start on the route-done count (``done``:
+        ``experts_runtime.route_done``; ``RubinGroupedExpertsKernel.routed``): routing
+        counts every CTA past its last store and releases the experts once its route
+        CTAs hold their logits (early "poll"), with the whole-SM carve-out so their
+        CTAs become resident beside it."""
+        views, front, _, situ, args, extra, code = self.plans[batch]
+        opts = {**self.route_opts[batch], "early": "poll", "routed": True}
+        route = compile_route(*self.route_keys[batch], **opts)
+        route = prepare_shared_carveout(route, self.device.index, 100)
+        extra = (*extra, to_cute(done))
+        self.plans[batch] = views, front, route, situ, args, extra, code
 
     def carved(self, batch, route):
         """``ROUTE_CARVEOUT_WIDE`` batches: the routing kernel with carve-out 100."""

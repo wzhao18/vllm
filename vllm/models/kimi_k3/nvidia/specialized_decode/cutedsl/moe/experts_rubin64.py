@@ -56,7 +56,9 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     RubinExpertsKernel,
+    claim_last,
     die_words,
+    load_acquire,
     nth_set,
     sm_id,
     stage16,
@@ -135,6 +137,12 @@ def match_arrival(bits, grid: cutlass.Constexpr[int], die, k):
 # The die census (``dies``): one 64-bit word (in 16 B) past ``ExpertsGeometry``'s
 # workspace (``experts_runtime.scratch``), armed all-ones like the workspace.
 CENSUS_BYTES = 16
+# Route-done words (``routed``), in the census's 16 B: at +8 the routing kernel's count
+# (every CTA adds after its last store, release; the adds sum to ROUTED_TOTAL, so an
+# acquire of ROUTED_TOTAL - 1 from the all-ones arm sees every routing store), at +12
+# the experts CTAs that saw it (the last re-arms both).
+ROUTED_WORDS = 8
+ROUTED_TOTAL = 1 << 16
 # FC2 tail pool: the producer lets the claim warp claim its first grain this many static
 # jobs before its last (a claim and its hand-over take ~0.45 us, a job ~0.23 us).
 POOL_LEAD = 3
@@ -151,10 +159,18 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False,
+        dies=(), static_groups=False, routed=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
+        # routed (``dies``): no dependency wait. The routing kernel (``RouteSitu``
+        # routed) counts every CTA past its last store into the route-done word, and
+        # thread 0 acquires the full count instead (``wait_routed``): the grid starts
+        # when routing's stores are visible, not when the kernels before it (the front
+        # GEMM's shared gate/up tiles) complete. Nothing else this kernel reads comes
+        # from a kernel still running then (``wait_routed``).
+        self.routed = routed
+        assert not routed or dies
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -925,6 +941,32 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         return before
 
     @cute.jit
+    def wait_routed(self, workspace):
+        """``routed``: thread 0 acquires the routing kernel's full count (every
+        routing store: ids, weights, plan), counts this CTA as seen, and the call's
+        last CTA re-arms both words; then a CTA barrier (the acquire, before every
+        thread's reads). The other inputs: the weights and scales are static; this
+        kernel's workspace words were last written by earlier calls, which completed
+        before this layer's front GEMM passed its dependency wait, i.e. before routing
+        saw its logits. The kernels still running (the front GEMM's gate/up tiles and
+        h, routing's exit) write nothing this kernel reads or writes. The next write
+        of the count is the next layer's routing, after that layer's front GEMM's
+        dependency wait (this grid has completed by then), so the re-arm precedes it."""
+        if thread()[0] == 0:
+            word = workspace.iterator + self.ws_census + ROUTED_WORDS
+            ready = False
+            sgn, sgt = spin_start()
+            while not ready:
+                ready = load_acquire(word) == Uint32(ROUTED_TOTAL - 1)
+                if not ready:
+                    sleep_ns(32)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
+            # acq_rel: every other CTA's acquire precedes the last one's re-arm
+            if Int32(claim_last(word + 4)) == self.grid - 2:
+                store_words(word, (Uint32(4294967295), Uint32(4294967295)))
+        cute.arch.sync_threads()
+
+    @cute.jit
     def arrive(self, sm, workspace, before):
         """Warp 2 lane 0, before the experts table's barrier: (die, arrivals before this
         CTA, call, its rank k among the call's CTAs on its die) into misc 2688. The
@@ -1210,7 +1252,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         arrival = None
         if cutlass.const_expr(len(self.dies) > 0):
             arrival = self.ticket(workspace)
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.routed):
+            self.wait_routed(workspace)
+        else:
+            cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
