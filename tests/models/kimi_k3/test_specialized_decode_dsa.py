@@ -4678,6 +4678,21 @@ def test_projection_wide_batches(pitch, batch):
     torch.testing.assert_close(out.float(), ref, atol=0.25, rtol=2e-2)
 
 
+def test_late_query_fork_rows():
+    """Rubin DCP16 forks the query after the #63 merge's logits (QUERY_FORK_AT) at
+    1-64 rows (PreparedDsa's front and fork rows) and beside the index front above
+    (WideDsa's 65- rows, where MlaQuery outlasts the merge); never off Rubin or
+    without DCP."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.overlap import (
+        late_fork,
+    )
+
+    assert all(late_fork(b, True, True) for b in (1, 8, 16, 17, 32, 64))
+    assert not any(late_fork(b, True, True) for b in (65, 128, 256, 512))
+    assert not any(late_fork(b, False, True) for b in (8, 32, 64))
+    assert not any(late_fork(b, True, False) for b in (8, 32, 64))
+
+
 def test_front_overlap_rows():
     """The front query overlap serves 1-320 rows: the cluster IndexFront (it
     stages every row in shared memory) below FRONT_MMA_FROM rows and never past
