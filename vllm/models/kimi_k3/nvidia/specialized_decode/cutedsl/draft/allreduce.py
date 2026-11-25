@@ -109,13 +109,10 @@ from .context import div_rn, rsqrt_approx
 
 HIDDEN = 7168
 CAP = 64  # one-shot rows per step (B8: 56 query rows)
-TWO_CAP = 64  # two-shot rows per step (above: the wide box's cap)
+TWO_CAP = 64  # two-shot rows per step
 # Wide (``ArNormRows``) rows per step: the deployment's largest (``PreparedDraftAr``
 # sizes the wide box in 64-row tiles; hb192 measured to 576).
 WIDE_CAP = None
-# Two-shot (cluster-per-row ``ArNormTwoShot``) rows above TWO_CAP run over the wide box
-# (cap: their largest rows in whole 64-row tiles); at most this many rows.
-WIDE_TWO_CAP = 128
 CLUSTER = 8  # CTAs per row
 COLUMNS = HIDDEN // CLUSTER  # 896: 112 threads x 8 columns
 # Benchmarks only: one-shot sites write CTA (0, 0)'s %globaltimer at entry, after the
@@ -453,18 +450,16 @@ class ArNormTwoShot(ArNorm):
 
 
 @cache
-def compile_two_shot(
-    rows, sources, tp, device, polled=False, trigger=False, cap=TWO_CAP
-):
+def compile_two_shot(rows, sources, tp, device, polled=False, trigger=False):
     args = (
         fake((rows, HIDDEN)),
         fake((rows, HIDDEN)),
         fake((HIDDEN,)),
         Float32(0),
         fake((rows, HIDDEN)),
-        fake((tp, cap, HIDDEN // tp)),
+        fake((tp, TWO_CAP, HIDDEN // tp)),
         fake((tp,), None, torch.int64, 8),
-        fake((1, cap, HIDDEN)),
+        fake((1, TWO_CAP, HIDDEN)),
         Int64(0),
         Int32(0),
     )
@@ -726,11 +721,7 @@ class PreparedDraftAr:
         cap = WIDE_CAP or max(rows, default=0)
         self.wide_rows = frozenset(r for r in rows if r in wide and 64 < r <= cap)
         self.rows = tuple(
-            r
-            for r in rows
-            if r <= min(CAP, TWO_CAP)
-            or r in self.wide_rows
-            or (r in two_shot and r <= WIDE_TWO_CAP)
+            r for r in rows if r <= min(CAP, TWO_CAP) or r in self.wide_rows
         )
         self.two_rows = frozenset(r for r in self.rows if r in two_shot)
         self.gated = frozenset(r for r in self.rows if r in gated)  # one-shot
@@ -759,9 +750,8 @@ class PreparedDraftAr:
         # Wide rows: their own two-shot box (rows up to the largest, in whole 64-row
         # tiles), the sites' gather views per parity.
         self.wide_box, self.wide_cap = None, 0
-        self.wide_two = frozenset(r for r in self.two_rows if r > TWO_CAP)
-        if self.wide_rows or self.wide_two:
-            self.wide_cap = -(-max(self.wide_rows | self.wide_two) // 64) * 64
+        if self.wide_rows:
+            self.wide_cap = -(-max(self.wide_rows) // 64) * 64
             self.wide_box = TwoShot(group, device, tp, rank, HIDDEN, self.wide_cap, 2)
         self.two, self.two_views = None, []
         if self.two_rows:  # two-shot sites
@@ -784,13 +774,8 @@ class PreparedDraftAr:
                 self.embed[r] = compile_rows_site(r, 1, tp, wide_cap, index, trigger)
             elif r in self.two_rows:
                 trigger = r in self.early_two
-                two_cap = self.wide_cap if r in self.wide_two else TWO_CAP
-                self.reduce[r] = compile_two_shot(
-                    r, tp, tp, index, trigger=trigger, cap=two_cap
-                )
-                self.embed[r] = compile_two_shot(
-                    r, 1, tp, index, trigger=trigger, cap=two_cap
-                )
+                self.reduce[r] = compile_two_shot(r, tp, tp, index, trigger=trigger)
+                self.embed[r] = compile_two_shot(r, 1, tp, index, trigger=trigger)
             else:
                 options = dict(stamps=STAMPS, gate=r in self.gated)
                 options.update(valid=r in self.valid_ar)
@@ -938,8 +923,6 @@ class PreparedDraftAr:
         0 of parity 0 (one-shot) or the parity-0 gather row (two-shot)."""
         if rows in self.wide_rows:
             return int(self.wide_box.views(0)[3])
-        if rows in self.wide_two:
-            return int(self.wide_box.views(0)[3])
         if rows in self.two_rows:
             return int(self.two_views[0][3])
         return self.slot_address(0)
@@ -959,11 +942,7 @@ class PreparedDraftAr:
             return
         args = (to_cute(partial), to_cute(residual), to_cute(norm.weight))
         args += (Float32(norm.variance_epsilon), to_cute(out))
-        if rows in self.wide_two:
-            recv, peers, gather, mc = self.wide_box.views(parity)
-            args += (to_cute(recv), to_cute(peers, 8), to_cute(gather), Int64(mc))
-            args += (Int32(self.rank),)
-        elif rows in self.two_rows:
+        if partial.shape[0] in self.two_rows:
             args += (*self.two_views[parity], Int32(self.rank))
         else:
             args += (self.view, Int64(self.mc), Int32(parity), Int32(self.rank))
