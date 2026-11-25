@@ -334,11 +334,13 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // rows of at most split_min chunks run on split 0 alone (no merge across the cluster;
   // the other splits leave), longer ones on every split: chunks sp, sp + S, ..
   const bool solo = S > 1 && nall <= p.split_min;
-  // S = 2 solo rows: both CTAs walk every key of the row (QK and softmax computed
-  // alike, so the same P), each converts and multiplies only its half of the latent
-  // dims [256 sp, +256) in P V and pushes them (split 0: the LSE). Per dim the same
-  // arithmetic: bitwise the same partial, half the V conversion per CTA.
-  const bool dsplit = solo && S == 2;
+  // S = 2 / 4 solo rows: every CTA walks every key of the row (QK and softmax computed
+  // alike, so the same P), each converts and multiplies only its share of the latent
+  // dims [512 sp / S, +512 / S) in P V and pushes them (split 0: the LSE). Per dim the
+  // same arithmetic: bitwise the same partial, 1 / S of the V conversion per CTA.
+  const bool dsplit = solo && (S == 2 || S == 4);
+  // (dsplit: this CTA's 16-B FP8 columns of a V row, of 32, as a shift)
+  const int dlg = !dsplit ? 5 : S == 2 ? 4 : 3;
   if (solo && !dsplit && sp > 0) return;
   const int Se = solo ? 1 : S;
   const int kspl = solo ? 0 : sp;  // this CTA's key split
@@ -421,13 +423,13 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
         const int i = tid + j * kThreads;  // (dsplit: this CTA's 16 of the 32 16-B columns)
-        const int r = dsplit ? i >> 4 : i >> 5, c16 = dsplit ? 16 * sp + (i & 15) : i & 31;
+        const int r = i >> dlg, c16 = dsplit ? (sp << dlg) + (i & ((1 << dlg) - 1)) : i & 31;
         if (r < vrows) w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
       }
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
         const int i = tid + j * kThreads;
-        const int r = dsplit ? i >> 4 : i >> 5, c16 = dsplit ? 16 * sp + (i & 15) : i & 31;
+        const int r = i >> dlg, c16 = dsplit ? (sp << dlg) + (i & ((1 << dlg) - 1)) : i & 31;
         if (r >= vrows) continue;
         const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
         uint32_t h[8];
@@ -444,7 +446,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     // ---- tile O += P V of chunk c (P columns [64 (c & 1), +64) of the tile; FP16
     // operands, FP32 accumulation): warp w owns latent dims [32 w, +32)
     auto pv = [&](int c) {
-      if (dsplit && (warp >> 3) != sp) return;  // (the other CTA's latent dims)
+      if (dsplit && (warp >> (dlg - 1)) != sp) return;  // (another CTA's latent dims)
       const int valid = valid_of(c);
       // ldmatrix.trans rows: lane l -> key 16 ks + 8 ((l >> 3) & 1) + (l & 7), dims
       // 32 w + 8 (l >> 4) (+ 16 for the second x4)
@@ -753,8 +755,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     }
   }
   __syncthreads();
-  for (int i = tid; i < kGroupHeads * (dsplit ? 32 : 64); i += kThreads) {
-    const int h = dsplit ? i >> 5 : i >> 6, ch = dsplit ? 32 * sp + (i & 31) : i & 63;
+  for (int i = tid; i < kGroupHeads << (dlg + 1); i += kThreads) {
+    const int h = i >> (dlg + 1), ch = dsplit ? (sp << (dlg + 1)) + (i & ((2 << dlg) - 1)) : i & 63;
     const int gh = h0 + h;
     const uint4 v = *reinterpret_cast<const uint4*>(sO + h * kOStr + 8 * ch);
     const int64_t slot = (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
@@ -762,7 +764,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     st_v4(dst, make_uint4(no_neg_zero(v.x), no_neg_zero(v.y), no_neg_zero(v.z),
                           no_neg_zero(v.w)));
   }
-  if (tid < kGroupHeads && sp == 0) {  // (S = 2 solo rows: split 0's)
+  if (tid < kGroupHeads && sp == 0) {  // (dim-split solo rows: split 0's)
     const int gh = h0 + tid;
     const float l = sL[tid], m = sM[tid];
     float lse = kEmptyLse;

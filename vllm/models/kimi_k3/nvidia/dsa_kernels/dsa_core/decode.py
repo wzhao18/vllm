@@ -104,8 +104,8 @@ ROWS = 16
 # (csrc/dsa_core.cu dsplit): 1-node DSA chain (W4, 24 heads, q8, us per layer) 2x16s2
 # / 2x16s3 + dim split, rows 8 37.27 / 36.26, rows 16 39.23 / 38.15 (Rhea 136829).
 VARIANT = {
-    **{q: "1-16:2x16s3" for q in range(2, 8)},  # q2-q7
-    8: "1-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
+    **{q: "1-8:4x16s3,9-16:2x16s3" for q in range(2, 8)},  # q2-q7
+    8: "1-8:4x16s3,9-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
 }
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
