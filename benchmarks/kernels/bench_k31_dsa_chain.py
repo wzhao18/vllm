@@ -377,6 +377,14 @@ def dsac_phases(rows):
         if ok.any():
             rel = (col[ok] - d[ok, 0]) / 1e3
             out[n] = [round(float(rel.mean()), 3), round(float(rel.max()), 3)]
+    # the loop's first tile in SM clocks from its start (dbg[18]): gather landed,
+    # QK + V cast, softmax, PV (dsa_core.cu dbg 10-13)
+    base = d[:, 18]
+    for i, n in {10: "clk_gather", 11: "clk_qk", 12: "clk_softmax", 13: "clk_pv"}.items():
+        ok = (d[:, i] > 0) & (base > 0)
+        if ok.any():
+            rel = d[ok, i] - base[ok]
+            out[n] = [round(float(rel.mean())), round(float(rel.max()))]
     return out
 
 
