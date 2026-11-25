@@ -1761,14 +1761,17 @@ def static_unsupported(indexer, rows, q) -> str | None:
     return None
 
 
-def supports(indexer, rows, q) -> str | None:
-    """Why the fused indexer cannot run this layer (None: it can)."""
+def supports(indexer, rows, q, fp4=False) -> str | None:
+    """Why the fused indexer cannot run this layer (None: it can); ``fp4``: its
+    MXFP4 DCP scorer (IndexerScoreFp4)."""
     reason = static_unsupported(indexer, rows, q)
     cache = indexer.k_cache.kv_cache
+    entry = DIM // 2 + DIM // 32 if fp4 else DIM + 4
     if reason is None and (
-        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != DIM + 4
+        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != entry
     ):
-        reason = f"indexer cache {tuple(cache.shape)} (needs FP8 [blocks, 64, 132])"
+        what = f"{'MXFP4' if fp4 else 'FP8'} [blocks, 64, {entry}]"
+        reason = f"indexer cache {tuple(cache.shape)} (needs {what})"
     return reason
 
 

@@ -371,14 +371,19 @@ class PreparedDsa:
                 "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
                 "the stock sparse_attn_indexer op and the Triton slot filter",
             )
-        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER).
+        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER). On
+        # an MXFP4 indexer cache its scorer (IndexerScoreFp4: DeepGEMM's logits bit
+        # for bit) replaces DeepGEMM's under DCP everywhere, Rubin included; the
+        # merge's DeepSelect + pack keep the local top-N (FP4_DCP_SCORER).
+        fp4 = self.indexer.use_fp4_cache
         rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
-        self.dcp_fused = bool(local_topk) and rubin_fused
+        self.dcp_fused = bool(local_topk) and (rubin_fused or fp4)
         static = (
             fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
         )
-        # The fused indexer reads FP8 keys only (check_index_cache).
-        fused = self.fp8 and not self.indexer.use_fp4_cache
+        # The fused TP indexer reads FP8 keys only (check_index_cache).
+        fused = self.fp8 and not fp4
+        fused = fused or (fp4 and self.dcp_fused)
         if fused and (self.dcp == 1 or self.dcp_fused) and not any(static):
             # The fused indexer's buffers (prepare_cache), shared by every layer,
             # sized for the longest context the KV cache can hold: reserved now, as
@@ -421,6 +426,9 @@ class PreparedDsa:
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
         check_index_cache(self.indexer, unsupported)
+        fp4_unsupported = [
+            fused_indexer_unsupported(self.indexer, *s, fp4=True) for s in self.shapes
+        ]
         fused = self.box is None and self.fp8
         fused = fused and not any(unsupported)
         if not fused:  # the late query follows the fused indexer's select
@@ -476,7 +484,18 @@ class PreparedDsa:
             args = self.indexer, self.shapes, self.device, rows
             self.fused = FusedIndexer(*args, hold=hold, page=kv.shape[1])
         stage = self.indexer_stage
-        if self.dcp_fused and not any(unsupported):
+        if self.dcp_fused and self.indexer.use_fp4_cache:
+            if not any(fp4_unsupported):
+                # Logits only: DeepSelect + pack take the local top-N (the fused
+                # local select is slower than them on Rubin).
+                stage.fused = FusedIndexer(
+                    self.indexer,
+                    self.shapes,
+                    self.device,
+                    rows,
+                    local_topk=stage.local_topk,
+                )
+        elif self.dcp_fused and not any(unsupported):
             stage.fused = FusedIndexer(
                 self.indexer,
                 self.shapes,
@@ -486,7 +505,7 @@ class PreparedDsa:
                 packed=True,
             )
         stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
-        self.log_policy(unsupported)
+        self.log_policy(unsupported + fp4_unsupported)
         if unserved and self.strict:
             # NQ-NOFALLBACK: a shape the core's variant table lists but whose rows
             # exchange "proj" partials would quietly run FlashInfer's chain.
