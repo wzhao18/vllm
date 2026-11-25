@@ -337,7 +337,7 @@ def build(batch, q, world, local_len, topk):
 
     return SimpleNamespace(
         config=config, context=context, layers=layers, run=run, info=info,
-        check=check,
+        check=check, outputs=lambda: {"out": out.clone()},
     )  # fmt: skip
 
 
@@ -429,6 +429,10 @@ def bench(case, args, rank):
             e1.record()
             e1.synchronize()
             times.append(e0.elapsed_time(e1) * 1000 / args.layers)
+        if args.dump:  # the last layer's output after the replays (out_digest.py)
+            path = os.path.join(args.dump, args.tag)
+            os.makedirs(path, exist_ok=True)
+            torch.save(case.outputs(), f"{path}/M{args.cur_rows}.rank{rank}.pt")
         trace = None
         if args.prof:
             from torch.profiler import ProfilerActivity, profile
@@ -463,6 +467,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--dsac-dbg", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--dump", default="", help="dir: per-tag/rows/rank outputs")
     args = ap.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])

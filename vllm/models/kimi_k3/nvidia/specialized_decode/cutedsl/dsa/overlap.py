@@ -87,7 +87,11 @@ QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
 # beside QueryNorm: wq_b, DsaIndex and the scorer then run without MlaQuery's
 # one-CTA-per-SM grid, and MlaQuery runs beside DeepSelect / pack / select (few CTAs)
 # with slack until the join before the sparse decode. PreparedDsa and WideDsa.
-QUERY_FORK_AT = "17-256:logits"
+# 1-node chain (4 ranks, a DCP16 rank's 6 query heads, q8, AgentX-like 8250 local
+# keys, ABBA us/layer early -> late fork): M32 41.91 -> 40.46, M64 47.22 -> 45.35,
+# M128 52.56 -> 54.45, M256 75.85 -> 85.45 (MlaQuery, 16 / 35 us there, outlasts the
+# top-k merge): late at 17-64 rows only.
+QUERY_FORK_AT = "17-64:logits"
 
 
 def late_fork(batch, rubin, dcp):
