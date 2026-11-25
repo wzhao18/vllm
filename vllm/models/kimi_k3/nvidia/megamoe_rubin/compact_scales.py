@@ -104,10 +104,11 @@ def install(modules: list, cpu_group) -> bool:
         )
         return False
     if not all(_reads_compact(m) for m in modules):
+        buckets = ", ".join(f"{b.variant} {b.max_tokens}" for b in modules[0].buckets)
         logger.info_once(
             "Rubin MegaMoE: full NVFP4 scale planes (buckets %s: only the prefill "
             "inference kernel reads compact planes).",
-            sorted({(b.variant, b.max_tokens) for b in modules[0].buckets}),
+            buckets,
         )
         return False
     planes = [(m.kernel_weights.fc1[1], m.kernel_weights.fc2[1]) for m in modules]
