@@ -480,11 +480,11 @@ SITU_FUSED_WIDE = {384: "3-8:1"}
 # rows 1 us later), us per layer: -0.24 (B8), -0.05..-0.11 (B5). Bitwise identical.
 # M64 (B8 verify): the merged front kernel triggers at entry, so an entry release
 # brings the 208-CTA grid up beside it; after it: -0.7 us per layer (one-GPU proxy).
-# M9-63 (B2-B7 verify, grouped experts beside SharedDown): released at routing's exit,
-# the experts' launch and prologue sat between routing and their grouping; released
-# after the front they are resident when routing exits (one-GPU RouteSitu -> grouped
-# experts chain, CUDA graph, K31_SPIN_GUARD=0: see ``moe.prepared``).
-RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,9-64:1"}
+# M9-63 (B2-B7 verify): NOT released after the front. Their routing is lean + polled
+# (logits by mailbox, no completion wait); the release's entry griddepcontrol_wait
+# serializes all of routing after the front GEMM's completion: 16 ranks (L13 ABBA,
+# prod cfg) B2 +0.18 ms/step (RouteSitu 3.90 -> 6.24 us per layer), B4 +0.006.
+RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,64:1"}
 # Those devices, TP16 B3-8 (lean polled routing): each thread's four exact sigmoids
 # share one div.rn fallback branch (``primitives.sigmoids``, bitwise equal on all 2^32
 # inputs) instead of a slow-path region per division, so their fast paths interleave:
@@ -510,9 +510,8 @@ COPY_SYNC_WIDE = {288: "64:1"}
 # kernel it runs, so with the default (132 KB) the routed experts CTAs (212 KB),
 # launched beside routing by PDL, could not start on routing's SMs until it exited.
 # B64 (B8 x q8): routing's 128 CTAs kept the M64 experts (212 KB) off their SMs the
-# same way (2.11 us p50 overlap in the ds16 B8 serving capture). M9-63: the experts
-# released after the front (``RELEASE_AFTER_FRONT_WIDE``) come up beside routing too.
-ROUTE_CARVEOUT_WIDE = {288: "8:1,9-64:1"}
+# same way (2.11 us p50 overlap in the ds16 B8 serving capture).
+ROUTE_CARVEOUT_WIDE = {288: "8:1,64:1"}
 # Those devices, TP16 B3-8 (token-group geometry): the front GEMM issues its register
 # weight loads at entry, ahead of the barrier setup. Issued right before the PDL wait,
 # ptxas schedules the wait first and every weight load after it (SASS: ACQBULK, then the

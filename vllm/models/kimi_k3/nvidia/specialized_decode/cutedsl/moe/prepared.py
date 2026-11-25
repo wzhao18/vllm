@@ -83,14 +83,10 @@ JOIN = {8: "9-16:0", 16: ""}
 # once the front kernel completed). M64 (B8 verify; SharedDown on its split SMs): the
 # experts' launch and prologue overlap routing, -0.68 / -0.70 us per layer (release
 # after the front) in a one-GPU MoE layer proxy (391 / 293 distinct experts),
-# outputs bitwise identical. M9-63 (B2-B7 verify, grouped experts beside SharedDown):
-# released at routing's exit, their launch and prologue (~0.7 + 0.8 us) sat between
-# routing and the grouping; released after the front they are resident and their
-# dependency wait returns soon after routing exits. One-GPU chain (RouteSitu ->
-# grouped experts, CUDA graph, K31_SPIN_GUARD=0), partition after the last logit:
-# M16 / 24 / 32 / 48 3.70 / 3.65 / 3.73 / 3.66 -> 3.48 / 3.42 / 3.44 / 3.33 us (ABAB,
-# M64 control unchanged). Same ids, plan and arithmetic.
-RELEASE_EARLY_WIDE = "3-8:1,9-64:1"
+# outputs bitwise identical. M9-63 stay released at routing's exit: their routing is
+# polled and an after-front release puts a completion wait at its entry (16 ranks: B2
+# +0.18 ms/step; ``front.RELEASE_AFTER_FRONT_WIDE``).
+RELEASE_EARLY_WIDE = "3-8:1,64:1"
 
 
 class PreparedMoE:

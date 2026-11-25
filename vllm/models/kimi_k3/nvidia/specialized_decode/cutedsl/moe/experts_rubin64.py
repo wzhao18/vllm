@@ -136,14 +136,15 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False, warm=True,
+        dies=(), static_groups=False, warm=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
         # ``RubinExpertsKernel.warm``: an L2 prefetch per weight page before the wait.
         # One GPU, L2 flushed, launched 20 us before its predecessor's end, q4 verify
         # routes: the last CTA's epilogue at M16 / 32 / 48 / 64 -0.39 / -0.32 / -0.48 /
-        # -0.44 us.
+        # -0.44 us. OFF: in-step at 16 ranks the prefetch burst lands beside routing and
+        # SharedDown: B2 / B4 / B8 +0.038 / +0.043 / +0.013 ms/step (Hecate ABBA, prod cfg).
         self.warm = warm
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
