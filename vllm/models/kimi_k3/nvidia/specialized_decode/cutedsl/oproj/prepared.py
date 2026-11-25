@@ -29,7 +29,7 @@ from ..common.host import (
 )
 from ..common.policy import batch_table
 from ..gemm.projection import weight_map
-from .consumer import OprojConsumer, OprojFused
+from .consumer import OprojConsumer, OprojFused, OprojUmmaFold
 from .producer import OprojProducer, OprojUmma, OprojUmmaRows
 
 # The largest batch (token rows) of the tuned tables, the 64-row mailboxes and the
@@ -288,6 +288,19 @@ def oneshot_ring(tp, batch, device):
     return True, xmc if n % (8 * xmc) == 0 else 1
 
 
+# Rubin (compute capability 10.7) producer-reduce two-shot batches per TP whose
+# producer also runs the consumer's AttnRes (``OprojUmmaFold``: clusters of 7, the
+# consumer's slice partition and order, bitwise) instead of a separate consumer grid.
+# Its x is not cluster-multicast (``X_MULTICAST`` does not apply).
+FOLD = {16: ""}
+
+
+def fold(tp, batch, device):
+    if torch.cuda.get_device_capability(device) != (10, 7):
+        return False
+    return bool(batch_table(FOLD.get(tp, "")).get(batch))
+
+
 def twoshot_batches(tp):
     table = batch_table(TWOSHOT.get(tp, ""))
     return {batch for batch, on in table.items() if on}
@@ -373,6 +386,10 @@ def compile_oproj(
     xmoe = fake((1, 4, 7168), (4 * 7168, 7168, 1)) if front else None
     hints = fake((224,), (1,), torch.int32) if front else None
     rows = (row, dynamic_fake(3), weight, weight, weight, row, xmoe, hints, eps, eps)
+    if kind == "fold":  # two-shot producer-reduce + its AttnRes (``FOLD``)
+        kernel = OprojUmmaFold(k, nb, has_delta=has_delta)
+        tail = (recv, peers, slot, box, mc)
+        return cute.compile(kernel, x, w, *tail, *rows, make_fake_stream())
     if kind == "consumer_owners":  # this rank's rows: TP slots in rank order
         kernel = OprojConsumer(nb, groups=1, has_delta=has_delta, out_mc=True)
         return cute.compile(kernel, box, *rows, mc, slot, make_fake_stream())
@@ -480,6 +497,7 @@ class PreparedOproj:
             batches = [b for b in batches if b <= OPROJ_ROWS]
         self.codes, self.twoshots = {}, twoshot_batches(tp) if self.twoshot else set()
         self.reduced: set[int] = set()  # two-shot batches reduced by the producer
+        self.folded: set[int] = set()  # reduced batches whose producer runs the AttnRes
         # X_MULTICAST batches: (x rows, the x tensor map) of ``x_buffer`` [:batch]
         self.xmaps: dict[int, tuple] = {}
         self.after_head: dict[int, tuple] = {}  # codes behind KdaHead (``PREFER_L1``)
@@ -498,9 +516,13 @@ class PreparedOproj:
             reduced = twoshot and producer_reduce(tp, b, self.device)
             if reduced:
                 self.reduced.add(b)
+            folded = reduced and fold(tp, b, self.device)
             resident, xmc = (0, 1)
             if twoshot:
                 resident, xmc = producer_ring(tp, b, self.device)
+            if folded:
+                self.folded.add(b)
+                resident, xmc = True, 1
             elif not fused:
                 resident, xmc = oneshot_ring(tp, b, self.device)
             if xmc > 1 and x_buffer is None:
@@ -510,6 +532,8 @@ class PreparedOproj:
                 tma = weight_map(rows, (b + 7) // 8 * 8 // xmc)  # kept alive here
                 self.xmaps[b] = rows, tma, cutlass.Int64(tma.data_ptr())
             vote = oproj_vote(tp, b, self.device) and not twoshot
+            if folded:
+                kinds = ("fold",)
             self.codes[b] = tuple(
                 compile_oproj(
                     kind,
@@ -525,10 +549,11 @@ class PreparedOproj:
                 for kind in kinds
             )
             extra = (False, False, False, 1, vote)  # batched, reduced, resident, xmc
-            carve = consumer_carveout(tp, b, self.device) if twoshot else None
+            carve = consumer_carveout(tp, b, self.device)
+            carve = carve if twoshot and not folded else None
             if carve is not None:  # every layer's consumer at this batch: one function
                 prepare_shared_carveout(self.codes[b][1], self.device.index, carve)
-            carve = None if fused else producer_carveout(tp, b, self.device)
+            carve = None if fused or folded else producer_carveout(tp, b, self.device)
             if carve is not None:  # likewise every layer's producer
                 prepare_shared_carveout(self.codes[b][0], self.device.index, carve)
             if fused and not mla and prefer_l1(tp, b, self.device):
@@ -555,7 +580,10 @@ class PreparedOproj:
             front = self.front[:2]
         rows = (dynamic_view(prefix), dynamic_view(blocks), *self.views)
         rows += (dynamic_view(out), *front, *self.eps, s)
-        if len(codes) == 1:
+        if batch in self.folded:
+            head, gather, tail = self.twoshot
+            codes[0](x, self.wview, *head, gather, tail[1], *rows)
+        elif len(codes) == 1:
             codes[0](x, self.wview, *self.head, *rows)
         elif batch in self.twoshots:
             head, gather, tail = self.twoshot
