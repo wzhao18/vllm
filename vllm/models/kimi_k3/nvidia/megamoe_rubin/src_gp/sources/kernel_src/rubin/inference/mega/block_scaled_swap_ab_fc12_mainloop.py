@@ -970,7 +970,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         m1w = getattr(self, "_m1a", None)
         m1acc = Int64(0)
         if cutlass.const_expr(m1w is not None):
-            m1w.vmin(m1_stamps.W_TMAA_FIRST, m1_stamps.gtime())
+            m1w.vmin(m1_stamps.W_TMAA_FIRST, m1_stamps.clk())
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             if cutlass.const_expr(m1w is not None):
@@ -1000,7 +1000,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 mcast_mask=multicast_mask,
             )
         if cutlass.const_expr(m1w is not None):
-            m1w.vmax(m1_stamps.W_TMAA_LAST, m1_stamps.gtime())
+            m1w.vmax(m1_stamps.W_TMAA_LAST, m1_stamps.clk())
             m1w.add(m1_stamps.N_TMAA_TILES, 1)
             m1w.add(m1_stamps.C_TMAA_ACQ, m1acc)
             if work_tile.phase == Int32(BlockPhase.Linear2):
@@ -1284,7 +1284,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             )
             cute.copy(sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)])
         if cutlass.const_expr(m1w is not None):
-            m1w.vmax(m1_stamps.W_TMAB_LAST, m1_stamps.gtime())
+            m1w.vmax(m1_stamps.W_TMAB_LAST, m1_stamps.clk())
             m1w.add(m1_stamps.N_TMAB_TILES, 1)
             m1w.add(m1_stamps.C_TMAB_ACQ, m1acc)
         return ab_pipeline_state
@@ -1327,7 +1327,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             kernel_extension.wait_for_input(work_tile)
             if cutlass.const_expr(m1w is not None):
                 m1w.add(m1_stamps.C_TMAB_FC1WAIT, m1_stamps.clk() - m1t0)
-                m1w.vmin(m1_stamps.W_TMAB_FIRST, m1_stamps.gtime())
+                m1w.vmin(m1_stamps.W_TMAB_FIRST, m1_stamps.clk())
             iket.range_pop()
             ab_pipeline_state = self._issue_tma_b_tile(
                 *routed_kind,
@@ -1809,7 +1809,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 acc_pipeline.producer_acquire(acc_producer_state)
                 if cutlass.const_expr(m1w is not None):
                     m1w.add(m1_stamps.C_MMA_ACCWAIT, m1_stamps.clk() - m1t0)
-                    m1w.vmin(m1_stamps.W_MMA_FIRST, m1_stamps.gtime())
+                    m1w.vmin(m1_stamps.W_MMA_FIRST, m1_stamps.clk())
                     m1w.add(m1_stamps.N_MMA_TILES, 1)
                     m1w.add(m1_stamps.N_KTILES, k_tile_count)
                     m1w.add(m1_stamps.N_TOKENS, work_tile.valid_tokens_in_cta_tile)
@@ -1863,7 +1863,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
                 if cutlass.const_expr(m1w is not None):
-                    m1w.vmax(m1_stamps.W_MMA_LAST, m1_stamps.gtime())
+                    m1w.vmax(m1_stamps.W_MMA_LAST, m1_stamps.clk())
 
             acc_producer_state.advance()
             if cutlass.const_expr(m1w is not None):

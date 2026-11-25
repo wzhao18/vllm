@@ -37,7 +37,7 @@ HDR_REGION = "m1.hdr"
 REC_REGION = "m1.rec"
 
 # ---- record words ------------------------------------------------------------------------------------------
-# globaltimer (ns) events
+# globaltimer (ns) events; the per-tile FIRST/LAST words of TMA-A, TMA-B, MMA and the epilogue hold %clock64 (cheap)
 W_ENTRY = 0            # scheduler warp entry
 W_SIZES_READY = 1      # scheduler: wait_for_sizes_ready returned (router metadata of every rank landed)
 W_TOKIN_SIZES = 2      # token_in warp 0: sizes ready

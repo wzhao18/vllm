@@ -1544,7 +1544,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         while work_tile_info.is_valid_tile:
             if cutlass.const_expr(m1w is not None):
                 m1tile0 = m1_stamps.clk()
-                m1w.vmin(m1_stamps.W_EPI_FIRST, m1_stamps.gtime())
+                m1w.vmin(m1_stamps.W_EPI_FIRST, m1_stamps.clk())
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
             if cutlass.const_expr(routed_ready_flag is not None):
@@ -1629,7 +1629,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
             if cutlass.const_expr(m1w is not None):
                 m1w.add(m1_stamps.C_EPI_TILE, m1_stamps.clk() - m1tile0)
-                m1w.vmax(m1_stamps.W_EPI_LAST, m1_stamps.gtime())
+                m1w.vmax(m1_stamps.W_EPI_LAST, m1_stamps.clk())
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
