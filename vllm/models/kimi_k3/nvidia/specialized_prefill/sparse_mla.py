@@ -856,6 +856,15 @@ def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple,
     return cute.compile(kernel, *args, options=opts)
 
 
+def precompile() -> None:
+    """Compile the prefill-sized launch of the dispatched kernel (calls of at least
+    MIN_ROWS rows run one CTA per SM) on the current device."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import _compiled
+
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    _compiled(min(sms, MIN_ROWS), ())
+
+
 def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None) -> torch.Tensor:

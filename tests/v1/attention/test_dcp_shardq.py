@@ -2691,3 +2691,108 @@ def test_profile_run_warms_the_dcp_path_on_mxfp4_keys(cache_dtype, kernel, tmp_p
         args=(world, init, cache_dtype, kernel, "mxfp4"),
         nprocs=world,
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(107),
+    reason="the specialized prefill sparse MLA needs sm_107 (Rubin)",
+)
+def test_shardq_slice_runs_the_specialized_prefill_sparse_mla():
+    """A prefill-sized ShardQ token slice (96 unpadded heads, >= MIN_ROWS rows)
+    attends through the specialized prefill sparse MLA over the gathered
+    workspace: the same output as over the replicated cache, no less precise
+    than trtllm-gen against an FP32 reference (DEP8's gate, 1.25x), and
+    smaller slices keep trtllm-gen bit for bit."""
+    from vllm import _custom_ops as ops
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import sparse_mla
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import _compiled
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        flat_kv_row_view,
+        triton_convert_req_index_to_global_index,
+    )
+
+    lens, world = SCENARIOS["page_tails"], 8
+    rep = Replicated(lens, _layout("fp8"), fill_random=False)
+    kv_c, k_pe, scale = _real_rows(rep, "fp8")
+    workspaces, plans = _push_all(rep, world, num_dst=1)
+    _, ws_mla, _ = workspaces[0]
+    ops.concat_and_cache_mla(kv_c, k_pe, ws_mla, plans[0].slot_mapping, "fp8", scale)
+
+    topk, req_id = _random_topk(lens)
+    rows = topk.shape[0]
+    assert rows >= sparse_mla.MIN_ROWS
+    q = _fp8_query(rows, NUM_HEADS)
+    impl = _flashinfer_impl("fp8", "trtllm", world)
+    impl.use_shardq = True
+    impl._shardq_sparse_mla = sparse_mla
+    assert impl.shardq_query_heads(NUM_HEADS, rows) == NUM_HEADS
+    assert impl.shardq_query_heads(NUM_HEADS, sparse_mla.MIN_ROWS - 1) == 128
+    assert impl.shardq_query_heads(NUM_HEADS) == 128  # the reservation's padding
+    sparse_mla.precompile()  # as reserve_workspace does
+
+    def slots(cache):
+        _, block_stride_rows = flat_kv_row_view(cache, PAGE)
+        return triton_convert_req_index_to_global_index(
+            req_id,
+            plans[0].block_table,
+            topk,
+            BLOCK_SIZE=PAGE,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=TOPK,
+            return_valid_counts=True,
+        )
+
+    def attend(cache, n=rows):
+        physical_topk, valid_counts = slots(cache)
+        return impl.attend_shardq_rows(
+            q[:n],
+            cache,
+            physical_topk[:n],
+            valid_counts[:n],
+            layer=SCALES,
+            block_size=PAGE,
+        )
+
+    def stock(cache, n=rows):
+        physical_topk, valid_counts = slots(cache)
+        out, _ = impl._forward_mqa_kernel(
+            q[:n],
+            cache,
+            physical_topk[:n],
+            valid_counts[:n],
+            layer=SCALES,
+            block_size=PAGE,
+            is_decode=False,
+            return_lse=False,
+        )
+        return out[:, :NUM_HEADS]
+
+    misses = _compiled.cache_info().misses
+    out = attend(ws_mla)
+    assert _compiled.cache_info().misses == misses, "compiled after precompile()"
+    assert out.shape == (rows, NUM_HEADS, 512)
+    assert torch.isfinite(out.float()).all()
+    assert torch.equal(out, attend(rep.mla))
+
+    # Precision: no worse than 1.25x trtllm-gen against an FP32 reference.
+    ref_out = stock(ws_mla)
+    physical_topk, valid_counts = slots(ws_mla)
+    kv_rows, _ = flat_kv_row_view(ws_mla.view(torch.float8_e4m3fn), PAGE)
+    sample = list(range(0, rows, max(1, rows // 64)))
+    exact = []
+    for t in sample:
+        n = int(valid_counts[t])
+        k = kv_rows[physical_topk[t, :n].long()].float()
+        p = torch.softmax(q[t].float() @ k.T * impl.bmm1_scale, dim=-1)
+        exact.append(p @ k[:, :512] * impl.bmm2_scale)
+    exact = torch.stack(exact)
+
+    def err(x):
+        d = (x[sample].float() - exact).norm(dim=-1) / exact.norm(dim=-1).clamp(min=1e-6)
+        return d.mean().item()
+
+    assert err(out) <= 1.25 * err(ref_out) + 1e-3, (err(out), err(ref_out))
+
+    # A slice below MIN_ROWS keeps trtllm-gen, bit for bit.
+    n = sparse_mla.MIN_ROWS - 1
+    assert torch.equal(attend(ws_mla, n), stock(ws_mla, n))
