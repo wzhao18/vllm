@@ -1536,7 +1536,9 @@ class IndexerLocalTopk:
             multimem_st_v4(box_mc + slot + Int64(c) * Int64(16), *v)
 
     @cute.kernel
-    def kernel(self, logits, row_ends, out, valid, ordinals, box_mc, rank, max_rows):
+    def kernel(
+        self, logits, row_ends, out, valid, ordinals, box_mc, box_rank, max_rows
+    ):
         N = self.n
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -1700,7 +1702,7 @@ class IndexerLocalTopk:
                 valid[row] = Int32(N)
         if cutlass.const_expr(self.world > 0):
             cute.arch.sync_threads()  # the row's words and plane, block-visible
-            self.publish(out, row, ordinals, box_mc, rank, max_rows, tid)
+            self.publish(out, row, ordinals, box_mc, box_rank, max_rows, tid)
 
     @cute.jit
     def list_pass(
