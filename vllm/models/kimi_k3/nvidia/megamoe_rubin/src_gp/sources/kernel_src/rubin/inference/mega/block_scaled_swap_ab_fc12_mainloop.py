@@ -919,7 +919,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         producer), the leader expands its own before the SMEM -> TMEM copy."""
         producers = 2
         if cutlass.const_expr(self.compact_weight_sf):
-            producers += self.mma_cta_count - 1
+            import os as _os
+            if cutlass.const_expr("nopeer" not in _os.environ.get("P8X", "")):
+                producers += self.mma_cta_count - 1
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
                 for stage in cutlass.range_constexpr(self.num_ab_pipeline_stages):
@@ -1961,7 +1963,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                         self.num_mma_instructions_per_ab_stage,
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
-            if cutlass.const_expr(self.compact_weight_sf and self.use_2cta_instrs):
+            import os as _os
+            if cutlass.const_expr(self.compact_weight_sf and self.use_2cta_instrs and "nopeer" not in _os.environ.get("P8X", "")):
                 if self.mma_cta_index != Int32(0):
                     ab_pipeline_state = self._expand_compact_sfa_peer_tile(k_tile_count, ab_pipeline_state)
 
