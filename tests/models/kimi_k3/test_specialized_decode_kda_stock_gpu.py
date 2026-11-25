@@ -47,6 +47,7 @@ pytest.importorskip("cutlass")
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("needs a Rubin GPU (compute capability 10.7)", allow_module_level=True)
 
+from tests.models.kimi_k3.kda_protocol import accepted_states  # noqa: E402
 from tests.models.kimi_k3.test_specialized_decode_kda_fp32_gpu import (  # noqa: E402
     FA_ROWS,
     HIDDEN,
@@ -182,10 +183,15 @@ def assert_stock(got, got_caches, want, want_caches, base, used):
     conv_diff = bits(got_caches[0]) != bits(want_caches[0])
     assert not conv_diff.any(), f"conv window: {int(conv_diff.sum())} differ"
     untouched = torch.ones(base[1].shape[0], dtype=torch.bool, device=DEVICE)
-    untouched[used] = False
+    untouched[used.reshape(-1).long()] = False
     stale = bits(got_caches[1][untouched]) != bits(base[1][untouched])
     assert not stale.any(), "untouched state slots written"
-    state_error = relative_error(got_caches[1][used], want_caches[1][used])
+    if used.dim() == 2:  # a verify: the accepted states (either state protocol)
+        got_states = accepted_states(got_caches[1], used)
+        want_states = accepted_states(want_caches[1], used)
+    else:
+        got_states, want_states = got_caches[1][used], want_caches[1][used]
+    state_error = relative_error(got_states, want_states)
     assert state_error < 2e-7, state_error  # FP32 order; KdaSplit's math: ~2.1e-3
     torch.testing.assert_close(got.float(), want.float(), rtol=1e-2, atol=1e-2)
     off = (bits(got) != bits(want)).sum().item()
@@ -266,7 +272,7 @@ def test_fp32_heads_match_stock(monkeypatch, rows, q, polled, seed):
     want, want_caches = stock_run(
         attention, projected, base, table, accepted, q, monkeypatch
     )
-    assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
+    assert_stock(got, got_caches, want, want_caches, base, table)
 
 
 @pytest.mark.parametrize("seed", [3, 11])
@@ -324,7 +330,7 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q, seed):
     want, want_caches = stock_run(
         attention, published, base, table, accepted, q, monkeypatch
     )
-    assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
+    assert_stock(got, got_caches, want, want_caches, base, table)
 
 
 def assert_projection(published, weight, x, columns):
@@ -405,7 +411,7 @@ def test_fp32_tp8_verify_matches_stock(monkeypatch, q, requests):
     want, want_caches = stock_run(
         attention, projected, base, table, accepted, q, monkeypatch
     )
-    assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
+    assert_stock(got, got_caches, want, want_caches, base, table)
 
 
 # A non-speculative 12-head deployment's stock q = 1 decode is the CUDA

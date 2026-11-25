@@ -807,8 +807,10 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
     names = {
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
+        prepared.KdaVerifyLoopDefer: "loopstock",  # (its record form)
         prepared.KdaVerifyFeed: "feed",
         prepared.KdaVerifyHalfStock: "halfstock",
+        prepared.KdaVerifyHalfDefer: "halfstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",

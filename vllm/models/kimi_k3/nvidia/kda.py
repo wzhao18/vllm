@@ -1349,7 +1349,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and m.num_decodes == 0
         ):
             # (stock-format checkpoints: never under the record protocol)
-            assert not self.state_records
+            assert not getattr(self, "state_records", False)
             assert self.decode_conv1d_weight is not None
             assert self.decode_norm_weight is not None
             assert spec_state_indices_tensor is not None
@@ -1513,7 +1513,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
                     for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
                 )
-                if self.state_records:  # the accepted state into slot 0
+                records = getattr(self, "state_records", False)
+                if records:  # the accepted state into slot 0
                     materialize(
                         recurrent_state,
                         spec_state_indices_tensor,
@@ -1534,7 +1535,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     out=spec_out,
-                    records=self.state_records,
+                    records=records,
                 )
 
         # Prefill or plain-decode path.

@@ -969,7 +969,7 @@ def record_state_heads(layer: Any, state: torch.Tensor) -> int:
     """Head count of a record-format temporal state (``RECORD_TAG_ROW``): a layer
     whose ``state_records`` is set, an FP32 [blocks, heads, 128, 128] state, dense
     within the block. 0: a plain state."""
-    if not getattr(layer, "state_records", False):
+    if getattr(layer, "state_records", False) is not True:
         return 0
     if (
         state.dtype != torch.float32

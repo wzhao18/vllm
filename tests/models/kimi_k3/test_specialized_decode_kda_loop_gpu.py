@@ -39,6 +39,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7
 
 os.environ.setdefault("VLLM_SSM_CONV_STATE_LAYOUT", "DS")  # the decode's conv layout
 
+from tests.models.kimi_k3.kda_protocol import accepted_states  # noqa: E402
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.models.kimi_k3.nvidia import kda as kda_module  # noqa: E402
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention  # noqa: E402
@@ -225,6 +226,8 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     stock_kinds = (
         prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
         prepared.KdaVerifyHalfStock,
+        # their deferred-verify record forms (the FP32 default)
+        prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer, prepared.KdaVerifyHalfDefer,
     )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
@@ -243,7 +246,10 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     untouched = torch.ones(slots, dtype=torch.bool, device=DEVICE)
     untouched[used] = False
     assert_bitwise("untouched slots", state[1][untouched], base[1][untouched])
-    state_error = relative_error(state[1][used], want_state[1][used])
+    # the accepted states a = 1 .. q (either state protocol: kda_protocol)
+    state_error = relative_error(
+        accepted_states(state[1], table), accepted_states(want_state[1], table)
+    )
     assert state_error < 2e-7, state_error  # FP32 order; KdaSplit's math: ~2.1e-3
     torch.testing.assert_close(out.float(), want.float(), rtol=1e-2, atol=1e-2)
     off = (bits(out) != bits(want)).sum().item()
