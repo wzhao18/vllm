@@ -70,6 +70,11 @@ def main():
     ap.add_argument("--shapes", default="4x192x512,16x192x2048", help="WxNxK,...")
     ap.add_argument("--levels", default="0,4", help="score quantization (0: none)")
     ap.add_argument("--dist", default="relu", help="relu | tail (see case())")
+    ap.add_argument(
+        "--per-pass",
+        action="store_true",
+        help="the per-pass radix (non-folded select) instead of the cut-only one",
+    )
     ap.add_argument("--calls", type=int, default=20)
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument(
@@ -98,8 +103,12 @@ def main():
                 req = torch.arange(rows, dtype=torch.int32, device="cuda")
                 ro = _RowsOutput(req, table, rows_out, valid, w - 1, BLOCK, 64)
 
-                def call(packed=packed, ro=ro, n=n, k=k):
-                    _DCP_TOPK_SELECT_KERNEL(packed, None, local_topk=n, topk=k, rows=ro)
+                fast = not args.per_pass
+
+                def call(packed=packed, ro=ro, n=n, k=k, fast=fast):
+                    _DCP_TOPK_SELECT_KERNEL(
+                        packed, None, local_topk=n, topk=k, rows=ro, fast=fast
+                    )
 
                 for _ in range(3):
                     call()
@@ -129,7 +138,13 @@ def main():
                     for _ in range(20):
                         st.zero_()
                         _DCP_TOPK_SELECT_KERNEL(
-                            packed, None, local_topk=n, topk=k, rows=ro, stamps=st
+                            packed,
+                            None,
+                            local_topk=n,
+                            topk=k,
+                            rows=ro,
+                            stamps=st,
+                            fast=fast,
                         )
                         torch.cuda.synchronize()
                         acc.append(st.clone())

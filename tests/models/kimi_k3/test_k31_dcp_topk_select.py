@@ -9,7 +9,8 @@ radix passes; rows with fewer than K candidates keep all of them. ``dist``:
 relu rows (exact zeros: score range > 512 ord16 values, the 9 + 7 bit score
 passes), tail rows (each rank's top-N of 8250 logits: a narrow range, the one
 score pass on ord16 - min) and rows spanning exactly 511 / 512 ord16 values
-(either side of that switch)."""
+(either side of that switch). ``fast``: the cut-only radix (the folded
+select's) and the per-pass one (non-folded select, rescue kernel)."""
 
 import pytest
 import torch
@@ -120,7 +121,8 @@ def _reference(o16, gid, rank, block_table, stride_rows):
         (16, 0, -1, "span512"),
     ],
 )
-def test_select_matches_reference(rows, levels, short, dist):
+@pytest.mark.parametrize("fast", [False, True])
+def test_select_matches_reference(rows, levels, short, dist, fast):
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         _DCP_TOPK_SELECT_KERNEL,
         _RowsOutput,
@@ -140,7 +142,7 @@ def test_select_matches_reference(rows, levels, short, dist):
     valid_out = torch.empty((rows,), dtype=torch.int32, device="cuda")
     req_id = torch.arange(rows, dtype=torch.int32, device="cuda")
     ro = _RowsOutput(req_id, block_table, rows_out, valid_out, rank, BLOCK, stride_rows)
-    _DCP_TOPK_SELECT_KERNEL(packed, out, local_topk=N, topk=K, rows=ro)
+    _DCP_TOPK_SELECT_KERNEL(packed, out, local_topk=N, topk=K, rows=ro, fast=fast)
     torch.cuda.synchronize()
     ref_ids, ref_rows, ref_counts = _reference(
         o16, gid, rank, block_table.long(), stride_rows
