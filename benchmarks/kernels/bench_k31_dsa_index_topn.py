@@ -86,7 +86,7 @@ def main():
         indexer = SimpleNamespace(
             k_cache=SimpleNamespace(kv_cache=x.index),
             topk_tokens=2048,
-            max_model_len=args.local * 16,
+            max_model_len=(args.local + 64) * 16,
             dcp_world_size=16,
         )
         fused = FusedIndexer(
@@ -125,6 +125,19 @@ def main():
         def new():
             fused.run_dcp(x.q_rows, x.weights, decode, rows, q)
 
+        score_only = FusedIndexer(
+            indexer, [(rows, q)], torch.device("cuda"), max(64, rows), local_topk=n,
+        )  # fmt: skip
+
+        def score():
+            score_only.run_dcp(x.q_rows, x.weights, decode, rows, q)
+
+        def deepgemm():
+            fp8_fp4_paged_mqa_logits(
+                dg_q, dg_kv, x.weights, lens, dg_table, sched,
+                max_model_len=pitch, indices=idx,
+            )  # fmt: skip
+
         stock()
         packed, logits, _ = fused.run_dcp(x.q_rows, x.weights, decode, rows, q)
         ref = deepgemm_fp4_logits(x, q, pitch)
@@ -142,7 +155,7 @@ def main():
                       f"{b.sort().values[:6].tolist()} counts {int(fused.valid[t])}")
         bad = (bad_logits, bad_sets)
         print(f"CHECK requests {reqs} rows {rows}: mismatches {bad}", flush=True)
-        for name, fn in (("stock", stock), ("fused", new)):
+        for name, fn in (("stock", stock), ("fused", new), ("score", score), ("deepgemm", deepgemm)):
             us, per = graph_us(fn, args.layers, args.reps)
             kern = " | ".join(f"{k}: {v:.2f}" for k, v in sorted(per.items()))
             print(f"REC {name} requests {reqs} rows {rows}: {us:.2f} us/layer "
