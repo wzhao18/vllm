@@ -3149,28 +3149,46 @@ def _publish_units(items, t, device, ctas=None):
 @triton.jit
 def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
                            slots: tl.constexpr, tile: tl.constexpr, sb: tl.constexpr):
-    """Per row and key lane: region copies 1.. appended after copy 0's slots, in copy
-    order; a column that reaches ``slots`` keeps count ``slots`` (overflowed: the
-    select flags the row and the exact full path recomputes it). One program per
-    row; each copy moves in [sb slots, tile lanes] blocks up to its longest column."""
+    """Program (row, k), k >= 1: copy k's slots of every key lane appended after the
+    slots of copies 0 .. k - 1 in copy 0's column (copy order = the unsplit order);
+    slots past ``slots`` are dropped (that column counts as overflowed below).
+    Programs of one row write disjoint slots and only read count words."""
     row = tl.program_id(0)
+    k = tl.program_id(1) + 1
     lane = tl.arange(0, tile)
     sl = tl.arange(0, sb)[:, None]
     base = cand_ptr + row.to(tl.int64) * row_words
-    total = tl.load(base + lane).to(tl.int32)
-    ovf = total >= slots
-    for k in tl.static_range(1, n_split):
-        src = base + k * region_words
-        c = tl.load(src + lane).to(tl.int32)
-        ovf = ovf | (c >= slots) | (total + c >= slots)
-        cmax = tl.minimum(tl.max(c, axis=0), slots)
-        for s0 in range(0, cmax, sb):
-            s = s0 + sl
-            dst = total[None, :] + s
-            m = (s < c[None, :]) & (dst < slots)
-            v = tl.load(src + (1 + s) * tile + lane[None, :], mask=m)
-            tl.store(base + (1 + dst) * tile + lane[None, :], v, mask=m)
-        total = total + c
+    off = tl.zeros([tile], dtype=tl.int32)
+    for j in tl.static_range(0, n_split - 1):
+        if j < k:
+            off += tl.load(base + j * region_words + lane).to(tl.int32)
+    src = base + k * region_words
+    c = tl.load(src + lane).to(tl.int32)
+    cmax = tl.minimum(tl.max(c, axis=0), slots)
+    for s0 in range(0, cmax, sb):
+        s = s0 + sl
+        dst = off[None, :] + s
+        m = (s < c[None, :]) & (dst < slots)
+        v = tl.load(src + (1 + s) * tile + lane[None, :], mask=m)
+        tl.store(base + (1 + dst) * tile + lane[None, :], v, mask=m)
+
+
+@triton.jit
+def _concat_counts_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
+                          slots: tl.constexpr, tile: tl.constexpr):
+    """Copy 0's count words := the concatenated counts; a column whose copies reach
+    ``slots`` keeps count ``slots`` (overflowed: the select flags the row and the
+    exact full path recomputes it). After _concat_regions_kernel (it reads them)."""
+    row = tl.program_id(0)
+    lane = tl.arange(0, tile)
+    base = cand_ptr + row.to(tl.int64) * row_words
+    total = tl.zeros([tile], dtype=tl.int32)
+    ovf = tl.zeros([tile], dtype=tl.int1)
+    for j in tl.static_range(0, n_split):
+        c = tl.load(base + j * region_words + lane).to(tl.int32)
+        ovf = ovf | (c >= slots)
+        total += c
+    ovf = ovf | (total >= slots)
     tl.store(base + lane, tl.where(ovf, slots, total).to(tl.int32))
 
 
@@ -3190,8 +3208,11 @@ def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLI
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.pub_items,
           sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
           n_items=sp.n_pub_items)
-    _concat_regions_kernel[(sp.t,)](
+    _concat_regions_kernel[(sp.t, split - 1)](
         cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, 8, num_warps=4,
+    )
+    _concat_counts_kernel[(sp.t,)](
+        cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, num_warps=4,
     )
     return cand[: (sp.t + 1) * REGION]
 
