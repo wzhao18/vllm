@@ -1751,6 +1751,15 @@ def logits_scratch(device, elements: int, name: str = "logits") -> torch.Tensor:
 
 
 @functools.cache
+def topn_buffers(device, rows):
+    """The MXFP4 scorer's top-N state, shared by every layer: per-row 11-bit key
+    histograms [rows * BINS] and per-request tile arrivals + row passes
+    [2 * MAX_REQUESTS], each zero between calls (the kernel re-zeroes them)."""
+    hist = torch.zeros(rows * BINS, dtype=torch.int32, device=device)
+    return hist, torch.zeros(2 * MAX_REQUESTS, dtype=torch.int32, device=device)
+
+
+@functools.cache
 def select_outputs(device, rows, topk, fill=-1):
     """The physical rows (DCP: B' rows) and counts, shared by every layer (each
     layer's consumer reads them before the next layer's indexer runs), and the
@@ -1785,6 +1794,8 @@ def reserve(indexer, device, max_rows, local_topk=0, blocks=None):
         width, fill = indexer.topk_tokens, -1
     logits = logits_scratch(device, capacity)
     tops = logits_scratch(device, capacity // 8, "tops")
+    if local_topk and getattr(indexer, "use_fp4_cache", False):
+        topn_buffers(device, max_rows)
     out, valid, ends = select_outputs(device, max_rows, width, fill=fill)
     return logits, tops, out, valid, ends, pitch
 
@@ -1842,7 +1853,9 @@ def compile_indexer(
     (every DSA layer's is the same). DCP (``pitch``): DeepGEMM-layout logits and,
     ``packed``, the local top-``topk`` select into B' rows (else none).
     ``page``: the MLA cache's tokens per block (TP select). ``fp4``: an MXFP4
-    indexer cache (DCP only: IndexerScoreFp4)."""
+    indexer cache (DCP only: IndexerScoreFp4; ``packed``: its own exact local
+    top-N into the B' rows and, ``world``, the #63 round-1 mailbox; no select
+    kernel)."""
     fp8 = cutlass.Float8E4M3FN
     with torch.accelerator.device_index(device):
         weights = fake((rows * HEADS,), (1,), torch.bfloat16)
@@ -1855,12 +1868,24 @@ def compile_indexer(
             from .indexer_fp4 import IndexerScoreFp4
 
             assert pitch, "the MXFP4 scorer writes DeepGEMM's layout (DCP) only"
-            score = IndexerScoreFp4(rows, q, ctas, pitch)
+            topn = topk if packed else 0
+            score = IndexerScoreFp4(rows, q, ctas, pitch, topn, world if topn else 0)
             query = fake((rows * HEADS, DIM // 2), (DIM // 2, 1), torch.uint8)
             q_sf = fake((rows * HEADS,), (1,), torch.int32)
             key_view = fake(*keys, torch.uint8)
             args = query, q_sf, weights, key_view, scale_view, *table, ends, scratch
-            score_kernel = cute.compile(score, *args, s)
+            width = topk + topk // 32
+            args += (
+                fake((rows * BINS,), (1,), torch.int32),
+                fake((2 * MAX_REQUESTS,), (1,), torch.int32),
+                fake((rows, width), (width, 1), torch.int32, 4),
+                fake((rows,), (1,), torch.int32, 4),
+                fake((rows,), (1,), torch.int32, 4),
+                Int64(0),
+                Int32(0),
+                Int32(0),
+            )
+            return cute.compile(score, *args, s), None
         else:
             score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
             query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
@@ -1935,6 +1960,9 @@ class FusedIndexer:
         self.ids: torch.Tensor | None = None
         # The packed select publishes the #63 merge's round-1 rows itself.
         self.box = None
+        # MXFP4: the scorer's own top-N (IndexerScoreFp4 topn), its histograms and
+        # request counters (zero between calls; shared by every layer).
+        self.topn_buffers = topn_buffers(device, max_rows) if self.fp4 else None
         if self.packed:
             from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
                 dcp_topk_round1_mailbox,
@@ -1965,8 +1993,18 @@ class FusedIndexer:
         """DCP: whether ``run_dcp`` selects the B' rows itself: one CTA per row
         on its own SM (past the SM count, rows sharing an SM select about 1.7x
         slower, behind DeepSelect + #63's pack; measured on GB300 at 160-320
-        rows)."""
-        return self.packed and rows <= self.ctas
+        rows). MXFP4: the scorer selects them at any rows."""
+        return self.packed and (self.fp4 or rows <= self.ctas)
+
+    def mailbox_args(self, rows, valid):
+        """(ordinals, multicast address, rank, mailbox rows) of the round-1
+        mailbox (placeholders without one)."""
+        box = self.box
+        if box is None:
+            return to_cute(valid, 4), Int64(0), Int32(0), Int32(0)
+        assert rows <= box.max_rows, (rows, box.max_rows)
+        ordinals = to_cute(box.ordinals[:rows], 4)
+        return ordinals, Int64(box.box_mc), Int32(box.rank), Int32(box.max_rows)
 
     def write_ids(self, ids: torch.Tensor):
         """Also write the selected key indices (the logical top-k, -1 past the
@@ -1999,6 +2037,8 @@ class FusedIndexer:
         if self.fp4:
             # DsaIndex's MXFP4 query of this ``rows``-row step (fp4_query_views).
             packed, q_sf = fp4_query_views(q_fp8, rows, rows)
+            hist, sync = self.topn_buffers
+            out, valid = self.out[:rows], self.valid[:rows]
             score(
                 to_cute(packed.reshape(rows * HEADS, DIM // 2)),
                 to_cute(q_sf.reshape(-1), 4),
@@ -2008,6 +2048,11 @@ class FusedIndexer:
                 *self._table(index_table),
                 to_cute(ends, 4),
                 to_cute(self.logits),
+                to_cute(hist[: rows * BINS]),
+                to_cute(sync),
+                to_cute(out, 4),
+                to_cute(valid, 4),
+                *self.mailbox_args(rows, valid),
                 stream(self.device),
             )
             return ends
@@ -2061,23 +2106,16 @@ class FusedIndexer:
         logits = logits.view(rows, self.pitch)
         if not self.packs(rows):
             return None, logits, ends
-        _, select = self.kernels[rows, q]
         out, valid = self.out[:rows], self.valid[:rows]
-        box = self.box
-        if box is not None:
-            assert rows <= box.max_rows, (rows, box.max_rows)
-            ordinals = to_cute(box.ordinals[:rows], 4)
-            mailbox = Int64(box.box_mc), Int32(box.rank), Int32(box.max_rows)
-        else:
-            ordinals = to_cute(valid, 4)  # placeholders (world 0)
-            mailbox = Int64(0), Int32(0), Int32(0)
+        if self.fp4:  # the scorer selected them
+            return out, logits, ends
+        _, select = self.kernels[rows, q]
         select(
             to_cute(self.logits),
             to_cute(ends, 4),
             to_cute(out, 4),
             to_cute(valid, 4),
-            ordinals,
-            *mailbox,
+            *self.mailbox_args(rows, valid),
             stream(self.device),
         )
         return out, logits, ends

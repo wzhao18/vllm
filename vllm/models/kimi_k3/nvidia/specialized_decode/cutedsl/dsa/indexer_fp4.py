@@ -34,24 +34,36 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..common.primitives import asm, load_words
 from .indexer import (
+    BINS,
     DIM,
     HEADS,
     ITEM_TILES,
+    LOCAL_ABOVE_BITS,
+    LOW,
     MAX_REQUESTS,
     PAGE,
     TILE,
     _first_request,
     _next_item,
     add_bf16x2,
+    block_exclusive,
     bulk_g2s,
     fma_bf16x2,
+    load_u16,
+    low_digit,
+    order16,
     relu_bf16x2,
     request_tiles,
+    shared_add,
+    shared_or,
     store_b16,
     stride_pages,
     table_entry,
+    vector_keys,
     warp_inclusive,
+    warp_topdown,
 )
+from .indexer import half as key_half
 
 BQ = 8  # query rows per MMA (N = BQ * HEADS); a request's q <= 8 rows
 N = BQ * HEADS
@@ -112,16 +124,94 @@ def fence_async_shared():
     return "fence.proxy.async.shared::cta;", "~{memory}", ()
 
 
+@asm()
+def red_add_u32(address, value):
+    return (
+        "red.relaxed.gpu.global.add.u32 [$0], $1;",
+        "l,r,~{memory}",
+        (
+            Int64(address),
+            Uint32(value),
+        ),
+    )
+
+
+@asm()
+def red_release_add(address, value):
+    return (
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r,~{memory}",
+        (
+            Int64(address),
+            Int32(value),
+        ),
+    )
+
+
+@asm(Int32)
+def ld_acquire_i32(address):
+    return "ld.acquire.gpu.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
+
+
+@asm(Int32)
+def atom_add_i32(address, value):
+    return (
+        "atom.relaxed.gpu.global.add.s32 $0, [$1], $2;",
+        "=r,l,r,~{memory}",
+        (
+            Int64(address),
+            Int32(value),
+        ),
+    )
+
+
+@asm()
+def st_global_u32(address, value):
+    return (
+        "st.relaxed.gpu.global.b32 [$0], $1;",
+        "l,r,~{memory}",
+        (
+            Int64(address),
+            Uint32(value),
+        ),
+    )
+
+
+@asm()
+def fence_gpu():
+    return "fence.acq_rel.gpu;", "~{memory}", ()
+
+
+@asm()
+def nanosleep_100():
+    return "nanosleep.u32 100;", "~{memory}", ()
+
+
+@asm()
+def load_v4(address):
+    code = "ld.relaxed.gpu.global.v4.u32 {$0,$1,$2,$3}, [$4];"
+    return code, "=r,=r,=r,=r,l,~{memory}", (Int64(address),), (Uint32,) * 4
+
+
+TOPN_CACHED = 4  # 8-key vectors a selecting thread keeps in registers
+
+
 class IndexerScoreFp4:
     """BF16 logits of ``rows`` rows (``q`` per request) into DeepGEMM's paged MQA
     logits layout (row ``t`` at element ``t * pitch``) over the MXFP4 indexer
     cache: see the module docstring. Every request is scored."""
 
-    def __init__(self, rows: int, q: int, ctas: int, pitch: int):
+    def __init__(
+        self, rows: int, q: int, ctas: int, pitch: int, topn: int = 0, world: int = 0
+    ):
         assert rows % q == 0 and 1 <= q <= BQ and rows // q <= MAX_REQUESTS
         assert pitch > 0 and pitch % 512 == 0
+        assert topn % 32 == 0 and topn < 1 << LOCAL_ABOVE_BITS
         self.rows, self.q, self.ctas, self.pitch = rows, q, ctas, pitch
         self.tiler = (TILE, N, DIM)
+        # topn > 0: also each row's exact local top-``topn`` as the #63 merge's B'
+        # rows (``select_row``), multicast into its round-1 mailbox (world > 0).
+        self.topn, self.world = topn, world
 
     @cute.jit
     def __call__(
@@ -136,6 +226,14 @@ class IndexerScoreFp4:
         table_width: Int32,
         row_ends: cute.Tensor,  # Int32 [rows]
         logits: cute.Tensor,  # BF16 bits as Int16 [capacity]
+        hist: cute.Tensor,  # Int32 [rows * BINS]: zero between calls (topn)
+        sync: cute.Tensor,  # Int32 [2 * MAX_REQUESTS]: zero between calls (topn)
+        out: cute.Tensor,  # Int32 [rows, topn + topn / 32]: the B' rows (topn)
+        valid: cute.Tensor,  # Int32 [rows]: their counts (topn)
+        ordinals: cute.Tensor,  # Int32 [rows]: the mailbox's (world)
+        box_mc: Int64,
+        box_rank: Int32,
+        max_rows: Int32,
         s,
     ):
         fp4 = cutlass.Float4E2M1FN
@@ -220,12 +318,238 @@ class IndexerScoreFp4:
             (table_address, table_pitch, table_width),
             row_ends,
             logits,
+            (hist, sync, out, valid, ordinals, box_mc, box_rank, max_rows),
         ).launch(
             grid=[self.ctas, 1, 1],
             block=[THREADS, 1, 1],
             stream=s,
             use_pdl=True,
         )
+
+    def topn_smem(self, smem):
+        """The selecting CTA's shared buffers (after the scoring's)."""
+        from vllm.v1.attention.ops.dcp_topk_merge.kernels import box_words
+
+        n = self.topn
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(BINS), 16)
+        low = smem.allocate_tensor(Uint32, cute.make_layout(LOW), 16)
+        plane = smem.allocate_tensor(Uint32, cute.make_layout(n // 32), 16)
+        stage = smem.allocate_tensor(Uint32, cute.make_layout(box_words(n)), 16)
+        scan = smem.allocate_tensor(Uint32, cute.make_layout(32), 16)
+        info = smem.allocate_tensor(Int32, cute.make_layout(8), 16)
+        return hist, low, plane, stage, scan, info
+
+    @cute.jit
+    def select_rows(self, sStart, requests, lo, hi, r_lo, sync, sel, ends, outs):
+        """After scoring: every CTA adds the tiles it scored to its requests'
+        arrival counts (release); row i of a request of T tiles is then selected by
+        the CTA that scored its tile (i T) / q, once the count reaches T (every
+        CTA of a request is resident: it arrives before it waits). A request
+        without tiles (no keys) has its empty rows written by CTA r % ctas."""
+        Q = self.q
+        tidx, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        arrive = sync.iterator.toint()
+        done = arrive + MAX_REQUESTS * 4
+        fence_gpu()  # this thread's logits and histogram adds, before the release
+        cute.arch.sync_threads()
+        if tidx == 0:
+            g = lo
+            r = r_lo
+            while g < hi:
+                req, _k0, ntile, g, r = _next_item(sStart, requests, g, r, hi)
+                red_release_add(arrive + Int64(req) * 4, ntile)
+        g = lo
+        r = r_lo
+        while g < hi:
+            req, k0, ntile, g, r = _next_item(sStart, requests, g, r, hi)
+            tiles = sStart[req + 1] - sStart[req]
+            t0 = k0 // TILE
+            for i in cutlass.range_constexpr(Q):
+                at = (i * tiles) // Q
+                if at >= t0 and at < t0 + ntile:  # noqa: SIM102
+                    if tidx == 0:
+                        while ld_acquire_i32(arrive + Int64(req) * 4) < tiles:
+                            nanosleep_100()
+                        if atom_add_i32(done + Int64(req) * 4, 1) == Q - 1:
+                            # Every row of the request passed its wait: re-arm.
+                            st_global_u32(arrive + Int64(req) * 4, 0)
+                            st_global_u32(done + Int64(req) * 4, 0)
+                    cute.arch.sync_threads()
+                    self.select_row(req * Q + i, sel, ends, outs, tidx, warp, lane)
+        for r0 in cutlass.range(bid, requests, self.ctas, unroll=1):
+            if sStart[r0 + 1] == sStart[r0]:
+                for i in cutlass.range_constexpr(Q):
+                    self.select_row(r0 * Q + i, sel, ends, outs, tidx, warp, lane)
+
+    @cute.jit
+    def topn_pass(
+        self, step: cutlass.Constexpr[int], vec, cached, state, sel, out, row
+    ):
+        """Pass ``step`` over this thread's keys (1: the threshold bin's low
+        digits; 2: count those above the threshold and the ties at it; 3: write
+        them) -> (the count, the state)."""
+        address, v0, v1, length, per = vec
+        _, low, plane, stage, _, _ = sel
+        bin_, threshold, take, slot, rank = state
+        n = self.topn
+        count = Uint32(0)
+        for i in cutlass.range(per, unroll=1):
+            keys = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
+            for c in cutlass.range_constexpr(TOPN_CACHED):
+                if i == c:
+                    keys = cached[c]
+            if i >= TOPN_CACHED and v0 + i < v1:
+                words = load_v4(address + Int64(v0 + i) * 16)
+                keys = vector_keys(words, v0 + i, length)
+            for e in cutlass.range_constexpr(8):
+                key = key_half(keys, e)
+                index = (v0 + i) * 8 + e
+                if key != Uint32(0):
+                    if cutlass.const_expr(step == 1):  # noqa: SIM102
+                        if (key >> Uint32(5)) == bin_:
+                            shared_add(low.iterator + (key & Uint32(31)), 1)
+                    if cutlass.const_expr(step == 2):
+                        if key > threshold:
+                            count += Uint32(1)
+                        elif key == threshold:
+                            count += Uint32(1 << LOCAL_ABOVE_BITS)
+                    if cutlass.const_expr(step == 3):
+                        at = Int32(-1)
+                        if key > threshold:
+                            at = Int32(slot)
+                            slot += Uint32(1)
+                        elif key == threshold:
+                            if rank < take:
+                                at = Int32(Uint32(n) - take + rank)
+                            rank += Uint32(1)
+                        if at >= 0:
+                            self.put(stage, plane, out, row, at, index, key)
+        return count, (bin_, threshold, take, slot, rank)
+
+    @cute.jit
+    def put(self, stage, plane, out, row, at, index, key):
+        """Key ``index`` (16-bit ``key``) into B' slot ``at``."""
+        word = (key << Uint32(16)) | (Uint32(0xFFFF) - (Uint32(index) & Uint32(0xFFFF)))
+        stage[at] = word
+        out[row, at] = Int32(word)
+        if (index >> 16) != 0:
+            shared_or(plane.iterator + at // 32, Uint32(1) << Uint32(at % 32))
+
+    @cute.jit
+    def select_row(self, row, sel, ends, outs, tidx, warp, lane):
+        """Row ``row``'s exact local top-N (IndexerLocalTopk's B' row: the keys
+        above the threshold in key order, then the ties at it, lowest keys first;
+        a row of at most N keys takes all of them) from its histogram and its
+        logits, into ``out`` and, ``world``, the round-1 mailbox."""
+        from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+            box_words,
+            multimem_st_v4,
+        )
+
+        n = self.topn
+        hist, low, plane, stage, scan, info = sel
+        row_ends, logits_address = ends
+        out, valid, ordinals, box_mc, box_rank, max_rows = outs
+        threads = THREADS
+        length = row_ends[row]
+        if tidx < n // 32:
+            plane[tidx] = Uint32(0)
+        if tidx < 32:
+            scan[tidx] = Uint32(0)
+            low[tidx] = Uint32(0)
+        address = logits_address + Int64(row) * Int64(self.pitch * 2)
+        hist_row = self.hist_base + Int64(row) * BINS * 4
+        if length > n:
+            for b in cutlass.range(tidx, BINS, threads, unroll=1):
+                hist[b] = Uint32(ld_acquire_i32(hist_row + Int64(b) * 4))
+                st_global_u32(hist_row + Int64(b) * 4, 0)  # zero for the next call
+        cute.arch.sync_threads()
+        if length <= n:
+            for j in cutlass.range(tidx, n, threads, unroll=1):
+                word = Uint32(0)
+                if j < length:
+                    key = order16(load_u16(address + Int64(j) * 2))
+                    word = (key << Uint32(16)) | (Uint32(0xFFFF) - Uint32(j & 0xFFFF))
+                    if (j >> 16) != 0:
+                        shared_or(plane.iterator + j // 32, Uint32(1) << Uint32(j % 32))
+                stage[j] = word
+                out[row, j] = Int32(word)
+        else:
+            if warp == 0:
+                b1, above = warp_topdown(hist, Uint32(n), lane)
+                if lane == 0:
+                    info[0] = Int32(b1)
+                    info[1] = Int32(above)
+            vectors = (length + 7) // 8
+            per = (vectors + threads - 1) // threads
+            v0 = cutlass.min(tidx * per, vectors)
+            v1 = cutlass.min(v0 + per, vectors)
+            cached = []
+            for c in cutlass.range_constexpr(TOPN_CACHED):
+                keys = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
+                if v0 + c < v1:
+                    words = load_v4(address + Int64(v0 + c) * 16)
+                    keys = vector_keys(words, v0 + c, length)
+                cached.append(keys)
+            vec = address, v0, v1, length, per
+            cute.arch.sync_threads()
+            bin_ = Uint32(info[0])
+            need = Uint32(n) - Uint32(info[1])
+            zero = Uint32(0)
+            state = bin_, zero, zero, zero, zero
+            self.topn_pass(1, vec, cached, state, sel, out, row)
+            cute.arch.sync_threads()
+            if warp == 0:
+                digit, above = low_digit(low[lane], need, lane)
+                if lane == 0:
+                    info[2] = Int32((bin_ << Uint32(5)) | digit)
+                    info[3] = Int32(need - above)
+            cute.arch.sync_threads()
+            threshold = Uint32(info[2])
+            take = Uint32(info[3])
+            state = bin_, threshold, take, zero, zero
+            count, _ = self.topn_pass(2, vec, cached, state, sel, out, row)
+            prior, _ = block_exclusive(count, scan, warp, lane)
+            mask = Uint32((1 << LOCAL_ABOVE_BITS) - 1)
+            state = (
+                bin_,
+                threshold,
+                take,
+                prior & mask,
+                prior >> Uint32(LOCAL_ABOVE_BITS),
+            )
+            self.topn_pass(3, vec, cached, state, sel, out, row)
+        cute.arch.sync_threads()
+        if tidx < n // 32:
+            out[row, n + tidx] = Int32(plane[tidx])
+        if tidx == 0:
+            valid[row] = cutlass.min(cutlass.max(length, Int32(0)), Int32(n))
+        if cutlass.const_expr(self.world > 0):
+            words = box_words(n)
+            mark = Uint32(0x10000)
+            parity = ordinals[row] & Int32(1)
+            slot = (
+                (Int64(parity) * Int64(max_rows) + Int64(row)) * Int64(self.world)
+                + Int64(box_rank)
+            ) * Int64(words * 4)
+            for c in cutlass.range(tidx, words // 4, threads, unroll=1):
+                v = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
+                for e in cutlass.range_constexpr(4):
+                    i = c * 4 + e
+                    w = mark
+                    if i < n:
+                        w = stage[i]
+                    elif i < n + 2 * (n // 32):
+                        bits = plane[(i - n) // 2]
+                        if (i - n) % 2 == 1:
+                            bits = bits >> Uint32(16)
+                        w = mark | (bits & Uint32(0xFFFF))
+                    v[e] = w
+                multimem_st_v4(box_mc + slot + Int64(c) * Int64(16), *v)
+        cute.arch.sync_threads()  # the buffers, before the next row
 
     def s2t(self, sSF, tSF):
         """SMEM -> TMEM scale-factor copy (tcgen05.cp 4x32dp128bit), as CUTLASS's
@@ -242,7 +566,7 @@ class IndexerScoreFp4:
 
     @cute.jit
     def tile_out(
-        self, taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane
+        self, taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane, hrow
     ):
         """One tile's logits of this thread's key for tokens tok0 .. tok0 + 3:
         stock's epilogue (see the module docstring); frees the accumulator once
@@ -276,6 +600,13 @@ class IndexerScoreFp4:
                     if key < sEnd[tok, qs]:
                         element = row0 + Int64(tok) * pitch + Int64(key)
                         store_b16(out_base + element * 2, total)
+                        if cutlass.const_expr(self.topn > 0):
+                            # The row's 11-bit key histogram (rows of more keys
+                            # than the top-N only), for select_row.
+                            k16 = order16(total & Uint32(0xFFFF))
+                            if sEnd[tok, qs] > self.topn and k16 != Uint32(0):
+                                bin_ = Int64(hrow + tok) * BINS + Int64(k16 >> 5)
+                                red_add_u32(self.hist_base + bin_ * 4, 1)
 
     @cute.jit
     def issue_tile(
@@ -336,8 +667,11 @@ class IndexerScoreFp4:
         table,
         row_ends: cute.Tensor,
         logits: cute.Tensor,
+        topn_args,
     ):
         Q = self.q
+        hist, sync, out, valid, ordinals, box_mc, box_rank, max_rows = topn_args
+        self.hist_base = hist.iterator.toint()
         sf_t = cutlass.Float8E8M0FNU
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -631,8 +965,9 @@ class IndexerScoreFp4:
                     key = k0 + t * TILE + lt
                     cute.arch.mbarrier_wait(acc_full, it & 1)
                     self.tile_out(
-                        taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane
-                    )
+                        taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty,
+                        lane, req * Q,
+                    )  # fmt: skip
                     it += 1
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -643,3 +978,8 @@ class IndexerScoreFp4:
         if warp == MMA_WARP:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+        if cutlass.const_expr(self.topn > 0):
+            sel = self.topn_smem(smem)
+            ends = row_ends, logits.iterator.toint()
+            outs = out, valid, ordinals, box_mc, box_rank, max_rows
+            self.select_rows(sStart, requests, lo, hi, r_lo, sync, sel, ends, outs)
