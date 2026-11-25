@@ -142,9 +142,8 @@ def fence_gpu():
 
 @asm(Uint32)
 def arrive(pointer):
-    """Acquire-release GPU-scope ``atom.add.u32`` of 1: the count before (a release
-    and an acquire pattern in one: ``fence.acq_rel.gpu`` + relaxed atom + fence)."""
-    return "atom.acq_rel.gpu.global.add.u32 $0,[$1],1;", "=r,l,~{memory}", (pointer,)
+    """Relaxed GPU-scope ``atom.add.u32`` of 1: the count before."""
+    return "atom.relaxed.gpu.global.add.u32 $0,[$1],1;", "=r,l,~{memory}", (pointer,)
 
 
 @asm(Uint64)
@@ -343,7 +342,9 @@ class MarkovWide:
                 red_max(maxima + (i * MAX_WIDTH + tid) * 2, mine)
             cute.arch.sync_threads()
             if tid == 0:
+                fence_gpu()
                 count = arrive(counters + i * 4)
+                fence_gpu()
                 flag = Int32(0)
                 if count == Uint32(self.ctas - 1):
                     flag = Int32(1)
