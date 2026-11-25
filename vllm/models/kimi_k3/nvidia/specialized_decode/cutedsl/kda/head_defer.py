@@ -435,6 +435,10 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             named_barrier(1, 128)  # shared_v, slot_rows
             wait(bar_qk)
             wait(bar_gate)
+            # every KDA CTA's q / k arrived (each sends after its fold): partition 0
+            # writes the k / decay records (async stores, drained under the loop)
+            if (partition == 0) & live:
+                self.key_records(record_page, head, kt, shared_k, shared_decay)
             # The token loop is a rolled loop (the next token's operands double-buffered
             # in registers): one ~130-instruction body instead of ~1000 instructions of
             # straight-line code fetched once per layer, which the serving neighbours'
@@ -494,8 +498,6 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                     conv_put(conv_page, (channel, i), value)
             if partition < T:  # token ``partition``: the gated RMS norm
                 wait(bar_out)
-                if (partition == 0) & live:  # every KDA CTA folded: k / decay records
-                    self.key_records(record_page, head, kt, shared_k, shared_decay)
                 raw_o = shared_o[self.vkda.output_position(kt)]
                 sums = cute.make_rmem_tensor(4, Float32)
                 for g in cutlass.range_constexpr(4):
@@ -831,6 +833,10 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             named_barrier(1, 128)  # shared_v, slot_rows
             wait(bar_qk)
             wait(bar_gate)
+            # the request's KDA CTAs' q / k arrived (each sends after its fold): its
+            # block-0 CTA writes the k / decay records under the loop
+            if (block == 0) & live:
+                self.key_records(record_page, head, kt, shared_k, shared_decay)
             lanes = (group, group_lane)
             chunks: cutlass.Constexpr = self.vkda.chunks
             buffers = (
@@ -889,8 +895,6 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             if cutlass.const_expr(T == KDA_CTAS):
                 # token row ``rank`` (position ``block`` of this CTA's request)
                 wait(bar_out)
-                if (block == 0) & live:  # the request's KDA CTAs folded: k / decay
-                    self.key_records(record_page, head, kt, shared_k, shared_decay)
                 self.norm_row(kt, shared_o, output, rank, qk_channel, nw, out_gate, eps)
             if block == 0:
                 for s in cutlass.range_constexpr(2):
