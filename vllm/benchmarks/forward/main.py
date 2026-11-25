@@ -149,6 +149,26 @@ def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
     return engine_args
 
 
+def _row_sums(model_state) -> torch.Tensor:
+    """(layers, local experts, tensors) int64 sums of each expert row's 32-bit words
+    of every EPLB-moved tensor (bench-only weight-movement check)."""
+    out = []
+    for layer in model_state.model.expert_weights:
+        cols = []
+        for t in layer:
+            u = t.contiguous().view(torch.uint8).reshape(t.shape[0], -1)
+            assert u.shape[1] % 4 == 0, u.shape
+            cols.append(u.view(torch.int32).sum(dim=1, dtype=torch.int64))
+        out.append(torch.stack(cols, dim=1))
+    return torch.stack(out)
+
+
+def _gather_rows(local: torch.Tensor, ep) -> torch.Tensor:
+    parts = [torch.empty_like(local) for _ in range(ep.world_size)]
+    torch.distributed.all_gather(parts, local, group=ep.device_group)
+    return torch.cat(parts, dim=1)  # (layers, physical, tensors)
+
+
 def apply_eplb_load(runner, path: str) -> dict[str, Any]:
     """Rebalance the experts once from the logical loads in ``path``.
 
@@ -194,6 +214,10 @@ def apply_eplb_load(runner, path: str) -> dict[str, Any]:
     before = {
         k: m.physical_to_logical_map.cpu().clone() for k, m in state.model_states.items()
     }
+    sums0 = {
+        k: (_gather_rows(_row_sums(m), ep), m.physical_to_logical_map.cpu().clone())
+        for k, m in state.model_states.items()
+    }
     free0 = torch.cuda.mem_get_info()[0]
     torch.accelerator.synchronize()
     t0 = _time.perf_counter()
@@ -214,6 +238,22 @@ def apply_eplb_load(runner, path: str) -> dict[str, Any]:
                 "per_rank_layer_max": int(per_rank.max()),
                 "busiest_rank_total": int(per_rank.sum(0).max()),
             }
+    for key, model_state in state.model_states.items():
+        before_sums, before_map = sums0[key]
+        after_sums = _gather_rows(_row_sums(model_state), ep).cpu()
+        after_map = model_state.physical_to_logical_map.cpu().long()
+        slot_of = torch.empty_like(before_map.long())
+        n = before_map.shape[1]
+        layers = torch.arange(before_map.shape[0]).unsqueeze(1)
+        slot_of[layers, before_map.long()] = torch.arange(n).expand_as(before_map)
+        expected = before_sums.cpu()[layers, slot_of[layers, after_map]]
+        bad = (expected != after_sums).any(-1)
+        stats.setdefault(key, {})["weight_rows_wrong"] = {
+            "rows": int(bad.sum()),
+            "layers": int(bad.any(-1).sum()),
+            "first": [(int(a), int(b)) for a, b in bad.nonzero()[:8].tolist()],
+            "per_tensor_wrong": (expected != after_sums).sum((0, 1)).tolist(),
+        }
     stats["rearrange_wall_s"] = round(wall, 4)
     stats["rearrange_free_mem_delta_mib"] = round((free1 - free0) / 2**20, 1)
     logger.info("EPLB load %s applied: busiest/mean rank load %s", path, stats)
