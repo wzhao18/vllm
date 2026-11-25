@@ -1806,7 +1806,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             word = words[chunk]
             sts128_byte_doubled(destination + Int32(32 * chunk), word[0], word[1])
             sts128_byte_doubled(destination + Int32(32 * chunk + 16), word[2], word[3])
-        cute.arch.fence_proxy("async.shared", space="cta")
+        import os as _os
+        if cutlass.const_expr("noproxyfence" not in _os.environ.get("P8X", "")):
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_warp()
 
     @cute.jit
@@ -1814,11 +1816,15 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         """Leader MMA warp, after the stage's AB barrier: the peer's expanded SFA (2-CTA) is visible at cluster
         scope, this CTA's compact bytes have landed; expand them before the SMEM -> TMEM copy."""
         stage_index = ab_pipeline_state.index
-        if cutlass.const_expr(self.use_2cta_instrs):
+        import os as _os
+        _x = _os.environ.get("P8X", "")
+        if cutlass.const_expr(self.use_2cta_instrs and "noacq" not in _x):
             mbarrier_wait_acquire_cluster(self.ab_full_mbarriers + stage_index, ab_pipeline_state.phase)
         cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
-        self._expand_compact_sfa_stage(stage_index)
-        tcgen05_fence_after_thread_sync()
+        if cutlass.const_expr("noleadexp" not in _x):
+            self._expand_compact_sfa_stage(stage_index)
+        if cutlass.const_expr("notcfence" not in _x):
+            tcgen05_fence_after_thread_sync()
 
     @cute.jit
     def _expand_compact_sfa_peer_tile(

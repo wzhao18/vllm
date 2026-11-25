@@ -860,6 +860,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             # Only the non-default value changes the name, so existing compiled kernels keep their keys.
             + ("_epiwarpgroups2" if self.two_epilogue_warpgroups else "")
             + ("_compactsfa" if self.compact_weight_sf else "")
+            + ("_p8x" + __import__("os").environ.get("P8X", "").replace(",", "_") if self.compact_weight_sf else "")
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
             + ("_diagskiptb" if self._diag_skip_token_back else "")
             + (
