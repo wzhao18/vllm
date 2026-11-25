@@ -2628,6 +2628,35 @@ def test_rubin_dcp_policy():
     assert not prepared.RUBIN_DCP_FUSED_INDEXER
 
 
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fp4_scorer_policy(topk):
+    """The MXFP4 DCP scorer (IndexerScoreFp4) runs or raises (NQ-NOFALLBACK): on an
+    MXFP4 indexer cache it serves every captured DCP16 shape at any top-k (it selects
+    nothing); on another cache layout a target deployment refuses instead of keeping
+    DeepGEMM's logits, and elsewhere it is off with the reason per shape."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
+        fp4_scorer_policy,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Uncovered
+
+    shapes = [(b * q, q) for b in (1, 2, 4, 8, 16, 32, 64) for q in (1, 8)]
+
+    def indexer(entry):
+        cache = torch.empty((4, 64, entry), dtype=torch.uint8)
+        return SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=cache), topk_tokens=topk
+        )
+
+    mxfp4 = indexer(128 // 2 + 128 // 32)
+    assert fp4_scorer_policy(mxfp4, shapes, strict=True) == []
+    fp8 = indexer(128 + 4)
+    with pytest.raises(Uncovered, match="MXFP4 DCP scorer"):
+        fp4_scorer_policy(fp8, shapes, strict=True)
+    reasons = fp4_scorer_policy(fp8, shapes, strict=False)
+    assert len(reasons) == len(shapes) and all("MXFP4" in r for r in reasons)
+    assert fp4_scorer_policy(fp8, (), strict=True) == []
+
+
 # One DCP16 rank's local contexts (interleave 1: ~1/16 of each request's), q8.
 DCP16_INDEXER_CASES = {
     "c1": [11200],  # C1: one request at ~178K
@@ -3847,9 +3876,12 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     keys = (
         select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
         rescue.dispatch(**key, block_size=1024),
+        # The variant that releases the DSA sparse core early (MergeRows.rows).
+        rescue.dispatch(**key, block_size=1024, release=True),
     )
     stage.warm(1024)
-    assert keys[0] in select._compiled_cache and keys[1] in rescue._compiled_cache
+    assert keys[0] in select._compiled_cache
+    assert keys[1] in rescue._compiled_cache and keys[2] in rescue._compiled_cache
     warm = MagicMock()
     monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
     stage.warm(1024)
