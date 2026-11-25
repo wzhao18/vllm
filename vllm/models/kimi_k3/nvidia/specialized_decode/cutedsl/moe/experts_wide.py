@@ -510,7 +510,11 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
 
     def diag_finalize(self):
         """DIAG (never merge): whether the finalize runs (plain Python, compile time)."""
-        return bool(self.publish) and not getattr(self, "diag_skip_fc2", False)
+        return (
+            bool(self.publish)
+            and not getattr(self, "diag_skip_fc2", False)
+            and getattr(self, "diag_fc2_mode", 0) == 0
+        )
 
     def staged_word(self, pair, tile, warp):
         """``RubinGroupedExpertsKernel.staged_word`` in the unit layout: pair p's slot

@@ -110,9 +110,13 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
     # an upper bound of what a faster FC2 epilogue buys (benchmarks set it).
     diag_skip_fc2 = False
 
+    # DIAG (never merge): 0 normal; 1 FC2 stores but no finalize; 2 FC2 shared transpose
+    # but no global store, no finalize (``diag_skip_fc2``: no FC2 epilogue work at all).
+    diag_fc2_mode = 0
+
     def diag_finalize(self):
         """DIAG (never merge): whether the finalize runs (plain Python, compile time)."""
-        return bool(self.publish) and not self.diag_skip_fc2
+        return bool(self.publish) and not self.diag_skip_fc2 and self.diag_fc2_mode == 0
 
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,

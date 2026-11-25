@@ -1187,6 +1187,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             chunk = load_words(
                 shared_address(buffer + t * 64 + part), count=4, shared=True
             )
+            if cutlass.const_expr(getattr(self, "diag_fc2_mode", 0) == 2):
+                pair = Int32(-1) - (Int32(chunk[0]) & Int32(0))  # keep the loads, no store
             if pair >= 0:
                 row = self.staged_word(pair, tile, warp)
                 store_words(workspace.iterator + self.ws_stage + row * 4 + part, chunk)
