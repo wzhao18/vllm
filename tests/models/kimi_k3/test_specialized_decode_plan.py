@@ -936,6 +936,12 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
                 prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
                 prepared.KdaSplitStock, prepared.KdaVerifyHalfStock,
             )  # fmt: skip
+            if prepared.record_protocol(q, False, KDA_HEADS, RUBIN):
+                # their deferred-verify record forms (TP16 q8)
+                stock = (
+                    prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer,
+                    prepared.KdaVerifyHalfDefer,
+                )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
                 "kdasplit",
@@ -1002,7 +1008,9 @@ def test_kda_fp32_fold_is_stock_math_at_q8_only():
             schedule = prepared.schedule_of(6, 8, 0, q, RUBIN, bf16_state)
             options = (6, 8, 0, False, schedule, q, bf16_state)
             kernel = prepared.make_kernel(options, RUBIN, prepared=True)
-            assert type(kernel) is KdaVerifyCols
+            records = prepared.record_protocol(q, bf16_state, 6, RUBIN)
+            want = prepared.KdaVerifyColsDefer if records else KdaVerifyCols
+            assert type(kernel) is want  # (the record form: TP16 q8 FP32)
             assert kernel.stock == (not bf16_state)
 
 

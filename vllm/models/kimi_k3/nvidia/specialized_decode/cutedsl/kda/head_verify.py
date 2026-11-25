@@ -657,10 +657,12 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
     cta_k = tile[1]
     kind = HEAD_VERIFY_KIND
-    if kind is None:  # the FP32 state's deferred-verify record form (head_defer)
+    if kind is None:  # the record form under the record protocol (head_defer)
         from .head_defer import KdaHeadVerifyDefer
+        from .prepared import record_protocol
 
-        kind = KdaHeadVerify if bf16_state else KdaHeadVerifyDefer
+        records = record_protocol(8, bf16_state, heads)  # (the B1 x q8 head)
+        kind = KdaHeadVerifyDefer if records else KdaHeadVerify
     kernel = kind(
         heads, stages=VERIFY_STAGES, cta_k=cta_k, tmem_tiles=VERIFY_TMEM_TILES,
         early_loads=VERIFY_EARLY_LOADS, hidden=hidden, bf16_state=bf16_state,
@@ -683,5 +685,5 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
 # .. -0.21 us/layer; 17 early tiles lose (+0.27 at 4 ranks). Outputs bitwise.
 VERIFY_STAGES, VERIFY_TMEM_TILES, VERIFY_EARLY_LOADS = 10, 15, 21
 # The class ``compile_head_verify`` builds (``head_defer.set_head_protocol``); None:
-# the deferred-verify record form for an FP32 state, KdaHeadVerify for a BF16 one.
+# the deferred-verify record form under ``prepared.record_protocol``, else KdaHeadVerify.
 HEAD_VERIFY_KIND = None

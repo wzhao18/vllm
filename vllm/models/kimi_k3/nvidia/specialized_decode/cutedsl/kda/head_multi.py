@@ -799,10 +799,12 @@ def compile_head_multi(
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
     stages, tmem_tiles, early = MULTI_TILE[requests, tokens]
     kind = HEAD_MULTI_KIND
-    if kind is None:  # the FP32 state's deferred-verify record form (head_defer)
+    if kind is None:  # the record form under the record protocol (head_defer)
         from .head_defer import KdaHeadMultiDefer
+        from .prepared import record_protocol
 
-        kind = KdaHeadMulti if bf16_state else KdaHeadMultiDefer
+        records = record_protocol(tokens, bf16_state, heads)
+        kind = KdaHeadMultiDefer if records else KdaHeadMulti
     kernel = kind(
         heads, requests=requests, tokens=tokens, stages=stages, tmem_tiles=tmem_tiles,
         early_loads=early, hidden=hidden, bf16_state=bf16_state, has_bias=has_bias,
@@ -820,5 +822,5 @@ def compile_head_multi(
 # keeps its tile (VERIFY_STAGES 10).
 MULTI_TILE = {(2, 8): (7, 15, 21), (2, 4): (10, 15, 21)}
 # The class ``compile_head_multi`` builds (``head_defer.set_head_protocol``); None:
-# the deferred-verify record form for an FP32 state, KdaHeadMulti for a BF16 one.
+# the deferred-verify record form under ``prepared.record_protocol``, else KdaHeadMulti.
 HEAD_MULTI_KIND = None

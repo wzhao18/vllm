@@ -29,6 +29,7 @@ from ..cutedsl.kda.head import (
     polled_out_batches,
 )
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
+from ..cutedsl.kda.prepared import record_protocol
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.mla.dcp import PAIR_SENT, DcpBox, polled_output
@@ -685,8 +686,10 @@ class Attention:
             # An FP32 state's verify kernels store the deferred-verify records
             # (kda.verify_defer): the layer's stock verify and the align copies
             # follow the record format (ops/kda_records.py).
-            if q > 1 and not runtime.bf16_state and not attention.use_recoverssm:
-                if attention.kda_spec_decode_backend == "flashinfer":
+            heads = attention.A_log.numel()
+            records = record_protocol(q, runtime.bf16_state, heads)
+            if records and not getattr(attention, "use_recoverssm", False):
+                if getattr(attention, "kda_spec_decode_backend", None) == "flashinfer":
                     raise RuntimeError(
                         "Kimi K3 decode: the KDA record protocol (FP32 state) needs "
                         "the native stock verify, not FlashInfer's packed decode"
