@@ -850,7 +850,18 @@ def test_tp8_rubin_tables_take_tp16_entries():
     assert oproj.CONSUMER_CARVEOUT[8] == oproj.CONSUMER_CARVEOUT[16]
     assert oproj.PRODUCER_CARVEOUT[8] == oproj.PRODUCER_CARVEOUT[16]
     assert oproj.TWOSHOT_BATCHED[8] == oproj.TWOSHOT[8]  # the TP8 two-shot rows
-    for table in ("FAST_CONTEXT", "FAST_AR", "GATED_AR", "SITE_DEFERRED", "VALID_AR"):
+    for table in ("FAST_CONTEXT", "GATED_AR", "SITE_DEFERRED", "VALID_AR"):
         assert getattr(draft, table)[8] == getattr(draft, table)[16], table
+    # FAST_AR: TP16's two-shot sites above 64 rows exist for its pushed producers
+    # (TWO_SHOT_PRODUCERS, TP16 only: the sites alone over the wide box measured no
+    # gain over ArNormRows); TP8 keeps ArNormRows there and equals TP16 elsewhere.
+    tp8 = draft.batch_table(draft.closed(draft.FAST_AR[8], 576))
+    tp16 = draft.batch_table(draft.closed(draft.FAST_AR[16], 576))
+    pushed = draft.batch_table(draft.closed(draft.TWO_SHOT_PRODUCERS[16], 576))
+    assert 8 not in draft.TWO_SHOT_PRODUCERS
+    for rows in range(1, 577):
+        if tp8.get(rows) != tp16.get(rows):
+            assert rows > 64 and pushed.get(rows), rows
+            assert (tp8.get(rows), tp16.get(rows)) == (3, 2), rows
     markov = draft.batch_table(draft.FUSED_MARKOV[8])
     assert all(markov.get(b) == 1 for b in (1, 8, 9, 64, 384))

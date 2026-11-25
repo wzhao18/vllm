@@ -357,7 +357,8 @@ def compile_oproj(
         owners = fake((tp, cap, 7168))  # cap: rows per owner
         kernel = OprojUmmaRows(k, owners=True)
         return cute.compile(kernel, x, w, owners, peers, slot, mc, make_fake_stream())
-    if kind.startswith("producer") and batch > OPROJ_ROWS:  # wide: OprojUmmaRows
+    # wide: OprojUmmaRows (``producer_umma``: the drafter's one OprojUmma, N <= 128)
+    if kind.startswith("producer") and kind != "producer_umma" and batch > OPROJ_ROWS:
         tail = (recv, peers, slot, box, mc, mc)  # + gather, its multicast, x's map
         kernel = OprojUmmaRows(k, chunk=chunk)
         return cute.compile(kernel, x, w, *tail, make_fake_stream())
