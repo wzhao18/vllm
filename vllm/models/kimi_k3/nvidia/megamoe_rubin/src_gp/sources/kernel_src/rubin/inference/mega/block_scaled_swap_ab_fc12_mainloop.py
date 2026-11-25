@@ -44,6 +44,7 @@ from .shared_expert_mainloop import SharedKindMainloopMixin
 # stage, same A stage, N = PR2_DUPN, plus its SFB copy: the marginal cost of a weight-stationary second token tile) |
 # nosf (scale-factor copies only on the first k-tile of a tile) | nomma (no MMA issued) | breuse (odd pair M tiles load
 # no tokens: M512 B-reuse bytes) | ws (2nd+ token tile of an expert loads no weights: weight-stationary bytes) | bws (both).
+# Combos: mb = nomma + brsf, mbe = nomma + brsf + epitmemonly, be = brsf + epitmemonly, me = nomma + epitmemonly.
 # Kernel name gains _pr2<probe>.
 PR2_PROBE = os.environ.get("PR2_PROBE", "")
 PR2_DUPN = int(os.environ.get("PR2_DUPN", "48"))
@@ -986,7 +987,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_a = True
         a_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf") and expected_tx is None):
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be") and expected_tx is None):
             # PR2 EXPERIMENT ONLY: each producer expects its own operand bytes (the stock even split assumes equal
             # A and B stage bytes); ws: an expert's 2nd+ token tile loads no weights (weight-stationary bytes).
             a_tx = Int32(self._pr2_a_tx)
@@ -1266,14 +1267,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_b = True
         b_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf") and expected_tx is None):
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be") and expected_tx is None):
             # PR2 EXPERIMENT ONLY: own operand bytes (see TMA-A); breuse: the odd pair M tile reuses the tokens.
             b_tx = Int32(self._pr2_b_tx)
-            if cutlass.const_expr(PR2_PROBE in ("breuse", "bws", "brsf", "bwsf")):
+            if cutlass.const_expr(PR2_PROBE in ("breuse", "bws", "brsf", "bwsf", "mb", "mbe", "be")):
                 load_b = (work_tile.tile_m_idx // Int32(self.mma_cta_count)) % Int32(2) == Int32(0)
                 if not load_b:
                     b_tx = Int32(0)
-                    if cutlass.const_expr(PR2_PROBE in ("brsf", "bwsf")):
+                    if cutlass.const_expr(PR2_PROBE in ("brsf", "bwsf", "mb", "mbe", "be")):
                         b_tx = Int32(self._pr2_sfb_tx)  # token data skipped, token scales still loaded
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1292,7 +1293,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
               )
               cute.copy(b_issue_atom, global_b_slice[(None, k_tile_idx)], partitioned_smem_b[(None, stage_index)])
             load_sfb = load_b
-            if cutlass.const_expr(PR2_PROBE in ("brsf", "bwsf")):
+            if cutlass.const_expr(PR2_PROBE in ("brsf", "bwsf", "mb", "mbe", "be")):
                 load_sfb = True
             if load_sfb:
               sfb_issue_atom = bind_executable_tma_load_fields(
@@ -1674,7 +1675,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                if cutlass.const_expr(PR2_PROBE != "nomma"):
+                if cutlass.const_expr(PR2_PROBE not in ("nomma", "mb", "mbe", "me")):
                     dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
                         quant_kind=quant_kind,
                         acc_tensor=accumulator,
@@ -1728,7 +1729,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                if cutlass.const_expr(PR2_PROBE != "nomma"):
+                if cutlass.const_expr(PR2_PROBE not in ("nomma", "mb", "mbe", "me")):
                     dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
                         quant_kind=quant_kind,
                         acc_tensor=accumulator,
