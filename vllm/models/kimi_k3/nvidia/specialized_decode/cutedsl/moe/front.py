@@ -113,6 +113,12 @@ class RouteSitu:
             # launch then never overlaps it (they still wait for this kernel's end).
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
+        elif c.const_expr(self.early == "poll"):
+            # Copy CTAs trigger at entry; route CTAs trigger once every thread has
+            # its logits (``route``): the experts launch when the last route CTA saw
+            # this layer's logits from every rank, not at this kernel's exit.
+            if role != Int32(0):
+                cute.arch.griddepcontrol_launch_dependents()
         elif c.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
         for r in c.range_constexpr(len(self.roles)):
@@ -361,6 +367,16 @@ class RouteSitu:
             if tid == 0:
                 found[0] = Int32(0)
         cute.arch.sync_threads()
+        if c.const_expr(self.early == "poll"):
+            # Every thread's logit poll returned (barrier above). Safe against the MoE
+            # tail's reloading polls (``SharedFront.release_early``) by the after-front
+            # release's argument: that release needs this rank's front GEMM to have
+            # passed its dependency wait (completion follows it); the polled words
+            # include this rank's own front outputs, stored only after that wait. So
+            # whatever the after-front release orders before the experts' launch (the
+            # previous layer's tail lanes done), this one does too; the exit release
+            # follows this poll as well.
+            cute.arch.griddepcontrol_launch_dependents()
         if warp == 0:
             group = km[0, lane]
             for w in c.range_constexpr(1, 8):
@@ -481,6 +497,11 @@ SITU_FUSED_WIDE = {384: "3-8:1"}
 # M64 (B8 verify): the merged front kernel triggers at entry, so an entry release
 # brings the 208-CTA grid up beside it; after it: -0.7 us per layer (one-GPU proxy).
 RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,64:1"}
+# Those devices, lean polled batches whose routing releases the experts once its route
+# CTAs hold their logits (``RouteSitu`` early="poll": no completion wait anywhere; copy
+# CTAs trigger at entry) instead of at its exit: the experts' launch and prologue
+# overlap the top-k select, the publish and the latent copy.
+RELEASE_AFTER_POLL_WIDE = {288: "9-63:1"}
 # Those devices, TP16 B3-8 (lean polled routing): each thread's four exact sigmoids
 # share one div.rn fallback branch (``primitives.sigmoids``, bitwise equal on all 2^32
 # inputs) instead of a slow-path region per division, so their fast paths interleave:
@@ -767,6 +788,7 @@ class SharedFront:
         rcp = batch_table(ROUTE_RCP_WIDE.get(n, "") if wide else "")
         halves = batch_table(COPY_HALVES_WIDE.get(n, "") if wide else "")
         sync_copy = batch_table(COPY_SYNC_WIDE.get(n, "") if wide else "")
+        after_poll = batch_table(RELEASE_AFTER_POLL_WIDE.get(n, "") if wide else "")
         early_ids = batch_table(EARLY_IDS_WIDE.get(n, "") if wide else "")
         situ_early = batch_table(SITU_EARLY_WIDE.get(n, "") if wide else "")
         carve = ROUTE_CARVEOUT_WIDE.get(n, "") if wide and verify else ""
@@ -791,6 +813,8 @@ class SharedFront:
                 self.route_opts[b]["halves"] = True
             if sync_copy.get(b):
                 self.route_opts[b]["sync_copy"] = True
+            if after_poll.get(b) and lean_b:
+                self.route_opts[b]["early"] = "poll"
             signal = routes is not None and planned == "image" and polled(tp, b, dev)
             if signal:
                 self.route_opts[b]["signal"] = True
@@ -853,11 +877,8 @@ class SharedFront:
                     f"MoE batch {b}: an entry release of the experts is unsafe with "
                     "the tail's reloading polls; release them after the front GEMM"
                 )
-            early = "front"
-            opts = self.route_opts[b]
-            route = self.carved(
-                b, compile_route(*self.route_keys[b], early=early, **opts)
-            )
+            opts = {**self.route_opts[b], "early": "front"}
+            route = self.carved(b, compile_route(*self.route_keys[b], **opts))
             self.plans[b] = (*plan[:2], route, *plan[3:])
 
     def carved(self, batch, route):
