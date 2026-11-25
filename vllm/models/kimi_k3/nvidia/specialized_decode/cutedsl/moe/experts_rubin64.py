@@ -529,7 +529,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     def stream(self, sm, maps, w13_scales, w2_scales, ranges, experts, steal=None):
         """``ExpertsKernel.stream`` (grouped, TP16) on the packed maps: FC1(A), FC1(B),
         then the FC2 jobs (``fc2_pool``); stage metadata only for the pool's jobs."""
-        w13, w2 = maps
+        w13, w2 = maps[0], maps[1]
         barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.stages)
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
         ring = (sm, barriers, metadata, w2_scales)
