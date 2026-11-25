@@ -292,7 +292,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, xgroup=1):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
@@ -317,6 +317,11 @@ class WideGemm:
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.threads = 256  # warps: 0+3 weights, 1 activations, 2 MMA, 4-7 epilogue
         self.wstages, self.astages, _ = _rings(rows, wstages)
+        # ``xgroup``: K tiles per activation ring stage (one barrier, ``xgroup`` TMA
+        # ops per issue round: a bigger round per issuer, hwdb INDEX 39 / w1_ws2).
+        self.xgroup = xgroup
+        assert self.astages >= 2 * xgroup, (rows, wstages, xgroup, self.astages)
+        self.agroups = self.astages // xgroup
         self.maxreg = -(-rows // split)  # tokens per owner (largest region)
         self.uneven = rows % split != 0
         self.tmem_cols = 32
@@ -497,13 +502,18 @@ class WideGemm:
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             if leader:
                 kblocks = cute.size(tCrA, mode=[2])
+                xg, ng = self.xgroup, self.agroups
                 for t in cutlass.range(k_count, unroll=1):
-                    s, sb = t % wst, t % ast
+                    s = t % wst
+                    g = t // xg
+                    gs = g % ng  # activation group stage
+                    sb = gs * xg + t % xg  # activation ring slot
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 88, _now())
                     cute.arch.mbarrier_wait(full + s, (t // wst) % 2)
-                    cute.arch.mbarrier_wait(bfull + sb, (t // ast) % 2)
+                    if t % xg == 0:
+                        cute.arch.mbarrier_wait(bfull + gs, (g // ng) % 2)
                     if t == 0:
                         if lane == 0:
                             _st_u64(stamp + 64, _now())
@@ -518,7 +528,9 @@ class WideGemm:
                                       tCrB[(None, None, kb, sb * chunks + c)], acc_c)  # fmt: skip
                     with cute.arch.elect_one():
                         tcgen05.commit(empty + s, 3, tcgen05.CtaGroup.TWO)
-                        tcgen05.commit(bempty + sb, 3, tcgen05.CtaGroup.TWO)
+                    if t % xg == xg - 1 or t == k_count - 1:
+                        with cute.arch.elect_one():
+                            tcgen05.commit(bempty + gs, 3, tcgen05.CtaGroup.TWO)
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 104, _now())
@@ -592,18 +604,23 @@ class WideGemm:
              step: cutlass.Constexpr):  # fmt: skip
         """Activation stages ``first``, ``first + step``, ... into their own ring (the
         caller has passed the PDL wait)."""
-        stages, chunks = self.astages, self.chunks
-        for t in cutlass.range(first, k_count, step, unroll=1):
-            s = t % stages
-            phase = Int32(1) ^ ((t // stages) % 2)
+        chunks, xg, ng = self.chunks, self.xgroup, self.agroups
+        for g in cutlass.range(first, (k_count + xg - 1) // xg, step, unroll=1):
+            s = g % ng
+            phase = Int32(1) ^ ((g // ng) % 2)
             cute.arch.mbarrier_wait(empty + s, phase)
+            tiles = cutlass.min(xg, k_count - g * xg)
             if leader:
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_b)
-            kt = (t + rot) % k_count
-            for c in cutlass.range_constexpr(chunks):
-                cute.copy(tma_b, tBgX[(None, c, k0 + kt, 0)], tBsB[(None, s * chunks + c)],
-                          tma_bar_ptr=full + s, mcast_mask=b_mask)  # fmt: skip
+                    cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_b * tiles)
+            for j in cutlass.range_constexpr(xg):
+                t = g * xg + j
+                if t < k_count:
+                    kt = (t + rot) % k_count
+                    for c in cutlass.range_constexpr(chunks):
+                        cute.copy(tma_b, tBgX[(None, c, k0 + kt, 0)],
+                                  tBsB[(None, (s * xg + j) * chunks + c)],
+                                  tma_bar_ptr=full + s, mcast_mask=b_mask)  # fmt: skip
 
     @cute.jit
     def epilogue(
@@ -895,18 +912,22 @@ class PreparedWide:
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            v += ((1,), None, (0, 3), False, False)[len(v) - 1:]
-            self.policies[r] = (v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]))
+            v += ((1,), None, (0, 3), False, False, 1)[len(v) - 1:]
+            self.policies[r] = (
+                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), int(v[6])
+            )  # fmt: skip
         self.kernels, self.state = {}, {}
 
     def prepare(self):
         dev = self.weight.device
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
-        for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
+        for rows, (split, act_warps, wst, w_warps, direct, rotate, xgroup) in (
+            self.policies.items()
+        ):
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, xgroup,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
