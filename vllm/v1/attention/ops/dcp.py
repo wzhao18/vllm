@@ -1030,25 +1030,37 @@ def dcp_shardq_few_token_rows(vllm_config: Any, decode_query_len: int) -> int:
     )
 
 
-def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
+def get_dcp_workspace_max_num_tokens(
+    vllm_config: VllmConfig, dcp_shardq: bool = False
+) -> int:
     """Rows of the direct DCP workspaces (query gather, A2A combine, top-k
-    merge rescue): the most rows one DCP-path pass takes on this instance.
+    merge rescue): the most rows one DCP-path pass takes.
 
     Decode and spec-verify steps take at most max_num_seqs x the decode query
-    length. Without DCP ShardQ a CUDA graph replay pushes its padded rows
-    through the DCP path, so the bound also covers the largest capture size.
+    length. By default (``dcp_shardq`` False) a CUDA graph replay may push its
+    padded rows through the DCP path, so the bound also covers the largest
+    capture size.
 
-    Under DCP ShardQ (``dcp_shardq_configured``) PIECEWISE graphs run attention
-    eagerly on the step's real rows, and FULL graphs are decode-only (FULL
-    mixed graphs exclude ShardQ) of at most max_num_seqs x the decode query
-    length rows. The DCP path then keeps only decode rows, few-token steps
-    (``dcp_shardq_few_token_rows``) and padded steps of at most those decode
-    rows; MLAAttention runs larger DCP-path passes (dense-MHA steps) in row
-    chunks of this many rows. The largest capture size does not enter: a
-    16384-token capture would otherwise size these workspaces (and the
+    ``dcp_shardq``: the caller's DCP-path passes run on a DCP ShardQ instance
+    (``dcp_shardq_configured``, which the caller must check) and keep only
+    decode rows, few-token steps and FULL decode graphs. That holds for an MLA
+    layer that takes ShardQ steps (``MLAAttention.use_shardq``, final at its
+    construction), whose larger DCP-path passes (dense-MHA steps) run in row
+    chunks of this many rows, and for paths that only ever see decode rows
+    (Kimi K3's dense MLA layer, the DSA top-k merge). PIECEWISE graphs run
+    attention eagerly on the step's real rows and FULL graphs are decode-only
+    (FULL mixed graphs exclude ShardQ) of at most max_num_seqs x the decode
+    query length rows, so the bound is the decode rows and the few-token steps
+    (``dcp_shardq_few_token_rows``). The largest capture size does not enter:
+    a 16384-token capture would otherwise size these workspaces (and the
     softmax-stats slab and the profile's DCP-path claim, through
     ``dcp_fallback_max_tokens``) for 16384 rows, ~11 GiB per GPU at Kimi K3.1
     TP8+DCP8 that no step uses.
+
+    A layer that does not take ShardQ steps (dense MLA, DeepSeek-V3.2's own
+    DCP path, sparse backends without DCP ShardQ, other platforms) keeps the
+    default bound even on an instance where DCP ShardQ is configured: its
+    whole steps reach the DCP path unchunked.
 
     Every bound of the DCP path's rows derives from this function, so they
     cannot drift apart."""
@@ -1058,7 +1070,10 @@ def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
         1 + vllm_config.num_speculative_tokens, max_decode_query_len(vllm_config)
     )
     decode_rows = scheduler_config.max_num_seqs * tokens_per_seq
-    if dcp_shardq_configured(vllm_config):
+    if dcp_shardq:
+        assert dcp_shardq_configured(vllm_config), (
+            "DCP ShardQ rows bound on an instance without DCP ShardQ"
+        )
         # tokens_per_seq is at least the indexer's decode threshold (1 + the
         # speculative tokens), so this covers dcp_fallback_max_tokens.
         rows = max(decode_rows, dcp_shardq_few_token_rows(vllm_config, tokens_per_seq))
@@ -1092,7 +1107,8 @@ def dcp_path_rows_bound(vllm_config: VllmConfig) -> int | None:
         or kv_transfer_config.is_kv_producer
     ):
         return None
-    return get_dcp_workspace_max_num_tokens(vllm_config)
+    # A kv_consumer never runs DCP ShardQ (dcp_shardq_configured).
+    return get_dcp_workspace_max_num_tokens(vllm_config, dcp_shardq=False)
 
 
 def cp_kv_cache_interleave_one(vllm_config: Any) -> bool:
@@ -1629,6 +1645,7 @@ class MLADCPManager:
 
     _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
     # See __init__.
+    dcp_shardq: bool = False
     strict_direct_rows: bool = False
 
     def __init__(
@@ -1643,12 +1660,18 @@ class MLADCPManager:
         padded_num_heads: int | None,
         is_lse_base_on_e: bool,
         use_pcp: bool,
+        dcp_shardq: bool = False,
+        strict_direct_rows: bool = False,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
         self.device = torch.device(device)
         self.num_ubatches = max(parallel_config.num_ubatches, 1)
-        self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
+        # The owner's DCP-path rows (get_dcp_workspace_max_num_tokens): only a
+        # path that keeps DCP ShardQ's rows passes dcp_shardq, so a layer that
+        # takes whole steps unchunked keeps the capture-size bound.
+        self.dcp_shardq = dcp_shardq
+        self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config, dcp_shardq)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -1659,12 +1682,12 @@ class MLADCPManager:
         self.output_dtype = output_dtype
         self.is_lse_base_on_e = is_lse_base_on_e
         self.direct_a2a: DirectDCPA2AWorkspace | None = None
-        # Set by a DCP ShardQ layer (MLAAttention.process_weights_after_loading):
-        # its DCP-path passes stay within the direct workspaces (larger ones run
-        # in row chunks), so a pass past them is a bug and raises instead of
-        # taking the NCCL fallback (whose communicator buffers would take GiBs
-        # the memory profile never saw).
-        self.strict_direct_rows = False
+        # A DCP ShardQ layer (MLAAttention, use_shardq) keeps its DCP-path
+        # passes within the direct workspaces (larger ones run in row chunks),
+        # so a pass past them is a bug and raises instead of taking the NCCL
+        # fallback (whose communicator buffers would take GiBs the memory
+        # profile never saw).
+        self.strict_direct_rows = strict_direct_rows
 
         self.combine = self._init_combine(
             num_heads,

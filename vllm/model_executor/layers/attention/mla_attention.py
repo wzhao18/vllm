@@ -426,6 +426,19 @@ def split_kv_b_proj(
     return weight.split([qk_nope_head_dim, v_head_dim], dim=-1)
 
 
+def shardq_opt_in_indexer(indexer: Any, impl: Any, use_sparse: bool) -> Any | None:
+    """The indexer (op) that follows an MLA layer's ShardQ token split, or None
+    when the layer takes no ShardQ steps: a sparse layer whose impl runs ShardQ
+    (``use_shardq``) and whose indexer op, or indexer module without one (Kimi
+    K3's DSA indexer), declares ``supports_shardq``. A model without such an
+    indexer (DeepSeek-V3.2's own DCP path) keeps whole steps on the DCP path."""
+    if not use_sparse or indexer is None or not getattr(impl, "use_shardq", False):
+        return None
+    indexer_op = getattr(indexer, "indexer_op", None)
+    target = indexer_op if indexer_op is not None else indexer
+    return target if getattr(target, "supports_shardq", False) else None
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -614,17 +627,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.impl = impl  # type: ignore[assignment]
         # ShardQ gives each TP rank a slice of a prefill step's tokens, so the
         # indexer must score only that slice and write its top-k compactly.
-        # Indexer ops opt in; DeepseekV32Attention decides on its own.
-        indexer_op = getattr(indexer, "indexer_op", None)
-        self.use_shardq = False
-        if (
-            use_sparse
-            and indexer_op is not None
-            and getattr(impl, "use_shardq", False)
-            and getattr(indexer_op, "supports_shardq", False)
-        ):
-            self.use_shardq = True
-            indexer_op.shardq_layer_name = self.layer_name
+        # The decision is final here: the DCP manager below sizes its
+        # workspaces by it.
+        shardq_indexer = shardq_opt_in_indexer(indexer, impl, use_sparse)
+        self.use_shardq = shardq_indexer is not None
+        if shardq_indexer is not None:
+            shardq_indexer.shardq_layer_name = self.layer_name
         index_group = getattr(impl, "index_group", None)
         self.hisparse_cache = (
             index_group.cache(cast(Any, impl).index_group_index)
@@ -753,6 +761,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=self.use_pcp,
+                # A ShardQ layer's DCP-path passes keep DCP ShardQ's rows (larger
+                # ones run in row chunks, _dcp_mqa_row_cap) and must fit the
+                # direct workspaces; any other layer takes whole steps and keeps
+                # the capture-size bound (get_dcp_workspace_max_num_tokens).
+                dcp_shardq=self.use_shardq,
+                strict_direct_rows=self.use_shardq,
             )
 
         # TODO(ROCm): both BMM kernels re-quantize kv_b_proj online, ignoring
@@ -1821,12 +1835,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # unless overridden), mirroring Attention.process_weights_after_loading.
         self.impl.process_weights_after_loading(act_dtype)
 
-        if self.dcp_manager is not None:
-            # ShardQ is final now (a model may opt the layer in after
-            # construction): a DCP ShardQ layer's DCP-path passes fit the
-            # direct workspaces (_dcp_mqa_row_cap), so its manager raises
-            # instead of taking the NCCL fallback past them.
-            self.dcp_manager.strict_direct_rows = self.use_shardq
+        if (
+            self.dcp_manager is not None
+            and self.dcp_manager.dcp_shardq != self.use_shardq
+        ):
+            # The manager sized its direct workspaces by the construction-time
+            # decision: a layer opted in or out of ShardQ later would run past
+            # them (or waste them).
+            raise RuntimeError(
+                f"{self.layer_name}: use_shardq={self.use_shardq} changed after "
+                "the DCP manager was built for "
+                f"dcp_shardq={self.dcp_manager.dcp_shardq}; decide ShardQ in "
+                "MLAAttention.__init__ (the indexer's supports_shardq)."
+            )
 
         if self.is_amx_bmm_enabled:
             # AMXMLAImpl already packed its own W_UK/W_UV above, for both

@@ -1768,7 +1768,7 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
     # Three requests: another power-of-two bucket than the profile run's one.
     lens = LAYER_LENS
     num_tokens = sum(n for _, n in lens)
-    assert num_tokens > get_dcp_workspace_max_num_tokens(config)
+    assert num_tokens > get_dcp_workspace_max_num_tokens(config, dcp_shardq=True)
     with set_current_vllm_config(config):
         init_distributed_environment(
             world_size=world,
@@ -1847,13 +1847,16 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
             fallback_tokens = dcp.dcp_fallback_max_tokens(
                 config, DeepseekV32IndexerMetadataBuilder.get_decode_threshold(config)
             )
-            assert fallback_tokens == get_dcp_workspace_max_num_tokens(config)
+            assert fallback_tokens == get_dcp_workspace_max_num_tokens(
+                config, dcp_shardq=True
+            )
+            assert layer.dcp_manager.max_num_tokens == fallback_tokens
             direct = layer.dcp_manager.direct_a2a
             if direct is not None:
                 assert direct.max_num_tokens == fallback_tokens
                 assert not a2a_sizes, a2a_sizes
-            # As process_weights_after_loading does for a ShardQ layer.
-            layer.dcp_manager.strict_direct_rows = layer.use_shardq
+            # A ShardQ layer's manager is strict from construction.
+            assert layer.use_shardq and layer.dcp_manager.strict_direct_rows
             torch.accelerator.synchronize()
 
             compiled: list[str] = []
@@ -2127,8 +2130,19 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             assert calls == [row_cap] * (num_mqa // row_cap) + [num_mqa % row_cap]
             chunked = out.clone()
 
-            # The single pass over every MQA row, as before.
+            # A ShardQ layer's strict manager caps the chunks at the direct
+            # workspace even without the impl's own bound.
+            manager = layer.dcp_manager
+            assert manager.strict_direct_rows
             layer.impl.dcp_path_max_rows = None
+            calls.clear()
+            run(*step, out)
+            assert calls == [row_cap] * (num_mqa // row_cap) + [num_mqa % row_cap]
+
+            # The single pass over every MQA row, as before: only a non-strict
+            # manager (and no impl bound) leaves the step whole, past the
+            # direct workspaces onto the NCCL fallback.
+            manager.strict_direct_rows = False
             calls.clear()
             out.fill_(0)
             single_peak = run(*step, out)
@@ -2143,9 +2157,11 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             err = (chunked.float() - out.float()).norm() / out.float().norm()
             assert err < 1e-3, err
             single = out.clone()
+            # The chunks through the NCCL A2A (still a non-strict manager).
             direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
             run(*step, out)
             direct.max_num_tokens = direct_rows
+            manager.strict_direct_rows = True
             assert torch.equal(out, single)
             # Below the profile run's claim; the single pass is far above it.
             gib = 1 << 30

@@ -5,15 +5,18 @@
 
 Under DCP ShardQ the DCP path keeps decode rows, few-token steps and FULL
 decode graphs only (PIECEWISE graphs run attention eagerly on the real rows),
-so the bound no longer follows the largest CUDA graph capture size: a
-16384-token capture used to size the direct workspaces, the trtllm-gen
+so a ShardQ layer's bound no longer follows the largest CUDA graph capture
+size: a 16384-token capture used to size the direct workspaces, the trtllm-gen
 softmax-stats slab and the profile's DCP-path claim for 16384 rows (~11 GiB per
-GPU at Kimi K3.1 TP8+DCP8). Every other instance (decode-only P/D consumers,
-DCP without ShardQ) keeps the old bound. A DCP ShardQ layer runs larger
-DCP-path passes in row chunks of the bound, and its manager raises past the
-direct workspaces instead of silently taking the NCCL fallback.
+GPU at Kimi K3.1 TP8+DCP8). The bound is per layer: a layer that takes no
+ShardQ steps (dense MLA, DeepSeek-V3.2's own DCP path, sparse backends without
+DCP ShardQ) keeps the old bound even where DCP ShardQ is configured, and so do
+decode-only P/D consumers. A DCP ShardQ layer runs larger DCP-path passes in
+row chunks of the bound, and its manager raises past the direct workspaces
+instead of silently taking the NCCL fallback.
 """
 
+import copy
 import functools
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -272,10 +275,19 @@ CONFIGS = {
 
 @pytest.mark.parametrize("name", list(CONFIGS))
 def test_workspace_rows(name):
+    """``new``: the bound of a layer that takes ShardQ steps where DCP ShardQ
+    is configured (Kimi K3.1's DSA layers on FlashInfer sparse, SM10x)."""
     cfg, shardq, old, new = CONFIGS[name]
     assert dcp.dcp_shardq_configured(cfg) is shardq
     assert _old_bound(cfg) == old
-    rows = dcp.get_dcp_workspace_max_num_tokens(cfg)
+    # Any layer that takes no ShardQ steps keeps the old bound, on every
+    # instance (the default).
+    assert dcp.get_dcp_workspace_max_num_tokens(cfg) == old
+    assert dcp.get_dcp_workspace_max_num_tokens(cfg, dcp_shardq=False) == old
+    if not shardq:
+        with pytest.raises(AssertionError, match="without DCP ShardQ"):
+            dcp.get_dcp_workspace_max_num_tokens(cfg, dcp_shardq=True)
+    rows = dcp.get_dcp_workspace_max_num_tokens(cfg, dcp_shardq=shardq)
     assert rows == new
     sc = cfg.scheduler_config
     decode_rows = sc.max_num_seqs * (1 + cfg.num_speculative_tokens)
@@ -318,6 +330,45 @@ def test_decode_only_bounds_unchanged(name):
     )
 
 
+# Layers that take no ShardQ steps on instances where DCP ShardQ is configured
+# (sparse_mla_shard_q defaults to True, interleave to 1): their whole steps
+# reach the DCP path unchunked, so their bound keeps the capture size.
+# name -> (config, old = layer bound, ShardQ layer bound on the same instance)
+NON_SHARDQ_LAYERS = {
+    # Dense MLA (DeepSeek-R1/V3, Kimi K2), TP8+DCP8, default capture 512.
+    "dense_mla_tp8dcp8_capture512": (
+        _config(tp=8, dcp_size=8, role=None, mns=256, k=0, mnbt=8192, capture=512),
+        512,
+        1279,
+    ),
+    # Dense MLA with MTP: 256 x 2 = 512 decode rows.
+    "dense_mla_tp8dcp8_mtp1": (
+        _config(tp=8, dcp_size=8, role=None, mns=256, k=1, mnbt=8192, capture=512),
+        512,
+        1535,
+    ),
+    # DeepSeek-V3.2 (its own whole-step DCP path), kv_both, capture 2048.
+    "deepseek_v32_tp8dcp8_kv_both": (
+        _config(
+            tp=8, dcp_size=8, role="kv_both", mns=32, k=7, mnbt=16384, capture=2048
+        ),
+        2048,
+        1279,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(NON_SHARDQ_LAYERS))
+def test_non_shardq_layer_keeps_its_bound_where_shardq_is_configured(name):
+    """The predicate alone (dcp_shardq_configured) is true here; only a layer
+    that takes ShardQ steps may drop the capture size."""
+    cfg, old, shardq_rows = NON_SHARDQ_LAYERS[name]
+    assert dcp.dcp_shardq_configured(cfg)
+    assert _old_bound(cfg) == old
+    assert dcp.get_dcp_workspace_max_num_tokens(cfg) == old
+    assert dcp.get_dcp_workspace_max_num_tokens(cfg, dcp_shardq=True) == shardq_rows
+
+
 def test_p6_bytes_recovered():
     """P6mem.md section 1: 514,816 B per row of persistent DCP workspaces
     (LSE slab 256 KiB, A2A receive 192 KiB, Q gather 54 KiB, A2A LSE 768 B) and
@@ -348,7 +399,7 @@ def _manager_config():
     return config
 
 
-def _manager(monkeypatch, strict: bool):
+def _manager(monkeypatch, strict: bool, config=None, dcp_shardq: bool = False):
     group = MagicMock(world_size=2)
     group.all_gather.side_effect = lambda q, dim: q
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
@@ -365,7 +416,7 @@ def _manager(monkeypatch, strict: bool):
     nccl_combine = MagicMock(side_effect=lambda out, lse, **kwargs: out * 3)
     monkeypatch.setattr(dcp, "dcp_a2a_lse_reduce", nccl_combine)
     manager = dcp.MLADCPManager(
-        vllm_config=_manager_config(),
+        vllm_config=_manager_config() if config is None else config,
         device=torch.device("cpu"),
         num_heads=2,
         query_head_dim=8,
@@ -375,12 +426,35 @@ def _manager(monkeypatch, strict: bool):
         padded_num_heads=None,
         is_lse_base_on_e=True,
         use_pcp=False,
+        dcp_shardq=dcp_shardq,
+        strict_direct_rows=strict,
     )
-    assert manager.max_num_tokens == _DIRECT_ROWS
+    if config is None:
+        assert manager.max_num_tokens == _DIRECT_ROWS
     assert manager.direct_a2a is direct_a2a
-    assert not manager.strict_direct_rows
-    manager.strict_direct_rows = strict
+    assert manager.strict_direct_rows is strict
+    assert manager.dcp_shardq is dcp_shardq
     return manager, group, nccl_combine
+
+
+@pytest.mark.parametrize(
+    "dcp_shardq, rows", [(True, 1279), (False, 16384)], ids=["shardq", "other"]
+)
+def test_manager_rows_follow_the_layer(monkeypatch, dcp_shardq, rows):
+    """P6 arm B: a ShardQ layer's manager sizes its direct workspaces for 1279
+    rows; a layer without ShardQ on the same instance keeps 16384 (a separate
+    cached workspace: the cache is keyed by the rows)."""
+    cfg = copy.deepcopy(CONFIGS["p6_arm_b_prefill"][0])
+    cfg.parallel_config.num_ubatches = 1
+    cfg.parallel_config.dcp_comm_backend = "a2a"
+    cfg.kernel_config = SimpleNamespace(enable_jit_warmup=False)
+    manager, _, _ = _manager(
+        monkeypatch, strict=dcp_shardq, config=cfg, dcp_shardq=dcp_shardq
+    )
+    assert manager.max_num_tokens == rows
+    a2a_rows = dcp.get_direct_dcp_a2a_workspace.call_args.args[2]
+    gather_rows = dcp.get_direct_dcp_q_gather_workspace.call_args.args[2]
+    assert a2a_rows == gather_rows == rows
 
 
 def _combine(manager, rows: int):
@@ -427,6 +501,7 @@ def test_overflow_raises_under_shardq(monkeypatch):
 def test_uninitialized_manager_is_not_strict():
     assert dcp.MLADCPManager.strict_direct_rows is False
     assert object.__new__(dcp.MLADCPManager).strict_direct_rows is False
+    assert object.__new__(dcp.MLADCPManager).dcp_shardq is False
 
 
 # MLAAttention: chunk rows and the ShardQ flag.
@@ -446,7 +521,9 @@ def _layer(impl_rows, manager, exchange=None):
 
 
 def _strict_manager(rows: int, strict: bool = True):
-    return SimpleNamespace(max_num_tokens=rows, strict_direct_rows=strict)
+    return SimpleNamespace(
+        max_num_tokens=rows, strict_direct_rows=strict, dcp_shardq=strict
+    )
 
 
 @pytest.mark.parametrize(
@@ -537,19 +614,120 @@ def test_row_chunks_stay_in_the_direct_workspace(monkeypatch):
     group.all_gather.assert_not_called()
 
 
-@pytest.mark.parametrize("use_shardq", [False, True])
-def test_process_weights_sets_strict_rows(use_shardq):
-    """The flag follows the layer's final ShardQ decision (a model may opt the
-    layer in after construction, as Kimi K3.1's DSA layer does)."""
+@pytest.mark.parametrize(
+    "use_shardq, manager_shardq",
+    [(False, False), (True, True), (True, False), (False, True)],
+)
+def test_process_weights_checks_the_shardq_decision(use_shardq, manager_shardq):
+    """ShardQ is decided at construction, where the manager sizes its
+    workspaces: a layer whose decision changed later raises."""
     from vllm.model_executor.layers.attention import mla_attention
 
-    layer = _layer(1279, _strict_manager(1279, strict=False))
+    layer = _layer(1279, _strict_manager(1279, strict=manager_shardq))
     layer.__dict__.update(
         impl=MagicMock(),
         use_shardq=use_shardq,
+        layer_name="model.layers.0.self_attn",
         is_amx_bmm_enabled=True,
         kv_b_proj=SimpleNamespace(weight=torch.empty(2)),
     )
     with patch.object(mla_attention, "replace_parameter"):
-        layer.process_weights_after_loading(torch.bfloat16)
-    assert layer.dcp_manager.strict_direct_rows is use_shardq
+        if use_shardq is manager_shardq:
+            layer.process_weights_after_loading(torch.bfloat16)
+        else:
+            with pytest.raises(RuntimeError, match="changed after"):
+                layer.process_weights_after_loading(torch.bfloat16)
+
+
+class _Indexer:
+    """An indexer module without an indexer op (Kimi K3's DSA indexer)."""
+
+    def __init__(self, supports_shardq: bool):
+        self.supports_shardq = supports_shardq
+        self.shardq_layer_name = ""
+
+
+@pytest.mark.parametrize(
+    "indexer, impl_shardq, use_sparse, opts_in",
+    [
+        # Kimi K3.1's DSA indexer: no indexer op, supports_shardq.
+        (_Indexer(True), True, True, "indexer"),
+        # Its impl runs no ShardQ (FlashMLA sparse, not SM10x, flag off).
+        (_Indexer(True), False, True, None),
+        # DeepSeek-V3.2: an indexer without ShardQ support keeps the DCP path.
+        (_Indexer(False), True, True, None),
+        (SimpleNamespace(), True, True, None),
+        # Indexer ops decide (unchanged).
+        (SimpleNamespace(indexer_op=_Indexer(True)), True, True, "op"),
+        (
+            SimpleNamespace(indexer_op=_Indexer(False), supports_shardq=True),
+            True,
+            True,
+            None,
+        ),
+        # Dense MLA: no indexer, not sparse.
+        (None, True, False, None),
+        (_Indexer(True), True, False, None),
+    ],
+)
+def test_shardq_opt_in_at_construction(indexer, impl_shardq, use_sparse, opts_in):
+    from vllm.model_executor.layers.attention.mla_attention import (
+        shardq_opt_in_indexer,
+    )
+
+    impl = SimpleNamespace(use_shardq=impl_shardq)
+    got = shardq_opt_in_indexer(indexer, impl, use_sparse)
+    expected = {
+        None: None,
+        "indexer": indexer,
+        "op": getattr(indexer, "indexer_op", None),
+    }[opts_in]
+    assert got is expected
+
+
+def test_kimi_dsa_indexer_opts_in_at_construction():
+    """Kimi K3.1's DSA indexer declares ShardQ support, so MLAAttention decides
+    at construction (before the DCP manager sizes its workspaces) instead of
+    the model opting the layer in afterwards."""
+    dsa = pytest.importorskip("vllm.models.kimi_k3.nvidia.dsa")
+    assert dsa.KimiK3DSAIndexer.supports_shardq is True
+
+
+@pytest.mark.parametrize(
+    "name, rows",
+    [
+        ("p6_arm_b_prefill", 1279),
+        ("p6_arm_a_prefill", 1279),
+        ("tp8dcp8_decode_k7", 512),
+        ("tp8dcp8_full_mixed_graphs", 2048),
+    ],
+)
+def test_topk_merge_rescue_rows(monkeypatch, name, rows):
+    """The DSA top-k merge rescue holds the indexer's decode rows (and, under
+    DCP ShardQ, the few-token steps): the ShardQ bound where DCP ShardQ is
+    configured, else the old bound."""
+    import vllm.distributed as distributed
+    import vllm.v1.attention.ops.cp_common as cp_common
+    from vllm.v1.attention.ops import dcp_topk_merge as gate
+    from vllm.v1.attention.ops.dcp_topk_merge import kernels
+
+    cfg = copy.deepcopy(CONFIGS[name][0])
+    cfg.kernel_config = SimpleNamespace(enable_jit_warmup=False)
+    allocated = []
+    monkeypatch.setattr(gate, "_MERGE_MAX_ROWS", {})
+    monkeypatch.setattr(
+        distributed,
+        "get_dcp_group",
+        lambda: SimpleNamespace(cpu_group=None, rank_in_group=0),
+    )
+    monkeypatch.setattr(cp_common, "direct_cp_enabled", lambda *args: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(
+        kernels,
+        "init_dcp_topk_rescue_workspace",
+        lambda max_rows, *args: allocated.append(max_rows),
+    )
+    monkeypatch.setattr(kernels, "init_dcp_topk_mailbox", lambda *args: False)
+    assert gate._init_rescue(cfg, 2048, 384) == 384
+    assert allocated == [rows]
+    assert gate.dcp_topk_merge_max_rows(2048, 384) == rows
