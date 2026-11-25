@@ -314,6 +314,42 @@ def pd_prefill_capture_sizes(max_num_batched_tokens: int) -> list[int]:
     return sorted({s for s in sizes if s <= cap} | {cap})
 
 
+def _capped_shared_overlap_tokens(
+    vllm_config: VllmConfig, max_tokens_per_rank: int
+) -> int | None:
+    """Largest per-rank step of a sequence-parallel MegaMoE layer that runs on an
+    SM-capped grid beside the side-stream shared expert (``KimiMoE._overlapped_forward``);
+    None = every step (decode, unified serving: the decode SP measurement behind
+    RUBIN_SHARED_OVERLAP_MAX_SMS).
+
+    P/D prefill workers: RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS. Their larger steps are
+    SM-throughput-bound in MegaMoE (TP8+DCP8 NVFP4, 4096 rows per rank: 884 -> 1182 us
+    per layer on the 148-SM cap), so they keep the full grid and overlap the shared
+    expert by stream priority instead. Decided by role, no switch."""
+    from .megamoe_rubin.experts import RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
+
+    if (
+        not pd_prefill_worker(vllm_config)
+        or max_tokens_per_rank <= RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
+    ):
+        return None
+    return RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
+
+
+_routed_priority_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def routed_priority_stream() -> torch.cuda.Stream:
+    """The current device's high-priority stream (above the default priority 0 of
+    the forward's stream) for the MegaMoE routing chain beside the shared expert
+    (``KimiMoE._overlapped_forward``), one per device."""
+    device = torch.accelerator.current_device_index()
+    stream = _routed_priority_streams.get(device)
+    if stream is None:
+        stream = _routed_priority_streams[device] = torch.cuda.Stream(priority=-1)
+    return stream
+
+
 def use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     """Whether the decoder runs sequence parallelism: each TP rank owns a 1/TP token
     shard between the attention blocks (o_proj GEMM-RS, SP all-gather before the
@@ -1120,9 +1156,16 @@ class KimiMoE(nn.Module):
             and not self.shared_experts.shard_sequence_parallel
         )
         if self._shared_overlap:
-            self.experts.reserve_sms_for_shared_expert()
+            self.experts.reserve_sms_for_shared_expert(
+                up_to_tokens=_capped_shared_overlap_tokens(
+                    vllm_config, self.experts.buckets[-1].max_tokens
+                )
+            )
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
+            # Full-grid buckets: the routing chain runs on a high-priority stream
+            # and the shared expert on this one (see _overlapped_forward).
+            self._routed_stream = routed_priority_stream()
         if self._prefill_moe is not None and self._prefill_moe.subcalls:
             from .specialized_prefill.moe import PrefillSubcallExperts
 
@@ -1284,6 +1327,58 @@ class KimiMoE(nn.Module):
         )
         return pack_k(act.activation())
 
+    def _overlapped_forward(
+        self,
+        hidden_states: torch.Tensor,
+        mxfp8_input: "QuantizedActivation | None",
+        shared_input: "torch.Tensor | QuantizedActivation",
+    ) -> torch.Tensor:
+        """Sequence-parallel MegaMoE (``_shared_overlap``) with the replicated
+        shared expert concurrent with the routed experts; same kernels, operands
+        and up-projection epilogue as the serial order, only concurrent.
+
+        * SM-capped bucket (``experts.shared_overlap``: decode, and P/D prefill
+          steps of at most RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS rows): the
+          MegaMoE grid leaves the shared expert its SMs; the shared expert runs on
+          the side stream from the dispatch on.
+        * Full-grid bucket (larger P/D prefill steps): MegaMoE needs every SM, so
+          the whole routing chain (router, top-k, latent down, dispatch, MegaMoE,
+          reduce) runs on a high-priority stream and the shared expert on the
+          current stream from the layer input on: the block scheduler hands each
+          SM freed by the chain to its next kernel first, so the shared GEMMs take
+          only what the chain leaves (router/top-k/dispatch gaps) and the MegaMoE
+          grid becomes resident as the shared CTAs retire (the shared kernels never
+          wait on MegaMoE, so its spin-waits cannot block on them).
+
+        Both forms fork and join inside this call (no eager break between), so
+        they are also legal inside breakable CUDA graph segments."""
+        start, done = self._shared_events
+        if self.experts.shared_overlap(hidden_states.shape[0]):
+            routed_hidden_states, router_output, topk_ids = (
+                self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+            )
+            start.record()
+            routed = self._routed_experts(routed_hidden_states, router_output, topk_ids)
+            with torch.cuda.stream(self._shared_stream):
+                start.wait()
+                shared_output = self.shared_experts(shared_input)
+                done.record()
+        else:
+            start.record()
+            with torch.cuda.stream(self._routed_stream):
+                start.wait()
+                routed_hidden_states, router_output, topk_ids = (
+                    self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+                )
+                routed = self._routed_experts(
+                    routed_hidden_states, router_output, topk_ids
+                )
+                done.record()
+            shared_output = self.shared_experts(shared_input)
+        done.wait()
+        assert self.routed_output_transform is not None
+        return self.routed_output_transform(routed, residual=shared_output)
+
     def _prefill_shared_stream(self, num_tokens: int) -> torch.cuda.Stream | None:
         """The stream that overlaps the shared experts with the routing front
         of a MegaMoE prefill chunk (from _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
@@ -1411,6 +1506,10 @@ class KimiMoE(nn.Module):
             if mxfp8_input is None
             else mxfp8_input
         )
+        if self._shared_overlap and resid_prefix is None:
+            return self._overlapped_forward(
+                hidden_states, mxfp8_input, shared_input
+            ).view(num_tokens, hidden_size)
         prefill_shared = self._prefill_shared_stream(num_tokens)
         if prefill_shared is not None:
             # The shared experts run beside the router, its top-k and the
@@ -1453,25 +1552,14 @@ class KimiMoE(nn.Module):
         elif self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
-            if self._shared_overlap:
-                final_hidden_states, shared_output = maybe_execute_in_parallel(
-                    lambda: self._routed_experts(
-                        routed_hidden_states, router_output, topk_ids
-                    ),
-                    lambda: self.shared_experts(shared_input),
-                    self._shared_events[0],
-                    self._shared_events[1],
-                    self._shared_stream,
-                )
-            else:
-                final_hidden_states = self._routed_experts(
-                    routed_hidden_states, router_output, topk_ids
-                )
-                shared_output = (
-                    self.shared_experts(shared_input)
-                    if self.shared_experts is not None
-                    else None
-                )
+            final_hidden_states = self._routed_experts(
+                routed_hidden_states, router_output, topk_ids
+            )
+            shared_output = (
+                self.shared_experts(shared_input)
+                if self.shared_experts is not None
+                else None
+            )
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
             final_hidden_states = self.routed_output_transform(
