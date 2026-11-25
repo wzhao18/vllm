@@ -292,7 +292,7 @@ TWO_SHOT_PRODUCERS = {16: "8-128:1"}
 # ranks, the drafter forward with pushed two-shot sites (scripts/dsdraft/layer_test.py),
 # us separate -> fused: B2 275.1 -> 262.4, B3 288.6 -> 274.6, B4 297.2 -> 283.2, B5
 # 330.2 -> 317.1, B8 385.5 -> 372.0.
-TWO_SHOT_SILU = {16: "8-64:1"}
+TWO_SHOT_SILU = {16: "8-128:1"}
 # Query rows whose two-shot sites release their PDL dependents right after their
 # own wait (cutedsl.draft.allreduce ArNormTwoShot ``trigger``), per TP, on Rubin: the
 # in-projection and gate/up GEMMs after them (weights on chip before their wait)
@@ -301,7 +301,7 @@ TWO_SHOT_SILU = {16: "8-64:1"}
 # 266.9 -> 260.8, B5 296.6 -> 282.4, B8 321.4 -> 300.7 (bitwise). Those sites prefer
 # the largest shared-memory carve-out, so that the tensor-memory GEMMs can place beside
 # them (16 ranks, us: B5 284.1 -> 262.9, B8 300.8 -> 285.3, B2 -1.6, B3 / B4 flat).
-TWO_SHOT_EARLY = {16: "8-64:1"}
+TWO_SHOT_EARLY = {16: "8-128:1"}
 
 
 class DraftProjectionMethod:
@@ -1183,6 +1183,16 @@ GQA_PROJECTIONS_WIDE = {
         ),
         (
             64,
+            {
+                (512, 7168): (128, 64, 6, 14, 14),
+                (640, 7168): (128, 64, 6, 14, 14),
+                (1792, 7168): (128, 64, 6, 14, 14),
+            },
+        ),
+        # 65-128 rows: the same tensor-memory tactics over two 64-token N tiles (the
+        # two-shot chain's qkv / context K/V / SiLU-fused gate/up instead of cuBLAS).
+        (
+            128,
             {
                 (512, 7168): (128, 64, 6, 14, 14),
                 (640, 7168): (128, 64, 6, 14, 14),
