@@ -104,6 +104,13 @@ def stamp_values(pointer, slot, a, b):
 
 
 @asm()
+def prefetch_tile3(descriptor, row):
+    """DIAG pf2 (never merged): one tensor-map box of ``descriptor`` at {0, row, 0} into L2."""
+    code = "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {0, $1, 0}];"
+    return code, "l,r", (descriptor, Int32(row))
+
+
+@asm()
 def require_below(value, bound):
     """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
     re-armed (see ``arrive``)."""
@@ -1270,6 +1277,16 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 self.gather_x(sm, x, ranges, batch)
                 if lane == 0:
                     self.stamp(14)
+                # DIAG pf2: this CTA's static FC2 tiles into L2 while FC1 drains and the
+                # hidden images are exchanged (HBM otherwise idles in the hand-off).
+                for g in cutlass.range_constexpr(2):
+                    if lane // 16 == g:
+                        lo, hi = (ranges[g, 4], ranges[g, 5])
+                        j0 = lo + 4 * (lane % 16)
+                        for i in cutlass.range_constexpr(4):
+                            if j0 + i < hi:
+                                unit, job = ((j0 + i) // self.jobs, (j0 + i) % self.jobs)
+                                prefetch_tile3(maps[1], experts[unit] * 3584 + job * 128)
                 self.rearm(workspace, generation)
                 if lane == 0:
                     self.claims(sm, workspace, ranges, generation & 1)
