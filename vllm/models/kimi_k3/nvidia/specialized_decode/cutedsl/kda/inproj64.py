@@ -695,9 +695,8 @@ class KdaInProj80(KdaInProj64):
         start = self.pf_coeff[4]
 
         def x_at(j):  # token base + j as BF16: own register or the owner's tile
-            if 0 <= j < width:
-                return xb[j]
-            return BFloat16(_ld_shared_bf16(tile + ((base + j) * SHARE + lane) * 2))
+            address = tile + ((base + j) * SHARE + lane) * 2
+            return xb[j] if 0 <= j < width else BFloat16(_ld_shared_bf16(address))
 
         own = 0 if phase == 0 else 1  # local request index of prefetch slot 0
         for j in cutlass.range_constexpr(width):
@@ -706,10 +705,8 @@ class KdaInProj80(KdaInProj64):
             acc = start
             for i in cutlass.range_constexpr(4):
                 w = t + i
-                if w < 3:  # (t < 3: an own request)
-                    term = self.pf_tap[rq - own, w]
-                else:
-                    term = x_at(j + i - 3)
+                # (w < 3 only where t < 3: an own request)
+                term = self.pf_tap[rq - own, w] if w < 3 else x_at(j + i - 3)
                 acc = fma(Float32(term), coeff[i], acc)
             y[j] = acc
         for rq in cutlass.range_constexpr(own, 3):
