@@ -489,7 +489,7 @@ class OprojUmma(OprojProducer):
                     copy_g2s(dst, src)
 
     @cute.jit
-    def multiply(self, ring, bars, tmem, n: Constexpr, stage: Constexpr):
+    def multiply(self, ring, bars, tmem, n: Constexpr, stage: Constexpr, maddr=None):
         """The MMA warp: wait for each K block, issue its four K16 MMAs from the
         elected lane and release its stage (the last block: the accumulator)."""
         stages: Constexpr = self.geometry(n)[2]
@@ -498,6 +498,10 @@ class OprojUmma(OprojProducer):
         for kb in cutlass.range_constexpr(self.blocks):
             s: Constexpr = kb % stages
             wait(bars.iterator + s, kb // stages % 2)
+            if cutlass.const_expr(maddr is not None and kb == 0):
+                ds.stamp(maddr, 1)  # DIAG: K block 0 (W + x) landed
+            if cutlass.const_expr(maddr is not None and kb + 1 == self.blocks):
+                ds.stamp(maddr, 2)  # DIAG: last K block (all of x) landed
             cute.arch.fence_proxy("async.shared", space="cta")
             fence_tmem()
             a = smem_desc(ring.iterator + s * stage, True)
@@ -549,6 +553,8 @@ class OprojUmma(OprojProducer):
         tid, warp, _, cta = thread()
         base, ctr = ds.buffer("umma", x.shape[0])
         saddr = ds.begin(base, ctr, cta, tid == 0)
+        mbase, mctr = ds.buffer("ummamma", x.shape[0])
+        maddr = ds.begin(mbase, mctr, cta, tid == 128)  # the MMA warp's elected lane
         smem = cutlass.utils.SmemAllocator()
         ring = alloc(smem, Uint8, stages * stage, 1024)
         bars = alloc(smem, Uint64, 2 * stages + 1, 8)
@@ -608,7 +614,7 @@ class OprojUmma(OprojProducer):
                 self.reduce_owned(args, cta, tid)
                 ds.stamp(saddr, 4)  # owned chunk: 16 sources landed, reduced, gathered
         else:
-            self.multiply(ring, bars, tmem, n, stage)
+            self.multiply(ring, bars, tmem, n, stage, maddr)
         release_tmem(tmem, columns, warp, 4)
         ds.stamp(saddr, 7)
         if cutlass.const_expr(self.xmc > 1):  # no CTA leaves while peers' tiles land
