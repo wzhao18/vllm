@@ -85,9 +85,27 @@ def test_shared_front_constructs(monkeypatch, tp, q, wide):
     )  # fmt: skip
     assert set(built.plans) == set(BATCHES)
     split = front.split_table(tp, q > 1, wide)
-    assert built.split == {b: split[b] for b in BATCHES if b > 8 and split.get(b)}
+    expect = {b: split[b] for b in BATCHES if b > 8 and split.get(b)}
+    if wide and tp == 16:  # SiTU-epilogue rows with SharedDown beside the experts
+        situ = front.batch_table(front.SITU_SPLIT_WIDE[tp][q > 1])
+        expect.update({b: n for b, n in situ.items() if b in BATCHES})
+    if wide and tp == 16:  # merged TMEM-front rows with SharedDown before the front
+        early = front.batch_table(front.EARLY_DOWN_WIDE[tp][q > 1])
+        tmem = front.batch_table(front.FRONT_TMEM_WIDE[packed.shape[0]])
+        early = {b: n for b, n in early.items() if b in built.merged and tmem.get(b)}
+        expect.update(early)
+        assert set(built.early_down) == set(early)
+        if q > 1:  # B2 / B4 / B8 verify
+            assert {16, 32, 64} <= set(built.early_down), built.early_down
+    else:
+        assert not built.early_down
+    assert built.split == expect
+    assert set(built.situ_down) == {b for b in expect if b <= 8}
+    if wide and tp == 16 and q > 1:  # B1 verify (8 rows): a table change must not drop it
+        assert 8 in built.situ_down, built.situ_down
     if wide and q > 1:
-        assert all(built.split[b] == 8 for b in (16, 32, 48)), built.split
+        rest = (b for b in (16, 32, 48) if b not in built.early_down)
+        assert all(built.split[b] == 8 for b in rest), built.split
     assert built.merged <= set(built.split)
 
 

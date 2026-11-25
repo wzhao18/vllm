@@ -564,15 +564,22 @@ class SharedDown(SharedBase):
     into alternating TMEM accumulators (warp 4) and peer-store each tile like the
     fused kernel (warps 0-3). Exactly the fused kernel's down numerics."""
 
-    def __init__(self, tp, batch, sms, budget=200 * 1024):
+    def __init__(self, tp, batch, sms, budget=200 * 1024, staged=False, writers=0):
         super().__init__(tp, batch)
         self.sms, self.image = sms, self.down * self.n * 128  # h as B tiles
+        # ``staged``: launched programmatically behind the kernel that writes h (PDL):
+        # the W ring fills while that kernel runs, only h's load waits for it.
+        # ``writers``: launched on another stream before the kernel that writes h; its
+        # ``writers`` CTAs each count once into ``ready`` (the last argument) after
+        # their h stores; the W ring fills meanwhile and only h's load polls the count.
+        # The last CTA past the poll re-arms ``ready`` (both words) for the next call.
+        self.staged, self.writers = staged, writers
         ring = budget - self.image - self.n * 68 * 4
         self.stages = min(24, ring // 8192)  # W [64, 64] K blocks (8 KB)
 
     @cute.jit
     def __call__(self, *args):
-        options = dict(pdl=False, min_blocks_per_mp=1)
+        options = dict(pdl=self.staged, min_blocks_per_mp=1)
         launch(self.kernel, args, self.sms, 192, **options)
 
     @cute.kernel
@@ -606,6 +613,15 @@ class SharedDown(SharedBase):
         tmem = slot[0]
         tiles = (ROWS - cta + self.sms - 1) // self.sms
         if warp < 4:
+            if c.const_expr(self.staged):
+                cute.arch.griddepcontrol_wait()  # h written
+            if c.const_expr(self.writers > 0):
+                count = args[6]
+                if tid == 0:
+                    wait_count(count.iterator, self.writers)
+                    if fetch_count(count.iterator + 1) == self.sms - 1:
+                        count[0], count[1] = Int32(0), Int32(0)
+                named_barrier(1, 128)  # h written (acquired by thread 0)
             for j in c.range_constexpr(self.down):
                 self.load_rows(image + j * self.n * 128, h, 64 * j)
             cute.arch.cp_async_mbarrier_arrive_noinc(ready)
@@ -678,11 +694,14 @@ def compile_shared(tp, batch, device, gate=False, front=None):
 
 
 @functools.cache
-def compile_down(tp, batch, device, sms):
-    """Arguments: h, ``weight_maps``, RS peers, parity, rank, capacity."""
+def compile_down(tp, batch, device, sms, staged=False, writers=0):
+    """Arguments: h, ``weight_maps``, RS peers, parity, rank, capacity (``writers``:
+    then the h-ready counters, Int32 [2], zeroed)."""
     args: tuple = (fake((batch, 6144 // tp)), fake((256,), None, c.Uint8, 64))
     args += (fake((tp,), None, Int64), Int32(0), Int32(0), Int32(0))
-    kernel = SharedDown(tp, batch, sms)
+    if writers:
+        args += (fake((2,), None, Int32),)
+    kernel = SharedDown(tp, batch, sms, staged=staged, writers=writers)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args, make_fake_stream())
 

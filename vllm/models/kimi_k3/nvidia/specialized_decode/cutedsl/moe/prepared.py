@@ -76,8 +76,9 @@ class MoEScratch:
             )
 
 
-# TP8 B16: the experts start beside the split gate/up half (+1% E2E).
-JOIN = {8: "9-16:0", 16: ""}
+# TP8 B16: the experts start beside the split gate/up half (+1% E2E). TP16 8 rows
+# (``front.SITU_SPLIT_WIDE``): the experts no longer wait for the shared expert.
+JOIN = {8: "9-16:0", 16: "8:0"}
 # Rubin-class TP16 batches whose routing releases the experts early
 # (``SharedFront.release_early``; ``front.RELEASE_AFTER_FRONT_WIDE`` picks the release
 # once the front kernel completed). M64 (B8 verify; SharedDown on its split SMs): the
@@ -139,7 +140,8 @@ class PreparedMoE:
         self.join = batch_table(JOIN[state.tp])
         self.sms = torch.cuda.get_device_properties(state.device).multi_processor_count
         for b, sms in front.split.items():  # the split's down CTAs take the SMs left
-            experts.grids[b] = min(experts.grid_for(b), self.sms - sms)
+            if not front.down_first(b):  # done before the experts need them
+                experts.grids[b] = min(experts.grid_for(b), self.sms - sms)
         if self.sms > 152 and state.tp == 16:
             # Rubin-class TP16 B3-8: routing releases the experts at entry (their
             # launch and prologue overlap it). The shared expert drains first (B5-8,
@@ -150,7 +152,8 @@ class PreparedMoE:
         for b in (b for b in state.batches if b <= CAP):
             _, expanded, buffers = state.views[b]
             publish, planned = tail.publish.get(b, ()), front.planned(b)
-            if publish and experts_push(state.tp, b, state.device):
+            beside = b in front.situ_down  # SharedDown pushes them
+            if publish and not beside and experts_push(state.tp, b, state.device):
                 # The experts push the shared rows; they must launch after the shared
                 # expert completed, i.e. join the side stream before (``run``): their
                 # grid spans every SM (``experts_push`` keys on it).
@@ -171,7 +174,20 @@ class PreparedMoE:
         # The shared expert runs on the side stream beside the routed experts, or, when
         # the persistent expert grid spans every SM, beside the front only. Split: its
         # gate/up half beside the front, its down rows beside the experts.
-        before = self.experts.grid_for(b) >= self.sms
+        before = self.experts.grid_for(b) >= self.sms and not self.front.down_first(b)
+        if self.front.merged_batch(b) and self.front.fork_first(b):
+            # SharedDown forks first: its weights stream while the merged front runs,
+            # its h load polls the front's count, and it exits before the experts need
+            # its SMs.
+            state.begin.record(main)
+            with torch.cuda.stream(state.stream):
+                state.stream.wait_event(state.begin)
+                shared, beside = self.front.shared_expert(x, self.tail)
+                beside()
+                state.shared_done.record(state.stream)
+            ids, weights, latent = self.front.route(x)
+            self.experts.group(ids)
+            return self.finish(b, out, latent, ids, weights, shared, consume)
         if self.front.merged_batch(b):
             # One kernel publishes the routing logits and leaves h; the down rows then
             # run beside the experts.
@@ -189,8 +205,9 @@ class PreparedMoE:
             state.stream.wait_event(state.begin)
             shared, beside = self.front.shared_expert(x, self.tail)
             if beside is not None:
-                state.gate_done.record(state.stream)
-                beside()
+                if self.join.get(b, 1):
+                    state.gate_done.record(state.stream)
+                beside()  # staged SharedDown: PDL right behind the SiTU GEMM
             state.shared_done.record(state.stream)
         ids, weights, latent = self.front.route(x)
         self.experts.group(ids)  # pregrouped unit table, beside the shared expert

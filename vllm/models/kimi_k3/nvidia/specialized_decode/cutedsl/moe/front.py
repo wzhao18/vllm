@@ -552,6 +552,27 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # TP8 (DFn on Rubin): the TP16 verify entries (the shared expert's down rows are 2x
 # the TP16 shard, so SharedDown on GB300's 3-6 SMs outlasts the experts there too).
 SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
+# Rubin TP16 verify batches of at most 8 rows whose shared down rows run ``SharedDown``
+# on this many SMs, behind the gate/up GEMM's SiTU epilogue (``SITU_FUSED_WIDE``),
+# instead of a split-K down GEMM the routed experts wait for (they then pushed the
+# shared rows themselves: ``tail_runtime.RUBIN_EXPERTS_PUSH``). Staged: SharedDown
+# launches by PDL behind the SiTU GEMM, before routing releases the experts (after the
+# front GEMM), streams its W while the SiTU runs and leaves its SMs ~2 us after h; the
+# experts keep a grid of every SM (``moe.prepared``) and their last CTAs start there.
+# B1 MoE layer proxy (in-step h / routing times), us per layer vs the experts joining
+# the split-K down: 12 SMs beside the experts (grid 200) -0.50; staged on 32 / 56 / 80
+# / 112 SMs -0.88 / -0.94 / -0.87 / -0.79 (no shared expert at all: -1.50).
+SITU_SPLIT_WIDE = {16: ("", "8:56")}
+# Rubin TP16 verify ``MERGED`` batches on ``MoeFrontTmem64`` whose SharedDown runs on
+# this many SMs launched on the side stream before the merged front (``SharedDown``
+# writers: its W ring fills meanwhile, its h load polls the front's gate/up CTAs'
+# count), so it is done shortly after h, before the routed experts need the SMs: their
+# grid spans every SM (``moe.prepared``) instead of leaving SharedDown's. B2 / B4 / B8
+# MoE layer proxy (lanes/SHX shx_proxy2.py: real SharedDown, stand-in front / routing /
+# experts), us per layer vs SharedDown on 8 / 8 / 4 SMs beside the experts after
+# routing: 24 SMs -0.56 / -1.19 / -0.43, 56 SMs -0.60 / -1.21 / -0.53 (no shared
+# expert -1.09 / -1.76 / -1.08). Same SharedDown math: bitwise the plain kernel's rows.
+EARLY_DOWN_WIDE = {16: ("", "16:56,32:56,64:56")}
 
 
 def split_table(tp, verify, wide):
@@ -660,12 +681,14 @@ def compile_route(
 
 
 @functools.cache
-def compile_front_tmem(split, valid, shard, hidden, device):
+def compile_front_tmem(split, valid, shard, hidden, device, ready=False):
     """``MoeFrontTmem64``: the packed front rows (router ``valid`` padded to
-    ``split``, then the latent shard) and ``hidden`` gate/up pairs."""
-    from .front_tmem import MoeFrontTmem64
+    ``split``, then the latent shard) and ``hidden`` gate/up pairs. ``ready``:
+    ``MoeFrontTmem64Ready`` (one more argument before the stream: the h-ready count)."""
+    from .front_tmem import MoeFrontTmem64, MoeFrontTmem64Ready
 
-    kernel = MoeFrontTmem64(valid=valid, split_rows=split, shard=shard, hidden=hidden)
+    cls = MoeFrontTmem64Ready if ready else MoeFrontTmem64
+    kernel = cls(valid=valid, split_rows=split, shard=shard, hidden=hidden)
 
     def matrix():
         shape = tuple(cute.sym_int() for _ in range(3))
@@ -674,10 +697,15 @@ def compile_front_tmem(split, valid, shard, hidden, device):
 
     args: tuple = (matrix(), matrix(), fake((64, hidden)), fake((1, 64, WIDTH)))
     args += (c.Int64(0), Int32(0), Int32(0), c.Float32(1), c.Float32(1))
-    args += (c.Int64(0), c.Int64(0), make_fake_stream())
+    args += (c.Int64(0), c.Int64(0)) + (c.Int64(0),) * ready + (make_fake_stream(),)
     with torch.accelerator.device_index(device):
         arch = "sm_{}{}a".format(*torch.cuda.get_device_capability(device))
         return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
+
+
+def front_tmem_writers(hidden):
+    """``MoeFrontTmem64Ready``'s h writers at up to 64 tokens: gate/up tiles x K split."""
+    return hidden // 64 * 8
 
 
 @functools.cache
@@ -742,9 +770,16 @@ class SharedFront:
         verify = q > 1
         split = split_table(tp, verify, wide)
         self.split = {b: split[b] for b in fused if split.get(b)}  # down SMs
-        if fused:  # TMA maps and counters of the fused kernel
+        # SiTU-epilogue batches whose down rows run SharedDown beside the experts.
+        situ_split = batch_table(SITU_SPLIT_WIDE.get(tp, ("", ""))[verify] if wide else "")
+        self.situ_down: dict[int, object] = {}
+        for b in batches:
+            if situ_split.get(b) and b in fuse:
+                self.split[b] = situ_split[b]
+                self.situ_down[b] = compile_down(tp, b, dev, situ_split[b], True)
+        if fused or self.situ_down:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
-            self.fused = to_cute(self.maps, 64), to_cute(counters)
+            self.fused = to_cute(self.maps, 64), to_cute(counters) if fused else None
         merged_spec = MERGED[tp]
         if wide and tp in MERGED_WIDE:
             merged_spec = f"{merged_spec},{MERGED_WIDE[tp]}"
@@ -753,10 +788,23 @@ class SharedFront:
         tmem = batch_table(FRONT_TMEM_WIDE.get(packed.shape[0], "") if wide else "")
         # MERGED batches on MoeFrontTmem64: code, (packed, gate/up) tensor maps
         self.front_tmem: dict[int, tuple] = {}
+        early_down = EARLY_DOWN_WIDE.get(tp, ("", ""))[verify] if wide else ""
+        early_down = batch_table(early_down)
+        # MERGED batches whose SharedDown polls MoeFrontTmem64Ready's h count (their
+        # down code); the count (Int32 [2], re-armed by SharedDown)
+        self.early_down: dict[int, object] = {}
+        self.h_ready = torch.zeros(2, dtype=torch.int32, device=packed.device)
+        self.front_launched: set[int] = set()  # ``fork_first``
         for b in sorted(self.merged):
             if tmem.get(b):
                 split_rows, hidden = packed.shape[0] - shard, gate_up.shape[0] // 2
-                code = compile_front_tmem(split_rows, valid, shard, hidden, dev)
+                ready = bool(early_down.get(b))
+                code = compile_front_tmem(split_rows, valid, shard, hidden, dev, ready)
+                if ready:
+                    writers = front_tmem_writers(hidden)
+                    self.split[b] = early_down[b]
+                    early = compile_down(tp, b, dev, early_down[b], writers=writers)
+                    self.early_down[b] = early
                 if not self.front_tmem:
                     self.tmem_maps = (weight_map(packed, 128), weight_map(gate_up, 64))
                     self.tmem_views = matrix_view(packed)
@@ -815,7 +863,7 @@ class SharedFront:
             if b in self.merged:
                 gate = compile_shared(tp, b, dev, True, geometry)
                 code = gate, compile_down(tp, b, dev, self.split[b])
-            elif b in self.split:
+            elif b in self.split and b not in self.situ_down:
                 gate = compile_shared(tp, b, dev, gate=True)
                 code = gate, compile_down(tp, b, dev, self.split[b])
             elif b in fused:
@@ -831,6 +879,8 @@ class SharedFront:
         if x.shape[0] in self.front_tmem:
             tmem, maps = self.front_tmem[x.shape[0]]
             work = (self.tmem_views, matrix_view(x), args[7], *self.box)
+            if x.shape[0] in self.early_down:  # + the h-ready count
+                maps = (*maps, c.Int64(self.h_ready.data_ptr()))
             tmem(*work, *self.scalars[1:], *maps, s)
         elif x.shape[0] in self.merged:
             maps, unused = self.merged_args
@@ -874,6 +924,24 @@ class SharedFront:
     def merged_batch(self, batch):
         return batch in self.merged
 
+    def down_first(self, batch):
+        """SharedDown done before the routed experts need its SMs (``situ_down`` behind
+        the SiTU GEMM; ``early_down`` polling the merged front's h count)."""
+        return batch in self.situ_down or batch in self.early_down
+
+    def fork_first(self, batch):
+        """``early_down`` batches: SharedDown may launch before the merged front. Not on
+        a batch's first eager call: the front's module loads lazily at its first launch,
+        and that load waits for the device, i.e. for the SharedDown already polling for
+        the front (a hang). That call launches the front first (SharedDown then finds
+        the count complete); captures and later calls fork first."""
+        if batch not in self.early_down:
+            return False
+        if batch in self.front_launched or torch.cuda.is_current_stream_capturing():
+            return True
+        self.front_launched.add(batch)
+        return False
+
     def planned(self, batch):
         return bool(self.plans[batch][5])
 
@@ -893,9 +961,18 @@ class SharedFront:
             gate, down = code
             if x.shape[0] not in self.merged:  # merged: h comes from ``route``
                 gate(*front, s)
+            if (early := self.early_down.get(x.shape[0])) is not None:
+                # launched before ``route``: polls the merged front's h count
+                ready = to_cute(self.h_ready)
+                run = lambda: early(args[7], maps, *mailbox, ready, stream(self.device))  # noqa: E731
+                return views[5], run
             return views[5], lambda: down(args[7], maps, *mailbox, stream(self.device))
         if self.gate_situ is not None and x.shape[0] in self.gate_situ.kernels:
             self.gate_situ.run(x, views[4])  # h straight from the gate/up GEMM
+            if (down := self.situ_down.get(x.shape[0])) is not None:
+                mailbox = (tail.peers, *tail.ring, Int32(CAP))
+                maps = self.fused[0]
+                return views[5], lambda: down(args[7], maps, *mailbox, stream(self.device))
         else:
             self.gate_up.run(x, views[1])
             situ(*args, s)
