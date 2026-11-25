@@ -236,6 +236,81 @@ def buffer_row_maps(
     return maps
 
 
+def staging_passes(
+    old_indices: np.ndarray,
+    new_indices: np.ndarray,
+    num_local_experts: int,
+    buffer_rows: int,
+) -> list[np.ndarray]:
+    """Intermediate placements `[P1, ..., Pk = new]` of one layer such that
+    each step `P(i-1) -> P(i)` stages at most `buffer_rows` rows per rank
+    (`buffer_rows_needed`), for a receive buffer smaller than a layer.
+
+    One step when the whole move fits (the usual case: the bounded move budget
+    swaps a few experts per layer). Otherwise the placement change must be a
+    permutation of the slots (no redundant experts): it is applied as a
+    sequence of slot swaps, each placing one slot for good, grouped into steps
+    whose swaps touch disjoint slots and keep their order on shared slots.
+    Every intermediate is a permutation of the old placement, so every expert
+    stays resident somewhere between steps."""
+    if buffer_rows < 1:
+        raise ValueError(
+            f"EPLB staging needs at least one buffer row, got {buffer_rows}"
+        )
+    need = buffer_rows_needed(old_indices, new_indices, num_local_experts)
+    if max(len(r) for r in need) <= buffer_rows:
+        return [new_indices]
+    n = old_indices.shape[0]
+    if buffer_rows < 2:  # a swap inside one rank stages two rows there
+        raise ValueError("EPLB staging in passes needs at least two buffer rows")
+    if sorted(old_indices.tolist()) != list(range(n)) or sorted(
+        new_indices.tolist()
+    ) != list(range(n)):
+        raise ValueError(
+            f"EPLB: a layer needs {max(len(r) for r in need)} staged rows on one "
+            f"rank but the receive buffer holds {buffer_rows}; splitting the move "
+            "into passes needs a slot permutation (no redundant experts)."
+        )
+    cur = old_indices.copy()
+    pos = np.empty(n, dtype=np.int64)
+    pos[cur] = np.arange(n)
+    swaps: list[tuple[int, int]] = []
+    for s in range(n):
+        if cur[s] != new_indices[s]:
+            t = int(pos[new_indices[s]])
+            cur[s], cur[t] = cur[t], cur[s]
+            pos[cur[s]], pos[cur[t]] = s, t
+            swaps.append((s, t))
+    last = np.full(n, -1, dtype=np.int64)
+    load: list[np.ndarray] = []
+    groups: list[list[tuple[int, int]]] = []
+    ranks = n // num_local_experts
+    for s, t in swaps:
+        p = int(max(last[s], last[t])) + 1
+        rs, rt = s // num_local_experts, t // num_local_experts
+        while True:
+            if p == len(groups):
+                groups.append([])
+                load.append(np.zeros(ranks, dtype=np.int64))
+            add = np.zeros(ranks, dtype=np.int64)
+            add[rs] += 1
+            add[rt] += 1
+            if (load[p] + add <= buffer_rows).all():
+                break
+            p += 1
+        groups[p].append((s, t))
+        load[p] += add
+        last[s] = last[t] = p
+    out = []
+    cur = old_indices.copy()
+    for group in groups:
+        for s, t in group:
+            cur[s], cur[t] = cur[t], cur[s]
+        out.append(cur.copy())
+    assert np.array_equal(out[-1], new_indices)
+    return out
+
+
 def _execute_migration_batch(
     batch: list[MigrationFlow],
     old_indices: np.ndarray,
@@ -843,26 +918,51 @@ def rearrange_expert_weights_inplace(
         old_global_expert_indices_cpu = old_global_expert_indices.cpu().numpy()
         new_global_expert_indices_cpu = new_global_expert_indices.cpu().numpy()
 
+    rows = communicator.buffer_rows
+    communicator.acquire_buffer()
     for layer_idx in range(num_moe_layers):
-        transfer_metadata = move_to_buffer(
-            num_local_experts=num_local_physical_experts,
-            old_indices=old_global_expert_indices_cpu[layer_idx],
-            new_indices=new_global_expert_indices_cpu[layer_idx],
-            expert_weights=expert_weights[layer_idx],
-            expert_weights_buffers=weights_buffer,
-            stream=None,
-            ep_rank=ep_rank,
-            communicator=communicator,
-            layer_idx=layer_idx,
-        )
+        old = old_global_expert_indices_cpu[layer_idx]
+        new = new_global_expert_indices_cpu[layer_idx]
+        if rows is None:
+            steps, maps = [new], [None]
+        else:
+            # A buffer smaller than a layer: stage the move in passes, each
+            # pass's rows packed into buffer rows [0, rows) on every rank.
+            if np.array_equal(old, new):
+                continue
+            steps = staging_passes(old, new, num_local_physical_experts, rows)
+            maps = []
+            prev = old
+            for step in steps:
+                need = buffer_rows_needed(prev, step, num_local_physical_experts)
+                maps.append(
+                    buffer_row_maps(need, [0] * ep_size, num_local_physical_experts)
+                )
+                prev = step
+        prev = old
+        for step, buffer_maps in zip(steps, maps):
+            transfer_metadata = move_to_buffer(
+                num_local_experts=num_local_physical_experts,
+                old_indices=prev,
+                new_indices=step,
+                expert_weights=expert_weights[layer_idx],
+                expert_weights_buffers=weights_buffer,
+                stream=None,
+                ep_rank=ep_rank,
+                communicator=communicator,
+                layer_idx=layer_idx,
+                buffer_maps=buffer_maps,
+            )
 
-        move_from_buffer(
-            expert_weights=expert_weights[layer_idx],
-            expert_weights_buffers=weights_buffer,
-            transfer_metadata=transfer_metadata,
-            new_indices=new_global_expert_indices_cpu[layer_idx],
-            ep_rank=ep_rank,
-        )
+            move_from_buffer(
+                expert_weights=expert_weights[layer_idx],
+                expert_weights_buffers=weights_buffer,
+                transfer_metadata=transfer_metadata,
+                new_indices=step,
+                ep_rank=ep_rank,
+            )
+            prev = step
+    communicator.release_buffer()
 
 
 def _map_old_expert_indices_with_rank_mapping(

@@ -47,7 +47,7 @@ from .config import (
 )
 from .session import RubinMegaMoeSession, layout_tag
 from .staging import PREFILL_STAGE_MIN_TOKENS, EplbStage, stage_inputs
-from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
+from .symm_arena import ALIGN, SymmetricArena, ensure_not_capturing, group_barrier
 from .weights import (
     RubinMoeWeights,
     prepare_nvfp4_checkpoint_weights,
@@ -483,6 +483,60 @@ class RubinMegaMoE:
                 session.prepare(
                     weights, session.empty_output, use_s2, (norm_weight, eps), shared
                 )
+
+    # -- idle scratch (EPLB staging) ------------------------------------------------
+
+    def idle_span(self) -> tuple[int, int]:
+        """The largest arena byte range ``[start, end)`` (ALIGN-aligned start) that
+        holds nothing between launches of any session: the union of the sessions'
+        idle intervals, the carve padding between them and the arena's unused
+        tail. Identical on every rank (same carve layout, verified)."""
+        intervals = []
+        for s in self.sessions.values():
+            intervals += s.idle_intervals(self.arena.base)
+        intervals.append((self.arena.used_bytes, self.arena.nbytes))
+        intervals.sort()
+        # Every carve is either wholly idle or a session's shared workspace whose
+        # reset prefix is excluded, so merging touching intervals never covers a
+        # live byte; check it against the carve layout anyway.
+        merged: list[list[int]] = []
+        for s, e in intervals:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        start, end = max(merged, key=lambda m: m[1] - m[0])
+        for tag, o, n in self.arena.layout:
+            lo, hi = max(o, start), min(o + n, end)
+            if lo < hi and not any(s <= lo and hi <= e for s, e in intervals):
+                raise AssertionError(
+                    f"Rubin MegaMoE idle span [{start}, {end}) covers live bytes of "
+                    f"{tag!r} [{lo}, {hi})."
+                )
+        if start % ALIGN:
+            raise AssertionError(f"Rubin MegaMoE idle span start {start} unaligned.")
+        return start, end
+
+    def eplb_scratch(self, owner: str):
+        """This runtime's idle arena span as EPLB staging scratch
+        (``SymmetricScratch``): the local span and every peer's mapping of it.
+        Used only between forwards (EPLB's sync rearrangement brackets its use
+        with group barriers)."""
+        from vllm.distributed.eplb.eplb_communicator import SymmetricScratch
+
+        if self.arena.handle is None or self.group is None:
+            raise RuntimeError("Rubin MegaMoE EPLB scratch needs an EP group > 1.")
+        start, end = self.idle_span()
+        peers = [
+            self.arena.handle.get_buffer(r, (self.arena.nbytes,), torch.uint8)[start:end]
+            for r in range(self.world)
+        ]
+        return SymmetricScratch(
+            local=self.arena.buf[start:end],
+            peers=peers,
+            ranks=list(dist.get_process_group_ranks(self.group)),
+            owner=owner,
+        )
 
     def destroy(self) -> None:
         ensure_not_capturing("RubinMegaMoE teardown")

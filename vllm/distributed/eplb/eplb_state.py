@@ -547,11 +547,25 @@ class EplbState:
             if backend == "symm_mem"
             else [torch.empty_like(w) for w in model.expert_weights[0]]
         )
+        # Sync symm_mem EPLB stages through the model's idle symmetric scratch
+        # when it lends one (no receive-buffer allocation). Async transfers run
+        # beside forwards that use that scratch, and redundant slots may need
+        # more rows than it holds, so they keep the allocated buffer.
+        scratch_fn = getattr(model, "eplb_symmetric_scratch", None)
+        scratch = (
+            scratch_fn()
+            if backend == "symm_mem"
+            and scratch_fn is not None
+            and not self.is_async
+            and model.num_redundant_experts == 0
+            else None
+        )
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
             backend=backend,
             expert_weights=model.expert_weights,
             expert_buffer=expert_buffer,
+            scratch=scratch,
         )
         expert_buffer = communicator.owned_expert_buffer or expert_buffer
         assert expert_buffer is not None

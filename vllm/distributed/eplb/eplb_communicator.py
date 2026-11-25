@@ -9,6 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -110,6 +111,24 @@ class EplbCommunicator(ABC):
         """Whether the profile path must run a dummy collective operation to reserve
         communication buffers."""
         return True
+
+    @property
+    def buffer_rows(self) -> int | None:
+        """Receive-buffer rows when the buffer holds fewer than one layer's
+        local experts (a borrowed scratch region), else `None`. The caller
+        then stages each layer through the buffer in passes of at most this
+        many rows per rank (`rebalance_execute.staging_passes`)."""
+        return None
+
+    def acquire_buffer(self) -> None:  # noqa: B027
+        """Called once before a rearrangement's first write into the buffer.
+        A backend whose buffer is borrowed waits here until no rank's owner
+        code (e.g. an in-flight kernel) still uses it."""
+
+    def release_buffer(self) -> None:  # noqa: B027
+        """Called once after a rearrangement's last copy out of the buffer.
+        A backend whose buffer is borrowed from memory other code reuses waits
+        here until every rank is done with it."""
 
     def set_stream(self, stream: torch.Stream | None) -> None:
         self._stream = stream
@@ -800,6 +819,21 @@ def select_eplb_communicator(
     )
 
 
+class SymmetricScratch(NamedTuple):
+    """An idle byte span of an existing symmetric allocation, lent to EPLB.
+
+    `local` is this rank's span; `peers[r]` is the same span on EP rank `r`
+    (peer mapping). `ranks` are the global ranks of the group the allocation
+    was rendezvoused over, in EP-rank order. The owner guarantees the span holds
+    no state between its own kernel launches; EPLB writes it only between
+    forwards and returns it (`release_buffer`) before the next one."""
+
+    local: torch.Tensor
+    peers: list[torch.Tensor]
+    ranks: list[int]
+    owner: str
+
+
 class SymmMemEplbCommunicator(EplbCommunicator):
     """Push expert rows into peers' receive buffers over symmetric memory.
 
@@ -807,12 +841,18 @@ class SymmMemEplbCommunicator(EplbCommunicator):
     row, which every rank derives from the global placements; `execute` is
     collective. CPU barriers only: GPU spin barriers can deadlock MegaMoE
     cooperative launches.
+
+    The receive buffer is either one layer of local experts, allocated here, or
+    (`scratch`) rows carved from an idle span of the model's own symmetric
+    workspace: no allocation, and the caller stages each layer in passes of at
+    most `buffer_rows` rows per rank.
     """
 
     def __init__(
         self,
         group_coordinator: GroupCoordinator,
         layer: Sequence[torch.Tensor],
+        scratch: SymmetricScratch | None = None,
     ) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -826,23 +866,58 @@ class SymmMemEplbCommunicator(EplbCommunicator):
                 "(MNNVL across nodes); use nixl or torch_gloo instead."
             )
 
-        # One buffer and one rendezvous cover all of the layer's tensors.
-        offsets = [0, *itertools.accumulate(round_up(w.nbytes, 256) for w in layer)]
-
-        def as_layer(buffer: torch.Tensor) -> list[torch.Tensor]:
-            return [
-                buffer[o : o + w.nbytes].view(w.dtype).view(w.shape)
-                for o, w in zip(offsets, layer)
+        self._rows: int | None = None
+        if scratch is not None:
+            rows, offsets = _scratch_rows(layer, scratch.local.numel())
+            if list(scratch.ranks) != list(group_coordinator.ranks):
+                raise ValueError(
+                    f"EPLB scratch from {scratch.owner} spans ranks {scratch.ranks}, "
+                    f"the EPLB group is {group_coordinator.ranks}."
+                )
+            if rows < 1 or scratch.local.data_ptr() % 256:
+                raise ValueError(
+                    f"EPLB scratch from {scratch.owner} ({scratch.local.numel()} B "
+                    f"at {scratch.local.data_ptr():#x}) cannot hold one expert row "
+                    f"({sum(w[0].nbytes for w in layer)} B, 256-B aligned)."
+                )
+            self._rows = rows
+        else:
+            rows = layer[0].shape[0]
+            offsets = [
+                0,
+                *itertools.accumulate(round_up(w.nbytes, 256) for w in layer),
             ]
 
-        buffer = symm_mem.empty(offsets[-1], dtype=torch.uint8, device=device)
-        # For MNNVL, rendezvous is what confirms all ranks share one NVLink domain.
-        self._handle = symm_mem.rendezvous(buffer, ep_group.group_name)
-        self._peer_buffers = [
-            as_layer(self._handle.get_buffer(rank, buffer.shape, torch.uint8))
-            for rank in range(ep_group.size())
-        ]
-        self._buffer = as_layer(buffer)
+        def as_layer(buffer: torch.Tensor) -> list[torch.Tensor]:
+            out = []
+            for o, w in zip(offsets, layer):
+                shape = (rows, *w.shape[1:])
+                n = rows * w[0].nbytes
+                out.append(buffer[o : o + n].view(w.dtype).view(shape))
+            return out
+
+        if scratch is not None:
+            self._handle = None
+            self._peer_buffers = [as_layer(p) for p in scratch.peers]
+            self._buffer = as_layer(scratch.local)
+            if is_local_first_rank():
+                logger.info(
+                    "symm_mem EPLB: receive buffer = %d expert rows (%.1f MiB) of "
+                    "%s's idle symmetric scratch (%.1f MiB); no allocation.",
+                    rows,
+                    offsets[-1] / 2**20,
+                    scratch.owner,
+                    scratch.local.numel() / 2**20,
+                )
+        else:
+            buffer = symm_mem.empty(offsets[-1], dtype=torch.uint8, device=device)
+            # For MNNVL, rendezvous confirms all ranks share one NVLink domain.
+            self._handle = symm_mem.rendezvous(buffer, ep_group.group_name)
+            self._peer_buffers = [
+                as_layer(self._handle.get_buffer(rank, buffer.shape, torch.uint8))
+                for rank in range(ep_group.size())
+            ]
+            self._buffer = as_layer(buffer)
 
         self._stream = None
         self._group_coordinator = group_coordinator
@@ -861,6 +936,26 @@ class SymmMemEplbCommunicator(EplbCommunicator):
     @property
     def owned_expert_buffer(self) -> list[torch.Tensor]:
         return self._buffer
+
+    @property
+    def buffer_rows(self) -> int | None:
+        return self._rows
+
+    def acquire_buffer(self) -> None:
+        if self._rows is not None:
+            # Local staging copies write this rank's scratch before execute()'s
+            # first barrier: every rank's forward (whose kernel writes its
+            # peers' spans) must be done first.
+            with device_stream(self._stream):
+                self._barrier()
+
+    def release_buffer(self) -> None:
+        if self._rows is not None:
+            # Every rank's copies out of its scratch are done before any rank's
+            # next forward writes that scratch (the owner's kernel pushes into
+            # its peers' spans).
+            with device_stream(self._stream):
+                self._barrier()
 
     def set_transfer_context(
         self,
@@ -935,6 +1030,22 @@ class SymmMemEplbCommunicator(EplbCommunicator):
         self._group_coordinator.cpu_all_reduce_(torch.zeros(1, dtype=torch.int32))
 
 
+def _scratch_rows(layer: Sequence[torch.Tensor], nbytes: int) -> tuple[int, list[int]]:
+    """The most expert rows (one row of every tensor of `layer`) that fit in
+    `nbytes`, each tensor's rows contiguous and 256-B aligned, and the
+    tensors' byte offsets."""
+    row_bytes = [w[0].nbytes for w in layer]
+
+    def offsets(rows: int) -> list[int]:
+        return [0, *itertools.accumulate(round_up(rows * b, 256) for b in row_bytes)]
+
+    rows = nbytes // sum(row_bytes)
+    while rows > 0 and offsets(rows)[-1] > nbytes:
+        rows -= 1
+    rows = min(rows, layer[0].shape[0])
+    return rows, offsets(rows)
+
+
 _PTR_COPY_KERNEL = None
 
 
@@ -969,6 +1080,7 @@ def create_eplb_communicator(
     backend: str,
     expert_weights: Sequence[Sequence[torch.Tensor]],
     expert_buffer: Sequence[torch.Tensor] | None,
+    scratch: SymmetricScratch | None = None,
 ) -> EplbCommunicator:
     """Create an EPLB communicator for the given backend.
 
@@ -990,6 +1102,8 @@ def create_eplb_communicator(
         expert_buffer: Pre-allocated receive buffer tensors (one per
             weight tensor in a single layer). `symm_mem` ignores it and
             uses its own `owned_expert_buffer`.
+        scratch: `symm_mem` only: an idle span of the model's symmetric
+            workspace to stage expert rows in instead of allocating a buffer.
 
     """
     first_layer = expert_weights[0] if expert_weights else []
@@ -1052,7 +1166,7 @@ def create_eplb_communicator(
         return _create_pynccl()
 
     if backend == "symm_mem":
-        return SymmMemEplbCommunicator(group_coordinator, first_layer)
+        return SymmMemEplbCommunicator(group_coordinator, first_layer, scratch)
     elif backend == "nixl":
         if not has_nixl():
             raise RuntimeError(

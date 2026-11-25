@@ -2992,6 +2992,20 @@ class KimiLinearForCausalLM(
         self.num_routed_experts = first.num_logical_experts
         self.num_redundant_experts = first.num_redundant_experts
 
+    def eplb_symmetric_scratch(self):
+        """EPLB staging scratch: the largest idle span of the Rubin MegaMoE
+        runtimes' symmetric arenas (the routed-expert workspace, idle between
+        forwards), so sync EPLB allocates no receive buffer."""
+        runtimes = {}
+        for layer in self.moe_layers:
+            runtime = layer.get_runtime()
+            runtimes[id(runtime)] = runtime
+        best = max(
+            runtimes.values(),
+            key=lambda r: (lambda s: s[1] - s[0])(r.idle_span()),
+        )
+        return best.eplb_scratch("Rubin MegaMoE arena")
+
     def update_physical_experts_metadata(
         self, num_physical_experts: int, num_local_physical_experts: int
     ) -> None:

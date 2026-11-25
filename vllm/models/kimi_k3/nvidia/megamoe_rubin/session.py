@@ -386,6 +386,35 @@ class RubinMegaMoeSession:
             total += aligned(n)
         return total
 
+    def idle_intervals(self, arena_base: int) -> list[tuple[int, int]]:
+        """Arena byte intervals ``[start, end)`` of this session that hold nothing
+        between launches: the staged inputs (``x``, ``x_sf``, ``topk_weights``,
+        rewritten by the stager before every launch) and the shared workspace's
+        ``data`` regions (written before read in every launch). The shared
+        workspace's reset prefix (barrier / tail-reset / zero-on-first-allocate
+        state, progress words) is excluded."""
+        if not self._carved:
+            raise RuntimeError("session used before its workspace was carved.")
+        prefix = 0
+        for kernel in self.kernels.values():
+            ws = kernel._device_workspace
+            prefix = max(prefix, int(ws.zero_on_allocate_bytes("shared")))
+            for region in ws.regions("shared"):
+                if region.reset != "data":
+                    end = int(ws.offset(region.name)) + int(ws.nbytes(region.name))
+                    prefix = max(prefix, end)
+        prefix = aligned(prefix)
+        out = []  # whole carves (the arena pads each to ALIGN)
+        for name in ("x", "x_sf", "topk_weights"):
+            t = getattr(self, name)
+            start = t.data_ptr() - arena_base
+            out.append((start, start + aligned(t.numel() * t.element_size())))
+        start = self.shared_workspace.data_ptr() - arena_base
+        end = start + aligned(self.shared_workspace.numel())
+        if start + prefix < end:
+            out.append((start + prefix, end))
+        return out
+
     def carve(self, arena: SymmetricArena, tag: str) -> None:
         cfg = self.cfg
         if self._carved:
