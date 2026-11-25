@@ -613,7 +613,20 @@ def _make_radix_select(
     num_warps = tb_size // _WARP
     gid_bits = _gid_bits(world_size)
     gid_mask = (1 << gid_bits) - 1
-    num_passes = -(-(16 + gid_bits) // radix_bits)
+    # Radix passes (shift, bits), most significant first, aligned to the score /
+    # gid boundary: the 16 score bits in two passes (9 + 7), then the gid bits
+    # only while the K-th key's score is tied (9-bit passes from the top). The
+    # unaligned schedule (5 x 9 bits from bit 0) spent its first pass on one bit
+    # and mixed score and gid bits in its third, so a typical row took 4-5
+    # passes; this one resolves a tie-free cut in 2 and a short tie in 3. Same
+    # total order, so the same selected set and outputs.
+    passes = [(gid_bits + 16 - radix_bits, radix_bits), (gid_bits, 16 - radix_bits)]
+    low = gid_bits
+    while low > 0:
+        width = min(radix_bits, low)
+        low -= width
+        passes.append((low, width))
+    num_passes = len(passes)
 
     @cute.jit
     def radix_select(
@@ -652,18 +665,15 @@ def _make_radix_select(
         cute.arch.sync_threads()
 
         for p in cutlass.range_constexpr(num_passes):
-            shift = (num_passes - 1 - p) * radix_bits
+            shift, pbits = passes[p]
             if scalars[3] == Int32(0):
                 prefix = prefix_ptr.load()
                 hist[tid] = Int32(0)
                 cute.arch.sync_threads()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
-                    if (
-                        key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
-                    ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
+                    if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
+                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
                         cute.arch.atomic_add(
                             hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
                         )
@@ -695,11 +705,8 @@ def _make_radix_select(
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
                     selected = False
-                    if (
-                        key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
-                    ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
+                    if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
+                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
                         selected = b > thr or (done and b == thr)
                     if selected:
                         score = Int32(key >> Uint64(gid_bits))
@@ -708,7 +715,7 @@ def _make_radix_select(
                         sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
                 cute.arch.sync_threads()
                 if tid == Int32(0) and not done:
-                    prefix_ptr.store((prefix << Uint64(radix_bits)) | Uint64(thr))
+                    prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
                 cute.arch.sync_threads()
 
         if cutlass.const_expr(emit_ids):
@@ -833,6 +840,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         block_size: int = 0
         exact: bool = False
         mailbox: bool = False
+        # The rescue (exact only) becomes resident while this grid runs.
+        early: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
@@ -840,8 +849,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         block_size = compile_key.block_size
         exact = compile_key.exact
         mailbox = compile_key.mailbox
+        early = compile_key.early
         assert emit_ids or block_size > 0
         assert exact or not mailbox
+        assert exact or not early
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
@@ -1128,6 +1139,9 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(early):
+                    # The rescue (PDL) becomes resident now and waits for this grid.
+                    cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1149,6 +1163,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         )
                     keys[i] = key
             else:
+                if cutlass.const_expr(early):
+                    # Launched in stream order (no PDL): the rescue (PDL with
+                    # ``early``) may become resident at once; it waits for this
+                    # grid before reading it. Otherwise the next kernel launches
+                    # at this grid's end.
+                    cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1348,6 +1368,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         block_size: int = 0,
         exact: bool = False,
         mailbox: bool = False,
+        early: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1357,6 +1378,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             block_size=block_size,
             exact=exact,
             mailbox=mailbox,
+            early=early and exact,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1385,6 +1407,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         rows: "_RowsOutput | None" = None,
         exact: "_ExactArgs | None" = None,
         mailbox: "_Mailbox | None" = None,
+        early: bool = False,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1394,6 +1417,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             block_size=0 if rows is None else rows.block_size,
             exact=exact is not None,
             mailbox=mailbox is not None,
+            early=early,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
@@ -1562,11 +1586,17 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         world_size: int
         emit_ids: bool = True
         block_size: int = 0
+        release: bool = False
+        # PDL launch (resident while the select runs; its ``early`` variant).
+        early: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
+        release = compile_key.release
+        early = compile_key.early
+        assert early or not release
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
@@ -1624,6 +1654,19 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             owner = storage.owner.get_tensor(cute.make_layout((16,)))
             prefix_ptr = storage.prefix.data_ptr()
             num_rows = gathered.shape[1]
+            # PDL (``early``): resident during the select, which it waits for here
+            # (a no-op in stream order).
+            cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(release):
+                # Only for a consumer that reads this grid's outputs after its own
+                # PDL wait (the DSA sparse core): it becomes resident while this
+                # grid runs. Triggering only after this wait keeps the guarantee
+                # that the consumer's launch implies every kernel before this one
+                # has completed (the core polls its q mailbox before its wait).
+                # Without ``release`` (FlashInfer's trtllm-gen / prims_ts read
+                # their counts / rows before their wait; the stock hook's
+                # consumers) dependents launch at this grid's completion.
+                cute.arch.griddepcontrol_launch_dependents()
 
             for row in cutlass.range(cta, num_rows, num_ctas, unroll=1):
                 word = recast_val(sat_word[row], Uint32)
@@ -1766,6 +1809,7 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
                 grid=(num_ctas, 1, 1),
                 block=(tb_size, 1, 1),
                 stream=stream,
+                use_pdl=early,
             )
 
         return host_entrypoint
@@ -1778,6 +1822,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         world_size: int,
         emit_ids: bool = True,
         block_size: int = 0,
+        release: bool = False,
+        early: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1785,6 +1831,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             world_size=world_size,
             emit_ids=emit_ids,
             block_size=block_size,
+            release=release,
+            early=early or release,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1809,6 +1857,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         topk: int,
         exact: _ExactArgs,
         rows: "_RowsOutput | None" = None,
+        release: bool = False,
+        early: bool = False,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1816,6 +1866,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             world_size=gathered.shape[0],
             emit_ids=out is not None,
             block_size=0 if rows is None else rows.block_size,
+            release=release,
+            early=early,
         )
         num_rows = gathered.shape[1]
         num_ctas = max(1, min(num_rows, _num_sms(gathered.device)))
@@ -2034,7 +2086,8 @@ def register_dcp_topk_merge_warmup(
     mailbox: bool | None = None,
 ) -> None:
     """Compile the pack kernel and one select (+ rescue) variant at JIT
-    warmup.
+    warmup (with ``block_size``, also the ``early`` select + rescue and the
+    rescue's ``release`` variants).
 
     The stock indexer uses the defaults (global ids); a caller of
     ``dcp_topk_merge_rows`` passes its ``block_size`` and whether it also
@@ -2051,23 +2104,33 @@ def register_dcp_topk_merge_warmup(
                 from_packed=from_packed,
             )
     _DCP_TOPK_PACK_KERNEL.register_warmup(local_topk=local_topk, has_row_ends=True)
-    _DCP_TOPK_SELECT_KERNEL.register_warmup(
-        topk=topk,
-        local_topk=local_topk,
-        world_size=world_size,
-        emit_ids=emit_ids,
-        block_size=block_size,
-        exact=exact,
-        mailbox=mailbox and exact,
-    )
-    if exact:
-        _DCP_TOPK_RESCUE_KERNEL.register_warmup(
+    # Physical rows (``dcp_topk_merge_rows``): also the early-resident rescue
+    # (``early``, per shape: ``merge_early``) and the variant that releases the
+    # DSA sparse core early (``release``).
+    phys = exact and block_size > 0
+    for early in (False, True) if phys else (False,):
+        _DCP_TOPK_SELECT_KERNEL.register_warmup(
             topk=topk,
             local_topk=local_topk,
             world_size=world_size,
             emit_ids=emit_ids,
             block_size=block_size,
+            exact=exact,
+            mailbox=mailbox and exact,
+            early=early,
         )
+    if exact:
+        variants = ((False, False), (True, False), (True, True))
+        for early, release in variants if phys else ((False, False),):
+            _DCP_TOPK_RESCUE_KERNEL.register_warmup(
+                topk=topk,
+                local_topk=local_topk,
+                world_size=world_size,
+                emit_ids=emit_ids,
+                block_size=block_size,
+                release=release,
+                early=early,
+            )
 
 
 def dcp_topk_pack_indices(
@@ -2179,11 +2242,20 @@ def dcp_topk_select(
     rows: _RowsOutput | None = None,
     exact: _ExactArgs | None = None,
     mailbox: _Mailbox | None = None,
+    release: bool = False,
+    early: bool | None = None,
 ) -> None:
     """Exact global top-K of the gathered ``[W, T, N + N/32]`` rows: the
     select, then the rescue (second round) of saturated rows. With
     ``mailbox`` the select reads round 1 from it (``gathered`` is then the
-    mailbox's own, which the select fills for the rescue)."""
+    mailbox's own, which the select fills for the rescue). ``release``: the
+    rescue releases its PDL dependents after its own wait, while it runs; only
+    for a consumer that reads the outputs after its PDL wait (else they launch
+    at the rescue's completion). ``early`` (default ``release``; implied by
+    it): the select launches the rescue (PDL) while it runs, so the rescue is
+    resident during the select (a per-shape choice: its idle CTAs hold SM
+    slots that overlapped kernels would use)."""
+    early = release if early is None else early or release
     if topk is None:
         assert topk_indices is not None
         topk = topk_indices.shape[1]
@@ -2207,6 +2279,7 @@ def dcp_topk_select(
         rows=rows,
         exact=exact,
         mailbox=mailbox,
+        early=early,
     )
     if exact is not None:
         _DCP_TOPK_RESCUE_KERNEL(
@@ -2216,6 +2289,8 @@ def dcp_topk_select(
             topk=topk,
             exact=exact,
             rows=rows,
+            release=release,
+            early=early,
         )
 
 
@@ -2408,6 +2483,8 @@ def dcp_topk_merge_rows(
     ids_out: torch.Tensor | None = None,
     group: Any = None,
     max_local_len: int | None = None,
+    release: bool = False,
+    early: bool | None = None,
 ) -> None:
     """Exact DCP top-K merge straight to this rank's physical KV rows.
 
@@ -2429,6 +2506,12 @@ def dcp_topk_merge_rows(
     ``[T, >= topk]`` int32 owned physical rows (compacted, -1 after; a rank
     may own up to ``topk`` of a row), ``valid_out`` ``[T]`` their count,
     ``ids_out`` ``[T, topk]`` the global ids (optional).
+
+    ``release``: the next kernel reads ``rows_out`` / ``valid_out`` only after
+    its PDL wait (the DSA sparse core), so the rescue may launch it while it
+    runs. Leave False for any consumer that reads them before its wait
+    (FlashInfer's trtllm-gen counts, prims_ts) or that is not audited.
+    ``early``: the rescue is resident while the select runs (``dcp_topk_select``).
 
     Collective over the DCP group (see the module docstring).
     """
@@ -2485,6 +2568,8 @@ def dcp_topk_merge_rows(
             rows=rows,
             exact=exact,
             mailbox=mailbox,
+            release=release,
+            early=early,
         )
         return
     dcp_topk_select(
@@ -2494,4 +2579,6 @@ def dcp_topk_merge_rows(
         topk=topk,
         rows=rows,
         exact=exact,
+        release=release,
+        early=early,
     )

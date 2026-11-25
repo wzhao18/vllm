@@ -572,7 +572,10 @@ def test_dsa_core_rows_source():
         def merge_source(self, batch):
             return self.source
 
-        def merge_rows(self, *args):
+        def merge_rows(self, *args, release=False):
+            # The core reads its rows after its PDL wait: the merge's rescue
+            # may release it early (FlashInfer's decode must not be).
+            assert release is True
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
