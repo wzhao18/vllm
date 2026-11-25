@@ -43,10 +43,14 @@ def _kv(role):
 def _cfg(role, extra=None, mnbt=16384, sizes=None, max_size=None, eager=False):
     """A VllmConfig stand-in with the fields the hook and _set_cudagraph_sizes read
     (TP8+DCP8 prefill / TP16+DCP16 decode recipe: max-num-seqs 32, DSpark k7)."""
+    # unset knobs are omitted (the config rejects an explicit None)
+    knobs = {}
+    if sizes is not None:
+        knobs["cudagraph_capture_sizes"] = sizes
+    if max_size is not None:
+        knobs["max_cudagraph_capture_size"] = max_size
     compilation = CompilationConfig(
-        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
-        cudagraph_capture_sizes=sizes,
-        max_cudagraph_capture_size=max_size,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE, **knobs
     )
     return SimpleNamespace(
         kv_transfer_config=_kv(role),
