@@ -55,6 +55,8 @@ from .window import conv_put
 
 DECAY_ROW = 8  # record page rows: k 0 .. q - 2, decay 8 .., corrections 16 ..
 V_ROW = 16
+RECORD_ROWS = V_ROW + 7  # rows staged with the state page (q <= 8)
+RECORD_BYTES = RECORD_ROWS * 128 * 4
 
 
 class KdaVerifyHalfDefer(KdaVerifyHalfStock):
@@ -82,6 +84,7 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
         )
         reductions = alloc(smem, Float32, 8 * T)
         shared_beta = alloc(smem, Float32, T)
+        rec = alloc(smem, Float32, RECORD_ROWS * K, align=128)  # the records' rows
         meta = alloc(smem, Int32, (1, 4 + T))  # LoopStock's per-item metadata
         pairs: cutlass.Constexpr = (T + 1) // 2
         bars = alloc(smem, cutlass.Int64, pairs + 1, 8).iterator
@@ -104,9 +107,14 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
             cute.arch.mbarrier_init(state_full, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
-        if (thread == 0) & (slot > 0):  # this half's 64 rows of the accepted page
+        if (thread == 0) & (slot > 0):  # (+ the records' rows)
             source = state[Int64(slot), None, None, None]
-            cute.arch.mbarrier_arrive_and_expect_tx(state_full, HALF_PAGE)
+            staged = HALF_PAGE + RECORD_BYTES * Int32(records > 0)
+            cute.arch.mbarrier_arrive_and_expect_tx(state_full, staged)
+            if records > 0:
+                record_source = state[Int64(records), None, None, None]
+                copy_g2s(rec.iterator, at(record_source, head, 0, 0), RECORD_BYTES,
+                         state_full)  # fmt: skip
             rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
             for i in cutlass.range_constexpr(HALF_PAGE // COPY_BYTES):
                 copy_g2s(
@@ -128,7 +136,8 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
             if thread < HALF_THREADS:
                 self.half_math(
                     args, (thread, lane, warp, group, j), (item, half, head, token),
-                    (offset, conv_slot, slot, records), (page, state_full, ready, meta),
+                    (offset, conv_slot, slot, records),
+                    (page, state_full, ready, meta, rec),
                     (shared_q, shared_k, shared_decay, shared_v, shared_o, reductions,
                      shared_beta),
                     window,
@@ -173,7 +182,7 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
         thread, lane, warp, group, j = ids
         item, half, head, token = where
         offset, conv_slot, slot, records = rows
-        page, state_full, ready, meta = staging
+        page, state_full, ready, meta, rec = staging
         shared_q, shared_k, shared_decay, shared_v, shared_o, reductions = shared[:6]
         shared_beta = shared[6]
         state, gate = args[9], args[11]
@@ -189,7 +198,8 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
                 values = load_f32x4(pointer, shared=True)
                 for e in cutlass.range_constexpr(4):
                     history[r, c, e] = values[e]
-        self.fold(history, state, records, head, row0, j, offset)
+        # (no records slot: nothing to fold; never at q >= 2)
+        self.fold(history, rec, row0, j, offset * Int32(records > 0))
         own_gates = zeros(2, gate.element_type)
         shared = (shared_q, shared_k, shared_v, reductions, shared_beta)
         if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
@@ -229,21 +239,14 @@ class KdaVerifyHalfDefer(KdaVerifyHalfStock):
             shared_o[position] = self.round_out(owned)
 
     @cute.jit
-    def fold(self, history, state, records, head, row0, j, pending):
+    def fold(self, history, rec, row0, j, pending):
         """The ``pending`` accepted tokens 1 .. pending of the previous verify into the
-        thread's rows (``loop_token``'s decay and update instructions, same order)."""
-        record_page = state[Int64(records), None, None, None]
+        thread's rows from the staged records ``rec`` (shared memory), with
+        ``loop_token``'s decay and update instructions in the same order."""
         for i in cutlass.range(pending, unroll=1):
-            k = zeros((CHUNKS, 4), Float32)
-            decay = zeros((CHUNKS, 4), Float32)
-            for c in cutlass.range_constexpr(CHUNKS):
-                column = 4 * (j + 8 * c)
-                kv = load_f32x4(at(record_page, head, i, column), mutable=True)
-                dv = load_f32x4(at(record_page, head, DECAY_ROW + i, column), mutable=True)
-                for e in cutlass.range_constexpr(4):
-                    k[c, e] = kv[e]
-                    decay[c, e] = dv[e]
-            v_new = [record_page[head, V_ROW + i, row0 + 4 * r] for r in range(2)]
+            k = self.column_chunks(rec, i, j)
+            decay = self.column_chunks(rec, DECAY_ROW + i, j)
+            v_new = [rec[(V_ROW + i) * K + row0 + 4 * r] for r in range(2)]
             for c in cutlass.range_constexpr(CHUNKS):
                 for e in cutlass.range_constexpr(4):
                     x = decay[c, e]
