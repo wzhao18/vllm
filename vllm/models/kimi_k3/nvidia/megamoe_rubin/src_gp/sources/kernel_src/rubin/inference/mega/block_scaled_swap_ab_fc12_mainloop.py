@@ -1,5 +1,6 @@
 """Mainloop component for the Rubin block-scaled swap-AB FC12 kernel."""
 
+import os
 from typing import ClassVar, Optional, Tuple
 
 import cutlass
@@ -37,6 +38,13 @@ from ...custom_mix_cga_helpers import (
 from . import dynamic_mainloop
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .shared_expert_mainloop import SharedKindMainloopMixin
+
+
+# PR2 EXPERIMENT ONLY (timing probes, wrong math except ""): PR2_PROBE = "" | dup (a second MMA window per weight
+# stage, same A stage, N = PR2_DUPN, plus its SFB copy: the marginal cost of a weight-stationary second token tile) |
+# nosf (scale-factor copies only on the first k-tile of a tile) | nomma (no MMA issued). Kernel name gains _pr2<probe>.
+PR2_PROBE = os.environ.get("PR2_PROBE", "")
+PR2_DUPN = int(os.environ.get("PR2_DUPN", "48"))
 
 
 class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
@@ -1605,39 +1613,59 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                for instruction_index in cutlass.range_constexpr(instructions_per_stage):
-                    # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
-                    lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
-                    lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
-                    cute.copy(
-                        tiled_copy_sfb,
-                        partitioned_smem_sfb[lower_n_lower_k_source_coord],
-                        partitioned_tmem_sfb[lower_n_lower_k_destination_coord],
-                    )
-                    lower_n_upper_k_source_coord = (None, 2, None, instruction_index, ab_pipeline_state.index)
-                    compact_upper_k_destination_coord = (None, 1, None, instruction_index)
-                    cute.copy(
-                        tiled_copy_sfb,
-                        partitioned_smem_sfb[lower_n_upper_k_source_coord],
-                        partitioned_tmem_sfb[compact_upper_k_destination_coord],
-                    )
+                do_sf = True
+                if cutlass.const_expr(PR2_PROBE == "nosf"):
+                    do_sf = k_tile_idx == Int32(0)
+                if do_sf:
+                  cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                  for instruction_index in cutlass.range_constexpr(instructions_per_stage):
+                      # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
+                      lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
+                      lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
+                      cute.copy(
+                          tiled_copy_sfb,
+                          partitioned_smem_sfb[lower_n_lower_k_source_coord],
+                          partitioned_tmem_sfb[lower_n_lower_k_destination_coord],
+                      )
+                      lower_n_upper_k_source_coord = (None, 2, None, instruction_index, ab_pipeline_state.index)
+                      compact_upper_k_destination_coord = (None, 1, None, instruction_index)
+                      cute.copy(
+                          tiled_copy_sfb,
+                          partitioned_smem_sfb[lower_n_upper_k_source_coord],
+                          partitioned_tmem_sfb[compact_upper_k_destination_coord],
+                      )
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=mma_tmem_sfb,
-                    valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=instructions_per_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                if cutlass.const_expr(PR2_PROBE != "nomma"):
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=mma_tmem_sfb,
+                        valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=instructions_per_stage,
+                        first_instruction_accumulate=k_tile_idx != 0,
+                    )
+                if cutlass.const_expr(PR2_PROBE == "dup"):
+                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=mma_tmem_sfb,
+                        valid_tokens_in_tile=Int32(PR2_DUPN),
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=instructions_per_stage,
+                        first_instruction_accumulate=True,
+                    )
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
@@ -1654,24 +1682,44 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                do_sf = True
+                if cutlass.const_expr(PR2_PROBE == "nosf"):
+                    do_sf = k_tile_idx == Int32(0)
+                if do_sf:
+                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=mma_tmem_sfb,
-                    valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=instructions_per_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                if cutlass.const_expr(PR2_PROBE != "nomma"):
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=mma_tmem_sfb,
+                        valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=instructions_per_stage,
+                        first_instruction_accumulate=k_tile_idx != 0,
+                    )
+                if cutlass.const_expr(PR2_PROBE == "dup"):
+                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=mma_tmem_sfb,
+                        valid_tokens_in_tile=Int32(PR2_DUPN),
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=instructions_per_stage,
+                        first_instruction_accumulate=True,
+                    )
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
