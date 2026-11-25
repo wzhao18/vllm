@@ -205,6 +205,21 @@ def phases(trace, rows):
             cells.append(f"{name} {col.median():.1f}/{col.max():.1f}")
     head = f"  M{rows} CTAs {int(used.sum())} phases us (median/max): "
     print(head + "; ".join(cells))
+    # DIAG producer stamps (grouped kernel, slots 21/22): FC1 stages, cycles waiting on
+    # empty slots, FC1 issue span in cycles; interval from the globaltimer stamps 3 / 4.
+    extra = words[used]
+    n1, waited, span = extra[:, 21, 0], extra[:, 21, 1], extra[:, 22, 0]
+    ok = (n1 > 1) & (span > 0)
+    if ok.any():
+        s3, s4 = stamps[:, 3][ok], stamps[:, 4][ok]
+        interval = (s4 - s3).double() / (n1[ok] - 1).double()
+        frac = waited[ok].double() / span[ok].double()
+        q = lambda x: f"{x.median():.3f} (p10 {x.quantile(0.1):.3f} p90 {x.quantile(0.9):.3f})"
+        print(
+            f"  M{rows} producer FC1 stages/CTA {n1[ok].double().median():.0f}; "
+            f"ns/stage {q(interval)}; empty-wait fraction {q(frac)}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

@@ -90,6 +90,19 @@ def census_add(pointer, increment):
     )
 
 
+@asm(Int64)
+def clock64():
+    """DIAG (never merged): the SM cycle counter."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
+@asm()
+def stamp_values(pointer, slot, a, b):
+    """DIAG (never merged): two raw 64-bit values into 16 B ``slot`` of ``pointer``."""
+    code = "st.global.v2.u64 [$0], {$1, $2};"
+    return code, "l,l,l,~{memory}", (pointer + 16 * slot, Int64(a), Int64(b))
+
+
 @asm()
 def require_below(value, bound):
     """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
@@ -482,6 +495,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
         ring = (sm, barriers, metadata, w2_scales)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        waited, c_first, fc1_stages = (Int64(0), Int64(0), Int32(0))
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
             ks, tile = (lo % 14, 3 * ranges[group, 0] + lo // 14)
@@ -491,6 +505,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 row = expert * self.w13_rows + r * 128
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
                 tma = (w13, w13_scales, row, ks, offset, Int32(1024))
+                if cutlass.const_expr(self.trace != 0):
+                    if issued >= self.stages:  # DIAG: producer time waiting on empty
+                        c0 = clock64()
+                        self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+                        waited += clock64() - c0
+                    if issued == 0:
+                        c_first = clock64()
+                    fc1_stages += 1
                 slot, phase, issued = self.issue(
                     ring, slot, phase, issued, None, tma, False
                 )
@@ -503,6 +525,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
         self.stamp(4)
+        if cutlass.const_expr(self.trace != 0):
+            base = Int64(self.trace) + Int64(thread()[3]) * 512
+            stamp_values(base, 21, Int64(fc1_stages), waited)
+            stamp_values(base, 22, clock64() - c_first, Int64(0))
         state = (slot, phase, issued, Int32(0), Int32(-1))
         work = (ring, state, maps, experts, ranges, *steal)
         slot, phase, issued = self.fc2_pool(*work)
