@@ -1215,6 +1215,21 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 self.qk_rope_head_dim,
             ):
                 self._prefill_sparse_mla = sparse_mla
+        # Kimi K3.1 TP8 + DCP8 ShardQ prefill on Rubin: a rank's token slice
+        # attends with every TP rank's heads (TP x local = 96, unpadded), the
+        # problem the DCP-1 kernel above solves; prefill-sized slices run it on
+        # the slice's physical slots, smaller ones keep trtllm-gen.
+        self._shardq_sparse_mla = None
+        if not self.use_prims_ts and self.use_shardq:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import sparse_mla
+
+            if sparse_mla.supported(
+                self.num_heads * get_tensor_model_parallel_world_size(),
+                kv_cache_dtype,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ):
+                self._shardq_sparse_mla = sparse_mla
         # Kimi K3.1 specialized prefill FP8 MLA KV insert: with the specialized
         # prefill sparse MLA, or on a DCP / ShardQ prefill worker (TP8+DCP8).
         self._prefill_kv_insert = self._prefill_sparse_mla is not None
@@ -1379,6 +1394,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         )
 
     def reserve_workspace(self) -> None:
+        psm = getattr(self, "_shardq_sparse_mla", None)
+        if psm is not None:
+            # The profile run builds no ShardQ split: compile the prefill-sized
+            # launch (grid = every SM) before serving starts.
+            psm.precompile()
         if not self.use_prims_ts:
             self._reserve_trtllm_gen()
             return
@@ -1622,10 +1642,50 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             is_decode=True,
         )
 
-    def shardq_query_heads(self, num_heads: int) -> int:
-        if self.use_prims_ts:
+    def _runs_shardq_sparse_mla(self, num_rows: int, num_heads: int) -> bool:
+        psm = getattr(self, "_shardq_sparse_mla", None)
+        return psm is not None and num_heads == psm.H and num_rows >= psm.MIN_ROWS
+
+    def shardq_query_heads(self, num_heads: int, num_rows: int = 0) -> int:
+        # The specialized prefill kernel takes the 96 heads unpadded.
+        if self.use_prims_ts or self._runs_shardq_sparse_mla(num_rows, num_heads):
             return num_heads
         return trtllm_gen_query_heads(num_heads)
+
+    def attend_shardq_rows(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        physical_topk: torch.Tensor,
+        valid_counts: torch.Tensor,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+    ) -> torch.Tensor:
+        if not self._runs_shardq_sparse_mla(q.shape[0], q.shape[1]):
+            return super().attend_shardq_rows(
+                q,
+                kv_cache,
+                physical_topk,
+                valid_counts,
+                layer=layer,
+                block_size=block_size,
+            )
+        psm = self._shardq_sparse_mla
+        assert q.dtype == torch.float8_e4m3fn, q.dtype
+        self._prepare_mqa_kernel(layer, q.device)
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        kv_rows, _ = flat_kv_row_view(kv_cache.view(q.dtype), block_size)
+        # Physical slots are flat rows of kv_rows (block stride included).
+        return psm.sparse_mla_prefill(
+            q.contiguous(),
+            kv_rows,
+            64,
+            physical_topk,
+            valid_counts,
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
 
     def forward_mqa(
         self,
