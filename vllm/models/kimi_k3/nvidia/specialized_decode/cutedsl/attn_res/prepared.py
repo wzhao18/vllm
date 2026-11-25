@@ -50,12 +50,33 @@ RUBIN_VOTE_REGISTERS = {6: 80}
 # AttnRes after the up projection 7.7 -> 5.9 us at B32 (nsys). On one GPU it is equal
 # or slower (the second wave there costs ~1 us), and at 129-192 rows ~0. Above 256
 # rows one token per cluster (several waves, correct at any rows). NQ-TUNE: 16 ranks,
-# 2 / 3 / 4 tokens per cluster at 384-2048 rows (ceil(rows / 181)).
-ROWS_TOKENS: dict = {"*": "193-256:2"}
+# 2 / 3 / 4 tokens per cluster at 384-2048 rows (ceil(rows / 181)). 257-384 rows: two
+# tokens, 1 GPU (L8 bench below, cold, us one vs two tokens): nb 1 5.53 vs 5.00, nb 4
+# 6.33 vs 6.00, nb 5 8.52 vs 6.64, nb 6 8.97 vs 9.51, nb 8 10.85 vs 10.19.
+ROWS_TOKENS: dict = {"*": "193-384:2"}
+# Saved-block counts (from the key on: an AttnRes with at least that many blocks) whose
+# token-batched form also serves these rows, over ``ROWS_TOKENS``. Above ~181 clusters
+# the one-token kernel's later waves repeat the block loads and both exchanges; the
+# two-token form halves the waves but streams each token's blocks one vector at a time,
+# so it wins only where the block reads dominate. VR200, 1 GPU, inputs from HBM
+# (back-to-back graph, us one token vs two): 512 rows nb 6 12.01 vs 10.83, nb 7 13.48
+# vs 11.43, nb 8 13.96 vs 11.82; nb <= 5 one token wins (7.9-9.8 vs 8.3-10.3); 3 or 4
+# tokens per cluster lose at every block count and row count measured (128-512).
+ROWS_TOKENS_BLOCKS: dict = {6: "385-512:2"}
 
 
-def rows_tokens(rows):
-    return rows_policy(ROWS_TOKENS, Shape(rows), 1)
+def rows_tokens(rows, nb=0):
+    """Tokens per cluster of the post-tail AttnRes with ``nb`` saved blocks."""
+    extra = [e for least, e in sorted(ROWS_TOKENS_BLOCKS.items()) if nb >= least]
+    spec = {key: ",".join([value, *extra]) for key, value in ROWS_TOKENS.items()}
+    return rows_policy(spec, Shape(rows), 1)
+
+
+def token_counts(nb):
+    """The token counts above one that ``rows_tokens`` picks for ``nb`` blocks."""
+    specs = [ROWS_TOKENS.get("*", "")]
+    specs += [extra for least, extra in ROWS_TOKENS_BLOCKS.items() if nb >= least]
+    return {t for spec in specs for t in batch_table(spec).values() if t > 1}
 
 
 @cache
@@ -175,7 +196,7 @@ class PreparedAttnRes:
         tail's output); ``run_ring`` reads it for batches above the bound ring's cap."""
         slots, cap = shape = tuple(mailbox.shape[:2])
         self.ring_rows = self._compile(slots, cap), to_cute(mailbox), shape
-        tokens = {t for t in batch_table(ROWS_TOKENS.get("*", "")).values() if t > 1}
+        tokens = token_counts(self.key[0])
         self.rows_codes = {
             t: (self._compile(slots, cap, tokens=t), None) for t in tokens
         }
@@ -246,7 +267,7 @@ class PreparedAttnRes:
             if self.ring_rows is None or rows > self.ring_rows[2][1]:
                 raise ValueError(f"AttnRes ring input of {rows} rows: no ring holds it")
             code = self.ring_rows[0] if aux is None else self.aux[2]
-            batched = self.rows_codes.get(rows_tokens(rows))
+            batched = self.rows_codes.get(rows_tokens(rows, self.key[0]))
             if batched is not None:
                 code = batched[0] if aux is None else batched[1]
             return self._launch(code, self.ring_rows[1], prefix, blocks, out, aux)
