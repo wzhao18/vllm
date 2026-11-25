@@ -61,7 +61,7 @@ ROWS = 16
 # Core variant by rows, per verify length q: "<S>x<HG>[s<M>]" = S KV splits (one
 # cluster; rows of at most M 64-key chunks, default 4, on one CTA) per (row, HG = 16 /
 # 32 gathered heads). A q without a table keeps FlashInfer's chain.
-# Round 3 Step 0a (FP16-P core, before the stock-precision P), one SM107 GPU, DCP16
+# Round 3 Step 0a (FP16-P core, before the stock-precision P), one GPU, DCP16
 # rank shapes (96 gathered heads, q8, slots over 1M FP8 KV rows), CUPTI us per call,
 # the trtllm-gen chain (+ reduction + LSE) / 1x16 / 2x16s2 / 4x16s2 / 8x16s4, where the
 # 8 rows of one request hold X local entries and the other rows 96-155 ("bal"):
@@ -75,7 +75,7 @@ ROWS = 16
 # 7.00 / 9.59, QueryWait 1.84 (side stream). 2x16s2 at 1-16 rows: -6.0 / -6.9 us per
 # layer balanced, -2.6 / -3.8 at 384 entries, +1.0 / -0.2 at 600, +24 at 2048.
 # Stock precision (the core computes trtllm-gen's per-tile E4M3 P and BF16 partials,
-# csrc/dsa_core.cu), re-measured on one VR200 (kern-dsa bench_core, CUDA graphs, us
+# csrc/dsa_core.cu), re-measured on one GPU (kern-dsa bench_core, CUDA graphs, us
 # per call, DCP16 rank shapes q8), trtllm-gen chain / stock-precision 2x16s2 (/ the
 # FP16-P core it replaced): M8 bal 14.44 / 9.17 (/ 8.36), x256 15.10 / 9.80 (/ 9.87),
 # x384 15.13 / 14.14 (/ 12.22), x600 16.77 / 18.14 (/ 16.59), x2048 19.12 / 42.80
@@ -95,7 +95,7 @@ ROWS = 16
 # and the core is q-agnostic (rows are tokens), so one entry serves TP8 = DCP8 and TP16 =
 # DCP16; q8 keeps its original entry. TP16 q4 (TP16NV LHF): B1 5852 -> 5601, B8 9449 ->
 # 8825 us/step. DCP8 rank shapes (TP8WIDE; 96 gathered heads, 12 per rank, CUDA graphs,
-# one VR200, us per call, core / trtllm-gen chain, 2-16 rows): balanced 256 local
+# one GPU, us per call, core / trtllm-gen chain, 2-16 rows): balanced 256 local
 # entries per rank-row 9.8-10.5 / 11.0-14.8; one row at 384 14.6-14.9 / 11.0-14.8; at
 # 600 18.6-18.9 / 11.9-15.4. With the core's pushed DcpValue against the "proj" one the
 # chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to

@@ -410,7 +410,7 @@ LOG2E = math.log2(math.e)
 
 def _emulate(q8, k8, bmm1, bmm2, kv_ctas):
     """The stock trtllm-gen sparse MLA decode of one row (FP32 emulation; probed bitwise
-    against trtllm-gen on VR200 at rows 1-64, local counts 100-2048): its KV CTA split
+    against trtllm-gen on one GPU at rows 1-64, local counts 100-2048): its KV CTA split
     (``kv_ctas`` = ops.trtllm_kv_ctas of the batch), the row's T = ceil(n / 128) tiles
     in pieces of k = ceil(T / kv_ctas) consecutive tiles. Per piece, one base-2 running
     max step per tile, P = E4M3(448 x 2^(s - m)), the piece's P V and sum (from the
@@ -460,7 +460,7 @@ def _ulps(a, b):
 @pytest.mark.parametrize("rows", [8, 14, 16])
 def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     """Stock precision, rank by rank (DCP16 q8 rows 8 / 14 / 16: trtllm-gen KV CTAs 8 /
-    7 / 6 on VR200, the served 2x16s3): every rank's pushed partial rows and base-2
+    7 / 6 on one GPU, the served 2x16s3): every rank's pushed partial rows and base-2
     LSEs against the stock trtllm-gen sparse MLA decode of the same rank's rows
     (attn_fi.trtllm's call), and both against the FP32 emulation of trtllm-gen's
     precision (``_emulate``), with local counts of up to 2048 (every piece size of
@@ -525,7 +525,7 @@ def test_dsa_core_serving_deadline():
 
 
 def test_trtllm_kv_ctas():
-    """trtllm-gen's KV CTAs per row as probed on VR200 (212 SMs, 128 padded heads,
+    """trtllm-gen's KV CTAs per row as probed on one GPU (212 SMs, 128 padded heads,
     2048 slots per row) and FlashInfer's rule elsewhere."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import trtllm_kv_ctas
 
