@@ -204,8 +204,10 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
     if kind == "loop":  # LoopStock's persistent 16-warp verify with records + fold
         if not record or tokens < 2:
             raise Unsupported("kda", shape, "loop: RecoverSSM verify records only")
-        return KdaVerifyLoopRecords(heads, requests, mode, has_bias, (0, 0, 0), tokens,
-                                    False)  # fmt: skip
+        schedule = (0, 0, 0)  # (unread: LoopStock's own geometry)
+        return KdaVerifyLoopRecords(
+            heads, requests, mode, has_bias, schedule, tokens, False
+        )
     if kind == "fused":
         split = next(s for bound, s in FUSED_SPLIT if items < bound)
         return KdaFused(heads, tokens, mode, has_bias, split)

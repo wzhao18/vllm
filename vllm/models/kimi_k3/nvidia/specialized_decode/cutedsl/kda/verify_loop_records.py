@@ -19,10 +19,11 @@ bit for bit given the same starting state):
    tokens of its last verify, clipped to [0, q]) are read with its slot;
 2. before any record of this step is written, every thread reads the old corrections
    of its two state rows (the old keys and raw gates feed step 3);
-3. as soon as the records land (bulk-copied ahead of the state page), all 16 warps
-   build the stock commit's per-key operands exactly as ``wide.KdaWide`` does (warp
-   butterfly + cross-warp sum of the recorded key squares, rsqrt.approx.ftz
-   normalized keys, the Triton gate decays, the reverse product P_t and D_n), and
+3. as soon as the records land (bulk-copied ahead of the state page, double-buffered),
+   warps 12-15 build the stock commit's per-key operands exactly as ``wide.KdaWide``
+   does while the prologue and gate warps go on (warp butterfly + cross-warp sum of
+   the recorded key squares, rsqrt.approx.ftz normalized keys, the Triton gate
+   decays, the reverse product P_t and D_n), and
    every thread folds its 32 state elements with the commit's instructions
    (fc = fma(u_t kn_t, P_t, fc) over t = n - 1 .. 0, then S = fma(S_0, D_n, fc)):
    bit for bit the stock Triton commit; the folded checkpoint is written back once;
@@ -70,7 +71,7 @@ from .verify_packed import CHUNKS
 from .wide import rsqrt_ftz
 from .window import conv_put, conv_tap
 
-FOLD_BARRIER = 3  # named barrier of warps 4-15 (the commit's per-key operands)
+FOLD_BARRIER = 3  # named barrier of warps 12-15 (the commit's per-key operands)
 
 
 class KdaVerifyLoopRecords(KdaVerifyLoopStock):
@@ -193,28 +194,28 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                                        live + 1)  # fmt: skip
                 own_gates = zeros(2, gate.element_type)
                 if thread < 128:
-                    self.record_prologue(args, thread, token, head, offset, slot,
-                                         shared_q, shared_k, shared_v, reductions,
-                                         shared_beta, own_gates, ready, rec)  # fmt: skip
+                    self.record_prologue(
+                        args, thread, token, head, offset, slot, shared_q, shared_k,
+                        shared_v, reductions, shared_beta, own_gates, ready, rec,
+                    )  # fmt: skip
+                elif thread < 128 + 32 * 8:
+                    self.record_gate(args, thread // 32 - 4, lane, head, token,
+                                     shared_decay, own_gates, rec)  # fmt: skip
+                    for p in cutlass.range_constexpr(pairs):
+                        cute.arch.mbarrier_arrive(ready + p)
                 else:
-                    # The pending commit's per-key operands on warps 4-15 (the
-                    # prologue warps go on), from the old records, which only this
-                    # step's later writes may overwrite.
+                    # Warps 12-15 (otherwise idle until their output gates): the
+                    # pending commit's per-key operands from the old records, which
+                    # only this step's later writes may overwrite.
                     if n > 0:
                         wait(records_full + buf, (live // 2) % 2, scope="cta")
-                        self.fold_operands(args, thread - 128, head, n, buf, staged_kg,
+                        self.fold_operands(args, thread - 384, head, n, buf, staged_kg,
                                            fold_sums, fold_dec, fold_keys, fold_suffix,
                                            fold_decay)  # fmt: skip
-                    if thread < 128 + 32 * 8:
-                        self.record_gate(args, thread // 32 - 4, lane, head, token,
-                                         shared_decay, own_gates, rec)  # fmt: skip
-                        for p in cutlass.range_constexpr(pairs):
-                            cute.arch.mbarrier_arrive(ready + p)
-                    else:
-                        cute.arch.mbarrier_arrive(fold_ready)
-                        cute.arch.griddepcontrol_wait()
-                        self.loop_own_gates(args, token, head, thread // 64,
-                                            thread % 64, own_gates)  # fmt: skip
+                    cute.arch.mbarrier_arrive(fold_ready)
+                    cute.arch.griddepcontrol_wait()
+                    self.loop_own_gates(args, token, head, thread // 64, thread % 64,
+                                        own_gates)  # fmt: skip
                 cute.arch.griddepcontrol_launch_dependents()
 
                 # The pending commit of the thread's rows (the stock commit), the
@@ -302,48 +303,39 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                 )
 
     @cute.jit
-    def fold_operands(self, args, thread, head, n, buf, staged_kg, fold_sums, fold_dec,
+    def fold_operands(self, args, key, head, n, buf, staged_kg, fold_sums, fold_dec,
                       fold_keys, fold_suffix, fold_decay):  # fmt: skip
-        """The stock commit's per-key operands of the n pending tokens (``wide.KdaWide``
-        bit for bit) on warps 4-15 (``thread`` 0-383 among them): the recorded key
-        squares (warp butterfly over 32 keys, then the cross-block sum), the Triton
-        gate decays, then per key (warps 12-15) the normalized keys kn_t, the reverse
-        products P_t and D_n."""
+        """The stock commit's per-key operands of the n pending tokens on warps 12-15
+        (``key`` 0-127 among them), as ``wide.KdaWide`` computes them, bit for bit: the
+        recorded key squares (warp butterfly over 32 keys, then the cross-block sum),
+        the Triton gate decays, the normalized keys kn_t, the reverse products P_t and
+        D_n."""
         a_log, dt_bias, lower_bound = args[6], args[7], args[13]
         RQ: cutlass.Constexpr = args[18].shape[2]
-        lane, warp = thread % 32, thread // 32
+        lane, block = key % 32, key // 32
         base = buf * RQ * 256
-        # squares: task (t, b) = keys [32 b, 32 b + 32) of token t; warp w: w + 12 i
-        for i in cutlass.range_constexpr(-(-4 * RQ // 12)):
-            task = warp + 12 * i
-            t, b = task // 4, task % 4
-            if (task < 4 * RQ) & (t < n):
-                x = Float32(staged_kg[base + 256 * t + 32 * b + lane])
-                squares = warp_sum(x * x)
-                if lane == 0:
-                    fold_sums[4 * t + b] = squares
-        # decays: key = thread % 128 of tokens thread // 128 + 3 i
-        key = thread % 128
         a = Float32(a_log[head])
         dtc = Float32(dt_bias[head * 128 + key])
-        for i in cutlass.range_constexpr(-(-RQ // 3)):
-            t = thread // 128 + 3 * i
+        for t in cutlass.range_constexpr(RQ):
             if t < n:
+                x = Float32(staged_kg[base + 256 * t + key])
+                squares = warp_sum(x * x)
+                if lane == 0:
+                    fold_sums[4 * t + block] = squares
                 raw = Float32(staged_kg[base + 256 * t + 128 + key])
                 fold_dec[128 * t + key] = triton_decay(a, raw, dtc, lower_bound)
-        named_barrier(FOLD_BARRIER, 384)
-        if thread >= 256:
-            final_decay = Float32(1)
-            for i in cutlass.range_constexpr(RQ):
-                t = RQ - 1 - i
-                if t < n:
-                    r4 = [fold_sums[4 * t + w] for w in range(4)]
-                    total = (r4[0] + r4[2]) + (r4[1] + r4[3]) + 1.0e-6
-                    raw_key = Float32(staged_kg[base + 256 * t + key])
-                    fold_keys[128 * t + key] = mul_rn(rsqrt_ftz(total), raw_key)
-                    fold_suffix[128 * t + key] = final_decay
-                    final_decay = mul_rn(final_decay, fold_dec[128 * t + key])
-            fold_decay[key] = final_decay
+        named_barrier(FOLD_BARRIER, 128)
+        final_decay = Float32(1)
+        for i in cutlass.range_constexpr(RQ):
+            t = RQ - 1 - i
+            if t < n:
+                r4 = [fold_sums[4 * t + w] for w in range(4)]
+                total = (r4[0] + r4[2]) + (r4[1] + r4[3]) + 1.0e-6
+                raw_key = Float32(staged_kg[base + 256 * t + key])
+                fold_keys[128 * t + key] = mul_rn(rsqrt_ftz(total), raw_key)
+                fold_suffix[128 * t + key] = final_decay
+                final_decay = mul_rn(final_decay, fold_dec[128 * t + key])
+        fold_decay[key] = final_decay
 
     @cute.jit
     def fold_rows(self, history, u_old, n, RQ: cutlass.Constexpr, j, operands):
