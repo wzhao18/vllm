@@ -1838,6 +1838,7 @@ class MooncakeStoreWorker:
             extra_config.get("save_decode_cache", False)
         )
         self.load_async = extra_config.get("load_async", True)
+        self._report_attn_hit = int(extra_config.get("store_junction_min_gap", 0)) > 0
         # Store failover: bound every RDMA get / put; a failed or timed-out get
         # is a cache miss (recompute), a failed or timed-out put is dropped.
         self._store_op_failover = str(
@@ -2890,6 +2891,10 @@ class MooncakeStoreWorker:
             return None
         return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
 
+    # Report the full-attention-only hit (store-side junction detection);
+    # set from kv_connector_extra_config["store_junction_min_gap"] > 0.
+    _report_attn_hit: bool = False
+
     def lookup(
         self,
         num_tokens: int,
@@ -3012,7 +3017,7 @@ class MooncakeStoreWorker:
         )
         if self._selective_lease is None:
             return hit
-        return self._selective_lease.lease_hit(
+        leased = self._selective_lease.lease_hit(
             block_hashes,
             hit,
             exists_set,
@@ -3025,6 +3030,9 @@ class MooncakeStoreWorker:
             ),
             mask_num=start_unit * self.hash_block_size,
         )
+        if hit.attn_hit_length > leased.hit_length and not leased.attn_hit_length:
+            leased.attn_hit_length = hit.attn_hit_length
+        return leased
 
     def _longest_hit(
         self,
@@ -3053,6 +3061,15 @@ class MooncakeStoreWorker:
                 usable_length,
                 cached_block_pool,
             )
+        attn_hit_length = 0
+        if self._report_attn_hit:
+            attn_hit_length = self.coord.full_attention_hit_length(
+                block_hashes,
+                self.coord.align_lookup_length(num_tokens - 1),
+                cached_block_pool,
+            )
+            if attn_hit_length <= hit_length:
+                attn_hit_length = 0
         return MooncakeLookupResult(
             hit_length,
             self._tail_key_boundaries(
@@ -3061,6 +3078,7 @@ class MooncakeStoreWorker:
                 cached_block_pool,
             ),
             known_prefix_tokens=known_prefix_tokens,
+            attn_hit_length=attn_hit_length,
         )
 
     def _tail_key_boundaries(

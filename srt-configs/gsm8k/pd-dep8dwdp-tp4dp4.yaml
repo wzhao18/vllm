@@ -13,12 +13,12 @@ identity:
     image: k31vr/kmc:kmr-sweep-freeze-r1
   frameworks:
     vllm: 'k31-agentx-dev-pd: prefill AND decode code = wzhao/k31-agentx-dev f9f1b28658 + agentx #25-#42 (stream-pool fix, KV pull cap, indexer chunk budget, decode serving fixes, MegaMoE stager EPLB, die-local GEMM, DPLB cost chunks, MegaMoE mxfp4_mxfp4, DeepSelect sm_107a build, cuDNN frontend 1.33, HRRN, die-local wiring, DepDsa, zero-comm SP DSA-DP, GVR V2 top-k, Mooncake same-step loads, NIXL larger remote blocks, dense DWDP at construction) on PYTHONPATH in place of /opt/k3/ov-p and /opt/k3/ov-d'
-    dynamo: 'Inferact/dynamo 9ac6228943 (#410 juntian/k31-rubin-router = 3dd0744 K3.1-release + active-prefill sums, Mooncake global-prefix store model, --router-prefill-cost, --router-decode-balance)'
+    dynamo: 'nvidia-vllm-agentx dynamo-k31-vr bdec0a54ce (same tree as Inferact/dynamo 9ac6228943, #410 juntian/k31-rubin-router = 3dd0744 K3.1-release + active-prefill sums, Mooncake global-prefix store model, --router-prefill-cost, --router-decode-balance)'
 dynamo:
   install: true
   source:
-    git: https://github.com/Inferact/dynamo
-    rev: 9ac6228943a7e523941a3995c83daeb8939c7997
+    git: https://github.com/Inferact/nvidia-vllm-agentx
+    rev: bdec0a54ced92e5808ecb0633075a6e8096ba77a
 slurm:
   time_limit: 04:00:00
 health_check:

@@ -939,6 +939,21 @@ def test_lookup_response_round_trip_preserves_tail_keys():
     )
 
 
+def test_lookup_response_round_trip_carries_attn_hit_past_tail_keys():
+    """The store-junction attention-only hit rides a sentinel tail entry: it
+    survives the round trip next to real tail keys and is dropped when it does
+    not run deeper than the reusable hit."""
+    boundary = TailKeyBoundary(group_id=1, num_tokens=20)
+    deeper = MooncakeLookupResult(
+        hit_length=20, tail_key_boundaries=(boundary,), attn_hit_length=36
+    )
+    assert protocol.decode_lookup_response(protocol.encode_lookup_response(deeper)) == (
+        deeper
+    )
+    shallow = MooncakeLookupResult(hit_length=20, attn_hit_length=20)
+    assert protocol.encode_lookup_response(shallow) == (20).to_bytes(4, "big")
+
+
 def test_scheduler_reset_connector_cache_invokes_connector_reset():
     """Cascade test: Scheduler.reset_prefix_cache(reset_connector=True)
     cascades into MooncakeStoreConnector.reset_cache without dragging in

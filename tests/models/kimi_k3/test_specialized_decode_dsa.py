@@ -25,6 +25,55 @@ pytestmark = pytest.mark.skipif(
 NOT_PORTED = pytest.mark.skip(reason="round 1 keeps its own runtime / MLA / AttnRes")
 
 
+@pytest.fixture(scope="module")
+def dist_init():
+    """tests/conftest.py's ``dist_init`` (world size 1, TP = PP = 1), once per module
+    instead of once per case. Creating and destroying vLLM's process groups (gloo +
+    NCCL) for every case, plus the global cleanup's ``gc.collect`` after it, cost
+    ~2.5 s per case: ~12 of this file's 15 minutes on one Rubin GPU, against ~0.1-0.6
+    s of test body. No case here changes the groups. A group that is already up (an
+    8 / 16-rank launch's ``dcp8_group``) is reused as is."""
+    import contextlib
+    import tempfile
+
+    from tests.utils import ensure_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    if model_parallel_is_initialized():
+        yield
+        return
+    fd, temp_file = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with ensure_current_vllm_config():
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"file://{temp_file}",
+                local_rank=0,
+                backend="nccl",
+            )
+            initialize_model_parallel(1, 1)
+            yield
+        cleanup_dist_env_and_memory()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_file)
+
+
+@pytest.fixture
+def should_do_global_cleanup_after_test():
+    """No per-case global cleanup (tests/conftest.py's ``cleanup_fixture``): it would
+    tear down the module's ``dist_init`` groups (and an 8 / 16-rank launch's
+    ``dcp8_group``) after every case; ``dist_init`` cleans up once at module end."""
+    return False
+
+
 def no_prims_ts():
     """Why FlashInfer's prims_ts sparse MLA cannot run here, else None (SM107:
     FlashInfer 0.7.2 has none, 0.7.3 accepts SM100 / SM103 only)."""
@@ -2970,9 +3019,13 @@ def dcp8_group():
     )
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
     rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
     local = int(os.environ["SLURM_LOCALID"])
     assert world == (16 if DCP16_INIT else 8), world
+    if model_parallel_is_initialized():  # the module's world-1 dist_init groups
+        cleanup_dist_env_and_memory()
     torch.accelerator.set_device_index(local)
     heads = HEADS
     if world == 16:

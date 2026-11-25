@@ -393,6 +393,37 @@ class MooncakeStoreCoordinator:
             masks.append(mask)
         return tuple(masks)
 
+    def full_attention_hit_length(
+        self,
+        block_hashes: Sequence[BlockHash],
+        max_length: int,
+        cached_block_pool: ExternalCachedBlockPool,
+    ) -> int:
+        """Longest prefix every full-attention group holds in the store, ignoring
+        Mamba / sliding-window groups (0 if there is no full-attention group).
+        Where it runs past the converged hit, a shared prefix's attention KV is
+        stored but no state checkpoint is: the shared-prefix junction."""
+        alignment_tokens = (
+            self.hash_block_size
+            if self.enable_partial_hash_hits
+            else self.lcm_block_size
+        )
+        best: int | None = None
+        for spec, group_ids, manager_cls, _group_eagle in self.attention_groups:
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+            _, length = manager_cls.find_longest_cache_hit(
+                block_hashes=block_hashes,  # type: ignore[arg-type]
+                max_length=max_length,
+                kv_cache_group_ids=group_ids,
+                block_pool=cast(BlockPool, cached_block_pool),
+                kv_cache_spec=spec,
+                drop_eagle_block=False,
+                alignment_tokens=alignment_tokens,
+            )
+            best = length if best is None else min(best, length)
+        return best or 0
+
     def block_hashes_for_spec(
         self, block_hashes: Sequence[BlockHash], spec: KVCacheSpec
     ) -> Sequence[BlockHash]:

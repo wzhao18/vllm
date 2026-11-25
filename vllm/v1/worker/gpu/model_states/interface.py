@@ -177,6 +177,13 @@ class ModelState(ABC):
         across block boundaries. No-op by default."""
         return None
 
+    def launch_state_precopy(self) -> None:
+        """Launch the state pre-copy ``preprocess_state`` staged. The runner calls
+        it right before the forward, after the KV connector's synchronous loads
+        have landed: they write state blocks outside the CUDA streams. No-op by
+        default."""
+        return None
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
