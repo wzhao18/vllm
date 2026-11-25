@@ -532,7 +532,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if cutlass.const_expr(self.trace != 0):
                     if issued >= self.stages:  # DIAG: producer time waiting on empty
                         c0 = clock64()
-                        self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+                        self.sync(barriers.iterator + self.stages + self.ring(slot), phase ^ 1)
                         waited += clock64() - c0
                     if issued == 0:
                         c_first = clock64()
