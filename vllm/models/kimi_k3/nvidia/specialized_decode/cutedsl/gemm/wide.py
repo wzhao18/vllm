@@ -218,6 +218,47 @@ def _sel_eq(a, b, x, y):
 
 
 @asm()
+def _arrive_peer(address, peer):
+    """Remote arrive (release, cluster scope) on CTA ``peer``'s mbarrier at my
+    shared ``address``."""
+    code = (
+        "{ .reg .b32 a; mapa.shared::cluster.u32 a, $0, $1; "
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [a]; }"
+    )
+    return code, "r,r,~{memory}", (Int32(address), Int32(peer))
+
+
+@asm()
+def _push_peer(dst, src, peer, nbytes, mbar):
+    """Bulk copy my shared [src, src + nbytes) to CTA ``peer``'s shared ``dst``,
+    completing on ``peer``'s mbarrier ``mbar`` (both given as my shared offsets)."""
+    code = (
+        "{ .reg .b32 d, b; mapa.shared::cluster.u32 d, $0, $2; "
+        "mapa.shared::cluster.u32 b, $4, $2; "
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes "
+        "[d], [$1], $3, [b]; }"
+    )
+    return code, "r,r,r,r,r,~{memory}", (
+        Int32(dst), Int32(src), Int32(peer), Int32(nbytes), Int32(mbar)
+    )  # fmt: skip
+
+
+@asm()
+def _commit_mask(mbar, mask):
+    """tcgen05.commit (cta_group::2) multicast to the CTAs in ``mask``."""
+    code = (
+        "{ .reg .b16 m; cvt.u16.u32 m, $1; tcgen05.commit.cta_group::2.mbarrier::"
+        "arrive::one.shared::cluster.multicast::cluster.b64 [$0], m; }"
+    )
+    return code, "r,r,~{memory}", (Int32(mbar), Int32(mask))
+
+
+@asm()
+def _fence_cluster():
+    return "fence.acq_rel.cluster;", "~{memory}", ()
+
+
+@asm()
 def _bar(barrier_id, count):
     return f"bar.sync {barrier_id}, {count};", "~{memory}", ()
 
@@ -292,7 +333,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False, xgroup=1):  # fmt: skip
+                 partials=False, xgroup=1, dsmem=False):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
@@ -324,6 +365,18 @@ class WideGemm:
         self.agroups = self.astages // xgroup
         self.maxreg = -(-rows // split)  # tokens per owner (largest region)
         self.uneven = rows % split != 0
+        # ``dsmem``: the split exchange inside one cluster of (2, split) CTAs (the
+        # pair x the K splits of its tiles): every CTA pushes the other owners' token
+        # ranges of its FP32 partial straight into their shared memory (bulk
+        # shared::cta -> shared::cluster, complete_tx on the owner's barrier) once the
+        # owner's operand ring is drained; the owner sums in split order (the same FP32
+        # order as the L2 exchange: bitwise equal to it).
+        self.dsmem = dsmem and split > 1
+        if self.dsmem:
+            assert not (silu or partials or direct), (silu, partials, direct)
+            assert 2 * split <= 16, split
+            ring = _rings(rows, wstages)[2]
+            assert (rows + split * self.maxreg) * 512 <= ring, (rows, split, ring)
         self.tmem_cols = 32
         while self.tmem_cols < rows:
             self.tmem_cols *= 2
@@ -373,6 +426,8 @@ class WideGemm:
             dealloc: cutlass.Int64
             tmem_holder: cutlass.Int32
             xfer: cutlass.Int64
+            ready: cutlass.Int64
+            done: cutlass.Int64
             sA: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(a_layout.outer)], 1024
             ]
@@ -387,7 +442,7 @@ class WideGemm:
         ).launch(  # fmt: skip
             grid=(2 * (self.n_pad // 256), self.split, 1),
             block=[self.threads, 1, 1],
-            cluster=(2, 1, 1),
+            cluster=(2, self.split if self.dsmem else 1, 1),
             stream=stream,
             use_pdl=True,
         )
@@ -406,7 +461,11 @@ class WideGemm:
         leader = v == 0
         pair = bidx // 2
         rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        coord_vmnk = cluster_vmnk.get_flat_coord(rank_in_cluster)
+        # the MMA pair's coordinate (dsmem: the cluster also spans the K splits)
+        coord_vmnk = cluster_vmnk.get_flat_coord(rank_in_cluster % 2)
+        pair_mask = Int32(3)
+        if cutlass.const_expr(self.dsmem):
+            pair_mask = Int32(3) << (rank_in_cluster - rank_in_cluster % 2)
         wst, ast, chunks = self.wstages, self.astages, self.chunks
 
         smem = utils.SmemAllocator()
@@ -431,6 +490,8 @@ class WideGemm:
                 cute.arch.mbarrier_init(acc_full, 1)
                 cute.arch.mbarrier_init(dealloc, 32)
                 cute.arch.mbarrier_init(st.xfer.ptr, 1)
+                cute.arch.mbarrier_init(st.ready.ptr, max(self.split - 1, 1))
+                cute.arch.mbarrier_init(st.done.ptr, max(self.split - 1, 1))
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()
 
@@ -527,17 +588,26 @@ class WideGemm:
                             cute.gemm(tiled_mma, acc_c, tCrA[(None, None, kb, s)],
                                       tCrB[(None, None, kb, sb * chunks + c)], acc_c)  # fmt: skip
                     with cute.arch.elect_one():
-                        tcgen05.commit(empty + s, 3, tcgen05.CtaGroup.TWO)
+                        if cutlass.const_expr(self.dsmem):
+                            _commit_mask(Int32((empty + s).toint()), pair_mask)
+                        else:
+                            tcgen05.commit(empty + s, 3, tcgen05.CtaGroup.TWO)
                     if t % xg == xg - 1 or t == k_count - 1:
                         with cute.arch.elect_one():
-                            tcgen05.commit(bempty + gs, 3, tcgen05.CtaGroup.TWO)
+                            if cutlass.const_expr(self.dsmem):
+                                _commit_mask(Int32((bempty + gs).toint()), pair_mask)
+                            else:
+                                tcgen05.commit(bempty + gs, 3, tcgen05.CtaGroup.TWO)
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 104, _now())
                 if lane == 0:
                     _st_u64(stamp + 72, _now())
                 with cute.arch.elect_one():
-                    tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
+                    if cutlass.const_expr(self.dsmem):
+                        _commit_mask(Int32(acc_full.toint()), pair_mask)
+                    else:
+                        tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
         elif warp >= 4:
             if warp == 4:
                 cute.arch.alloc_tmem(self.tmem_cols, tmem_holder, is_two_cta=True)
@@ -561,6 +631,13 @@ class WideGemm:
                     self.epilogue_partials(
                         acc, acc_full, warp - 4, lane, bidx, split_rank, mY, stamp
                     )
+                elif cutlass.const_expr(self.dsmem):
+                    self.epilogue_dsmem(
+                        acc, acc_full, st.xfer.ptr, st.ready.ptr, st.done.ptr, warp - 4,
+                        lane, bidx,
+                        split_rank, rank_in_cluster, Int32(st.sA.data_ptr().toint()), mY,
+                        stamp,
+                    )  # fmt: skip
                 elif cutlass.const_expr(self.direct):
                     self.epilogue_direct(
                         acc, acc_full, warp - 4, lane, bidx, split_rank, mY, mWs, stamp
@@ -723,6 +800,86 @@ class WideGemm:
                 if _atom_add(done, 1) == split - 1:
                     _st_relaxed(flag, 0)
                     _st_relaxed(done, 0)
+
+    @cute.jit
+    def epilogue_dsmem(
+        self, acc: cute.Tensor, acc_full, xfer, ready, done, ew: Int32, lane: Int32,
+        tile: Int32, split_rank: Int32, crank: Int32, stage_addr: Int32,
+        mY: cute.Tensor, stamp: Int64,
+    ):  # fmt: skip
+        """``epilogue``'s split exchange through DSMEM (``dsmem``). CTA (v, s) of the
+        cluster has rank v + 2 s; split o owns tokens [o T / S, (o + 1) T / S).
+        1. arm ``xfer`` for the peers' partials, stage TMEM -> shared [token][row];
+        2. tell every peer my ring is free (remote arrive on its ``ready``);
+        3. once every peer is free (my ``ready``), thread o pushes my partial of
+           owner o's tokens into o's slot ``split_rank`` (bulk, complete_tx on o's
+           ``xfer``); 4. sum my tokens in split order, round, store; 5. tell the
+           senders their data landed (``done``), wait for mine before exit."""
+        rows, split = self.rows, self.split
+        r = ew * 32 + lane
+        tid = r
+        lo = split_rank * rows // split
+        mine_n = (split_rank + 1) * rows // split - lo
+        v_rank = crank - 2 * split_rank  # my rank in the pair
+        if tid == 0:
+            _st_u64(stamp + 0, _now())
+        cute.arch.mbarrier_wait(acc_full, 0)
+        if tid == 0:
+            _st_u64(stamp + 8, _now())
+            cute.arch.mbarrier_arrive_and_expect_tx(xfer, (split - 1) * mine_n * 512)
+        cute.arch.griddepcontrol_launch_dependents()
+        _fence_after()
+        lane_bits = (ew * 32) << 16
+        col0 = [
+            Int32(acc[(None, None, None, c)].iterator.toint()) + lane_bits
+            for c in range(self.chunks)
+        ]
+        for j in cutlass.range_constexpr(rows // CHUNK):
+            c, off = divmod(j * CHUNK, self.n_mma)
+            vals = _tmem_wait16(*_tmem_ld16(col0[c] + off))
+            for i in cutlass.range_constexpr(CHUNK):
+                _sts_f32(stage_addr + ((j * CHUNK + i) * 128 + r) * 4, vals[i])
+        if tid == 0:
+            _st_u64(stamp + 16, _now())
+        recv, rstride = stage_addr + rows * 512, self.maxreg * 512
+        _fence_proxy_shared()
+        _bar(3, 128)  # staging complete (and xfer armed) before anyone is told
+        # 2. My ring is drained (acc_full: every MMA of the pair is done).
+        for o in cutlass.range_constexpr(split):
+            if tid == o:
+                if split_rank != o:
+                    _arrive_peer(Int32(ready.toint()), v_rank + 2 * o)
+        # 3. Push owner o's token range once every owner is free.
+        for o in cutlass.range_constexpr(split):
+            if tid == o:
+                if split_rank != o:
+                    cute.arch.mbarrier_wait(ready, 0)
+                    _fence_cluster()
+                    o_lo = o * rows // split
+                    o_bytes = ((o + 1) * rows // split - o_lo) * 512
+                    _push_peer(
+                        recv + split_rank * rstride, stage_addr + o_lo * 512,
+                        v_rank + 2 * o, o_bytes, Int32(xfer.toint()),
+                    )  # fmt: skip
+        cute.arch.mbarrier_wait(xfer, 0)
+        if tid == 0:
+            _st_u64(stamp + 32, _now())
+        # 4. Sum in split order (mine from the staging, the peers' from their slots).
+        y = mY.iterator.toint()
+        mine = stage_addr + lo * 512
+        for it in cutlass.range_constexpr((self.maxreg * 16 + 127) // 128):
+            e = it * 128 + tid
+            if e < mine_n * 16:
+                self.store_plain(recv, rstride, mine, split_rank, lo, y, tile, e)
+        if tid == 0:
+            _st_u64(stamp + 40, _now())
+        # 5. Release the senders (their pushes out of shared memory are complete).
+        for o in cutlass.range_constexpr(split):
+            if tid == o:
+                if split_rank != o:
+                    _arrive_peer(Int32(done.toint()), v_rank + 2 * o)
+        if tid == 0:
+            cute.arch.mbarrier_wait(done, 0)
 
     @cute.jit
     def epilogue_partials(
@@ -889,6 +1046,18 @@ class WideGemm:
 _COMPILED = {}
 
 
+def _non_portable_cluster(compiled, device_index):
+    """Allow cluster sizes above the portable 8 (VR200: up to 32) on ``compiled``."""
+    from ..common.host import resolve_kernel
+
+    _, function = resolve_kernel(compiled, device_index)
+    attribute = _cuda.CUfunction_attribute
+    attribute = attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+    (err,) = _cuda.cuFuncSetAttribute(function, attribute, 1)
+    if err != _cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuFuncSetAttribute(non-portable cluster): {err}")
+
+
 def permute_gate_up(weight):
     """[gate; up] rows -> per 128-row tile 64 gate rows then their 64 up rows."""
     n, k = weight.shape
@@ -912,9 +1081,10 @@ class PreparedWide:
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            v += ((1,), None, (0, 3), False, False, 1)[len(v) - 1:]
+            v += ((1,), None, (0, 3), False, False, 1, False)[len(v) - 1:]
             self.policies[r] = (
-                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), int(v[6])
+                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), int(v[6]),
+                bool(v[7]),
             )  # fmt: skip
         self.kernels, self.state = {}, {}
 
@@ -922,12 +1092,12 @@ class PreparedWide:
         dev = self.weight.device
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
-        for rows, (split, act_warps, wst, w_warps, direct, rotate, xgroup) in (
+        for rows, (split, act_warps, wst, w_warps, direct, rotate, xgroup, dsmem) in (
             self.policies.items()
         ):
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials, xgroup,
+                w_warps, direct, rotate, self.partials, xgroup, dsmem,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -952,6 +1122,8 @@ class PreparedWide:
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
+                if gemm.dsmem and 2 * split > 8:  # clusters of 2 x split CTAs
+                    _non_portable_cluster(_COMPILED[key], dev.index)
             self.kernels[rows] = _COMPILED[key]
             self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags))
         self.w = w
