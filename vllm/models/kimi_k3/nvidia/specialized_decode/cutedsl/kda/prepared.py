@@ -353,6 +353,9 @@ class KdaSplitStock(RecoverKdaSplit):
         self.narrow_fb = True
 
 
+# The FP32 KdaSplit verify kernel (the record form under the deferred protocol).
+SPLIT_STOCK = KdaSplitStock
+
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -478,7 +481,8 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     if wide:  # one or two CTAs per (request, head), or the chunked verify
         return WIDE_KINDS[wide - 1](*options)
     if not bf16_state:  # stock math (FP32 state): verify, q = 1, TP8
-        return KdaSplitStock(*options[:6])
+        split = SPLIT_STOCK if tokens > 1 else KdaSplitStock
+        return split(*options[:6])
     lean = tokens > 1 and capability in LEAN_VERIFY
     norm = verify_table("load_norm", capability, tokens).get(requests)
     return KdaSplit(*options, lean, bool(norm))
