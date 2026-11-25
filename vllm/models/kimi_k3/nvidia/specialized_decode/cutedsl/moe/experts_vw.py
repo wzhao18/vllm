@@ -93,6 +93,24 @@ def stage_vw(mma, weight_scales, activation_scales, release, done, n8, *, kind, 
     return "\n".join(code), ",".join(kinds) + ",~{memory}", values
 
 
+@asm(Uint64)
+def diag_clock():
+    """DIAG (never merge): %clock64."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
+@asm(Uint64)
+def diag_gtimer():
+    """DIAG (never merge): %globaltimer."""
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@asm()
+def diag_red(pointer, value):
+    """DIAG (never merge): fire-and-forget 64-bit add."""
+    return "red.relaxed.gpu.global.add.u64 [$0], $1;", "l,l,~{memory}", (pointer, value)
+
+
 @cute.jit
 def smem_desc_rows(pointer, sbo: cutlass.Constexpr[int]):
     """``primitives.smem_desc`` (128B-swizzled K-major) with stride byte offset
@@ -184,6 +202,38 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         self.workspace_bytes = self.ws_planes + (self.subs - 1) * self.plane_bytes
         # ``fc2_bounds``' rank x weight products stay in Int32.
         assert grid * 28 * (fc2_base * self.streams + units) < 2**31
+
+    @cute.jit
+    def dclk(self):
+        """DIAG (never merge): region start (%clock64), 0 without trace."""
+        value = Uint64(0)
+        if cutlass.const_expr(self.trace != 0):
+            value = diag_clock()
+        return value
+
+    @cute.jit
+    def dacc(self, slot: cutlass.Constexpr[int], start, count: cutlass.Constexpr[bool] = False):
+        """DIAG (never merge): lane 0 adds (%clock64 - start) (or 1 if ``count``) to
+        this warp's region ``slot`` at trace + 256 KiB + (16 cta + warp) * 128."""
+        if cutlass.const_expr(self.trace != 0):
+            end = diag_clock()
+            _, warp, lane, cta = thread()
+            if lane == 0:
+                base = Int64(self.trace) + 262144 + (Int64(cta) * 16 + warp) * 128
+                if cutlass.const_expr(count):
+                    diag_red(base + slot * 8, Uint64(1))
+                else:
+                    diag_red(base + slot * 8, end - start)
+
+    @cute.jit
+    def dset(self, slot: cutlass.Constexpr[int]):
+        """DIAG (never merge): lane 0 stores %globaltimer into region ``slot``."""
+        if cutlass.const_expr(self.trace != 0):
+            now = diag_gtimer()
+            _, warp, lane, cta = thread()
+            if lane == 0:
+                base = Int64(self.trace) + 262144 + (Int64(cta) * 16 + warp) * 128
+                diag_red(base + slot * 8, now)
 
     def tables(self, sm, window=True):
         """Streams' experts, then the sub-units' eight Int16 pair rows (as words)."""
@@ -620,6 +670,8 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         in order (``take``: the slot released after the last read) and handles each
         as the 64-row kernel handles a unit."""
         eg = (thread()[1] - 4) // 4
+        self.dset(14)
+        c_all = self.dclk()
         full = view(sm.iterator, self.off_misc + self.bar_accfull, Uint64, 16)
         empty = view(sm.iterator, self.off_misc + self.bar_accempty, Uint64, 16)
         sub0 = self.sub_starts(sm)
@@ -641,17 +693,34 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 first = sub0[stream]
                 k = sub0[stream + 1] - first
                 b = use % self.big
+                c0 = self.dclk()
                 self.sync(full.iterator + b, use // self.big & 1, True)
+                self.dacc(0 if kk < 2 else 5, c0)
                 for s in cutlass.range(k, unroll=1):
+                    c1 = self.dclk()
                     values = self.take(tmem, empty, b, s, s == k - 1)
+                    self.dacc(1 if kk < 2 else 6, c1)
                     if cutlass.const_expr(kk < 2):
-                        if self.sub_partials(workspace, values, item, ranges, s):
+                        c2 = self.dclk()
+                        owner = self.sub_partials(workspace, values, item, ranges, s)
+                        if owner:
+                            self.dacc(3, c2)
+                        else:
+                            self.dacc(2, c2)
+                        self.dacc(10, c2, True)
+                        if owner:
+                            self.dacc(12, c2, True)
+                            c3 = self.dclk()
                             tile = (first + s) * self.tiles + item % self.tiles
                             store = (sm, workspace, values, tile, parity)
                             self.store_hidden(*store, scalars[:3])
+                            self.dacc(4, c3)
                     else:
+                        c2 = self.dclk()
                         unit, tile = (first + s, item % self.jobs)
                         self.fc2(sm, workspace, output, values, unit, tile, ranges)
+                        self.dacc(7, c2)
+                        self.dacc(11, c2, True)
             offset += count
         # The pool: this group's uses offset + m (m of its parity); pmeta[b]'s phase
         # counts the earlier pool uses of the slot (m // big).
@@ -661,20 +730,33 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         while not ended:
             pool_use = offset + m
             slot = pool_use % self.big
+            c0 = self.dclk()
             self.sync(pmeta.iterator + slot, m // self.big & 1)
+            self.dacc(8, c0)
             kind, unit0, tile0 = (accmeta[4 * slot + i] for i in range(3))
             if kind != 1:  # this group's end marker
                 ended = True
             else:
                 first = sub0[unit0]
                 k = sub0[unit0 + 1] - first
+                c0 = self.dclk()
                 self.sync(full.iterator + slot, pool_use // self.big & 1, True)
+                self.dacc(5, c0)
                 for s in cutlass.range(k, unroll=1):
+                    c1 = self.dclk()
                     values = self.take(tmem, empty, slot, s, s == k - 1)
+                    self.dacc(6, c1)
+                    c2 = self.dclk()
                     self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
+                    self.dacc(7, c2)
+                    self.dacc(11, c2, True)
                 m += 2
+        self.dacc(13, c_all)
+        self.dset(15)
+        c9 = self.dclk()
         if cutlass.const_expr(self.publish):
             self.finalize(workspace, output, batch, scalars[3:], sm=sm)
+        self.dacc(9, c9)
 
     @cute.jit
     def take(self, tmem, empty, b, s, last):
