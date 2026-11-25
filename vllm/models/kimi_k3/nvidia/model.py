@@ -293,20 +293,23 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
 TOKEN_SHARD_GEMM_AR_MIN_TOKENS = 288
 
 
-def megamoe_shared_overlap_role(vllm_config: VllmConfig) -> bool:
-    """Whether this role may run the sequence-parallel shared expert concurrently with
-    an SM-capped MegaMoE grid (``reserve_sms_for_shared_expert``, the decode SP
-    measurement behind RUBIN_SHARED_OVERLAP_MAX_SMS).
+def megamoe_shared_overlap_max_tokens(vllm_config: VllmConfig) -> int | None:
+    """Largest per-rank step that runs the sequence-parallel shared expert beside an
+    SM-capped MegaMoE grid (``reserve_sms_for_shared_expert``, the decode SP measurement
+    behind RUBIN_SHARED_OVERLAP_MAX_SMS); None = every step (decode, unified serving).
 
-    Not on P/D prefill workers: their chunks are compute-bound, and the capped grid
-    cost MegaMoE ~1.3x (TP8+DCP8 NVFP4 prefill, 4K tokens/GPU: 884 -> 1182 us per
-    layer, same bucket and knob record) while the shared expert hid only part of it.
-    They keep the full grid and run the shared expert beside the routing front
-    (``KimiMoE._prefill_shared_stream``), as the DEP prefill workers do; the shared
-    output enters the same up-projection epilogue, so the result is unchanged.
-    Decided by role, no switch; decode and unified serving keep the overlap.
+    P/D prefill workers: RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS. Their large chunks are
+    compute-bound and the capped grid cost MegaMoE ~1.3x (TP8+DCP8 NVFP4 prefill, 4096
+    rows per rank: 884 -> 1182 us per layer), so those run on the full grid with the
+    shared expert after it; small steps keep the capped overlap, which is faster there.
+    Per-shape (the bucket a forward selects), decided by role, no switch; the shared
+    output enters the same up-projection epilogue either way.
     """
-    return not pd_prefill_worker(vllm_config)
+    if not pd_prefill_worker(vllm_config):
+        return None
+    from .megamoe_rubin.experts import RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
+
+    return RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
 
 
 def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
@@ -1105,13 +1108,14 @@ class KimiMoE(nn.Module):
         self._shared_overlap = (
             self.use_mega_moe
             and use_sequence_parallel
-            and megamoe_shared_overlap_role(vllm_config)
             and vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE
             and isinstance(self.shared_experts, KimiMLP)
             and not self.shared_experts.shard_sequence_parallel
         )
         if self._shared_overlap:
-            self.experts.reserve_sms_for_shared_expert()
+            self.experts.reserve_sms_for_shared_expert(
+                up_to_tokens=megamoe_shared_overlap_max_tokens(vllm_config)
+            )
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
         if self._prefill_moe is not None and self._prefill_moe.subcalls:
@@ -1522,7 +1526,9 @@ class KimiMoE(nn.Module):
         elif self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
-            if self._shared_overlap:
+            if self._shared_overlap and self.experts.shared_overlap(
+                routed_hidden_states.shape[0]
+            ):
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
                     lambda: self._routed_experts(
                         routed_hidden_states, router_output, topk_ids
