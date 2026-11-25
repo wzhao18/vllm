@@ -28,6 +28,7 @@ from cutlass._mlir.dialects import llvm, vector
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
+from ......common import m1_stamps
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32, ScalarF32
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.activation_variants import activation_accumulator
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
@@ -1536,7 +1537,14 @@ class SwapABGatedActEpilogue(KernelComponent):
         )
 
         routed_ready = cutlass.Int32(0)
+        m1w = getattr(self, "_m1e", None)
+        acc_pipeline_epi = acc_pipeline
+        if cutlass.const_expr(m1w is not None):
+            acc_pipeline_epi = _M1AccWaitTimer(acc_pipeline, m1w)
         while work_tile_info.is_valid_tile:
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_EPI_TILE)
+                m1w.vmin(m1_stamps.W_EPI_FIRST, m1_stamps.clk())
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
             if cutlass.const_expr(routed_ready_flag is not None):
@@ -1555,14 +1563,14 @@ class SwapABGatedActEpilogue(KernelComponent):
                 fc1_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
+                    acc_pipeline=acc_pipeline_epi,
                     acc_consumer_state=acc_consumer_state,
                 )
             else:
                 fc2_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
+                    acc_pipeline=acc_pipeline_epi,
                     acc_consumer_state=acc_consumer_state,
                 )
             prev_work_tile_info = work_tile_info
@@ -1587,7 +1595,11 @@ class SwapABGatedActEpilogue(KernelComponent):
                     flag_tracker.fire()
                     flag_tracker = flag_tracker.drained()
 
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_EPI_SCHED)
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_EPI_SCHED)
 
             if not publish_before_fetch:
                 # Every asynchronous store commits at issue; drain before completion or scratch reuse.
@@ -1615,6 +1627,9 @@ class SwapABGatedActEpilogue(KernelComponent):
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_EPI_TILE)
+                m1w.vmax(m1_stamps.W_EPI_LAST, m1_stamps.clk())
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
@@ -3708,3 +3723,32 @@ __all__ = [
     "make_fc2_tma_process_pipeline",
     "make_fc2_ublk_process_pipeline",
 ]
+
+
+class _M1AccWaitTimer:
+    """M1 EXPERIMENT ONLY: the accumulator pipeline with its consumer_wait timed (epilogue writer lane)."""
+
+    def __init__(self, inner, writer):
+        object.__setattr__(self, "_m1_inner", inner)
+        object.__setattr__(self, "_m1_writer", writer)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_m1_inner"), name)
+
+    def __extract_mlir_values__(self):
+        from cutlass.cutlass_dsl import extract_mlir_values
+
+        return extract_mlir_values(self._m1_inner) + extract_mlir_values(self._m1_writer)
+
+    def __new_from_mlir_values__(self, values):
+        from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
+
+        n = len(extract_mlir_values(self._m1_inner))
+        return _M1AccWaitTimer(new_from_mlir_values(self._m1_inner, values[:n]),
+                               new_from_mlir_values(self._m1_writer, values[n:]))
+
+    def consumer_wait(self, *args, **kwargs):
+        self._m1_writer.begin(m1_stamps.C_EPI_ACCWAIT)
+        result = self._m1_inner.consumer_wait(*args, **kwargs)
+        self._m1_writer.end(m1_stamps.C_EPI_ACCWAIT)
+        return result
