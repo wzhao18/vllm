@@ -1330,8 +1330,19 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             compiled: list[str] = []
             monitoring = [False]
 
-            def record(*, backend, event, fn_name, detail=None):
-                if monitoring[0]:
+            # jit_monitor._handle_jit_event's signature; count=0 events (a
+            # compile's duration, report_compile_time) are not compiles.
+            def record(
+                *,
+                backend,
+                event,
+                fn_name,
+                detail=None,
+                seconds=None,
+                gate=True,
+                count=1,
+            ):
+                if monitoring[0] and count:
                     compiled.append(f"{backend} {event}: {fn_name}")
 
             jit_monitor._handle_jit_event = record
@@ -1747,8 +1758,19 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
             compiled: list[str] = []
             monitoring = [False]
 
-            def record(*, backend, event, fn_name, detail=None):
-                if monitoring[0]:
+            # jit_monitor._handle_jit_event's signature; count=0 events (a
+            # compile's duration, report_compile_time) are not compiles.
+            def record(
+                *,
+                backend,
+                event,
+                fn_name,
+                detail=None,
+                seconds=None,
+                gate=True,
+                count=1,
+            ):
+                if monitoring[0] and count:
                     compiled.append(f"{backend} {event}: {fn_name}")
 
             jit_monitor._handle_jit_event = record
