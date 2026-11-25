@@ -177,9 +177,10 @@ def census_offset(device):
 
 
 def route_done(workspace):
-    """The route-done words (int32 [2]) of a ``scratch`` workspace."""
-    start = census_offset(workspace.device) + ROUTED_WORDS
-    return workspace[start : start + 8].view(torch.int32)
+    """The census's 16 B (int32 [4]) of a ``scratch`` workspace: the route-done
+    words are its words 2-3 (``ROUTED_WORDS``)."""
+    start = census_offset(workspace.device)
+    return workspace[start : start + 16].view(torch.int32)
 
 
 def route_mailbox(workspace):

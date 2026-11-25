@@ -33,7 +33,7 @@ from ..gemm.splitk_situ import PreparedSitu
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .experts_rubin import ROUTE_WORDS, count_image, image_chunk
-from .experts_rubin64 import ROUTED_TOTAL
+from .experts_rubin64 import ROUTED_TOTAL, ROUTED_WORDS
 from .experts_runtime import polled, rubin
 from .shared import compile_down, compile_shared, situ, weight_maps
 from .tail_runtime import CAP
@@ -186,7 +186,7 @@ class RouteSitu:
                 share = Uint32(1)
                 if cta == 0:
                     share = Uint32(ROUTED_TOTAL - (ctas - 1))
-                count_routed(done.iterator, share)
+                count_routed(done.iterator + ROUTED_WORDS // 4, share)
 
     @cute.jit
     def select(self, key, threshold, buffers, signal=None, token=None):
@@ -694,7 +694,7 @@ def compile_route(
     blocks = -(-batch // 64)
     args += (fake((blocks * PLAN_BYTES,), None, c.Uint8),) * bool(plan)
     args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal
-    args += (fake((2,), None, c.Int32),) * routed + (make_fake_stream(),)
+    args += (fake((4,), None, c.Int32),) * routed + (make_fake_stream(),)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
