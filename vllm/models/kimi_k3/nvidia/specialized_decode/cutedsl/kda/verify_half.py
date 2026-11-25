@@ -217,7 +217,9 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 if (thread // 64 < first) & (t < T):
                     gates = zeros(2, BFloat16)
                     for h in cutlass.range_constexpr(2):
-                        gates[h] = self.projected(gate, token + t, head * 128 + c + 64 * h)
+                        gates[h] = self.projected(
+                            gate, token + t, head * 128 + c + 64 * h
+                        )
                     self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
                                     token, head)  # fmt: skip
         cute.arch.griddepcontrol_launch_dependents()
