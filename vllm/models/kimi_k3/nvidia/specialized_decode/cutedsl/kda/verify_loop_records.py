@@ -222,11 +222,7 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                 # folded checkpoint written back once.
                 cute.arch.mbarrier_wait(fold_ready, phase)
                 if n > 0:
-                    u_old = zeros((2, RQ), Float32)
-                    for r in cutlass.range_constexpr(2):
-                        for t in cutlass.range_constexpr(RQ):
-                            u_old[r, t] = staged_u[(buf * RQ + t) * 128 + row0 + 4 * r]
-                    self.fold_rows(history, u_old, n, RQ, j,
+                    self.fold_rows(history, staged_u, buf * RQ * 128 + row0, n, j,
                                    (fold_keys, fold_suffix, fold_decay))  # fmt: skip
                     destination = state[Int64(slot), None, None, None]
                     for r in cutlass.range_constexpr(2):
@@ -338,31 +334,41 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
         fold_decay[key] = final_decay
 
     @cute.jit
-    def fold_rows(self, history, u_old, n, RQ: cutlass.Constexpr, j, operands):
+    def fold_rows(self, history, staged_u, base, n, j, operands):
         """``wide.KdaWide.fold`` on this thread's rows row0 + 4 r and keys
-        4 (j + 8 c) + [0, 4): the stock commit's instructions per element."""
+        4 (j + 8 c) + [0, 4): per element the stock commit's instructions,
+        fc = fma(u_t kn_t, P_t, fc) over t = n - 1 .. 0, then S = fma(S_0, D_n, fc).
+        ``staged_u[base + 128 t]``: the staged old correction of row0, token t.
+        Tokens outer (a dynamic loop over the n pending ones), the four key chunks'
+        operands loaded together per token."""
         keys, suffix, decay = operands
+        fc = zeros((2, CHUNKS, 4), Float32)
+        for i in cutlass.range(n, unroll=1):
+            t = n - 1 - i
+            u = [staged_u[base + 128 * t + 4 * r] for r in range(2)]
+            k4 = [
+                load_f32x4(keys.iterator + 128 * t + 4 * (j + 8 * c), shared=True)
+                for c in range(CHUNKS)
+            ]
+            p4 = [
+                load_f32x4(suffix.iterator + 128 * t + 4 * (j + 8 * c), shared=True)
+                for c in range(CHUNKS)
+            ]
+            for c in cutlass.range_constexpr(CHUNKS):
+                for r in cutlass.range_constexpr(2):
+                    for p in cutlass.range_constexpr(2):
+                        # (packed: IEEE per lane, the scalar mul / fma bits)
+                        update = mul2((u[r], u[r]), (k4[c][2 * p], k4[c][2 * p + 1]))
+                        acc = (fc[r, c, 2 * p], fc[r, c, 2 * p + 1])
+                        acc = fma2(update, (p4[c][2 * p], p4[c][2 * p + 1]), acc)
+                        fc[r, c, 2 * p], fc[r, c, 2 * p + 1] = acc
         for c in cutlass.range_constexpr(CHUNKS):
-            key = 4 * (j + 8 * c)
-            d4 = load_f32x4(decay.iterator + key, shared=True)
-            fc = zeros((2, 4), Float32)
-            for i in cutlass.range_constexpr(RQ):
-                t = RQ - 1 - i
-                if t < n:
-                    k4 = load_f32x4(keys.iterator + 128 * t + key, shared=True)
-                    p4 = load_f32x4(suffix.iterator + 128 * t + key, shared=True)
-                    for r in cutlass.range_constexpr(2):
-                        u = u_old[r, t]
-                        for p in cutlass.range_constexpr(2):
-                            update = mul2((u, u), (k4[2 * p], k4[2 * p + 1]))
-                            acc = (fc[r, 2 * p], fc[r, 2 * p + 1])
-                            acc = fma2(update, (p4[2 * p], p4[2 * p + 1]), acc)
-                            fc[r, 2 * p], fc[r, 2 * p + 1] = acc
+            d4 = load_f32x4(decay.iterator + 4 * (j + 8 * c), shared=True)
             for r in cutlass.range_constexpr(2):
                 for p in cutlass.range_constexpr(2):
                     pair = (history[r, c, 2 * p], history[r, c, 2 * p + 1])
                     pair = fma2(pair, (d4[2 * p], d4[2 * p + 1]),
-                                (fc[r, 2 * p], fc[r, 2 * p + 1]))  # fmt: skip
+                                (fc[r, c, 2 * p], fc[r, c, 2 * p + 1]))  # fmt: skip
                     history[r, c, 2 * p], history[r, c, 2 * p + 1] = pair
 
     @cute.jit
