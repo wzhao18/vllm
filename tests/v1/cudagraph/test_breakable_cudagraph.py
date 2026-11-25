@@ -823,3 +823,65 @@ def test_unwrap_recurses_through_nested_wrappers():
 
     assert inner.unwrap() is model
     assert outer.unwrap() is model
+
+
+def test_capture_output_store_with_sp_sharded_aux_rows():
+    """Aux hidden-state rows are not monotone in the capture size on a TP8
+    sequence-parallel prefill worker (num_tokens / 8 rows at SP sizes, num_tokens
+    below): 16384 -> 2048 rows, 12288 -> 1536, 3072 -> 3072. The eager warmup of
+    PIECEWISE sizes must not copy into buffers sized by the first size; FULL sizes
+    still store and replay their outputs."""
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils as cu
+
+    hidden = 16
+    manager = cu.ModelCudaGraphManager.__new__(cu.ModelCudaGraphManager)
+    manager.hidden_states = None
+    manager.aux_hidden_states = []
+    manager.intermediate_tensors = None
+    manager.use_breakable_cg = False
+    manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    manager.is_first_pp_rank = manager.is_last_pp_rank = True
+    manager.max_num_reqs = 8
+    manager.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1)
+    )
+
+    def aux_rows(n):
+        return n // 8 if n >= 8192 else n
+
+    def model(input_ids, positions, intermediate_tensors, **_):
+        n = input_ids.shape[0]
+        out = torch.full((n, hidden), float(n))
+        return out, [torch.full((aux_rows(n), hidden), float(n))]
+
+    descs = [
+        cu.BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, n, None)
+        for n in (16384, 12288, 3072, 1024)
+    ] + [cu.BatchExecutionDescriptor(CUDAGraphMode.FULL, n, n) for n in (8, 4)]
+
+    def fake_base_capture(self, create_forward_fn, progress_bar_desc=""):
+        for desc in descs:  # warmup pass of every size, as CudaGraphManager.capture
+            create_forward_fn(desc, warmup=True)(CUDAGraphMode.NONE)
+
+    n_max = 16384
+    input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(n_max, dtype=torch.long),
+        positions=torch.zeros(n_max, dtype=torch.long),
+        is_padding=torch.zeros(n_max, dtype=torch.bool),
+    )
+    model_state = SimpleNamespace(prepare_dummy_inputs=lambda r, t: {})
+    with (
+        patch.object(cu.CudaGraphManager, "capture", fake_base_capture),
+        patch.object(cu, "has_compiled_submodule", return_value=True),
+        patch.object(cu, "prepare_inputs_to_capture", return_value=(None, None)),
+        patch.object(cu, "set_forward_context", return_value=nullcontext()),
+    ):
+        manager.capture(
+            model, model_state, input_buffers, None, None, [], None,
+            use_aux_hidden_state_outputs=True,
+        )  # fmt: skip
+    # buffers come from the largest FULL size and hold the last FULL size's outputs
+    assert manager.hidden_states.shape == (8, hidden)
+    assert manager.aux_hidden_states[0].shape == (8, hidden)
+    assert torch.all(manager.aux_hidden_states[0][:4] == 4.0)

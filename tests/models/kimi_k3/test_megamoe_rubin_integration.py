@@ -377,6 +377,41 @@ def test_shared_overlap_sm_cap_admits_every_server_bucket(monkeypatch, world, to
         X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
 
 
+@pytest.mark.parametrize("world,tokens", [(8, 8192), (8, 2048), (16, 8192)])
+def test_prefill_full_grid_beside_shared_expert(monkeypatch, world, tokens):
+    """P/D prefill workers (full_grid_beside_shared_expert): every bucket keeps the
+    full grid and its knobs (no extra capped bucket, no extra arena share), the layer
+    is marked sequence-parallel, shared_overlap() is False at every size (the caller
+    overlaps by stream priority); refused after the runtime is built or on a capped
+    bucket."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import die_local
+
+    monkeypatch.setattr(die_local, "current_die_sm_mask32", lambda: None)
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
+    buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)
+    module = SimpleNamespace(
+        bucket=buckets[-1], buckets=buckets, kernel_weights=None, prefix="layer",
+        prefill_worker=True, max_num_tokens=tokens, dp_size=1,
+        sequence_parallel=False,
+    )  # fmt: skip
+    X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(module)
+    assert module.buckets == buckets and module.sequence_parallel
+    assert all(b.max_sm_count is None for b in module.buckets)
+    module.select_bucket = lambda n: X.KimiK3MegaMoEExperts.select_bucket(module, n)
+    for n in (1, 1024, tokens):
+        assert X.KimiK3MegaMoEExperts.shared_overlap(module, n) is False
+    module.kernel_weights = object()
+    with pytest.raises(RuntimeError):
+        X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(module)
+    capped = SimpleNamespace(
+        buckets=(dataclasses.replace(buckets[-1], max_sm_count=148),),
+        kernel_weights=None, prefix="layer",
+    )  # fmt: skip
+    with pytest.raises(RuntimeError):
+        X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(capped)
+
+
 def test_server_bucket_without_knob_record_borrows_nearest():
     """No EP4 genphase record: the nearest tuned contract's knobs are borrowed
     (juntian #21, for redundant experts / EP sizes without records), with a note."""
@@ -997,7 +1032,9 @@ def test_model_picks_experts_class(backend, cls):
     assert kimi_model.mega_moe_experts_cls(cfg) is cls
 
 
-def test_moe_token_shard_accepts_rubin(monkeypatch):
+def test_prefill_worker_sequence_parallel_on_rubin(monkeypatch):
+    """A P/D prefill worker on the Rubin MegaMoE (TP8, EP, DP1) runs sequence
+    parallelism, as every other role does."""
     monkeypatch.setattr(kimi_model, "pd_prefill_worker", lambda cfg: True)
     cfg = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend=KIMI_K3_MEGA_MOE),
@@ -1008,7 +1045,7 @@ def test_moe_token_shard_accepts_rubin(monkeypatch):
             tensor_parallel_size=8,
         ),
     )
-    assert kimi_model.use_moe_token_shard(cfg)
+    assert kimi_model.use_sequence_parallel(cfg)
 
 
 def test_deep_gemm_header_install_skips_rubin(monkeypatch):

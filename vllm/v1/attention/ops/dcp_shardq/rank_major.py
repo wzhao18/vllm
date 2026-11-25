@@ -14,17 +14,28 @@ rank ``r``'s region of ``region_rows`` rows holds, for each prefill request
 
 Per layer, each rank
 
-1. after the barrier that opens the indexer's gather (every peer is done
-   reading the previous layer's workspace), copies its own context rows from
-   its DCP-local paged cache into its own region (``pack``: local HBM only);
+1. once every peer is done reading the previous layer's workspace, copies its
+   own context rows from its DCP-local paged cache into its own region
+   (``pack``: local HBM only);
 2. lets the copy engine copy that region's context rows into the same region
-   of every peer's workspace, on a side stream, while the indexer runs; then
-   a one-warp kernel on that stream, ordered after the copies, stores the
-   layer's epoch into each peer's flag word (a system-scope release store
-   over NVLink: ``cuStreamWriteValue32`` into a peer's memory fails with
+   of every peer's workspace, on a side stream; then a one-warp kernel on that
+   stream, ordered after the copies, stores 1 into this rank's "landed" word on
+   each peer (a system-scope release store over NVLink:
+   ``cuStreamWriteValue32`` into a peer's memory fails with
    CUDA_ERROR_INVALID_VALUE when the peer is on another MNNVL node);
 3. before the sparse attention, waits on its own stream until every peer's
-   flag word holds the epoch (``cuStreamWaitValue32``).
+   landed word holds 1 (``cuStreamWaitValue32``).
+
+The context rows do not depend on the step's tokens, so steps 1-2 of a layer
+run a DSA layer ahead (``prefetch``): right after the previous DSA layer's
+sparse attention (or, for the step's first DSA layer, at the start of the
+forward), under the layers in between, instead of after the indexer's barrier
+of their own layer. A rank that finished reading its workspace stores 1 into
+its "done" word on every peer; a prefetch's copies wait until every peer's
+done word holds 1. Each flag word is reset to 0 by the rank that waited on it
+before that rank's next store can make the peer set it again, so the waits
+compare against a constant and stay correct when a CUDA graph replays them
+(an increasing epoch would be baked into the graph at capture).
 
 No SM runs a copy or spins on a flag. Every rank writes all new tokens' rows
 into its own workspace itself (``kv_insert``), at the rows ``slot_mapping``
@@ -33,7 +44,6 @@ or one whose rank-major rows exceed a region, keeps the token-ordered layout
 and the SM push of ``gather.py``.
 """
 
-import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -247,8 +257,9 @@ RANK_MAJOR_PACK_KERNEL = RankMajorPackKernel()
 
 
 class RankMajorSignalKernel(VllmTritonJitKernel["RankMajorSignalKernel.CompileKey"]):
-    """Store ``epoch`` into this rank's flag word on every peer (release, system
-    scope), after the copies queued before it on the same stream."""
+    """Store ``epoch`` (the flag value, 1) into this rank's flag word on every
+    peer (release, system scope), after the work queued before it on the same
+    stream."""
 
     @dataclass(frozen=True)
     class CompileKey:
@@ -333,18 +344,23 @@ def pack(
 
 @dataclass
 class _Flags:
-    # int32 [world] on every rank: word p is rank p's epoch of its last copy
-    # into this rank.
+    # int32 [2 * world] on every rank: word p is 1 once rank p's copies into
+    # this rank landed ("landed"), word world + p is 1 once rank p finished
+    # reading its own workspace ("done"); the rank that waits on a word resets
+    # it to 0.
     local: torch.Tensor
-    # This rank's word on every peer.
-    peer_addrs: list[int]
-    # int64 [world]: ``peer_addrs`` on the device, for the signal kernel.
-    peer_addrs_gpu: torch.Tensor
+    # int64 [world]: this rank's landed word on every peer, for the signal
+    # kernel.
+    landed_addrs_gpu: torch.Tensor
+    # int64 [world]: this rank's done word on every peer.
+    done_addrs_gpu: torch.Tensor
 
 
 _flags: dict[str, _Flags] = {}
-_epochs: dict[str, itertools.count] = {}
 _side_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+# The value a rank stores into a peer's flag word; the waiter resets it to 0.
+_SET = 1
 
 
 def reserve_flags(group, world: int, rank: int, device: torch.device) -> _Flags:
@@ -354,24 +370,38 @@ def reserve_flags(group, world: int, rank: int, device: torch.device) -> _Flags:
     key = group.group_name
     flags = _flags.get(key)
     if flags is None:
-        buf = _symm_buffer(group, "dcp_shardq_flags", world, torch.int32, device)
-        buf.storage[:world].zero_()
+        buf = _symm_buffer(group, "dcp_shardq_flags", 2 * world, torch.int32, device)
+        buf.storage[: 2 * world].zero_()
         torch.accelerator.synchronize()
         # Every rank zeroed its words before any peer can write them.
         buf.handle.barrier()
         torch.accelerator.synchronize()
-        peer_addrs = [
-            int(buf.handle.get_buffer(peer, [world], torch.int32, 0).data_ptr())
-            + rank * 4
+        base = [
+            int(buf.handle.get_buffer(peer, [2 * world], torch.int32, 0).data_ptr())
             for peer in range(world)
         ]
+        landed = [b + rank * 4 for b in base]
+        done = [b + (world + rank) * 4 for b in base]
         flags = _flags[key] = _Flags(
-            buf.storage[:world],
-            peer_addrs,
-            torch.tensor(peer_addrs, dtype=torch.int64, device=device),
+            buf.storage[: 2 * world],
+            torch.tensor(landed, dtype=torch.int64, device=device),
+            torch.tensor(done, dtype=torch.int64, device=device),
         )
-        _epochs[key] = itertools.count(1)
     return flags
+
+
+# Streams the copies into the peers alternate between (the side stream first).
+COPY_STREAMS = 2
+_extra_streams: dict[torch.device, list[torch.cuda.Stream]] = {}
+
+
+def _extra_copy_streams(device: torch.device) -> list[torch.cuda.Stream]:
+    streams = _extra_streams.get(device)
+    if streams is None:
+        streams = _extra_streams[device] = [
+            torch.cuda.Stream(device=device) for _ in range(COPY_STREAMS - 1)
+        ]
+    return streams
 
 
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
@@ -389,39 +419,78 @@ def _check(result) -> None:
         raise RuntimeError(f"CUDA driver call failed: {err}")
 
 
+def _wait_words(
+    stream: torch.cuda.Stream, flags: _Flags, first: int, rank: int, reset: bool
+) -> None:
+    """Order ``stream`` after every peer's word ``first + peer`` of this rank's
+    flags holds 1; with ``reset``, then store 0 into each of them."""
+    from cuda.bindings import driver
+
+    handle = driver.CUstream(stream.cuda_stream)
+    base = flags.local.data_ptr() + 4 * first
+    world = flags.landed_addrs_gpu.shape[0]
+    for peer in range(world):
+        if peer == rank:
+            continue
+        _check(
+            driver.cuStreamWaitValue32(
+                handle,
+                driver.CUdeviceptr(base + 4 * peer),
+                _SET,
+                driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ,
+            )
+        )
+    if reset:
+        _reset_words(stream, flags, first, rank)
+
+
+def _reset_words(
+    stream: torch.cuda.Stream, flags: _Flags, first: int, rank: int
+) -> None:
+    """Store 0 into this rank's flag words ``first + peer`` (local memory)."""
+    from cuda.bindings import driver
+
+    handle = driver.CUstream(stream.cuda_stream)
+    base = flags.local.data_ptr() + 4 * first
+    world = flags.landed_addrs_gpu.shape[0]
+    for peer in range(world):
+        if peer == rank:
+            continue
+        _check(
+            driver.cuStreamWriteValue32(
+                handle,
+                driver.CUdeviceptr(base + 4 * peer),
+                0,
+                driver.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT,
+            )
+        )
+
+
 class InFlight:
     """One layer's copies into the peers, and how to wait for theirs."""
 
-    def __init__(self, flags: _Flags, epoch: int, rank: int, done: torch.cuda.Event):
+    def __init__(self, flags: _Flags, rank: int, done: torch.cuda.Event):
         self.flags = flags
-        self.epoch = epoch
         self.rank = rank
         self.done = done
         self.waited = False
 
     def wait(self) -> None:
         """Order the current stream after every peer's copies into this rank
-        (and this rank's own copies, so the next layer may reuse its region)."""
+        (and this rank's own copies, so the next layer may reuse its region).
+        The landed words stay set until ``release`` resets them."""
         if self.waited:
             return
-        from cuda.bindings import driver
-
         stream = torch.cuda.current_stream()
-        handle = driver.CUstream(stream.cuda_stream)
-        base = self.flags.local.data_ptr()
-        for peer in range(self.flags.local.shape[0]):
-            if peer == self.rank:
-                continue
-            _check(
-                driver.cuStreamWaitValue32(
-                    handle,
-                    driver.CUdeviceptr(base + 4 * peer),
-                    self.epoch,
-                    driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
-                )
-            )
+        _wait_words(stream, self.flags, 0, self.rank, reset=False)
         stream.wait_event(self.done)
         self.waited = True
+
+
+def release(flags: _Flags, rank: int) -> None:
+    """After a layer's sparse attention, when no prefetch follows in the step:
+    reset the landed words its wait read, on the current stream."""
+    _reset_words(torch.cuda.current_stream(), flags, 0, rank)
 
 
 def copy_to_peers(
@@ -431,32 +500,62 @@ def copy_to_peers(
     row_bytes: int,
     after: torch.cuda.Event,
     device: torch.device,
+    pack_args: tuple | None = None,
+    after_layer: bool = False,
 ) -> InFlight:
-    """On the side stream, once ``after`` (the pack) completed: copy this
-    rank's region's context rows into every peer's workspace with the copy
-    engine, then publish the epoch into each peer's flag word for this rank
-    (``RANK_MAJOR_SIGNAL_KERNEL``: stream memory operations cannot write a
-    peer on another MNNVL node)."""
+    """On the side stream, once ``after`` completed: copy this rank's region's
+    context rows into every peer's workspace with the copy engine, then set
+    this rank's landed word on each peer (``RANK_MAJOR_SIGNAL_KERNEL``: stream
+    memory operations cannot write a peer on another MNNVL node).
+
+    ``after`` is the pack (the indexer's gather, behind its barrier), or, for a
+    prefetch, the previous DSA layer's sparse attention (``after_layer``) or
+    the start of the forward. A prefetch packs on the side stream
+    (``pack_args``: ``pack``'s arguments after the plan). After a layer it
+    first resets the landed words that layer's wait read, sets this rank's done
+    word on every peer, and waits until every peer set its done word here
+    (then resets them): no peer still reads the workspace region its copies
+    overwrite. At the start of the forward the step's collectives already
+    ordered every peer's reads of the previous step before it."""
     from cuda.bindings import driver
 
-    flags = reserve_flags(group, plan.world, plan.rank, device)
-    # cuStreamWaitValue32's GEQ compares (int32)(word - epoch) >= 0: wraps.
-    epoch = next(_epochs[group.group_name]) & 0xFFFFFFFF
+    world, rank = plan.world, plan.rank
+    flags = reserve_flags(group, world, rank, device)
     side = _side_stream(device)
     side.wait_event(after)
-    handle = driver.CUstream(side.cuda_stream)
-    rank = plan.rank
+    if after_layer:
+        _reset_words(side, flags, 0, rank)
+        with torch.cuda.stream(side):
+            RANK_MAJOR_SIGNAL_KERNEL(flags.done_addrs_gpu, rank, _SET, world)
+    if pack_args is not None:
+        with torch.cuda.stream(side):
+            pack(plan, *pack_args)
+    if after_layer:
+        _wait_words(side, flags, world, rank, reset=True)
     region = rank * plan.region_rows
     spans = [
         ((region + int(start)) * row_bytes, int(rows) * row_bytes)
-        for start, rows in zip(plan.starts.tolist(), plan.context_rows[:, rank].tolist())
+        for start, rows in zip(
+            plan.starts.tolist(), plan.context_rows[:, rank].tolist()
+        )
         if rows
     ]
     local = workspace_peer_ptrs[rank]
-    for peer in range(plan.world):
-        if peer == rank:
-            continue
+    # Peers in rotated order (rank + 1 first): at each step every rank copies
+    # into a different peer, instead of all ranks into the same one. The peers
+    # alternate between COPY_STREAMS streams, so the copy engines have the next
+    # copy queued while one completes.
+    streams = [side] + _extra_copy_streams(device)
+    if len(streams) > 1:
+        forked = torch.cuda.Event()
+        forked.record(side)
+        for stream in streams[1:]:
+            stream.wait_event(forked)
+    handles = [driver.CUstream(stream.cuda_stream) for stream in streams]
+    for step in range(1, world):
+        peer = (rank + step) % world
         remote = workspace_peer_ptrs[peer]
+        handle = handles[(step - 1) % len(handles)]
         for offset, nbytes in spans:
             _check(
                 driver.cuMemcpyDtoDAsync(
@@ -466,14 +565,12 @@ def copy_to_peers(
                     handle,
                 )
             )
+    for stream in streams[1:]:
+        joined = torch.cuda.Event()
+        joined.record(stream)
+        side.wait_event(joined)
     with torch.cuda.stream(side):
-        # The epoch's int32 bit pattern (the waits compare it as an int32).
-        RANK_MAJOR_SIGNAL_KERNEL(
-            flags.peer_addrs_gpu,
-            rank,
-            epoch - (1 << 32) if epoch >= 1 << 31 else epoch,
-            plan.world,
-        )
+        RANK_MAJOR_SIGNAL_KERNEL(flags.landed_addrs_gpu, rank, _SET, world)
     done = torch.cuda.Event()
     done.record(side)
-    return InFlight(flags, epoch, rank, done)
+    return InFlight(flags, rank, done)

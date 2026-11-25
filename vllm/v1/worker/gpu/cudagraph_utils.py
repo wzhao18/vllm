@@ -683,7 +683,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                         torch.empty_like(x) for x in aux_hidden_states
                     ]
                 for i, aux in enumerate(aux_hidden_states):
-                    self.aux_hidden_states[i][:num_tokens] = aux
+                    # Aux hidden states keep their own row count: under sequence
+                    # parallelism (large prefill steps) each rank holds
+                    # num_tokens / TP rows, not num_tokens.
+                    rows = aux.shape[0]
+                    if rows > self.aux_hidden_states[i].shape[0]:
+                        raise RuntimeError(
+                            f"capture size {num_tokens}: aux hidden state {i} has "
+                            f"{rows} rows, its capture buffer "
+                            f"{self.aux_hidden_states[i].shape[0]} (allocated by the "
+                            "first captured size)."
+                        )
+                    self.aux_hidden_states[i][:rows] = aux
             else:
                 # Non-last PP rank.
                 assert isinstance(model_output, IntermediateTensors)
@@ -808,7 +819,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # model outputs. No need to keep track of the hidden states.
                     return None
 
-                store_capture_output(num_tokens, model_output)
+                # Only FULL replays read the stored outputs (run_fullgraph). The
+                # eager warmup of a PIECEWISE size stores nothing: its outputs need
+                # not fit the buffers (aux hidden states of SP-sharded sizes have
+                # num_tokens / TP rows, other sizes num_tokens).
+                if desc.cg_mode != CUDAGraphMode.PIECEWISE:
+                    store_capture_output(num_tokens, model_output)
 
             return forward_fn
 

@@ -288,7 +288,11 @@ def _check_workspace(
     byte still holds it. With a ``rank_major`` plan the MLA rows are
     rank-major (dcp_shardq.rank_major): token t of request q at row
     (t % W) * region_rows + starts[q] + t // W."""
-    workspaces = {"mla": ws_mla, "index": ws_index}
+    workspaces = {
+        name: ws
+        for name, ws in (("mla", ws_mla), ("index", ws_index))
+        if ws is not None
+    }
     expected = {
         name: torch.full_like(_flat(ws), FILL) for name, ws in workspaces.items()
     }
@@ -300,6 +304,8 @@ def _check_workspace(
         tokens = torch.arange(context + new, device="cuda")
         for section in _sections(rep.layout):
             name, offset, row = section
+            if name not in workspaces:
+                continue
             keep = tokens if name == "index" or new_mla_rows else tokens[:context]
             cache, src = rep.token_bytes(q, keep, section)
             if name == "mla" and rank_major is not None:
@@ -317,7 +323,7 @@ def _check_workspace(
                 dst = dst.reshape(-1)
             expected[name][dst] = _flat(cache)[src.reshape(-1)]
             written[name][dst] = True
-    for name, ws in (("mla", ws_mla), ("index", ws_index)):
+    for name, ws in workspaces.items():
         if fill:
             assert torch.equal(_flat(ws), expected[name])
         else:
@@ -870,6 +876,107 @@ def test_dense_mha_step_mqa_rows_beyond_the_lse_slab():
     assert torch.equal(lse, ref_lse)
 
 
+# The DCP path's most rows per launch at Kimi K3.1 C512 prefill under DCP
+# ShardQ (dcp_path_max_rows: dcp_fallback_max_tokens).
+DCP_PATH_ROWS = 2048
+
+
+def _dcp_path_cubins_worker(rank):
+    """In a fresh process (no cubin loaded yet): the DCP ShardQ warmup of the
+    trtllm-gen DCP path loads cubins, after which the layer's DCP-path launch
+    (``_forward_mqa_kernel``, K3.1's 96 gathered heads padded to 128, LSE)
+    of every row count up to ``DCP_PATH_ROWS``, on real inputs, loads none."""
+    try:
+        from vllm.utils import jit_monitor
+        from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
+
+        device = torch.device("cuda", 0)
+        workspace = fims._get_workspace_buffer(
+            device,
+            fims.compute_trtllm_sparse_mla_workspace_bytes(
+                fims._DEFAULT_WORKSPACE_BUFFER_SIZE, 8, NUM_HEADS // 8, DCP_PATH_ROWS
+            ),
+        )
+        heads = fims.trtllm_gen_query_heads(NUM_HEADS)
+        fims._reserve_kv_counters(device, DCP_PATH_ROWS, heads)
+        loads: list[str] = []
+
+        def record(*, backend, event, fn_name, count=1, **_):
+            if backend == "FlashInfer cubin" and count:
+                loads.append(fn_name)
+
+        jit_monitor._handle_jit_event = record
+        jit_monitor.activate()
+
+        fims.TRTLLM_GEN_DCP_PATH_CUBINS.warmup(
+            max_rows=DCP_PATH_ROWS,
+            num_heads=heads,
+            dtype=torch.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            topk_capacity=TOPK,
+            topk_lens=False,
+        )
+        # The multi-CTA KV split forms (few rows) and the others.
+        warmed = set(loads)
+        assert any("MultiCtasKv" in name for name in warmed), warmed
+        assert any("MultiCtasKv" not in name for name in warmed), warmed
+        loads.clear()
+
+        impl = _flashinfer_impl("fp8", "trtllm", 8)
+        impl._workspace_buffer = workspace
+        num_pages = 2 * TOPK // PAGE
+        kv_cache = (torch.randn(num_pages, PAGE, 576, device="cuda") / 4).to(
+            torch.float8_e4m3fn
+        )
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        q = _fp8_query(DCP_PATH_ROWS, NUM_HEADS)
+        topk = torch.randint(
+            0,
+            num_pages * PAGE,
+            (DCP_PATH_ROWS, TOPK),
+            generator=gen,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        valid = torch.randint(
+            1,
+            TOPK + 1,
+            (DCP_PATH_ROWS,),
+            generator=gen,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for rows in range(1, DCP_PATH_ROWS + 1):
+            out, lse = impl._forward_mqa_kernel(
+                q[:rows],
+                kv_cache,
+                topk[:rows],
+                valid[:rows],
+                layer=SCALES,
+                block_size=PAGE,
+                is_decode=True,
+            )
+            assert lse is not None and out.shape == (rows, NUM_HEADS, 512)
+        torch.accelerator.synchronize()
+        assert not loads, sorted(set(loads))
+    except BaseException:
+        _exit_failed_rank()
+
+
+def test_dcp_shardq_warmup_loads_every_dcp_path_cubin():
+    """A DCP ShardQ step keeps the DCP path for its leading decode rows (and
+    the planner leaves few-token and padded steps on it): launches of any row
+    count up to dcp_path_max_rows, whose trtllm-gen kernel (multi-CTA KV split
+    or not, tile and swap-AB form) FlashInfer picks by row count and loads on
+    first use. The warmup loads all of them: no launch after it loads a
+    cubin."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_dcp_path_cubins_worker, nprocs=1)
+
+
 def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
     """One rank of a DCP = TP group: the production gather, indexer and
     attention over the gathered context against TP ShardQ over the replicated
@@ -1067,6 +1174,332 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
             _exit_failed_rank()
         finally:
             cleanup_dist_env_and_memory()
+
+
+# (context, new tokens) per request of the prefetch test: several context
+# spans per rank region, one request without context.
+PREFETCH_LENS = [(1000, 300), (513, 64), (0, 70), (4097, 37)]
+PREFETCH_LAYERS = 4
+
+
+def _prefetch_worker(rank, world, init_file):
+    """One rank of a DCP = TP group: a step of PREFETCH_LAYERS DSA layers whose
+    context MLA rows are copied a DSA layer ahead (the first at the forward
+    start). Each layer's caches hold other bytes, and the ranks attend
+    (sleep, then snapshot their workspace) for rank- and layer-dependent
+    times, so a copy into a peer still reading the previous layer, or a read
+    before every peer's copies landed, shows as wrong bytes. Eagerly, then as
+    CUDA graphs (several skews) replayed many times."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.forward_context import create_forward_context, override_forward_context
+
+    torch.accelerator.set_device_index(rank)
+    config = VllmConfig()
+    config.parallel_config.tensor_parallel_size = world
+    config.parallel_config.decode_context_parallel_size = world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        try:
+            layout = _layout("fp8")
+            plan = _build_context(PREFETCH_LENS, layout, world, rank)
+            assert plan.rank_major is not None
+            reps, shards, metadata = [], [], {}
+            for layer in range(PREFETCH_LAYERS):
+                rep = Replicated(PREFETCH_LENS, layout, fill_random=False)
+                torch.manual_seed(100 + layer)
+                rep.mla.random_(0, 256)
+                shard = _shard(rep, world, rank, seed=rank + 7 * layer)
+                name = f"model.layers.{layer}.self_attn.attn"
+                metadata[name] = SimpleNamespace(
+                    shardq=SimpleNamespace(gathered_context=plan),
+                    block_table=shard.mla_table,
+                )
+                config.compilation_config.static_forward_context[name] = (
+                    SimpleNamespace(kv_cache=shard.mla)
+                )
+                reps.append(rep)
+                shards.append(shard)
+            forward_context = create_forward_context(metadata, config)
+            snaps = [torch.empty_like(plan.mla_view(s.mla)) for s in shards]
+
+            def step(skews):
+                with override_forward_context(forward_context):
+                    plan.prefetch_first()
+                    assert len(plan._dsa_layers()) == PREFETCH_LAYERS
+                    for layer, shard in enumerate(shards):
+                        # The indexer's gather (its pack and copies prefetched).
+                        prefetched = plan.mla_prefetch
+                        assert prefetched is not None
+                        assert prefetched[0] == shard.mla.data_ptr()
+                        plan.mla_prefetch = None
+                        plan.mla_in_flight = prefetched[1]
+                        arrive, read = skews[layer]
+                        torch.cuda._sleep(arrive)
+                        plan.wait_mla()
+                        torch.cuda._sleep(read)
+                        snaps[layer].copy_(plan.mla_view(shard.mla))
+                        plan.after_attend(shard.mla)
+                    assert plan.mla_prefetch is None and plan.mla_in_flight is None
+
+            def check():
+                for layer in range(PREFETCH_LAYERS):
+                    _check_workspace(
+                        snaps[layer],
+                        None,
+                        reps[layer],
+                        new_mla_rows=False,
+                        fill=False,
+                        rank_major=plan.rank_major,
+                    )
+
+            gen = np.random.default_rng(rank)
+
+            def skews():
+                return [
+                    (int(gen.integers(0, 200_000)), int(gen.integers(0, 400_000)))
+                    for _ in range(PREFETCH_LAYERS)
+                ]
+
+            # Every peer finished the previous step before the next one starts
+            # (the step's collectives order this in a real forward).
+            for _ in range(3):
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                get_tp_group().barrier()
+                step(skews())
+                torch.accelerator.synchronize()
+                check()
+            stream = torch.cuda.Stream()
+            graphs = []
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        step(skews())
+                    graphs.append(graph)
+            torch.accelerator.synchronize()
+            get_tp_group().barrier()
+            for replay in range(60):
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                get_tp_group().barrier()
+                graphs[replay % len(graphs)].replay()
+                torch.accelerator.synchronize()
+                check()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+def test_context_rows_prefetched_a_layer_ahead(tmp_path):
+    import torch.multiprocessing as mp
+
+    world = min(torch.accelerator.device_count(), 4)
+    mp.spawn(_prefetch_worker, args=(world, str(tmp_path / "dist_init")), nprocs=world)
+
+
+# Steps of different request counts and per-rank context lengths, all fitting
+# VARYING_PAGES workspace pages: a CUDA graph captured on one replays the others.
+VARYING_PLANS = [
+    [(1000, 300), (513, 64), (0, 70), (4097, 37)],
+    [(3000, 128), (64, 64)],
+    [(200, 16), (7000, 256), (1500, 8), (0, 40), (129, 3)],
+]
+VARYING_PAGES = 256
+
+
+def _varying_plan_worker(rank, world, init_file, index_format):
+    """One rank of a DCP = TP group running a forward of PREFETCH_LAYERS DSA
+    layers the production way under a breakable CUDA graph capture
+    (FULL_AND_PIECEWISE prefill): the forward-start prefetch hook, then per
+    layer an eager-break op (as the indexer and MLA attention ops are) that
+    gathers (barrier, prefetched context MLA rows, indexer-row push), waits,
+    snapshots the whole workspace and issues the next layer's copies, with
+    captured work between the layers. Captured on one step's plan, the graph
+    replays steps of other request counts and context lengths: every replay's
+    workspaces must hold exactly that step's rows, as the eager forward's do."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.forward_context import (
+        create_forward_context,
+        get_forward_context,
+        override_forward_context,
+    )
+    from vllm.v1.attention.ops.dcp_shardq.context import (
+        _check_issue_not_captured,
+        _workspace,
+        prefetch_first_context_rows,
+    )
+
+    torch.accelerator.set_device_index(rank)
+    config = VllmConfig()
+    config.parallel_config.tensor_parallel_size = world
+    config.parallel_config.decode_context_parallel_size = world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        try:
+            layout = _layout("fp8", index_format)
+            names = [
+                f"model.layers.{layer}.self_attn.attn"
+                for layer in range(PREFETCH_LAYERS)
+            ]
+            steps = []
+            for i, lens in enumerate(VARYING_PLANS):
+                plan = _build_context(lens, layout, world, rank, VARYING_PAGES)
+                assert plan.rank_major is not None
+                reps, shards, metadata = [], [], {}
+                for layer, name in enumerate(names):
+                    rep = Replicated(lens, layout)
+                    torch.manual_seed(1000 * i + layer)
+                    rep.mla.random_(0, 256)
+                    rep.index.random_(0, 256)
+                    shard = _shard(rep, world, rank, seed=rank + 7 * layer + 50 * i)
+                    metadata[name] = SimpleNamespace(
+                        shardq=SimpleNamespace(gathered_context=plan),
+                        block_table=shard.mla_table,
+                    )
+                    reps.append(rep)
+                    shards.append(shard)
+                context = create_forward_context(
+                    metadata, config, cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
+                )
+                steps.append((plan, reps, shards, context))
+            storage = _workspace(layout, VARYING_PAGES, torch.device("cuda")).storage
+            snaps = [torch.empty_like(storage) for _ in names]
+            mla_bytes = VARYING_PAGES * layout.mla_page_bytes
+            gen = np.random.default_rng(rank)
+
+            @eager_break_during_capture
+            def layer_op(layer: int, snap: torch.Tensor) -> None:
+                forward_context = get_forward_context()
+                name = names[layer]
+                layer_metadata = forward_context.attn_metadata[name]
+                plan = layer_metadata.shardq.gathered_context
+                caches = forward_context.no_compile_layers[name]
+                plan.gather(
+                    caches.kv_cache,
+                    layer_metadata.block_table,
+                    caches.index,
+                    caches.index_table,
+                )
+                torch.cuda._sleep(int(gen.integers(0, 200_000)))
+                plan.wait_mla()
+                torch.cuda._sleep(int(gen.integers(0, 400_000)))
+                snap.copy_(storage)
+                plan.after_attend(caches.kv_cache)
+
+            between = torch.zeros(1024, device="cuda")
+
+            def forward():
+                prefetch_first_context_rows()
+                for layer in range(len(names)):
+                    layer_op(layer, snaps[layer])
+                    between.add_(1)  # captured work between the DSA layers
+
+            def enter(step):
+                plan, _, shards, context = step
+                for name, shard in zip(names, shards):
+                    config.compilation_config.static_forward_context[name] = (
+                        SimpleNamespace(
+                            kv_cache=shard.mla,
+                            index=shard.index,
+                            index_table=shard.index_table,
+                        )
+                    )
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                # Every peer finished the previous step (a real step's
+                # collectives order this).
+                get_tp_group().barrier()
+                return context
+
+            def check(step):
+                plan, reps, _, _ = step
+                torch.accelerator.synchronize()
+                assert plan.mla_prefetch is None and plan.mla_in_flight is None
+                for snap, rep in zip(snaps, reps):
+                    entry = _index_entry(layout)
+                    _check_workspace(
+                        snap[:mla_bytes].view(VARYING_PAGES, PAGE, -1),
+                        snap[mla_bytes:].view(VARYING_PAGES, PAGE, entry),
+                        rep,
+                        new_mla_rows=False,
+                        fill=False,
+                        rank_major=plan.rank_major,
+                    )
+
+            for step in steps:  # eager reference forwards
+                with override_forward_context(enter(step)):
+                    forward()
+                check(step)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                with override_forward_context(enter(steps[0])):
+                    with BreakableCUDAGraphCapture() as capture:
+                        forward()
+                check(steps[0])
+                assert capture.num_eager_breaks == 1 + len(names)
+                for replay in range(30):
+                    step = steps[(replay + 1) % len(steps)]
+                    with override_forward_context(enter(step)):
+                        capture.replay()
+                    check(step)
+                # Control: an issue point inside a captured PIECEWISE segment
+                # refuses (its plan-derived copies would replay stale).
+                graph = torch.cuda.CUDAGraph()
+                with override_forward_context(steps[0][3]):
+                    with pytest.raises(RuntimeError, match="captured into"):
+                        with torch.cuda.graph(graph, stream=stream):
+                            _check_issue_not_captured()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("index_format", INDEX_FORMATS)
+def test_breakable_graph_replays_steps_of_other_plans(index_format, tmp_path):
+    import torch.multiprocessing as mp
+
+    world = min(torch.accelerator.device_count(), 8)
+    mp.spawn(
+        _varying_plan_worker,
+        args=(world, str(tmp_path / "dist_init"), index_format),
+        nprocs=world,
+    )
 
 
 # Requests within the top-k, so every row selects all its keys: the top-k
@@ -1713,10 +2146,13 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
     ``index_format``).
 
     Its memory profile run (the layer without attention metadata) runs the DCP
-    path's collectives at the profile's size, beyond the direct workspace, so
-    the NCCL A2A connects its peers and allocates its buffers there, and warms
-    the A2A's Triton kernels: a later step that keeps the DCP path (here, one
-    that overflows the gathered-context workspace) compiles none of them.
+    path's collectives at the largest DCP-path step, which under DCP ShardQ
+    fits the direct workspaces (get_dcp_workspace_max_num_tokens): no NCCL A2A
+    over the DCP group, whose buffers the profile would have to account. A
+    later step that keeps the DCP path (here, one that overflows the
+    gathered-context workspace) runs in row chunks of that size on the direct
+    workspaces, takes no NCCL A2A and compiles none of its kernels; a pass past
+    the direct workspaces raises.
     """
     from tests.v1.attention.utils import create_vllm_config
     from vllm.config import CUDAGraphMode, set_current_vllm_config
@@ -1765,7 +2201,7 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
     # Three requests: another power-of-two bucket than the profile run's one.
     lens = LAYER_LENS
     num_tokens = sum(n for _, n in lens)
-    assert num_tokens > get_dcp_workspace_max_num_tokens(config)
+    assert num_tokens > get_dcp_workspace_max_num_tokens(config, dcp_shardq=True)
     with set_current_vllm_config(config):
         init_distributed_environment(
             world_size=world,
@@ -1838,16 +2274,22 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                     dtype=torch.bfloat16,
                 ),
             )
-            # The NCCL query gather and A2A of the largest step that can still
-            # take the DCP path (the scheduler keeps whole prefill steps within
-            # the ShardQ workspace): every local head's query, and every head's
-            # partial outputs (and LSEs), of every token.
+            # The largest step that can still take the DCP path (the scheduler
+            # keeps whole prefill steps within the ShardQ workspace) fits the
+            # direct workspaces: the profile warms no NCCL A2A.
             fallback_tokens = dcp.dcp_fallback_max_tokens(
                 config, DeepseekV32IndexerMetadataBuilder.get_decode_threshold(config)
             )
-            assert gather_sizes
-            assert max(gather_sizes) >= fallback_tokens * local_heads * 512
-            assert a2a_sizes and max(a2a_sizes) >= fallback_tokens * LAYER_HEADS * 512
+            assert fallback_tokens == get_dcp_workspace_max_num_tokens(
+                config, dcp_shardq=True
+            )
+            assert layer.dcp_manager.max_num_tokens == fallback_tokens
+            direct = layer.dcp_manager.direct_a2a
+            if direct is not None:
+                assert direct.max_num_tokens == fallback_tokens
+                assert not a2a_sizes, a2a_sizes
+            # A ShardQ layer's manager is strict from construction.
+            assert layer.use_shardq and layer.dcp_manager.strict_direct_rows
             torch.accelerator.synchronize()
 
             compiled: list[str] = []
@@ -1907,21 +2349,23 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                 index_metadata,
             )
             _layer_forward(layer, q, kv_c, k_pe, shard.mla, metadata)
-            # The step combined its outputs with the NCCL A2A.
-            assert len(a2a_sizes) > num_a2a
-            # Another number of requests and an odd number of tokens: with 4
-            # local heads, the A2A buffers' per-rank stride is then not a
-            # multiple of 16 elements.
-            num_seqs, odd_tokens = 5, num_tokens - 1
-            assert odd_tokens % 2 == 1 and odd_tokens > num_seqs
-            layer.dcp_manager.combine(
-                torch.zeros(odd_tokens, LAYER_HEADS, 512, device="cuda").bfloat16(),
-                torch.zeros(odd_tokens, LAYER_HEADS, device="cuda"),
-                seq_lens=torch.ones(num_seqs, dtype=torch.int32, device="cuda"),
-                query_start_loc=torch.tensor(
-                    [0, 1, 2, 3, 4, odd_tokens], dtype=torch.int32, device="cuda"
-                ),
-            )
+            if direct is not None:
+                # The step ran in row chunks on the direct workspaces.
+                assert len(a2a_sizes) == num_a2a, a2a_sizes[num_a2a:]
+                # A pass past them raises instead of taking the NCCL A2A.
+                odd_tokens = direct.max_num_tokens + 1
+                with pytest.raises(RuntimeError, match="DCP ShardQ"):
+                    layer.dcp_manager.combine(
+                        torch.zeros(
+                            odd_tokens, LAYER_HEADS, 512, device="cuda"
+                        ).bfloat16(),
+                        torch.zeros(odd_tokens, LAYER_HEADS, device="cuda"),
+                        seq_lens=torch.ones(1, dtype=torch.int32, device="cuda"),
+                        query_start_loc=torch.tensor(
+                            [0, odd_tokens], dtype=torch.int32, device="cuda"
+                        ),
+                    )
+                assert len(a2a_sizes) == num_a2a
             torch.accelerator.synchronize()
             monitoring[0] = False
             assert not [c for c in compiled if "_dcp_a2a" in c], compiled
@@ -1975,10 +2419,11 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
     step's peak memory stays below the profile run's, and its output is bit
     for bit the single pass's, which peaks far above it.
 
-    With ``capture_size`` (the CUDA graph capture bound, as served) the DCP
-    workspace and the chunks are that many rows, so the chunks gather and
-    combine through the direct symmetric-memory workspace while the single
-    pass, beyond it, takes the NCCL fallback; without, both take NCCL."""
+    Under DCP ShardQ the DCP workspace and the chunks are the few-token rows
+    whatever ``capture_size`` (the CUDA graph capture bound, as served), so
+    the chunks gather and combine through the direct symmetric-memory
+    workspace while the single pass (a non-strict manager here), beyond it,
+    takes the NCCL fallback."""
     from tests.v1.attention.utils import create_vllm_config
     from vllm.config import CUDAGraphMode, set_current_vllm_config
     from vllm.distributed import (
@@ -2047,15 +2492,12 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             registry.warmup()
             row_cap = layer.impl.dcp_path_max_rows
             # max_num_seqs x the indexer's decode threshold (1 token without
-            # speculation) + the ShardQ minimum - 1 = 32 x 1 + 1023, or the
-            # DCP workspace (the capture bound) if larger.
+            # speculation) + the ShardQ minimum - 1 = 32 x 1 + 1023: the DCP
+            # workspace's rows, whatever the capture bound.
             assert row_cap == trtllm_gen_lse_max_rows(config, True)
-            assert row_cap == max(1055, capture_size or 0)
+            assert row_cap == 1055
             direct = layer.dcp_manager.direct_a2a
-            if capture_size is not None:
-                assert direct is not None and direct.max_num_tokens == row_cap
-            else:
-                assert direct is None or direct.max_num_tokens < row_cap
+            assert direct is not None and direct.max_num_tokens == row_cap
             assert num_mqa == 30000 > 14 * row_cap
 
             def run(q, kv_c, k_pe, kv_cache, metadata, out) -> int:
@@ -2121,8 +2563,19 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             assert calls == [row_cap] * (num_mqa // row_cap) + [num_mqa % row_cap]
             chunked = out.clone()
 
-            # The single pass over every MQA row, as before.
+            # A ShardQ layer's strict manager caps the chunks at the direct
+            # workspace even without the impl's own bound.
+            manager = layer.dcp_manager
+            assert manager.strict_direct_rows
             layer.impl.dcp_path_max_rows = None
+            calls.clear()
+            run(*step, out)
+            assert calls == [row_cap] * (num_mqa // row_cap) + [num_mqa % row_cap]
+
+            # The single pass over every MQA row, as before: only a non-strict
+            # manager (and no impl bound) leaves the step whole, past the
+            # direct workspaces onto the NCCL fallback.
+            manager.strict_direct_rows = False
             calls.clear()
             out.fill_(0)
             single_peak = run(*step, out)
@@ -2130,20 +2583,19 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             layer.impl.dcp_path_max_rows = row_cap
 
             assert torch.isfinite(chunked).all()
-            if capture_size is None:
-                assert torch.equal(chunked, out)
-            else:
-                # The chunks combine in the direct workspace, the single pass
-                # with the NCCL A2A fallback: two combine kernels whose bf16
-                # rounding differs (on any inputs), here on ~0.15% of the
-                # outputs. Through the NCCL A2A the chunks match bit for bit.
-                err = (chunked.float() - out.float()).norm() / out.float().norm()
-                assert err < 1e-3, err
-                single = out.clone()
-                direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
-                run(*step, out)
-                direct.max_num_tokens = direct_rows
-                assert torch.equal(out, single)
+            # The chunks combine in the direct workspace, the single pass
+            # with the NCCL A2A fallback: two combine kernels whose bf16
+            # rounding differs (on any inputs), here on ~0.15% of the
+            # outputs. Through the NCCL A2A the chunks match bit for bit.
+            err = (chunked.float() - out.float()).norm() / out.float().norm()
+            assert err < 1e-3, err
+            single = out.clone()
+            # The chunks through the NCCL A2A (still a non-strict manager).
+            direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
+            run(*step, out)
+            direct.max_num_tokens = direct_rows
+            manager.strict_direct_rows = True
+            assert torch.equal(out, single)
             # Below the profile run's claim; the single pass is far above it.
             gib = 1 << 30
             print(
@@ -2162,8 +2614,8 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
 @pytest.mark.parametrize(
     "capture_size",
     [
-        pytest.param(None, id="nccl_collectives"),
-        pytest.param(2048, id="direct_collectives"),
+        pytest.param(None, id="no_capture_bound"),
+        pytest.param(2048, id="capture_bound_2048"),
     ],
 )
 def test_dense_mha_step_runs_the_dcp_path_in_row_chunks(capture_size, tmp_path):
