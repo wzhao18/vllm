@@ -1294,7 +1294,9 @@ class KimiMoE(nn.Module):
             return None
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
-        if BreakableCUDAGraphCapture.is_active():
+        # Never inside a stream capture (breakable or a whole-step graph): the side
+        # stream is not part of the capture; the shared experts then run in order.
+        if BreakableCUDAGraphCapture.is_active() or torch.cuda.is_current_stream_capturing():
             return None
         return self._prefill_shared_side_stream
 
