@@ -59,6 +59,7 @@ from ..common.primitives import (
     load_volatile,
     load_words,
     pack_pair,
+    publish_hint,
     release_tmem,
     shared_address,
     sleep_ns,
@@ -518,7 +519,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             if lane == 0:
                 if warp == 4:
                     self.stamp(6)
-                count_image(folded)
+                publish_hint(folded)  # DIAG: relaxed (no release wait on the folds)
         # One poller a warp (lane 0, acquire), backed off: the 10 grid warps on one
         # line all through FC2 (warps 2 / 3 arrive early) slowed the folds' L2 slice
         # (+6..+8 us exit with every lane polling at 64 ns). The other lanes' reads
