@@ -1188,6 +1188,194 @@ def test_context_rows_prefetched_a_layer_ahead(tmp_path):
     mp.spawn(_prefetch_worker, args=(world, str(tmp_path / "dist_init")), nprocs=world)
 
 
+# Steps of different request counts and per-rank context lengths, all fitting
+# VARYING_PAGES workspace pages: a CUDA graph captured on one replays the others.
+VARYING_PLANS = [
+    [(1000, 300), (513, 64), (0, 70), (4097, 37)],
+    [(3000, 128), (64, 64)],
+    [(200, 16), (7000, 256), (1500, 8), (0, 40), (129, 3)],
+]
+VARYING_PAGES = 256
+
+
+def _varying_plan_worker(rank, world, init_file, index_format):
+    """One rank of a DCP = TP group running a forward of PREFETCH_LAYERS DSA
+    layers the production way under a breakable CUDA graph capture
+    (FULL_AND_PIECEWISE prefill): the forward-start prefetch hook, then per
+    layer an eager-break op (as the indexer and MLA attention ops are) that
+    gathers (barrier, prefetched context MLA rows, indexer-row push), waits,
+    snapshots the whole workspace and issues the next layer's copies, with
+    captured work between the layers. Captured on one step's plan, the graph
+    replays steps of other request counts and context lengths: every replay's
+    workspaces must hold exactly that step's rows, as the eager forward's do."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.forward_context import (
+        create_forward_context,
+        get_forward_context,
+        override_forward_context,
+    )
+    from vllm.v1.attention.ops.dcp_shardq.context import (
+        _check_issue_not_captured,
+        _workspace,
+        prefetch_first_context_rows,
+    )
+
+    torch.accelerator.set_device_index(rank)
+    config = VllmConfig()
+    config.parallel_config.tensor_parallel_size = world
+    config.parallel_config.decode_context_parallel_size = world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        try:
+            layout = _layout("fp8", index_format)
+            names = [
+                f"model.layers.{layer}.self_attn.attn"
+                for layer in range(PREFETCH_LAYERS)
+            ]
+            steps = []
+            for i, lens in enumerate(VARYING_PLANS):
+                plan = _build_context(lens, layout, world, rank, VARYING_PAGES)
+                assert plan.rank_major is not None
+                reps, shards, metadata = [], [], {}
+                for layer, name in enumerate(names):
+                    rep = Replicated(lens, layout)
+                    torch.manual_seed(1000 * i + layer)
+                    rep.mla.random_(0, 256)
+                    rep.index.random_(0, 256)
+                    shard = _shard(rep, world, rank, seed=rank + 7 * layer + 50 * i)
+                    metadata[name] = SimpleNamespace(
+                        shardq=SimpleNamespace(gathered_context=plan),
+                        block_table=shard.mla_table,
+                    )
+                    reps.append(rep)
+                    shards.append(shard)
+                context = create_forward_context(
+                    metadata, config, cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
+                )
+                steps.append((plan, reps, shards, context))
+            storage = _workspace(layout, VARYING_PAGES, torch.device("cuda")).storage
+            snaps = [torch.empty_like(storage) for _ in names]
+            mla_bytes = VARYING_PAGES * layout.mla_page_bytes
+            gen = np.random.default_rng(rank)
+
+            @eager_break_during_capture
+            def layer_op(layer: int, snap: torch.Tensor) -> None:
+                forward_context = get_forward_context()
+                name = names[layer]
+                layer_metadata = forward_context.attn_metadata[name]
+                plan = layer_metadata.shardq.gathered_context
+                caches = forward_context.no_compile_layers[name]
+                plan.gather(
+                    caches.kv_cache,
+                    layer_metadata.block_table,
+                    caches.index,
+                    caches.index_table,
+                )
+                torch.cuda._sleep(int(gen.integers(0, 200_000)))
+                plan.wait_mla()
+                torch.cuda._sleep(int(gen.integers(0, 400_000)))
+                snap.copy_(storage)
+                plan.after_attend(caches.kv_cache)
+
+            between = torch.zeros(1024, device="cuda")
+
+            def forward():
+                prefetch_first_context_rows()
+                for layer in range(len(names)):
+                    layer_op(layer, snaps[layer])
+                    between.add_(1)  # captured work between the DSA layers
+
+            def enter(step):
+                plan, _, shards, context = step
+                for name, shard in zip(names, shards):
+                    config.compilation_config.static_forward_context[name] = (
+                        SimpleNamespace(
+                            kv_cache=shard.mla,
+                            index=shard.index,
+                            index_table=shard.index_table,
+                        )
+                    )
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                # Every peer finished the previous step (a real step's
+                # collectives order this).
+                get_tp_group().barrier()
+                return context
+
+            def check(step):
+                plan, reps, _, _ = step
+                torch.accelerator.synchronize()
+                assert plan.mla_prefetch is None and plan.mla_in_flight is None
+                for snap, rep in zip(snaps, reps):
+                    entry = _index_entry(layout)
+                    _check_workspace(
+                        snap[:mla_bytes].view(VARYING_PAGES, PAGE, -1),
+                        snap[mla_bytes:].view(VARYING_PAGES, PAGE, entry),
+                        rep,
+                        new_mla_rows=False,
+                        fill=False,
+                        rank_major=plan.rank_major,
+                    )
+
+            for step in steps:  # eager reference forwards
+                with override_forward_context(enter(step)):
+                    forward()
+                check(step)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                with override_forward_context(enter(steps[0])):
+                    with BreakableCUDAGraphCapture() as capture:
+                        forward()
+                check(steps[0])
+                assert capture.num_eager_breaks == 1 + len(names)
+                for replay in range(30):
+                    step = steps[(replay + 1) % len(steps)]
+                    with override_forward_context(enter(step)):
+                        capture.replay()
+                    check(step)
+                # Control: an issue point inside a captured PIECEWISE segment
+                # refuses (its plan-derived copies would replay stale).
+                graph = torch.cuda.CUDAGraph()
+                with override_forward_context(steps[0][3]):
+                    with pytest.raises(RuntimeError, match="captured into"):
+                        with torch.cuda.graph(graph, stream=stream):
+                            _check_issue_not_captured()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("index_format", INDEX_FORMATS)
+def test_breakable_graph_replays_steps_of_other_plans(index_format, tmp_path):
+    import torch.multiprocessing as mp
+
+    world = min(torch.accelerator.device_count(), 8)
+    mp.spawn(
+        _varying_plan_worker,
+        args=(world, str(tmp_path / "dist_init"), index_format),
+        nprocs=world,
+    )
+
+
 # Requests within the top-k, so every row selects all its keys: the top-k
 # kernels break ties between equal scores nondeterministically. The tiny
 # prefills (fewer tokens than 2 x the DCP size, like the engine's 5-token
