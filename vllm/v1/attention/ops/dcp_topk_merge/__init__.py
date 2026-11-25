@@ -139,10 +139,20 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
 
     from vllm.distributed import get_dcp_group
     from vllm.v1.attention.ops.cp_common import direct_cp_enabled
-    from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
+    from vllm.v1.attention.ops.dcp import (
+        dcp_shardq_configured,
+        get_dcp_workspace_max_num_tokens,
+    )
 
     group = get_dcp_group()
-    max_rows = get_dcp_workspace_max_num_tokens(vllm_config)
+    # The merge takes the indexer's decode rows (at most max_num_seqs x the
+    # decode threshold; FULL graphs pad only decode steps unless they are FULL
+    # mixed, which DCP ShardQ excludes) and, under DCP ShardQ, the few-token
+    # steps: the DCP ShardQ bound covers both on such an instance, whichever
+    # layer takes ShardQ steps. A larger step takes the exact generic merge.
+    max_rows = get_dcp_workspace_max_num_tokens(
+        vllm_config, dcp_shardq=dcp_shardq_configured(vllm_config)
+    )
     # All ranks must agree before the collective allocation, or one would
     # wait on the others (in the allocation, or later on rescue flags).
     agree = torch.tensor(
