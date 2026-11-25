@@ -489,7 +489,6 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         low = [Float32(0), Float32(0)]
         high = [Float32(0), Float32(0)]
         for slot in cutlass.range_constexpr(16):
-            store_words(source + slot * 256, (ones, ones))
             for v in cutlass.range_constexpr(2):
                 low[v] = fma(bf16(words[2 * slot + v]), scale[slot], low[v])
                 high[v] = fma(bf16(words[2 * slot + v], True), scale[slot], high[v])
@@ -507,6 +506,11 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         else:
             dst = Int64(box[0]) + (Int64(token) * 3584 + column + 4 * lane) * 2
             store_words(dst, packed)
+        # The re-arm after the unit's push: the consumer polls the pushed words, and
+        # 16 re-arm stores queued ahead of the push delayed it (B-MOE-12: re-arms
+        # ~2 us of the M512 finalize). Same words, same addresses.
+        for slot in cutlass.range_constexpr(16):
+            store_words(source + slot * 256, (ones, ones))
 
     def staged_word(self, pair, tile, warp):
         """``RubinGroupedExpertsKernel.staged_word`` in the unit layout: pair p's slot
