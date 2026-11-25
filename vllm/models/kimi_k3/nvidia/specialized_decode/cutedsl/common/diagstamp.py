@@ -46,8 +46,8 @@ def clock_store(address, when):
 @asm()
 def mio_keep(value):
     """DIAG: two SHFLs and one LDS (smem offset 0, read only): keeps the SM's MIO path busy in a poll loop."""
-    code = "{ .reg .b32 t; .reg .b32 u; shfl.sync.idx.b32 t, $0, 0, 31, -1; "
-    code += "shfl.sync.idx.b32 t, t, 1, 31, -1; ld.shared.u32 u, [0]; }"
+    code = "{ .reg .b32 t; .reg .b32 u; .reg .u32 a; mov.u32 a, 0; shfl.sync.idx.b32 t, $0, 0, 31, -1; "
+    code += "shfl.sync.idx.b32 t, t, 1, 31, -1; ld.volatile.shared.u32 u, [a]; }"
     return code, "r,~{memory}", (Int32(value),)
 
 
