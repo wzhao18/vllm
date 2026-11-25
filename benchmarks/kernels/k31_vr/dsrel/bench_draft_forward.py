@@ -235,6 +235,10 @@ def main():
         os.makedirs(args.out, exist_ok=True)
         path = os.path.join(args.out, f"forward_w{world}.csv")
         out_rows = []
+        if args.spec_only:  # the stock arm created the cuBLAS handles before capture
+            stock_forward(model, torch.zeros(max(rows), dtype=torch.int32,
+                                             device=device), rank, shard)  # fmt: skip
+            torch.accelerator.synchronize(device)
         for r in rows:
             ids = torch.randint(0, vocab, (r,), generator=shared, device=device,
                                 dtype=torch.int32)  # fmt: skip
