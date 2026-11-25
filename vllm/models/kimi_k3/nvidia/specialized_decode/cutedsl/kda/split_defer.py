@@ -5,8 +5,9 @@
 verify's records at slot 1, folded before the PDL wait; one state store (slot 0,
 after token 0) instead of q; the records of tokens 1 .. q - 1 to slot 1.
 
-Each CTA cp.asyncs the pending tokens' records (k / decay rows, its rows'
-corrections) into shared memory before the PDL wait, and folds them into its registers with ``update``'s two instructions
+Each CTA bulk-copies the head's record rows (``RECORD_BYTES``: k, decay, corrections
+of tokens 1 .. 7) into shared memory before the PDL wait when the request has
+pending tokens, and folds them into its registers with ``update``'s two instructions
 (``history *= decay``, then ``fma(k, v_new, history)``), so the folded state is bit
 for bit the checkpoint the stock protocol stores. A CTA writes its rows'
 corrections (as the RecoverSSM record mode does); partition 0 writes the head's k /
@@ -30,7 +31,7 @@ from ..common.primitives import (
 )
 from .recover import KdaSplit as RecoverKdaSplit
 from .recover import advance, mul_rn, reciprocal, sqrt_approx
-from .verify_defer import DECAY_ROW, RECORD_ROWS, V_ROW
+from .verify_defer import DECAY_ROW, RECORD_BYTES, RECORD_ROWS, V_ROW
 from .window import conv_tap
 
 
@@ -97,6 +98,7 @@ class KdaSplitDefer(RecoverKdaSplit):
                 barrier = smem.allocate(8 * owned, 8)
                 barrier = cute.recast_ptr(barrier, dtype=cutlass.Uint64)
             rec = alloc(smem, Float32, RECORD_ROWS * 128, align=128)
+            rec_barrier = smem.allocate(cutlass.Uint64, 8)
             if cutlass.const_expr(self.trigger_at_entry):
                 cute.arch.griddepcontrol_launch_dependents()
             if cutlass.const_expr(not self.early):
@@ -115,9 +117,12 @@ class KdaSplitDefer(RecoverKdaSplit):
                 state_page = page(slot)
                 conv_page = conv_state[Int64(conv_slot), None, None]
                 state_row = lambda r, c, s=state_page: at(s, head, value_base + r, c)
-                if pending > 0:  # the pending tokens' records, with the rows
-                    self.stage_records(rec, page(records), head, pending, value_base,
-                                       thread)  # fmt: skip
+                if (thread == 0) & (pending > 0):  # the head's records, with the rows
+                    cute.arch.mbarrier_init(rec_barrier, 1)
+                    cute.arch.mbarrier_init_fence()
+                    cute.arch.mbarrier_arrive_and_expect_tx(rec_barrier, RECORD_BYTES)
+                    copy_g2s(rec.iterator, at(page(records), head, 0, 0),
+                             RECORD_BYTES, rec_barrier)  # fmt: skip
                 history = zeros((self.passes, self.chunks, 4), Float32)
                 for p in cutlass.range_constexpr(self.passes):
                     row = p * self.groups + group
@@ -145,10 +150,9 @@ class KdaSplitDefer(RecoverKdaSplit):
                                 accum[3 * t + s] = accum[s]
                 nw = norm_weight[thread]
                 # the fold (before the PDL wait: records and counts are host-ordered)
+                cute.arch.barrier(barrier_id=2, number_of_threads=128)  # rec_barrier armed
                 if pending > 0:
-                    cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier(barrier_id=2, number_of_threads=128)  # staged records
-                if pending > 0:
+                    wait(rec_barrier, 0, scope="cta")
                     self.fold(history, rec, pending, value_base, group, group_lane)
 
                 cute.arch.griddepcontrol_wait()
@@ -327,30 +331,6 @@ class KdaSplitDefer(RecoverKdaSplit):
         for u in cutlass.range_constexpr(1, self.tokens):
             record_page[head, u - 1, thread] = shared_k[128 * u + thread]
             record_page[head, DECAY_ROW + u - 1, thread] = shared_decay[128 * u + thread]
-
-    @cute.jit
-    def stage_records(self, rec, record_page, head, pending, value_base, thread):
-        """cp.async of the pending tokens' k / decay rows (every column) and this
-        CTA's rows of their corrections into ``rec`` (the record page's layout)."""
-        for which in cutlass.range_constexpr(2):  # k rows 0 .., decay rows 8 ..
-            for c in cutlass.range_constexpr(2):
-                index = thread + 128 * c
-                if index < 7 * 32:
-                    r, column = index // 32, 4 * (index % 32)
-                    if r < pending:
-                        row = DECAY_ROW * which + r
-                        copy_g2s(rec.iterator + row * 128 + column,
-                                 at(record_page, head, row, column))  # fmt: skip
-        chunks: cutlass.Constexpr = self.rows // 4  # 16-byte chunks of a token's rows
-        for c in cutlass.range_constexpr(-(-7 * chunks // 128)):
-            index = thread + 128 * c
-            if index < 7 * chunks:
-                r = index // chunks
-                column = value_base + 4 * (index % chunks)
-                if r < pending:
-                    copy_g2s(rec.iterator + (V_ROW + r) * 128 + column,
-                             at(record_page, head, V_ROW + r, column))  # fmt: skip
-        cute.arch.cp_async_commit_group()
 
     @cute.jit
     def fold(self, history, rec, pending, value_base, group, group_lane):
