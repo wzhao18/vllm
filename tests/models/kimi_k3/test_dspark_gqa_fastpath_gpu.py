@@ -273,16 +273,16 @@ def _rel(out, exact):
     return (diff / exact.abs().mean()).item()
 
 
-SITE_ROWS = (6, 7, 9, 14, 21, 28, 56, 63, 70, 112, 224)
+SITE_ROWS = (6, 7, 9, 14, 21, 28, 56, 63, 70, 84, 112, 128, 224)
 
 
 def _sites_main(rank, world, device, group, tp=16):
     """GqaSites (GqaDraftFastPath's site build with the TP``tp`` GQA tables, at the
     TP``tp`` per-rank geometry, over the local world) in a CUDA graph vs the stock
-    math, at one-shot (6, 7: ring producers, polled sites), two-shot (9-63: pushing
-    producers, SiLU-fused gate/up; stored partials where the tables have none) and
-    wide (70-224: ArNormRows over stored partials) rows; three replays bitwise
-    equal."""
+    math, at one-shot (6, 7: ring producers, polled sites), two-shot (9-128: pushing
+    producers, SiLU-fused gate/up; 65-128 over the wide box; stored partials where
+    the tables have none) and wide (224: ArNormRows over stored partials) rows;
+    three replays bitwise equal."""
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.allreduce import (
