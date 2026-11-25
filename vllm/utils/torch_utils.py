@@ -921,6 +921,9 @@ def weak_ref_tensors(
     """
     if isinstance(tensors, torch.Tensor):
         return weak_ref_tensor(tensors)
+    if isinstance(tensors, list) and hasattr(tensors, "map_tensors"):
+        # A list type with metadata (e.g. Kimi K3 SpLocalAux) keeps its type.
+        return tensors.map_tensors(weak_ref_tensors)
     if isinstance(tensors, list):
         return [weak_ref_tensors(t) for t in tensors]
     if isinstance(tensors, tuple):

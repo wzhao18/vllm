@@ -8,7 +8,14 @@ the drafter then projects all rows on every rank. When the drafter supports it
 (``aux_head_rows`` / ``combine_aux_rows``), a large eager step instead gathers
 only the final hidden states and hands the drafter the local aux shards as
 ``SpLocalAux``: each rank projects its own shard's rows and all-gathers the
-projected rows. CUDA-graph captures and small steps keep the packed gather.
+projected rows. Small steps keep the packed gather.
+
+CUDA graphs: the forward is captured with ``SpLocalAux`` outputs too (the
+packed gather moved 6x the bytes of the hidden-only gather: 1.23 GB vs 205 MB
+per step at 2,048 rows per rank, TP8). A graph wrapper hands back weak
+references of its outputs (``weak_ref_tensors``), which keeps the type through
+``map_tensors``; the shard size comes from the tensors, so a replay for a
+smaller batch (same capture size) reads the same rows as the capture.
 """
 
 import torch
@@ -27,9 +34,14 @@ class SpLocalAux(list):
         self.shard = shards[0].shape[0]
         self.num_rows = num_rows
 
+    def map_tensors(self, fn) -> "SpLocalAux":
+        """The same aux states with ``fn`` applied to each shard tensor (graph
+        output weak references keep the sequence-shard type)."""
+        return SpLocalAux([fn(t) for t in self], self.num_rows)
+
 
 def use_local_aux(num_rows: int) -> bool:
-    return num_rows >= MIN_TOKENS and not torch.cuda.is_current_stream_capturing()
+    return num_rows >= MIN_TOKENS
 
 
 def local_span(start: int, end: int, shard: int, rank: int) -> tuple[int, int]:
