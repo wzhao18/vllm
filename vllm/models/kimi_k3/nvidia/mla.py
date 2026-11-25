@@ -97,7 +97,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
-from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp import MLADCPManager, dcp_shardq_configured
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -401,6 +401,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
+                # The DCP path takes only the step's decode rows (forward_impl:
+                # prefill rows run the fused prefill). On a DCP ShardQ instance
+                # FULL graphs are decode-only, so no step brings the capture
+                # size here, and the layer shares the DSA layers' workspaces.
+                dcp_shardq=dcp_shardq_configured(vllm_config),
             )
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
