@@ -102,7 +102,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         # HALF_SMEM: at most one of these CTAs per SM
         launch(
             self.kernel, args, ctas, ALL_THREADS, smem=HALF_SMEM,
-            max_number_threads=[ALL_THREADS, 1, 1], min_blocks_per_mp=2,
+            max_number_threads=[ALL_THREADS, 1, 1], min_blocks_per_mp=1,
         )  # fmt: skip
 
     @cute.kernel
