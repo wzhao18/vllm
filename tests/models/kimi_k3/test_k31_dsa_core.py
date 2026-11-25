@@ -118,6 +118,49 @@ def test_dsa_core_push(splits, heads_per_cta):
         assert bool((other == -0x80000000).all())
 
 
+@pytest.mark.parametrize("rows", [8, 16])
+def test_dsa_core_dim_split_matches_one_cta(rows):
+    """2x16s3 rows of <= 3 chunks (the pair splitting the latent dims; one pass when
+    every tile is its own piece) push bitwise the partial rows and LSEs of one CTA per
+    row (1x16, the per-tile loop) at the trtllm-gen KV CTA split of ``rows`` rows."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
+
+    base = [1, 17, 63, 64, 65, 100, 127, 128, 129, 140, 150, 160, 177, 191, 192, 0]
+    counts = (base * 2)[:rows]
+    box, sel, cnt, kv8, q8, q_scale, k_scale = _case(rows, counts, seed=rows)
+    sm_scale = 1.0 / math.sqrt(192)
+    core = DsaCore(torch.device("cuda"), cap=rows, heads=H, max_splits=8)
+    out = {}
+    for name, splits, split_min in (("1x16", 1, 4), ("2x16s3", 2, 3)):
+        part = torch.zeros(2, 1, rows, H, 512, dtype=torch.bfloat16, device="cuda")
+        lse = torch.zeros(2, 1, rows, H, dtype=torch.float32, device="cuda")
+        part.view(torch.int32).fill_(-0x80000000)
+        lse.view(torch.int32).fill_(-1)
+        core.run(
+            box,
+            sel,
+            cnt,
+            kv8.view(torch.uint8),
+            bmm1_scale=sm_scale * q_scale * k_scale,
+            bmm2_scale=k_scale,
+            part_peers=torch.tensor([part.data_ptr()], dtype=torch.int64, device="cuda"),
+            lse_peers=torch.tensor([lse.data_ptr()], dtype=torch.int64, device="cuda"),
+            box_cap=rows,
+            hpr=H,
+            parity=0,
+            rank=0,
+            rows=rows,
+            splits=splits,
+            split_min=split_min,
+            heads_per_cta=16,
+        )
+        torch.cuda.synchronize()
+        core.check()
+        out[name] = (part[0, 0].view(torch.int16).clone(), lse[0, 0].view(torch.int32).clone())
+    assert torch.equal(out["1x16"][0], out["2x16s3"][0])
+    assert torch.equal(out["1x16"][1], out["2x16s3"][1])
+
+
 # --- DCP16 on one GPU: 16 emulated ranks (the core's 16 pushes to the head owners'
 # boxes per rank), as PreparedDsa runs it (dsa_core.decode).
 W, HPR, CAP = 16, 6, 64
