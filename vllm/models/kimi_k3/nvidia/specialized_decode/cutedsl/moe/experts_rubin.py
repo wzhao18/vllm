@@ -420,10 +420,15 @@ class RubinExpertsKernel(ExpertsKernel):
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
-        dies=(), static_groups=False, fast_exchange=False,
+        dies=(), static_groups=False, fast_exchange=False, issuers=1,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
+        # issuers: threads (lane 0 of warp 0, then of warp 3) issuing the FC1 stages
+        # round robin; TMA ops of one thread complete one at a time (~0.4-0.5 us per
+        # op whatever the ring depth), so a second issuing warp overlaps two stages.
+        assert issuers in (1, 2)
+        self.issuers = issuers
         super().__init__(16, 8, experts, grid, publish, True, False, False, slots)
         if fast_exchange:
             from .experts_rubin64 import CENSUS_BYTES
@@ -722,6 +727,17 @@ class RubinExpertsKernel(ExpertsKernel):
         barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.parts * stages)
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * stages)
         ring = (sm, barriers, metadata, w2_scales)
+        slot, phase, issued = self.produce_fc1(sm, maps, w13_scales, ranges, experts, 0)
+        self.produce_fc2(sm, maps, w2_scales, ranges, experts, workspace, slot, phase, issued)
+
+    @cute.jit
+    def produce_fc1(self, sm, maps, w13_scales, ranges, experts, role: cutlass.Constexpr[int]):
+        """The FC1(A), FC1(B) stages; with ``issuers`` 2 this thread issues the
+        stages whose index is ``role`` mod 2 and only steps the ring past the others."""
+        stages, (w13, w2) = (self.stages, maps)
+        barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.parts * stages)
+        metadata = view(sm.iterator, self.off_meta, Int32, 4 * stages)
+        ring = (sm, barriers, metadata, None)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
@@ -733,13 +749,32 @@ class RubinExpertsKernel(ExpertsKernel):
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
                 chunk = ks if self.packed else 2 * ks
                 tma = (w13, w13_scales, row, chunk, offset, Int32(1024))
-                slot, phase, issued = self.issue16(ring, slot, phase, issued, None, tma)
+                if cutlass.const_expr(self.issuers == 1):
+                    slot, phase, issued = self.issue16(ring, slot, phase, issued, None, tma)
+                else:
+                    if issued % 2 == role:
+                        self.issue16(ring, slot, phase, issued, None, tma)
+                    slot += 1
+                    if slot == stages:
+                        slot, phase = (Int32(0), phase ^ 1)
+                    issued += 1
                 ks += 1
                 if ks == 14:
                     ks, tile, r = (Int32(0), tile + 1, r + 1)
                     if r == 3:
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
+        return slot, phase, issued
+
+    @cute.jit
+    def produce_fc2(
+        self, sm, maps, w2_scales, ranges, experts, workspace, slot, phase, issued
+    ):  # fmt: skip
+        """The static FC2(A) / FC2(B) tiles, the claimed pool grains, the end marker."""
+        stages, (w13, w2) = (self.stages, maps)
+        barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.parts * stages)
+        metadata = view(sm.iterator, self.off_meta, Int32, 4 * stages)
+        ring = (sm, barriers, metadata, w2_scales)
         pool = workspace.iterator + self.ws_xflag
         units = ranges[1, 1] // 42
         pooled = units * self.pool // 4 if self.grain else Int32(0)
@@ -1499,6 +1534,9 @@ class RubinExpertsKernel(ExpertsKernel):
                     self.match_fc2(sm, workspace, experts, distinct)
                 self.load_hidden16(sm, workspace, own & 1)
             elif warp == 3:
+                if cutlass.const_expr(self.issuers == 2):
+                    if lane == 0:
+                        self.produce_fc1(sm, maps, w13_scales, ranges, experts, 1)
                 self.rearm(workspace, own)
                 if cutlass.const_expr(self.fast_exchange):
                     self.rearm_peers(workspace, own & 1 ^ 1, cta)
