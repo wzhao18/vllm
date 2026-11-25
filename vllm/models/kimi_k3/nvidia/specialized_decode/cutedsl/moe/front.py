@@ -104,7 +104,7 @@ class RouteSitu:
         # ROUTED_TOTAL to the experts' route-done word (``RubinGroupedExpertsKernel``
         # routed: the experts acquire it instead of their dependency wait).
         self.routed = routed
-        assert not routed or (self.lean and polled and early == "poll")
+        assert not routed or (self.lean and polled and early in (None, False, "poll"))
 
     @cute.jit
     def __call__(self, *args):
