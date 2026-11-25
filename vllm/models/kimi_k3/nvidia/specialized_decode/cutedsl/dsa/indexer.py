@@ -1807,17 +1807,12 @@ def compile_indexer(
             from .indexer_fp4 import IndexerScoreFp4
 
             assert pitch, "the MXFP4 scorer writes DeepGEMM's layout (DCP) only"
-            # Packed: the scorer also takes the local top-N (no IndexerLocalTopk).
-            score = IndexerScoreFp4(rows, q, ctas, pitch, topk if packed else 0)
+            score = IndexerScoreFp4(rows, q, ctas, pitch)
             query = fake((rows * HEADS, DIM // 2), (DIM // 2, 1), torch.uint8)
             q_sf = fake((rows * HEADS,), (1,), torch.int32)
             key_view = fake(*keys, torch.uint8)
-            width = topk + topk // 32
-            out = fake((rows, width), (width, 1), torch.int32, 4)
-            valid = fake((rows,), (1,), torch.int32, 4)
-            counter = fake((MAX_REQUESTS,), (1,), torch.int32, 4)
             args = query, q_sf, weights, key_view, scale_view, *table, ends, scratch
-            return cute.compile(score, *args, out, valid, counter, s), None
+            score_kernel = cute.compile(score, *args, s)
         else:
             score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
             query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
@@ -1884,8 +1879,6 @@ class FusedIndexer:
         if local_topk:  # a rank's keys of a context (interleave 1)
             self.max_local_len = -(-indexer.max_model_len // indexer.dcp_world_size)
         buffers = reserve(indexer, device, max_rows, local_topk, blocks)
-        # MXFP4: tiles scored per request (the scorer zeroes it after each request)
-        self.counter = select_outputs(device, MAX_REQUESTS, 1, fill=0)[2]
         self.logits, self.tops, self.out, self.valid, self.ends, self.pitch = buffers
         self.ctas = torch.cuda.get_device_properties(device).multi_processor_count
         self.ids: torch.Tensor | None = None
@@ -1940,7 +1933,7 @@ class FusedIndexer:
         if self.fp4:
             # DsaIndex's MXFP4 query of this ``rows``-row step (fp4_query_views).
             packed, q_sf = fp4_query_views(q_fp8, rows, rows)
-            score(  # B' rows and counts too when packs(rows)
+            score(
                 to_cute(packed.reshape(rows * HEADS, DIM // 2)),
                 to_cute(q_sf.reshape(-1), 4),
                 to_cute(head_w[:rows].reshape(-1)),
@@ -1949,9 +1942,6 @@ class FusedIndexer:
                 *self._table(index_table),
                 to_cute(ends, 4),
                 to_cute(self.logits),
-                to_cute(self.out[:rows], 4),
-                to_cute(self.valid[:rows], 4),
-                to_cute(self.counter, 4),
                 stream(self.device),
             )
             return ends
@@ -2005,10 +1995,8 @@ class FusedIndexer:
         logits = logits.view(rows, self.pitch)
         if not self.packs(rows):
             return None, logits, ends
-        out, valid = self.out[:rows], self.valid[:rows]
-        if self.fp4:  # the scorer took the local top-N
-            return out, logits, ends
         _, select = self.kernels[rows, q]
+        out, valid = self.out[:rows], self.valid[:rows]
         s = stream(self.device)
         select(
             to_cute(self.logits),
