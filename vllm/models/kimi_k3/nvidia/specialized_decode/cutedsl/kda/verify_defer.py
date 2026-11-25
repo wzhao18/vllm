@@ -38,6 +38,7 @@ from ..common.primitives import (
     fma2,
     load_f32x4,
     mul2,
+    named_barrier,
     wait,
     zeros,
 )
@@ -445,17 +446,39 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                     self.stage(state, page, state_full, meta, live_items, first,
                                live + 1)  # fmt: skip
                 own_gates = zeros(2, BFloat16)
-                if thread < 128:
-                    self.loop_prologue(args, thread, token, head, offset, conv_slot,
-                                       shared_q, shared_k, shared_v, reductions,
-                                       shared_beta, own_gates, ready)  # fmt: skip
-                elif thread < 128 + 32 * 8:
+                operands = (shared_q, shared_k, shared_v, reductions, shared_beta)
+                # The stock convolution / SiLU / q-k norms in two warp groups (as
+                # HalfStock's halves): threads 0-127 token pairs [0, pairs / 2) (+ the
+                # betas and the conv window), threads 384-511 the rest, each its own
+                # named barrier; channel = thread % 128.
+                if thread < GROUP:
+                    window = (zeros((3, 3), BFloat16), zeros(3 * T, BFloat16))
+                    KdaVerifyHalfStock.half_prologue(
+                        self, args, thread, token, head, offset, conv_slot, operands,
+                        ready, (0, pairs // 2), 1, window,
+                    )  # fmt: skip
+                    self.loop_own_gates(args, token, head, thread // 64, thread % 64,
+                                        own_gates)  # fmt: skip
+                    # the other group has read its taps: overwrite the window
+                    named_barrier(3, 2 * GROUP)
+                    conv_page = args[3][Int64(conv_slot), None, None]
+                    taps, inputs = window
+                    for s in cutlass.range_constexpr(3):
+                        values = (taps[s, 1], taps[s, 2],
+                                  *(inputs[3 * t + s] for t in range(T)))  # fmt: skip
+                        channel = s * H * 128 + head * 128 + thread
+                        for i, value in enumerate(values):
+                            conv_put(conv_page, (channel, i), value)
+                elif thread < GROUP + 32 * 8:
                     self.loop_gate(args, thread // 32 - 4, lane, head, token,
                                    shared_decay, own_gates)  # fmt: skip
                     for p in cutlass.range_constexpr(pairs):
                         cute.arch.mbarrier_arrive(ready + p)
                 else:
-                    cute.arch.griddepcontrol_wait()
+                    KdaVerifyHalfStock.half_prologue(
+                        self, args, thread - 3 * GROUP, token, head, offset, conv_slot,
+                        operands, ready, (pairs // 2, pairs), 2, None, taps_read=3,
+                    )  # fmt: skip
                     self.loop_own_gates(args, token, head, thread // 64, thread % 64,
                                         own_gates)  # fmt: skip
                 cute.arch.griddepcontrol_launch_dependents()

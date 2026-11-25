@@ -335,12 +335,14 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
 
     @cute.jit
     def half_prologue(self, args, thread, token, head, offset, conv_slot, shared,
-                      ready, span, barrier_id, window):  # fmt: skip
+                      ready, span, barrier_id, window, taps_read=None):  # fmt: skip
         """``KdaVerifyLoopStock.loop_prologue`` for channel ``thread`` (0..127) and
         token pairs [span[0], span[1]) on named barrier ``barrier_id`` (each warp
         group its own); the betas with the first pair; ``window``: (taps, inputs)
         register tensors that receive the conv window's taps and inputs (the kernel
-        writes the window after the halves' exchange)."""
+        writes the window after the halves' exchange); ``taps_read``: a named barrier
+        this group arrives on (2 groups) once it holds its taps (the window writer's
+        sync before overwriting them)."""
         x, weights, bias, conv_state, f_a, beta = args[:6]
         scale = args[14]
         shared_q, shared_k, shared_v, reductions, shared_beta = shared
@@ -360,6 +362,8 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             if cutlass.const_expr(self.has_bias):
                 for t in cutlass.range_constexpr(T):
                     accum[3 * t + s] = Float32(bias[s * dim + channel])
+        if cutlass.const_expr(taps_read is not None):
+            named_barrier(taps_read, 2 * GROUP, arrive=True)
         cute.arch.griddepcontrol_wait()
         inputs = cute.make_rmem_tensor(3 * T, BFloat16)
         for t in cutlass.range_constexpr(T):
