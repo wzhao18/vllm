@@ -43,6 +43,7 @@ from ..common.primitives import (
     load_tmem,
     load_volatile,
     load_words,
+    mailbox_store,
     multicast_words,
     mx_exponent,
     mx_rescale,
@@ -153,6 +154,9 @@ TMEM_DONE = 7
 # Named barrier (``lean_route``): warp 0's unit tables are written (it arrives, every
 # other warp waits).
 ROUTED = 2
+# Named barrier (``match_fc1``): the FC1 home bits and the census rank are in shared
+# memory (all 384 threads), then warp 0's matched FC1 ranks (it arrives, others wait).
+MATCHED = 3
 
 # Descriptor start addresses are 18 bits: every MMA / tcgen05.cp operand must sit in
 # the first 256 KiB of the shared window (the dynamic base is 1 KiB in).
@@ -260,6 +264,23 @@ def die_words(dies):
     words = (len(dies) + 31) // 32
     bit = lambda i: 1 if i < len(dies) and dies[i] else 0
     return tuple(sum(bit(32 * w + i) << i for i in range(32)) for w in range(words))
+
+
+@asm(Uint64)
+def census_add(pointer, increment):
+    """Relaxed GPU-scope ``atom.add.u64`` (the die census): the value before."""
+    return (
+        "atom.relaxed.gpu.global.add.u64 $0,[$1],$2;",
+        "=l,l,l,~{memory}",
+        (pointer, Uint64(increment)),
+    )
+
+
+@asm()
+def require_below(value, bound):
+    """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
+    re-armed (``RubinExpertsKernel.matched_fc1``)."""
+    return "{ .reg .pred p; setp.ge.u32 p,$0,$1; @p trap; }", "r,r", (value, bound)
 
 
 @asm(Uint32)
@@ -420,7 +441,7 @@ class RubinExpertsKernel(ExpertsKernel):
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
-        dies=(), static_groups=False, fast_exchange=False, issuers=1,
+        dies=(), static_groups=False, fast_exchange=False, issuers=1, match_fc1=False,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
@@ -430,6 +451,17 @@ class RubinExpertsKernel(ExpertsKernel):
         assert issuers in (1, 2)
         self.issuers = issuers
         super().__init__(16, 8, experts, grid, publish, True, False, False, slots)
+        # match_fc1 (``dies``, ``fast_exchange``): FC1 die matching as the M64 kernel's
+        # (``RubinGroupedExpertsKernel.ticket`` / ``arrive`` / ``home_bits``): each CTA
+        # adds itself to the die census before the dependency wait, and the k-th CTA of
+        # die d runs the k-th FC1(A) / FC1(B) partition rank whose middle w13 stage sits
+        # on die d. Ranks, owners, peer slots and the partial-sum order are those of
+        # the die-oblivious partition (bitwise the same outputs). The census word is
+        # the M64 kernel's (same offset, re-armed by each call's last arrival).
+        self.match_fc1 = match_fc1
+        if match_fc1:
+            assert dies and fast_exchange
+            self.ws_census = (self.workspace_bytes + 15) // 16 * 16
         if fast_exchange:
             from .experts_rubin64 import CENSUS_BYTES
 
@@ -500,6 +532,9 @@ class RubinExpertsKernel(ExpertsKernel):
         # At least the unpacked five-slot size: one CTA per SM (two co-resident CTAs
         # would serialize in tcgen05.alloc while waiting on each other's partials).
         self.smem_bytes = max(self.off_misc + 5120, 212096)
+        # match_fc1: census info [4], home bits [2 lists][8 words], matched ranks [2].
+        self.off_match = self.off_misc + 5120
+        assert self.off_match + 96 <= self.smem_bytes
         # ``ExpertsGeometry`` placed the unit queue for five stages; it follows misc.
         self.off_queue = self.off_misc + 4608
         ring = self.parts * stages
@@ -995,6 +1030,7 @@ class RubinExpertsKernel(ExpertsKernel):
         group = Int32(tile >= self.tiles * ranges[1, 0])
         start = (tile - self.tiles * ranges[group, 0]) * 14
         owner = start >= ranges[group, 2]
+        cta = ranges[group, 6]  # the FC1 partition rank (``match_fc1``), else the CTA
         row = (32 * (warp & 3) + lane) * 32
         if not owner:
             slot = self.peer_slot(workspace, parity, group, cta) + row
@@ -1185,6 +1221,76 @@ class RubinExpertsKernel(ExpertsKernel):
                     scale_token
                 )
         self.group_sync(eg)
+
+    @cute.jit
+    def ticket(self, workspace):
+        """``match_fc1``, warp 2 lane 0 before the dependency wait: this CTA's census
+        add (``RubinGroupedExpertsKernel.ticket``); the value before is consumed in
+        ``matched_fc1``, so the atomic's round trip overlaps the routing wait."""
+        before = Uint64(0)
+        if (thread()[1] == 2) & (thread()[2] == 0):
+            increment = Uint64(1) + (Uint64(self.die()) << Uint64(32))
+            before = census_add(workspace.iterator + self.ws_census, increment)
+        return before
+
+    @cute.jit
+    def die(self):
+        """This SM's die (``dies``)."""
+        smid = sm_id()
+        word = Uint32(0)
+        for w in cutlass.range_constexpr(len(self.die_bits)):
+            if smid >> 5 == w:
+                word = Uint32(self.die_bits[w])
+        return Int32(word >> (smid & 31) & 1)
+
+    @cute.jit
+    def matched_fc1(self, sm, workspace, before, distinct, experts):
+        """``match_fc1``, all threads after the routed barrier: (FC1(A), FC1(B)) ranks
+        of this CTA. Warp 2 lane 0 turns its census value into (die, k) (and the call's
+        last arrival re-arms the word, ``RubinGroupedExpertsKernel.arrive``); threads
+        0 .. grid - 1 ballot the die of their rank's middle w13 stage per group; then
+        warp 0 lanes 0 / 1 ``match_rank`` the two lists."""
+        tid, warp, lane, _ = thread()
+        info = view(sm.iterator, self.off_match, Int32, 4)
+        bits = view(sm.iterator, self.off_match + 16, Uint32, 16)
+        ranks = view(sm.iterator, self.off_match + 80, Int32, 2)
+        if (warp == 2) & (lane == 0):
+            counts = before + Uint64(1)
+            arrivals = Uint32(counts & Uint64(4294967295))
+            ones = Uint32(counts >> Uint64(32))
+            require_below(arrivals, Uint32(self.grid))
+            die = self.die()
+            k = Int32(arrivals) - Int32(ones)
+            if die == 1:
+                k = Int32(ones)
+            if arrivals == Uint32(self.grid - 1):
+                base = workspace.iterator + self.ws_census
+                mailbox_store(base, (Uint32(4294967295), Uint32(4294967295)))
+            info[0], info[1] = (die, k)
+        if warp < (self.grid + 31) // 32:
+            ranges = ExpertsKernel.partition(self, distinct, tid)
+            homes = []
+            for group in cutlass.range_constexpr(2):
+                lo, hi = (ranges[group, 2], ranges[group, 3])
+                mid = (lo + hi) // 2
+                tile = 3 * ranges[group, 0] + mid // 14
+                row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
+                address = Int64(row) * 1792 + mid % 14 * 128
+                live = (tid < self.grid) & (lo < hi)
+                homes.append(live & ((address >> 21 & 1) != 0))
+            for group in cutlass.range_constexpr(2):
+                ballot = cute.arch.vote_ballot_sync(homes[group])
+                if lane == 0:
+                    bits[group * 8 + warp] = Uint32(ballot)
+        named_barrier(MATCHED, 384)
+        if warp == 0:
+            if lane < 2:
+                rows = view(sm.iterator, self.off_match + 16 + 32 * lane, Uint32, 8)
+                ranks[lane] = match_rank(rows, self.grid, info[0], info[1])
+            named_barrier(MATCHED, 384, arrive=True)
+        else:
+            named_barrier(MATCHED, 384)
+        return ranks[0], ranks[1]
 
     @cute.jit
     def match_fc2(self, sm, workspace, experts, distinct):
@@ -1440,6 +1546,9 @@ class RubinExpertsKernel(ExpertsKernel):
             generations = view(workspace.iterator, ws_generation, Int32, self.slots)
         if cutlass.const_expr(self.lean_route):
             self.route_init(sm, counters, generations)
+        before = Uint64(0)
+        if cutlass.const_expr(self.match_fc1):
+            before = self.ticket(workspace)
         source = ids
         if cutlass.const_expr(self.polled):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
@@ -1489,7 +1598,20 @@ class RubinExpertsKernel(ExpertsKernel):
         if cutlass.const_expr(self.stamp > 0):
             if tid == 0:
                 stamp_at(trace, 0)
-        ranges = self.partition(distinct, cta)
+        base = self.partition(distinct, cta)
+        # Column 6: the FC1 partition rank (``owner_sums``' peer slots and order).
+        ranges = cute.make_rmem_tensor((2, 7), Int32)
+        for g in cutlass.range_constexpr(2):
+            for i in cutlass.range_constexpr(6):
+                ranges[g, i] = base[g, i]
+            ranges[g, 6] = cta
+        if cutlass.const_expr(self.match_fc1):
+            fc1 = self.matched_fc1(sm, workspace, before, distinct, experts)
+            for g in cutlass.range_constexpr(2):
+                matched = ExpertsKernel.partition(self, distinct, fc1[g])
+                for i in cutlass.range_constexpr(4):
+                    ranges[g, i] = matched[g, i]
+                ranges[g, 6] = fc1[g]
         shift = Int32(0)
         if cutlass.const_expr(self.rotate):
             shift = ranges[0, 2] % 14

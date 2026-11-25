@@ -56,8 +56,10 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     RubinExpertsKernel,
+    census_add,
     die_words,
     nth_set,
+    require_below,
     sm_id,
     stage16,
     stamp_at,
@@ -78,23 +80,6 @@ def stage_bits(value):
 
 
 shuffle_bfly, shuffle_up = (cute.arch.shuffle_sync_bfly, cute.arch.shuffle_sync_up)
-
-
-@asm(Uint64)
-def census_add(pointer, increment):
-    """Relaxed GPU-scope ``atom.add.u64`` (the die census): the value before."""
-    return (
-        "atom.relaxed.gpu.global.add.u64 $0,[$1],$2;",
-        "=l,l,l,~{memory}",
-        (pointer, Uint64(increment)),
-    )
-
-
-@asm()
-def require_below(value, bound):
-    """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
-    re-armed (see ``arrive``)."""
-    return "{ .reg .pred p; setp.ge.u32 p,$0,$1; @p trap; }", "r,r", (value, bound)
 
 
 @cute.jit
