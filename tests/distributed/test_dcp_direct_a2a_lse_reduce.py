@@ -4,6 +4,7 @@
 
 import functools
 import os
+import sys
 import time
 from unittest.mock import MagicMock
 
@@ -1423,9 +1424,15 @@ class TestDeviceFaultWatch:
             CUDA_SUCCESS = 0
             CUDA_ERROR_NOT_READY = 600
             CUDA_ERROR_LAUNCH_FAILED = 719
+            CUDA_ERROR_ILLEGAL_ADDRESS = 700
+            CUDA_ERROR_ECC_UNCORRECTABLE = 214
+            CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED = 900
+            CUDA_ERROR_STREAM_CAPTURE_INVALIDATED = 901
+            CUDA_ERROR_STREAM_CAPTURE_IMPLICIT = 906
 
         watch = cp_common._DeviceFaultWatch.__new__(cp_common._DeviceFaultWatch)
         watch.device_index = 3
+        watch.polls = 0
         watch.driver = types.SimpleNamespace(CUresult=CUresult)
         replies = iter(CUresult[name] for name in errors)
         watch.query = lambda: next(replies)  # type: ignore[method-assign]
@@ -1445,6 +1452,53 @@ class TestDeviceFaultWatch:
         (message,) = aborted
         assert "device 3" in message and "CUDA_ERROR_LAUNCH_FAILED" in message
         assert "direct DCP" in message
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED",
+            "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED",
+            "CUDA_ERROR_STREAM_CAPTURE_IMPLICIT",
+        ],
+    )
+    def test_capture_results_are_not_faults(self, name):
+        # A query that met a stream capture is no context fault (bench forward
+        # per-case capture aborted every rank with exit 87 on 4351d8f4f0).
+        watch, aborted = self._watch([name, "CUDA_SUCCESS"])
+        assert not watch.check()
+        assert not watch.check()
+        assert aborted == []
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "CUDA_ERROR_LAUNCH_FAILED",
+            "CUDA_ERROR_ILLEGAL_ADDRESS",
+            "CUDA_ERROR_ECC_UNCORRECTABLE",
+        ],
+    )
+    def test_real_faults_abort(self, name):
+        watch, aborted = self._watch([name])
+        assert watch.check()
+        (message,) = aborted
+        assert name in message
+
+    def test_fault_after_capture_result_still_aborts(self):
+        watch, aborted = self._watch(
+            ["CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED", "CUDA_ERROR_ILLEGAL_ADDRESS"]
+        )
+        assert not watch.check()
+        assert watch.check()
+        assert len(aborted) == 1 and "CUDA_ERROR_ILLEGAL_ADDRESS" in aborted[0]
+
+    def test_classification_covers_the_driver_capture_family(self):
+        driver = pytest.importorskip("cuda.bindings.driver")
+        for name in cp_common._CAPTURE_RESULTS | cp_common._HEALTHY_RESULTS:
+            assert hasattr(driver.CUresult, name), name
+        assert (
+            cp_common._classify_cuda_result(driver.CUresult.CUDA_ERROR_ILLEGAL_ADDRESS)
+            == "fault"
+        )
 
     def test_cpu_device_starts_no_watch(self, monkeypatch):
         monkeypatch.setattr(cp_common, "_device_fault_watches", {})
@@ -1475,6 +1529,49 @@ def test_device_fault_aborts_blocked_host(tmp_path):
         process.join()
     assert process.exitcode == cp_common.DEVICE_FAULT_EXIT_CODE, process.exitcode
     assert "faulted" in stderr.read_text()
+
+
+def _capture_while_watching_worker(stderr_path: str) -> None:
+    """Capture graphs on every torch pool stream (global capture mode) while the
+    watcher polls every millisecond; replay and check the results."""
+    stderr = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(stderr, 2)
+    torch.accelerator.set_device_index(0)
+    torch.zeros(1, device="cuda")
+    cp_common._DeviceFaultWatch.POLL_S = 0.001
+    cp_common.watch_device_faults(torch.device("cuda:0"))
+    (watch,) = cp_common._device_fault_watches.values()
+    pool = [torch.cuda.Stream() for _ in range(64)]  # wraps torch's stream pool
+    # The watcher's stream is its own, never one a capture can draw.
+    assert int(watch.stream) not in {s.cuda_stream for s in pool}
+    x = torch.ones(1 << 16, device="cuda")
+    for stream in pool[:32]:
+        graph = torch.cuda.CUDAGraph()
+        start = watch.polls
+        with torch.cuda.graph(graph, stream=stream):  # capture_error_mode global
+            y = x
+            deadline = time.monotonic() + 0.01  # >= several polls per capture
+            while time.monotonic() < deadline or watch.polls < start + 2:
+                y = y + 1.0
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert watch.polls >= start + 2
+        assert torch.all(y == y[0]) and y[0].item() > 1.0
+    print(f"polls={watch.polls}", file=sys.stderr, flush=True)
+    os._exit(0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need a GPU.")
+def test_capture_while_watching_does_not_abort(tmp_path):
+    stderr = tmp_path / "worker.stderr"
+    process = mp.Process(target=_capture_while_watching_worker, args=(str(stderr),))
+    process.start()
+    process.join(timeout=110)
+    if process.is_alive():
+        process.kill()
+        process.join()
+    assert process.exitcode == 0, (process.exitcode, stderr.read_text()[-4000:])
+    assert "faulted" not in stderr.read_text()
 
 
 def _distributed_direct_a2a_worker(env: dict[str, str]) -> None:

@@ -118,6 +118,52 @@ def test_dsa_core_push(splits, heads_per_cta):
         assert bool((other == -0x80000000).all())
 
 
+@pytest.mark.parametrize("kv_ctas", [None, 1])
+@pytest.mark.parametrize("rows", [8, 16])
+def test_dsa_core_dim_split_matches_one_cta(rows, kv_ctas):
+    """2x16s3 rows of <= 3 chunks (the pair splitting the latent dims; one pass when
+    every tile is its own piece) push bitwise the partial rows and LSEs of one CTA per
+    row (1x16, the per-tile loop) at the trtllm-gen KV CTA split of ``rows`` rows, and
+    with one KV CTA (both tiles of a row one piece)."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
+
+    base = [1, 17, 63, 64, 65, 100, 127, 128, 129, 140, 150, 160, 177, 191, 192, 0]
+    counts = (base * 2)[:rows]
+    box, sel, cnt, kv8, q8, q_scale, k_scale = _case(rows, counts, seed=rows)
+    sm_scale = 1.0 / math.sqrt(192)
+    core = DsaCore(torch.device("cuda"), cap=rows, heads=H, max_splits=8)
+    out = {}
+    for name, splits, split_min in (("1x16", 1, 4), ("2x16s3", 2, 3)):
+        part = torch.zeros(2, 1, rows, H, 512, dtype=torch.bfloat16, device="cuda")
+        lse = torch.zeros(2, 1, rows, H, dtype=torch.float32, device="cuda")
+        part.view(torch.int32).fill_(-0x80000000)
+        lse.view(torch.int32).fill_(-1)
+        core.run(
+            box,
+            sel,
+            cnt,
+            kv8.view(torch.uint8),
+            bmm1_scale=sm_scale * q_scale * k_scale,
+            bmm2_scale=k_scale,
+            part_peers=torch.tensor([part.data_ptr()], dtype=torch.int64, device="cuda"),
+            lse_peers=torch.tensor([lse.data_ptr()], dtype=torch.int64, device="cuda"),
+            box_cap=rows,
+            hpr=H,
+            parity=0,
+            rank=0,
+            rows=rows,
+            splits=splits,
+            split_min=split_min,
+            kv_ctas=kv_ctas,
+            heads_per_cta=16,
+        )
+        torch.cuda.synchronize()
+        core.check()
+        out[name] = (part[0, 0].view(torch.int16).clone(), lse[0, 0].view(torch.int32).clone())
+    assert torch.equal(out["1x16"][0], out["2x16s3"][0])
+    assert torch.equal(out["1x16"][1], out["2x16s3"][1])
+
+
 # --- DCP16 on one GPU: 16 emulated ranks (the core's 16 pushes to the head owners'
 # boxes per rank), as PreparedDsa runs it (dsa_core.decode).
 W, HPR, CAP = 16, 6, 64
@@ -269,7 +315,7 @@ def _error(x, ref):
 
 @pytest.mark.parametrize("pattern", ["balanced", "skewed"])
 @pytest.mark.parametrize("rows", [8, 16])
-@pytest.mark.parametrize("variant", ["2x16s2", "1x16", "8x16s4", "4x32s2"])
+@pytest.mark.parametrize("variant", ["2x16s3", "2x16s2", "1x16", "8x16s4", "4x32s2"])
 def test_dsa_core_dcp16_merge_vs_trtllm(variant, rows, pattern):
     """DCP16 on one GPU (16 emulated ranks, interleave 1, q8 rows of 96 gathered
     heads): the 16 ranks' cores push their partial rows and base-2 LSEs into the
@@ -299,7 +345,7 @@ def test_dsa_core_dcp16_merge_vs_trtllm(variant, rows, pattern):
     assert ours_error <= 1.1 * trtllm_error + 1e-3, (ours_error, trtllm_error)
 
 
-@pytest.mark.parametrize("variant", ["2x16s2", "8x16s4"])
+@pytest.mark.parametrize("variant", ["2x16s3", "2x16s2", "8x16s4"])
 def test_dsa_core_graph_replay_alternates_parities(variant):
     """Two DSA layers on alternating DcpBox parities (each its own q mailbox and
     selection, with saturated, empty and skewed rows) captured in one CUDA graph
@@ -364,7 +410,7 @@ LOG2E = math.log2(math.e)
 
 def _emulate(q8, k8, bmm1, bmm2, kv_ctas):
     """The stock trtllm-gen sparse MLA decode of one row (FP32 emulation; probed bitwise
-    against trtllm-gen on VR200 at rows 1-64, local counts 100-2048): its KV CTA split
+    against trtllm-gen on one GPU at rows 1-64, local counts 100-2048): its KV CTA split
     (``kv_ctas`` = ops.trtllm_kv_ctas of the batch), the row's T = ceil(n / 128) tiles
     in pieces of k = ceil(T / kv_ctas) consecutive tiles. Per piece, one base-2 running
     max step per tile, P = E4M3(448 x 2^(s - m)), the piece's P V and sum (from the
@@ -411,23 +457,24 @@ def _ulps(a, b):
 
 
 @pytest.mark.parametrize("pattern", ["balanced", "skewed", "long"])
-@pytest.mark.parametrize("rows", [8, 14, 16])
+@pytest.mark.parametrize("rows", [8, 14, 16, 24, 32, 48])
 def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     """Stock precision, rank by rank (DCP16 q8 rows 8 / 14 / 16: trtllm-gen KV CTAs 8 /
-    7 / 6 on VR200, the served 2x16s2): every rank's pushed partial rows and base-2
+    7 / 6 on one GPU, the served 2x16s3): every rank's pushed partial rows and base-2
     LSEs against the stock trtllm-gen sparse MLA decode of the same rank's rows
     (attn_fi.trtllm's call), and both against the FP32 emulation of trtllm-gen's
     precision (``_emulate``), with local counts of up to 2048 (every piece size of
     trtllm-gen's KV CTA split at these rows). The old FP16-P core matched trtllm-gen
-    on 53-68% of the elements."""
+    on 53-68% of the elements. Rows 24 / 32 / 48 run the served 1x16 / 1x32."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import (
         VARIANT,
         parse_variant,
+        rows_table,
     )
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore, trtllm_kv_ctas
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    variant = parse_variant(VARIANT[8].split(":")[1])
+    variant = parse_variant(rows_table(VARIANT[8])[rows])  # the served variant
     box, sel, cnt, kv8, q8, q_scale, k_scale = _dcp_case(rows, pattern)
     sm_scale = 1.0 / math.sqrt(192)
     scales = sm_scale * q_scale * k_scale, k_scale
@@ -479,7 +526,7 @@ def test_dsa_core_serving_deadline():
 
 
 def test_trtllm_kv_ctas():
-    """trtllm-gen's KV CTAs per row as probed on VR200 (212 SMs, 128 padded heads,
+    """trtllm-gen's KV CTAs per row as probed on one GPU (212 SMs, 128 padded heads,
     2048 slots per row) and FlashInfer's rule elsewhere."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import trtllm_kv_ctas
 
@@ -506,11 +553,13 @@ def test_dsa_core_policy():
         with pytest.raises(ValueError):
             decode.parse_variant(bad)
     dsac = decode.DsacDecode(torch.device("cuda"), H)
-    assert dsac.rows == decode.ROWS == 16
-    assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 2)
-    assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 2)  # every q2-q8
+    assert dsac.rows == decode.ROWS == 48
+    assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 3)
+    assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 3)  # every q2-q8
+    assert dsac.variant(24, 8) == dsac.variant(32, 4) == (1, 16, 4)
+    assert dsac.variant(40, 8) == dsac.variant(48, 2) == (1, 32, 4)
     assert dsac.variant(8, 1) is None  # (no verify: no table)
-    assert dsac.variant(24, 8) is None  # past ROWS
+    assert dsac.variant(56, 8) is None  # past ROWS
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:4x32")
     assert every.variant(8, 4) == (1, 16, 4) and every.variant(64, 8) == (4, 32, 4)
 
@@ -572,7 +621,11 @@ def test_dsa_core_rows_source():
         def merge_source(self, batch):
             return self.source
 
-        def merge_rows(self, *args):
+        def merge_rows(self, *args, release=False, after_logits=None):
+            # The core reads its rows after its PDL wait: the merge's rescue
+            # may release it early (FlashInfer's decode must not be).
+            assert release is True
+            self.after_logits = after_logits  # (the late query fork's hook)
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
@@ -586,3 +639,9 @@ def test_dsa_core_rows_source():
         stage.source = step
         assert source.fits(64) is fits, step
     assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
+    hook = object()
+    assert source.rows(None, None, None, None, 64, q=8, after_logits=hook) == (
+        "sel",
+        "cnt",
+    )
+    assert stage.after_logits is hook

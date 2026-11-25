@@ -33,8 +33,12 @@ per-tensor FP8 MLA cache on an SM100-family GPU, at the verify lengths of ``VARI
 elsewhere (nvfp4_ds_mla, no DCP, SP) FlashInfer's chain, logged at startup.
 
 The core polls its q tiles before its PDL wait, which is safe because the kernel right
-before it never releases its dependents early: the #63 merge's rescue kernel, or
-DcpExchange's top-k (launched without PDL).
+before it releases its dependents only after its own PDL wait (the #63 merge's rescue
+kernel, ``release=True`` from ``MergeRows.rows`` only), or not early at all
+(DcpExchange's top-k, launched without PDL): the core's launch then implies every
+kernel before that one has completed (the mailbox re-arm of two DSA layers back
+included). FlashInfer's decode after the merge (``PreparedDsa.dcp_core``) reads its
+counts before its PDL wait (HELD_KERNELS), so there the rescue does not release early.
 """
 
 from __future__ import annotations
@@ -51,13 +55,14 @@ logger = init_logger(__name__)
 # B8 q8 11664 -> 11447, B1 q4 5852 -> 5601, B8 q4 9449 -> 8825.
 # Caveat: a row whose selection sits on one rank (a ~100K-way tie at the cut, e.g. all
 # index keys zero) walks its tiles serially: DCP4 skew bench B8 q8 97 -> 122 us/layer.
-# Here 16 (DL7 M8 / M16, see VARIANT): from 24 rows no variant holds up where one rank
-# holds 600 or more of a request's entries.
-ROWS = 16
+# Here 48: with one CTA per row and head group above 16 rows (1x16 to 32 rows, 1x32 to
+# 48) the core is faster than FlashInfer's chain at TP16 = DCP16 q8 on filled index
+# keys and in the all-zero-key tie case alike; above 48 rows the chain stays ahead.
+ROWS = 48
 # Core variant by rows, per verify length q: "<S>x<HG>[s<M>]" = S KV splits (one
 # cluster; rows of at most M 64-key chunks, default 4, on one CTA) per (row, HG = 16 /
 # 32 gathered heads). A q without a table keeps FlashInfer's chain.
-# Round 3 Step 0a (FP16-P core, before the stock-precision P), one SM107 GPU, DCP16
+# Round 3 Step 0a (FP16-P core, before the stock-precision P), one GPU, DCP16
 # rank shapes (96 gathered heads, q8, slots over 1M FP8 KV rows), CUPTI us per call,
 # the trtllm-gen chain (+ reduction + LSE) / 1x16 / 2x16s2 / 4x16s2 / 8x16s4, where the
 # 8 rows of one request hold X local entries and the other rows 96-155 ("bal"):
@@ -71,7 +76,7 @@ ROWS = 16
 # 7.00 / 9.59, QueryWait 1.84 (side stream). 2x16s2 at 1-16 rows: -6.0 / -6.9 us per
 # layer balanced, -2.6 / -3.8 at 384 entries, +1.0 / -0.2 at 600, +24 at 2048.
 # Stock precision (the core computes trtllm-gen's per-tile E4M3 P and BF16 partials,
-# csrc/dsa_core.cu), re-measured on one VR200 (kern-dsa bench_core, CUDA graphs, us
+# csrc/dsa_core.cu), re-measured on one GPU (kern-dsa bench_core, CUDA graphs, us
 # per call, DCP16 rank shapes q8), trtllm-gen chain / stock-precision 2x16s2 (/ the
 # FP16-P core it replaced): M8 bal 14.44 / 9.17 (/ 8.36), x256 15.10 / 9.80 (/ 9.87),
 # x384 15.13 / 14.14 (/ 12.22), x600 16.77 / 18.14 (/ 16.59), x2048 19.12 / 42.80
@@ -91,14 +96,17 @@ ROWS = 16
 # and the core is q-agnostic (rows are tokens), so one entry serves TP8 = DCP8 and TP16 =
 # DCP16; q8 keeps its original entry. TP16 q4 (TP16NV LHF): B1 5852 -> 5601, B8 9449 ->
 # 8825 us/step. DCP8 rank shapes (TP8WIDE; 96 gathered heads, 12 per rank, CUDA graphs,
-# one VR200, us per call, core / trtllm-gen chain, 2-16 rows): balanced 256 local
+# one GPU, us per call, core / trtllm-gen chain, 2-16 rows): balanced 256 local
 # entries per rank-row 9.8-10.5 / 11.0-14.8; one row at 384 14.6-14.9 / 11.0-14.8; at
 # 600 18.6-18.9 / 11.9-15.4. With the core's pushed DcpValue against the "proj" one the
 # chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to
 # -6 us per DSA layer on balanced rows, even with one row at 384 entries.
+# 2x16s3 (L1 round 6): rows of up to 3 chunks solo, the pair splitting the latent dims
+# (csrc/dsa_core.cu dsplit): 1-node DSA chain (W4, 24 heads, q8, us per layer) 2x16s2
+# / 2x16s3 + dim split, rows 8 37.27 / 36.26, rows 16 39.23 / 38.15 (Rhea 136829).
 VARIANT = {
-    **{q: "1-16:2x16s2" for q in range(2, 8)},  # q2-q7
-    8: "1-16:2x16s2",  # q8: the original entry (928a80c56b), unchanged
+    **{q: "1-16:2x16s3,17-32:1x16,33-48:1x32" for q in range(2, 8)},  # q2-q7
+    8: "1-16:2x16s3,17-32:1x16,33-48:1x32",  # q8: 1-16 the original entry (928a80c56b)
 }
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
@@ -140,10 +148,15 @@ class MergeRows:
         source, _ = self.stage.merge_source(batch)
         return source in ("merge", "exchange")
 
-    def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def rows(
+        self, *args, q: int = 1, after_logits=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
-        accepted."""
-        merged = self.stage.merge_rows(*args, q)
+        accepted. The core reads them after its PDL wait, so the merge's rescue
+        releases it early (``release``). ``after_logits``: as merge_rows'."""
+        merged = self.stage.merge_rows(
+            *args, q, release=True, after_logits=after_logits
+        )
         assert merged is not None, "merge_rows declined a step fits accepted"
         return merged
 

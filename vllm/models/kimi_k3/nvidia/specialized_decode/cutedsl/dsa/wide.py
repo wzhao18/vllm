@@ -41,7 +41,7 @@ from vllm.logger import init_logger
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.utils.torch_utils import _encode_layer_name
 
-from ...shapes import Choice, Path, rows_policy
+from ...shapes import Choice, Path, full_capture, refuse, rows_policy, target_topology
 from ..common.host import (
     check_residency,
     fake,
@@ -61,7 +61,11 @@ from . import dcp_value
 from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
-from .overlap import QueryWait, index_stream, side_stream
+from .indexer import FusedIndexer
+from .indexer import reserve as reserve_fused_indexer
+from .indexer import supports as fused_indexer_unsupported
+from .indexer_stage import IndexerStage
+from .overlap import QueryWait, index_stream, late_fork, side_stream
 from .query_stage import compile_norm, index_pin, is_rubin
 from .query_stage import index_policies as query_index_policies
 from .r1 import DsaBox
@@ -376,6 +380,38 @@ def dsa_on_flashinfer(attention) -> bool:
     return isinstance(attention.mla_attn.mla_attn.impl, FlashInferMLASparseImpl)
 
 
+# Wide rows whose sparse decode reads the #63 merge's rows (IndexerStage.merge_rows)
+# instead of the stock sparse_attn_indexer op + Triton slot filter (same per-row
+# selection: chain bench --check). 1-node DSA chain (W4, 6 heads per rank, q8, us
+# per layer, op / merge rows): 128 rows 55.59 / 52.87, 256 77.46 / 74.72, 512 115.22
+# / 115.71 (L1 round 6, Rhea 136406).
+WIDE_MERGE = "65-256:1"
+# Wide rows whose #63 merge reads IndexerScoreFp4's logits (MXFP4 indexer cache);
+# the others DeepGEMM's paged MQA logits (both bit for bit the same logits). None:
+# beside the forked MlaQuery (side stream) the scorer's SM-wide grid loses to
+# DeepGEMM's in the layer although it wins alone (128 rows 5.95 vs 9.09 us, one
+# GPU): 1-node DSA chain (W4, 6 heads per rank, q8, us per layer, merge rows on
+# the scorer / on DeepGEMM) 128 rows 53.40 / 52.85, 256 76.24 / 74.75, 512 117.12 /
+# 115.65 (L1 round 6, Rhea 136406).
+WIDE_SCORER = ""
+# The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
+# rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
+WIDE_LOCAL_TOPK = False
+
+
+def sms_of(device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@cache
+def merge_buffers(device, rows, topk):
+    """The #63 merge's owned-row outputs of WideDsa (rows [rows, topk], counts
+    [rows]), shared by every DSA layer: each layer's sparse decode reads them
+    before the next layer's merge writes them (stream order)."""
+    out = torch.full((rows, topk), -1, dtype=torch.int32, device=device)
+    return out, torch.zeros(rows, dtype=torch.int32, device=device)
+
+
 class WideDsa:
     """One K3.1 DSA layer's wide rows under DCP (round 1's PreparedDsa). ``attention``:
     the KimiK3DSAAttention; ``pitches``: the packed projection pitch per batch;
@@ -503,11 +539,58 @@ class WideDsa:
         self.max_model_len = self.indexer.max_model_len
         self.max_total = self.indexer.max_total_seq_len
         self.topk = self.indexer.topk_tokens
+        # On FlashInfer with the #63 merge (dcp_local_topk): the merge gives the
+        # sparse decode this rank's flat KV rows straight from the logits (no stock
+        # op, no slot filter), as PreparedDsa's merge rows; on an MXFP4 indexer
+        # cache IndexerScoreFp4 scores them (DeepGEMM's logits bit for bit). Its
+        # owned-row outputs are shared by every DSA layer (merge_buffers).
+        self.rubin = sms_of(self.device) > GB300_SMS
+        self.late_query = None  # the pending late query fork (forked_core)
+        self.strict = target_topology(self.rubin, self.dcp, self.dcp, max(queries))
+        stage_rows = rows if self.fp8 else 0
+        buffers = merge_buffers(self.device, rows, self.topk) if self.fp8 else None
+        self.indexer_stage = IndexerStage(
+            self.indexer, stage_rows, self.impl, buffers=buffers
+        )
+        local_topk = self.indexer_stage.local_topk
+        if self.strict and self.fp8 and not local_topk:
+            refuse(
+                "DSA indexer (WideDsa)",
+                "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
+                "the stock sparse_attn_indexer op and the Triton slot filter",
+            )
+        self.merged = batch_table(WIDE_MERGE) if WIDE_MERGE else {}
+        scored = batch_table(WIDE_SCORER) if WIDE_SCORER else {}
+        self.scored = [s for s in self.shapes if s[0] in scored]
+        self.scorer = bool(local_topk and self.scored) and self.indexer.use_fp4_cache
+        if self.scorer:
+            from .prepared import kv_cache_blocks
+
+            # The scorer's buffers (shared with PreparedDsa's, grown to these rows)
+            # before vLLM profiles its memory for the KV cache.
+            args = self.indexer, self.device, rows, local_topk
+            reserve_fused_indexer(*args, blocks=kv_cache_blocks())
 
     def prepare_cache(self, kv):
         from .indexer_stage import check_index_cache
+        from .prepared import fp4_scorer_policy
 
         check_index_cache(self.indexer)
+        stage = self.indexer_stage
+        if self.scorer:
+            unsupported = fp4_scorer_policy(self.indexer, self.scored, self.strict)
+            if not unsupported:
+                # Logits only: the merge's DeepSelect + pack take the local top-N
+                # (packs per WIDE_LOCAL_TOPK rows: IndexerLocalTopk's B' rows).
+                stage.fused = FusedIndexer(
+                    self.indexer,
+                    self.scored,
+                    self.device,
+                    max(self.pitches),
+                    local_topk=stage.local_topk,
+                    packed=WIDE_LOCAL_TOPK,
+                )
+        stage.warm(kv.shape[1])
         caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
         specs = tuple(layout(w) for w in (*self.weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -591,6 +674,9 @@ class WideDsa:
             "Triton slot filter where DcpExchange does not serve the step",
             "FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse",
         ]
+        if self.indexer_stage.local_topk and batch in self.merged:
+            # (the #63 merge's steps; DcpExchange's keep the op)
+            pieces[:2] = ["#63 merge rows (DeepGEMM logits) on merge steps"]
         if self.index_pin is not None and batch in self.index_pin.plans:
             pieces.append("wq_index pinned cuBLASLt (ltpin; no split-K tactic)")
         elif batch not in self.index_projection.kernels:
@@ -634,7 +720,9 @@ class WideDsa:
             dcp_local_topk=indexer.dcp_local_topk,
         )
 
-    def dcp_core(self, cache, topk, metadata, batch, box=None, wait=None):
+    def dcp_core(
+        self, cache, topk, metadata, batch, box=None, wait=None, projected=None, q=1
+    ):  # fmt: skip
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
         local shard into the DcpValue rows, LSE and per-row valid counts. The global
         top-k ids are filtered to this rank's slots and compacted to a prefix whose
@@ -642,7 +730,8 @@ class WideDsa:
         LSE; a fresh scheduler metadata per call follows those lengths) or, on a
         per-tensor FP8 cache, FlashInfer's sparse decode over the flat rows, as the
         stock decode. ``wait``: QueryWait's launch (publish-only rows), right before
-        the decode reads the gathered q mailbox."""
+        the decode reads the gathered q mailbox. ``topk`` None: the indexer stage's
+        #63 merge gives this rank's rows from ``projected``'s query (merge_rows)."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
         from vllm.v1.attention.backends.mla.sparse_utils import (
             flat_kv_row_view,
@@ -660,25 +749,47 @@ class WideDsa:
             _, stride_rows = flat_kv_row_view(cache, md.block_size)
         else:
             pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        # The DcpExchange top-k (dsa_kernels.dcp_exchange.decode) already left this
-        # rank's slots and their counts in the buffer.
-        counts = self.impl.dcp_local_topk_counts
-        valid = counts(batch) if counts is not None else None
-        if valid is not None:
-            slots = topk[:batch]
-        else:
-            slots, valid = triton_filter_and_convert_dcp_index(
-                md.req_id_per_token[:batch],
-                md.block_table,
-                topk[:batch],
-                dcp_size=self.dcp,
-                dcp_rank=indexer.dcp_rank,
-                cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
-                BLOCK_SIZE=md.block_size,
-                BLOCK_STRIDE_ROWS=stride_rows,
-                NUM_TOPK_TOKENS=topk.shape[1],
-                return_valid_counts=True,
-            )
+        valid = None
+        if topk is None:  # the #63 merge's rows (merge_rows), else the stock op
+            # (DcpExchange's steps keep the op, whose decode hook serves them)
+            stage = self.indexer_stage
+            source = stage.merge_source(batch)[0] if stage.local_topk else None
+            args = self.q_fp8, self.head_w, md, stride_rows, batch
+            merge = source == "merge" and batch in self.merged
+            late, self.late_query = self.late_query, None
+            merged = stage.merge_rows(*args, q, after_logits=late) if merge else None
+            if merged is None and source is None and self.strict and full_capture():
+                # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
+                # would capture the stock indexer op and the slot filter.
+                refuse(
+                    "DSA indexer (WideDsa)",
+                    f"merge_rows declined the step ({stage.merge_source(batch)})",
+                    f"{batch}x{q}",
+                )
+            if merged is None:
+                topk = self.indexer_core(projected, batch)
+            else:
+                slots, valid = merged
+        if valid is None:
+            # The DcpExchange top-k (dsa_kernels.dcp_exchange.decode) already left
+            # this rank's slots and their counts in the buffer.
+            counts = self.impl.dcp_local_topk_counts
+            valid = counts(batch) if counts is not None else None
+            if valid is not None:
+                slots = topk[:batch]
+            else:
+                slots, valid = triton_filter_and_convert_dcp_index(
+                    md.req_id_per_token[:batch],
+                    md.block_table,
+                    topk[:batch],
+                    dcp_size=self.dcp,
+                    dcp_rank=indexer.dcp_rank,
+                    cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
+                    BLOCK_SIZE=md.block_size,
+                    BLOCK_STRIDE_ROWS=stride_rows,
+                    NUM_TOPK_TOKENS=topk.shape[1],
+                    return_valid_counts=True,
+                )
         if wait is not None:
             wait()
         if self.fp8:
@@ -742,10 +853,10 @@ class WideDsa:
         else:
             mq(*q_args, *publish, stream(self.device))
             self.run_index(x, index_slots, batch, index)
-            topk = self.indexer_core(projected, batch)
             if query_wait is not None:  # publish-only rows: poll before the decode
                 wait = partial(query_wait, mailbox, stream(self.device))
-            latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, wait)
+            args = cache, None, metadata, batch, box, wait, projected, q
+            latent, lse, valid = self.dcp_core(*args)
         s = stream(self.device)
         if self.dsa_box.mailbox(batch).format == PROJECTED:
             core, (w_uv, uv_view) = (latent, lse, valid), self.uv_gathered
@@ -778,23 +889,43 @@ class WideDsa:
         box = self.boxes[batch]
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
-        side.wait_stream(main)
         qc = to_cute(self.qc[:batch])
         norm = self.norms[batch]
-        norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
-        with torch.cuda.stream(side):
-            mq(*q_args, *publish, stream(self.device))
+        # the late query fork (overlap.QUERY_FORK_AT): MlaQuery launches once the
+        # merge's logits are enqueued, else (no merge) at the join
+        pending = []
+
+        def fork():
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                mq(*q_args, *publish, stream(self.device))
+
+        def launch():
+            if pending:
+                pending.pop()()
+
+        if late_fork(batch, self.rubin, self.dcp > 1):
+            norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
+            pending.append(fork)
+            self.late_query = launch
+        else:
+            side.wait_stream(main)
+            norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
+            with torch.cuda.stream(side):
+                mq(*q_args, *publish, stream(self.device))
         mailbox = publish[0]
 
         def join():
+            launch()
+            self.late_query = None
             joining = torch.cuda.current_stream(self.device)
             joining.wait_stream(side)
             query_wait(mailbox, stream(self.device))
 
         def chain():
             self.run_index(q_args[0], index_slots, batch, index)
-            topk = self.indexer_core(projected, batch)
-            return self.dcp_core(cache, topk, metadata, batch, box, join)
+            args = cache, None, metadata, batch, box, join, projected, q
+            return self.dcp_core(*args)
 
         if batch not in self.prioritized:
             return chain()
