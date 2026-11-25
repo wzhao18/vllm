@@ -21,13 +21,16 @@ from ..common.policy import batch_table
 from .kernel import KdaSplit
 from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
-from .verify_feed import KdaVerifyFeed
-from .verify_half import KdaVerifyHalfStock
-from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
+from .verify_feed import KdaVerifyFeed  # noqa: F401 (reference: no record form)
+from .verify_half import KdaVerifyHalfStock  # noqa: F401 (the stock protocol)
+from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock  # noqa: F401
 from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
 from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
+from .cols_defer import KdaVerifyColsDefer
+from .split_defer import KdaSplitDefer
+from .verify_defer import KdaVerifyHalfDefer, KdaVerifyLoopDefer
 from .window import check_conv_cache
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
@@ -222,9 +225,11 @@ FP32_VERIFY_WIDE: dict = {
     (10, 7): {4: "12:7,16-35:7,36-40:0,41-512:7", 8: "12:7,16-256:7"},
 }
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
+# An FP32 state's kinds (7-9) run the deferred-verify protocol's record forms
+# (``verify_defer``): KdaVerifyFeed has none, so its rows (q4 B41+) run LoopDefer.
 WIDE_KINDS = (
     KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
-    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfStock,
+    KdaVerifyLoop, KdaVerifyLoopDefer, KdaVerifyLoopDefer, KdaVerifyHalfDefer,
 )
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
               "loop", "loopstock", "feed", "halfstock")
@@ -354,9 +359,9 @@ class KdaSplitStock(RecoverKdaSplit):
 
 
 # The FP32 KdaSplit verify kernel (the record form under the deferred protocol).
-SPLIT_STOCK = KdaSplitStock
+SPLIT_STOCK = KdaSplitDefer
 # The prepared transposed verify kernel (the record form under the deferred protocol).
-COLS_KIND = KdaVerifyCols
+COLS_KIND = KdaVerifyColsDefer
 
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
@@ -475,7 +480,7 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     # (the prepared kernels compute the stock verify's math for an FP32 state, on
     # ``KdaInProj64(stock=True)``'s operands)
     if prepared and cols is not None:  # the transposed recurrence
-        return COLS_KIND(*options, cols)
+        return (KdaVerifyCols if bf16_state else COLS_KIND)(*options, cols)
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
         return KdaVerifyRows(*options, *rows)
     if prepared:  # the gates and betas arrive activated (the in-projection epilogue)

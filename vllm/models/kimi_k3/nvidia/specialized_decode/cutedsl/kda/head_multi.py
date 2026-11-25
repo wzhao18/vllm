@@ -798,7 +798,12 @@ def compile_head_multi(
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
     stages, tmem_tiles, early = MULTI_TILE[requests, tokens]
-    kernel = HEAD_MULTI_KIND(
+    kind = HEAD_MULTI_KIND
+    if kind is None:  # the FP32 state's deferred-verify record form (head_defer)
+        from .head_defer import KdaHeadMultiDefer
+
+        kind = KdaHeadMulti if bf16_state else KdaHeadMultiDefer
+    kernel = kind(
         heads, requests=requests, tokens=tokens, stages=stages, tmem_tiles=tmem_tiles,
         early_loads=early, hidden=hidden, bf16_state=bf16_state, has_bias=has_bias,
     )  # fmt: skip
@@ -814,5 +819,6 @@ def compile_head_multi(
 # tiles still fit: 15 to tensor memory, 6 in the ring). 2 x 4 has the M8 head's x and
 # keeps its tile (VERIFY_STAGES 10).
 MULTI_TILE = {(2, 8): (7, 15, 21), (2, 4): (10, 15, 21)}
-# The class ``compile_head_multi`` builds (``head_defer.set_head_protocol``).
-HEAD_MULTI_KIND = KdaHeadMulti
+# The class ``compile_head_multi`` builds (``head_defer.set_head_protocol``); None:
+# the deferred-verify record form for an FP32 state, KdaHeadMulti for a BF16 one.
+HEAD_MULTI_KIND = None
