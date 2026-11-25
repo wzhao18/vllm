@@ -52,6 +52,7 @@ from .indexer import (
     table_entry,
     warp_inclusive,
 )
+from .sparse_mla import globaltimer, st_global_u64
 
 BQ = 8  # query rows per MMA (N = BQ * HEADS); a request's q <= 8 rows
 N = BQ * HEADS
@@ -64,6 +65,11 @@ TMEM_COLS = 512  # N accumulator columns + the scale factors
 SF_A_BYTES = 512  # one stage's key scale-factor atom (128 rows x 4 UE8M0)
 SF_B_BYTES = 1024  # one stage's query scale-factor atoms (256 rows x 4 UE8M0)
 FP4_TILE_BYTES = TILE * DIM // 2
+# Bench probe (bench_k31_dsa_chain --front-stamps): the address of a [CTAs, 4] u64
+# globaltimer buffer the scorer stamps into when compiled while it is nonzero (0,
+# the default: no stamping code). Slots: 0 entry, 1 PDL wait returned, 2 exit.
+STAMP_ADDR = 0
+STAMP_SLOTS = 4
 assert ITEM_TILES * 2 <= 32  # one page id per producer lane
 
 
@@ -122,6 +128,7 @@ class IndexerScoreFp4:
         assert pitch > 0 and pitch % 512 == 0
         self.rows, self.q, self.ctas, self.pitch = rows, q, ctas, pitch
         self.tiler = (TILE, N, DIM)
+        self.stamp_addr = STAMP_ADDR
 
     @cute.jit
     def __call__(
@@ -315,6 +322,14 @@ class IndexerScoreFp4:
             tma_bar_ptr=kv_full + stage,
         )  # fmt: skip
 
+    @cute.jit
+    def mark(self, cta, slot, tid):
+        """Bench probe: thread 0 stamps globaltimer into slot ``slot`` of ``cta``."""
+        if cutlass.const_expr(self.stamp_addr != 0):
+            if tid == 0:
+                at_ = Int64(self.stamp_addr) + (Int64(cta) * STAMP_SLOTS + slot) * 8
+                st_global_u64(at_, globaltimer())
+
     @cute.kernel
     def kernel(
         self,
@@ -343,6 +358,7 @@ class IndexerScoreFp4:
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
+        self.mark(bid, 0, tidx)
 
         @cute.struct
         class Storage:
@@ -466,6 +482,7 @@ class IndexerScoreFp4:
                     )  # fmt: skip
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        self.mark(bid, 1, tidx)
 
         it = Int32(0)  # tiles issued / consumed by this role
         j = Int32(0)  # items issued / consumed by this role
@@ -640,6 +657,7 @@ class IndexerScoreFp4:
                 j += 1
 
         cute.arch.sync_threads()
+        self.mark(bid, 2, tidx)
         if warp == MMA_WARP:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)

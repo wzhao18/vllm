@@ -19,7 +19,7 @@ K quarter (384 columns) in shared memory, bulk-loaded before the PDL wait. After
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Uint32
+from cutlass import BFloat16, Float32, Int64, Uint32
 
 from ..common.primitives import (
     alloc,
@@ -55,11 +55,19 @@ from .index import (
     is_fp4_cache,
     quantize_fp4_query,
 )
+from .sparse_mla import globaltimer, st_global_u64
 
 CLUSTER = 4
 KQ = 1536 // CLUSTER  # K columns per CTA
 KS = KQ + 32  # padded shared row (elements): 832 B, conflict-free 16 B fragments
 CHUNKS = KQ // 8  # 16 B chunks per row quarter
+# Bench probe (bench_k31_dsa_chain --front-stamps): the address of a [CTAs, 8] u64
+# globaltimer buffer IndexFront stamps its phases into when compiled while it is
+# nonzero (0, the default: no stamping code). Slots: 0 entry, 1 PDL wait returned,
+# 2 x landed, 3 RMSNorm done, 4 MMAs done, 5 partials landed, 6 rows quantized +
+# key inserted, 7 exit.
+STAMP_ADDR = 0
+STAMP_SLOTS = 8
 
 
 class IndexFront:
@@ -71,11 +79,20 @@ class IndexFront:
         self.mt = -(-batch // 16)  # M16 tiles
         self.rows = 16 * self.mt
         self.owned = -(-batch // CLUSTER)  # most rows a CTA owns
+        self.stamp_addr = STAMP_ADDR
 
     @cute.jit
     def __call__(self, *args):
         options = dict(cluster=CLUSTER, preferred_smem_carveout=100)
         launch(self.kernel, args, (CLUSTER, HEADS, 1), 256, **options)
+
+    @cute.jit
+    def mark(self, cta, slot, tid):
+        """Bench probe: thread 0 stamps globaltimer into slot ``slot`` of ``cta``."""
+        if cutlass.const_expr(self.stamp_addr != 0):
+            if tid == 0:
+                at_ = Int64(self.stamp_addr) + (Int64(cta) * STAMP_SLOTS + slot) * 8
+                st_global_u64(at_, globaltimer())
 
     @cute.kernel
     def kernel(self, args):
@@ -97,6 +114,8 @@ class IndexFront:
         # The partial sums, after the MMAs, in place of x: [RP, 128] FP32.
         stage = view(x.iterator, 0, Float32, (RP, 128), (128, 1))
         own = cutlass.max(0, cutlass.min(OW, B - part * OW))  # rows part * OW, ...
+        cta = head * CLUSTER + part
+        self.mark(cta, 0, tid)
         if tid == 0:
             for bar in bars:
                 cute.arch.mbarrier_init(bar, 1)
@@ -113,12 +132,14 @@ class IndexFront:
             copy_evict(w.iterator + tid * KS, source, KQ * 2, bar_w)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        self.mark(cta, 1, tid)
         if tid < B:
             copy_g2s(x.iterator + tid * KS, at(projected, tid, k0), KQ * 2, bar_x)
         for c in range(tid, (RP - B) * CHUNKS, 256):  # the M tile's padding rows
             b, j = B + c // CHUNKS, c % CHUNKS
             store_shared_words(x.iterator + b * KS + j * 8, (Uint32(0),) * 4)
         wait(bar_x)
+        self.mark(cta, 2, tid)
         cute.arch.cluster_wait()  # the peers' barriers are initialized
         # Each row's sum of squares of this quarter, one row per warp, to every CTA.
         for b in range(warp, B, 8):
@@ -155,6 +176,7 @@ class IndexFront:
             store_shared_words(source, tuple(words))
         wait(bar_w)
         cute.arch.sync_threads()
+        self.mark(cta, 3, tid)
         # [RP, 384] x [384, 16] per warp. The lanes' K fragments are 8 contiguous
         # columns; A and B use the same K permutation (as MlaQuery.tiled).
         acc = zeros((MT * 2, 4), Float32)
@@ -179,6 +201,7 @@ class IndexFront:
                         bb = (z[n][2 * s], z[n][2 * s + 1])
                         mma_into(acc[m * 2 + n, None], a, bb, bf16=True)
         cute.arch.sync_threads()  # x is consumed: the partials take its place
+        self.mark(cta, 4, tid)
         for m in cutlass.range_constexpr(MT):
             for n in cutlass.range_constexpr(2):
                 for h in cutlass.range_constexpr(2):
@@ -201,6 +224,7 @@ class IndexFront:
                         size=rows * 512,
                     )
         wait(bar_red)
+        self.mark(cta, 5, tid)
         cute.arch.cluster_arrive_relaxed()  # the copies into this CTA have landed
         # The owned rows: one per warp, 4 columns per lane (the head's 128).
         for local in range(warp, own, 8):
@@ -231,7 +255,11 @@ class IndexFront:
         if (warp == 0) & (token < B):
             key = projected, self.key, norm_w, norm_b, cache, slots, token, key_eps
             insert_key(*key, self.mx, lane)
+        if cutlass.const_expr(self.stamp_addr != 0):
+            cute.arch.sync_threads()
+        self.mark(cta, 6, tid)
         cute.arch.cluster_wait()  # no CTA exits while a peer may read or write it
+        self.mark(cta, 7, tid)
 
     @cute.jit
     def fp8_head(self, values, projected, q_out, w_out, b, head, lane):
