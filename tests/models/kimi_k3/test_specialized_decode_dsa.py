@@ -3926,15 +3926,21 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     select = merge._DCP_TOPK_SELECT_KERNEL
     rescue = merge._DCP_TOPK_RESCUE_KERNEL
     mailbox = merge._mailbox_for(2048, 192) is not None
+    sel = dict(key, block_size=1024, exact=True, mailbox=mailbox)
     keys = (
-        select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
+        select.dispatch(**sel),
+        # The select that launches the rescue while it runs (``early``).
+        select.dispatch(**sel, early=True),
         rescue.dispatch(**key, block_size=1024),
+        rescue.dispatch(**key, block_size=1024, early=True),
         # The variant that releases the DSA sparse core early (MergeRows.rows).
         rescue.dispatch(**key, block_size=1024, release=True),
     )
+    assert keys[0] != keys[1] and len(set(keys[2:])) == 3
+    assert keys[4] == rescue.dispatch(**key, block_size=1024, release=True, early=True)
     stage.warm(1024)
-    assert keys[0] in select._compiled_cache
-    assert keys[1] in rescue._compiled_cache and keys[2] in rescue._compiled_cache
+    assert keys[0] in select._compiled_cache and keys[1] in select._compiled_cache
+    assert all(k in rescue._compiled_cache for k in keys[2:])
     warm = MagicMock()
     monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
     stage.warm(1024)
