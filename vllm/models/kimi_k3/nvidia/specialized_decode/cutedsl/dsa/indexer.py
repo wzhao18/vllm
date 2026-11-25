@@ -1747,14 +1747,16 @@ def reserve(indexer, device, max_rows, local_topk=0, blocks=None):
     return logits, tops, out, valid, ends, pitch
 
 
-def static_unsupported(indexer, rows, q) -> str | None:
+def static_unsupported(indexer, rows, q, fp4=False) -> str | None:
     """Why the fused indexer cannot run this layer's (rows, q), from what is known
-    before the KV cache exists (None: it can, if its cache layout does)."""
+    before the KV cache exists (None: it can, if its cache layout does); ``fp4``:
+    the MXFP4 DCP scorer, which has no select of the top-k."""
     from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
     if not mqa_logits_use_mx_scales():
         return "needs the SM100 MX-scaled indexer cache"
-    if indexer.topk_tokens % SELECT_THREADS or indexer.topk_tokens > 4096:
+    topk = indexer.topk_tokens
+    if not fp4 and (topk % SELECT_THREADS or topk > 4096):
         return f"top-k {indexer.topk_tokens}"
     if not 1 <= q <= 8 or rows % q or rows // q > MAX_REQUESTS:
         return f"rows {rows} q {q}"
@@ -1764,7 +1766,7 @@ def static_unsupported(indexer, rows, q) -> str | None:
 def supports(indexer, rows, q, fp4=False) -> str | None:
     """Why the fused indexer cannot run this layer (None: it can); ``fp4``: its
     MXFP4 DCP scorer (IndexerScoreFp4)."""
-    reason = static_unsupported(indexer, rows, q)
+    reason = static_unsupported(indexer, rows, q, fp4)
     cache = indexer.k_cache.kv_cache
     entry = DIM // 2 + DIM // 32 if fp4 else DIM + 4
     if reason is None and (

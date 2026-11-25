@@ -379,7 +379,7 @@ class PreparedDsa:
         rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
         self.dcp_fused = bool(local_topk) and (rubin_fused or fp4)
         static = (
-            fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
+            fused_indexer_static_unsupported(self.indexer, *s, fp4) for s in self.shapes
         )
         # The fused TP indexer reads FP8 keys only (check_index_cache).
         fused = self.fp8 and not fp4
