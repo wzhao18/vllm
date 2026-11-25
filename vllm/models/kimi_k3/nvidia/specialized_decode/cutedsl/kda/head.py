@@ -260,6 +260,173 @@ class SignalGemm(SplitKGemm):
                     _release_add(counter)
 
 
+class XSignalGemm(SignalGemm):
+    """``SignalGemm`` whose activations wait for the AttnRes's x counter
+    (``ClusterAttnRes.x_ready``: ``x_target`` CTA adds) instead of the PDL wait, so it
+    can be launched before the AttnRes; every CTA is one of ``x_readers`` readers of the
+    counter (with ``KdaHeadVerify.x_poll``), the last one re-arms it."""
+
+    @cute.experimental.jit
+    def __call__(
+        self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, a_map: cutlass.Int64,
+        counter: cutlass.Int64, x_ready: cutlass.Int64, x_target: Int32,
+        x_readers: Int32, stream: _cuda.CUstream,
+    ):  # fmt: skip
+        self.kernel(a, b, c, a_map, counter, x_ready, x_target, x_readers).launch(
+            grid=(
+                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
+                c.layout.shape[2],
+            ),
+            block=(self.threads_per_cta, 1, 1),
+            cluster=self.cluster_shape,
+            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, a_map: cutlass.Int64,
+        counter: cutlass.Int64, x_ready: cutlass.Int64, x_target: Int32,
+        x_readers: Int32,
+    ):  # fmt: skip
+        stages = self.num_ab_stage
+        ab_dtype = mA.element_type
+        majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            ab_dtype, ab_dtype, *majors, self.acc_dtype, self.cta_group,
+            self.mma_tiler_mn,
+        )  # fmt: skip
+        mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+        block_idx = cute.arch.block_idx()
+        bidx = block_idx[0]
+        split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        n_idx = block_idx[1] // self.split_k
+        l_idx = block_idx[2]
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
+        sA = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*shape))
+        sB = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_b(*shape))
+        acc_layout = cute_ext.make_tmem_layout_acc(
+            tiled_mma, self.mma_tiler_mn, acc_stage=1
+        )
+        bar_full = _smem(cutlass.Int64, stages, 8).iterator
+        bar_empty = _smem(cutlass.Int64, stages, 8).iterator
+        bar_mma_epilog = _smem(cutlass.Int64, 1, 8).iterator
+        bar_tmem_alloc = _smem(cutlass.Int64, 1, 8).iterator
+        tmem_base_ptr = _smem(cutlass.Int32, 1, 4).iterator
+        mailbox = _smem(cutlass.Float32, self.mailbox_elements, 128)
+        bar_reduce = _smem(cutlass.Int64, 1, 8).iterator
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                for i in range(stages):
+                    cute.arch.mbarrier_init(bar_full + i, 2)
+                    cute.arch.mbarrier_init(bar_empty + i, 1)
+                cute.arch.mbarrier_init(bar_mma_epilog, 1)
+                cute.arch.mbarrier_init(bar_tmem_alloc, 160)
+                cute.arch.mbarrier_init(bar_reduce, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.cluster_arrive_relaxed()
+        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        tiles = (split_rank * k_tile_count, k_tile_count)
+        cute.arch.cluster_wait()
+        if warp_idx == 0:
+            self.weight_warp(bar_full, bar_empty, sA, a_map, bidx * self.cta_m, *tiles)
+        elif warp_idx == 1:
+            b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx))
+            b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+            if cute.arch.lane_idx() == 0:
+                x_poll_counter(x_ready, x_target, x_readers)
+            cute.arch.sync_warp()
+            _fence_proxy_async_global()
+            self.x_activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+        elif warp_idx == 2:
+            k_blocks = self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2])
+            self.mma_warp(
+                bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc, tiled_mma, sA, sB,
+                tmem_base_ptr, acc_layout, k_blocks, k_tile_count,
+            )  # fmt: skip
+        elif warp_idx >= 4:
+            tile = cute.local_tile(mC, (self.cta_m, self.cta_n), (bidx, n_idx, l_idx))
+            self.epilog_warp(
+                bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
+                cute.arch.thread_idx()[0] - 128, mC.element_type,
+                utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
+            )  # fmt: skip
+            if split_rank == 0:
+                named_barrier(3, 128)  # every owner thread's output stores
+                if cute.arch.thread_idx()[0] == 128:
+                    cute.arch.fence_acq_rel_gpu()
+                    _release_add(counter)
+
+
+    @cute.experimental.jit
+    def x_activation_warp(
+        self, bar_full, bar_empty, g_tile: cute.Tensor, s_tile: cute.Tensor,
+        cta_v_map: cute.Layout, k_tile_start: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+    ):  # fmt: skip
+        """``SplitKGemm.activation_warp`` without the PDL wait (x polled before)."""
+        stages = self.num_ab_stage
+        stage_bytes = cute.size_in_bytes(
+            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
+        )
+        empty_phase = cutlass.Int32(1)
+        for k_tile in cutlass.range(k_tile_count, unroll=1):
+            stage = k_tile % stages
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
+            cute_ext.tma_load(
+                g_tile[None, None, k_tile_start + k_tile],
+                s_tile[None, None, None, stage],
+                (bar_full + stage).value,
+                cta_v_map=cta_v_map,
+                tma_operation_type=cute_ext.OperationTypeEnum.SM90_TMA_LOAD,
+                update_expect_tx=False,
+            )
+            if stage == stages - 1:
+                empty_phase = empty_phase ^ 1
+        self.drain(bar_empty, empty_phase, k_tile_count)
+
+
+@asm()
+def _fence_proxy_async_global():
+    return "fence.proxy.async.global;", "~{memory}", ()
+
+
+@cute.jit
+def x_poll_counter(x_ready, x_target, x_readers):
+    """One thread: spin (acquire) until the AttnRes's x counter reaches ``x_target``,
+    then count this reader; the last of ``x_readers`` re-arms the pair."""
+    seen = Int32(_acquire_load(x_ready))
+    sgn, sgt = spin_start()
+    while seen < x_target:
+        seen = Int32(_acquire_load(x_ready))
+        sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
+    if Int32(_fetch_add(x_ready + 4)) == x_readers - 1:
+        _store_zero(x_ready)
+        _store_zero(x_ready + 4)
+
+
+@cache
+def compile_xsignal(tactic, arch):
+    from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+
+    def fake(leading):
+        shape = tuple(cute.sym_int() for _ in range(3))
+        stride = (1, cute.sym_int(64), 0) if leading == 0 else (cute.sym_int(64), 1, 0)
+        return make_fake_tensor(cutlass.BFloat16, shape, stride, assumed_align=16)
+
+    kernel = XSignalGemm(tactic=SplitKTactic(*tactic))
+    args = (fake(1), fake(1), fake(0), cutlass.Int64(0), cutlass.Int64(0))
+    args += (cutlass.Int64(0), Int32(0), Int32(0))
+    return cute.experimental.compile(
+        kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
+    )
+
+
 @cache
 def compile_signal(tactic, arch):
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
@@ -1752,7 +1919,30 @@ class PreparedKdaHead:
                     )  # fmt: skip
         return self
 
-    def run_verify(self, x, out, *, caches, slots, accepted, rearm=None, x_ready=None):
+    def x_signal_ctas(self, b):
+        """CTAs of the F_A GEMM at ``b`` rows (x-counter readers with ``launch_fa_x``)."""
+        m, n, split = FA_TACTIC_ROWS.get(b, FA_TACTIC)[:3]
+        return -(-self.fa_weight.shape[0] // m) * -(-b // n) * split
+
+    def launch_fa_x(self, x, x_ready):
+        """The F_A GEMM (``XSignalGemm``) on the side stream, launched BEFORE the
+        AttnRes that writes ``x``: its activations poll the AttnRes's x counter."""
+        b = x.shape[0]
+        fa_tactic = FA_TACTIC_ROWS.get(b, FA_TACTIC)
+        code = compile_xsignal(fa_tactic, architecture(self.device))
+        readers = CLUSTER * self.core.heads + self.x_signal_ctas(b)
+        with torch.cuda.stream(self.side.fork()):
+            code(
+                matrix_view(self.fa_weight), matrix_view(x),
+                matrix_view(self.fa_out[:b], output=True),
+                cutlass.Int64(self.fa_map.data_ptr()),
+                cutlass.Int64(self.counter.data_ptr()), cutlass.Int64(x_ready.data_ptr()),
+                Int32(7 * b), Int32(readers), stream(self.device),
+            )  # fmt: skip
+
+    def run_verify(
+        self, x, out, *, caches, slots, accepted, rearm=None, x_ready=None, fa_x=False
+    ):
         """``KdaHeadVerify`` of one request x q verify rows (``slots`` [1, q], vLLM's
         spec slots; ``accepted`` [1]), or ``KdaHeadMulti`` of b // q requests;
         ``rearm`` as ``run`` (the kernel is the polled variant when the batch is in
@@ -1765,12 +1955,13 @@ class PreparedKdaHead:
         fa_code = self.fa_code
         if fa_tactic != FA_TACTIC:
             fa_code = compile_signal(fa_tactic, architecture(self.device))
-        with torch.cuda.stream(self.side.fork()):
-            fa_code(
-                matrix_view(self.fa_weight), matrix_view(x),
-                matrix_view(fa, output=True), cutlass.Int64(self.fa_map.data_ptr()),
-                counter, stream(self.device),
-            )  # fmt: skip
+        if not fa_x:  # (fa_x: ``launch_fa_x`` before the AttnRes)
+            with torch.cuda.stream(self.side.fork()):
+                fa_code(
+                    matrix_view(self.fa_weight), matrix_view(x),
+                    matrix_view(fa, output=True), cutlass.Int64(self.fa_map.data_ptr()),
+                    counter, stream(self.device),
+                )  # fmt: skip
         if slots.stride() != (slots.shape[1], 1):
             slots = slots.contiguous()
         tensors = (*self._tensors(caches, slots[:requests], out), accepted[:requests])
@@ -1785,7 +1976,8 @@ class PreparedKdaHead:
         polled_x: tuple = ()
         if b == q:
             ready = 0 if x_ready is None else x_ready.data_ptr()
-            polled_x = (cutlass.Int64(ready), Int32(7 * b if ready else 0))
+            readers = CLUSTER * self.core.heads + (self.x_signal_ctas(b) if fa_x else 0)
+            polled_x = (cutlass.Int64(ready), Int32(7 * b if ready else 0), Int32(readers))
         self.verify_kernels[b, q](
             matrix_view(self.weight), matrix_view(x),
             cutlass.Int64(self.map.data_ptr()),

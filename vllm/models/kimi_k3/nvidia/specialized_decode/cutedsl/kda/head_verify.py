@@ -118,12 +118,12 @@ class KdaHeadVerify(KdaHeadWide):
         norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
         lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
         target: Int32, out_rearm: cutlass.Int64, x_ready: cutlass.Int64,
-        x_target: Int32, stream,
+        x_target: Int32, x_readers: Int32, stream,
     ):  # fmt: skip
         self.kernel(
             mA, mB, a_map, conv_w, bias, conv_state, fa_beta, a_log, dt_bias, slots,
             state, output, norm_w, f_b, accepted, lower_bound, scale, eps, counter,
-            target, out_rearm, x_ready, x_target,
+            target, out_rearm, x_ready, x_target, x_readers,
         ).launch(
             grid=(CLUSTER, self.heads, 1),
             block=(self.threads_per_cta, 1, 1),
@@ -142,7 +142,7 @@ class KdaHeadVerify(KdaHeadWide):
         norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
         lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
         target: Int32, out_rearm: cutlass.Int64, x_ready: cutlass.Int64,
-        x_target: Int32,
+        x_target: Int32, x_readers: Int32,
     ):  # fmt: skip
         T: cutlass.Constexpr = self.tokens
         x_poll: cutlass.Constexpr = self.x_poll
@@ -248,7 +248,7 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, True)
+                    self.x_wait(bar_x, x_ready, x_target, x_readers, True)
                     self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                     # completion order (successors' PDL waits are transitive through
                     # this grid; the polled output's re-arm below) off x's path
@@ -287,7 +287,7 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, False)
+                    self.x_wait(bar_x, x_ready, x_target, x_readers, False)
                     self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
                 else:
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
@@ -325,10 +325,10 @@ class KdaHeadVerify(KdaHeadWide):
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
     @cute.jit
-    def x_wait(self, bar_x, x_ready, x_target, poller: cutlass.Constexpr):
+    def x_wait(self, bar_x, x_ready, x_target, x_readers, poller: cutlass.Constexpr):
         """``x_poll``: warp 1 (``poller``) spins on the AttnRes's x counter
         (acquire) until all ``x_target`` CTA adds landed, re-arms it as its last reader
-        (every head CTA reads it once) and releases ``bar_x``; the other x / weight
+        (every head CTA reads it once, of ``x_readers`` with an x-polled F_A GEMM) and releases ``bar_x``; the other x / weight
         issuers wait on ``bar_x``. Then a proxy fence: x is read by TMA."""
         if cutlass.const_expr(poller):
             if cute.arch.lane_idx() == 0:
@@ -338,8 +338,7 @@ class KdaHeadVerify(KdaHeadWide):
                     seen = Int32(_acquire_load(x_ready))
                     sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
                 cute.arch.mbarrier_arrive(bar_x)
-                readers = Int32(CLUSTER * self.heads)
-                if Int32(_fetch_add(x_ready + 4)) == readers - 1:
+                if Int32(_fetch_add(x_ready + 4)) == x_readers - 1:
                     _store_zero(x_ready)
                     _store_zero(x_ready + 4)
             cute.arch.sync_warp()
@@ -779,6 +778,7 @@ def compile_head_verify(
     kernel.x_poll = x_poll
     args = (matrix(1), matrix(1), cutlass.Int64(0), *tensors, *scalars)
     args += (cutlass.Int64(0), Int32(0), cutlass.Int64(0), cutlass.Int64(0), Int32(0))
+    args += (Int32(0),)
     args += (make_fake_stream(),)
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
