@@ -178,6 +178,12 @@ def st_global_u32(address, value):
 
 
 @asm()
+def st_global_v4_zero(address):
+    code = "st.relaxed.gpu.global.v4.u32 [$0], {$1, $1, $1, $1};"
+    return code, "l,r,~{memory}", (Int64(address), Uint32(0))
+
+
+@asm()
 def fence_gpu():
     return "fence.acq_rel.gpu;", "~{memory}", ()
 
@@ -463,9 +469,18 @@ class IndexerScoreFp4:
         address = logits_address + Int64(row) * Int64(self.pitch * 2)
         hist_row = self.hist_base + Int64(row) * BINS * 4
         if length > n:
-            for b in cutlass.range(tidx, BINS, threads, unroll=1):
-                hist[b] = Uint32(ld_acquire_i32(hist_row + Int64(b) * 4))
-                st_global_u32(hist_row + Int64(b) * 4, 0)  # zero for the next call
+            # 16-byte loads, all in flight (thread 0's acquire + the barrier
+            # ordered them after every arrival); zeroed for the next call.
+            for c in cutlass.range_constexpr((BINS // 4 + THREADS - 1) // THREADS):
+                b = (tidx + c * threads) * 4
+                if b < BINS:
+                    w = load_v4(hist_row + Int64(b) * 4)
+                    for e in cutlass.range_constexpr(4):
+                        hist[b + e] = w[e]
+            for c in cutlass.range_constexpr((BINS // 4 + THREADS - 1) // THREADS):
+                b = (tidx + c * threads) * 4
+                if b < BINS:
+                    st_global_v4_zero(hist_row + Int64(b) * 4)
         cute.arch.sync_threads()
         if length <= n:
             for j in cutlass.range(tidx, n, threads, unroll=1):
