@@ -261,24 +261,25 @@ def test_selective_topk_long_rows_random(recover_all):
     ],
 )
 def test_split_publish_matches_unsplit(monkeypatch, reqs, zero_rows):
-    """Key-tile split PUBLISH units (pub_split 2: each item's tiles in two ranges, each
-    into its own candidate region copy, concatenated per key lane) give the unsplit
-    top-k bit for bit, order included, and the same recomputed rows."""
+    """Key-tile split PUBLISH units (pub_split 2 / 4: each item's tiles in that many
+    ranges, each into its own candidate region copy, concatenated per key lane) give
+    the unsplit top-k bit for bit, order included, and the same recomputed rows."""
     q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, zero_rows)
     outs, flags = [], []
-    for cap in (1, 2):
+    for cap in (1, 2, 4):
         monkeypatch.setattr(pidx, "PUB_SPLIT_MAX", cap)
         sp = pidx.SelectivePlan(
             [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
         )
-        assert sp.pub_split == cap
+        assert sp.pub_split == cap  # fewer items than SMs: the most ranges win
         out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
         row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
         outs.append(out)
         flags.append(row_bin[1 : 3 * sp.t : 3].clone())
-    assert torch.equal(flags[0], flags[1])
-    same = (outs[0] == outs[1]).all(1)
-    assert same.all(), f"{int((~same).sum())} rows differ"
+    for i in (1, 2):
+        assert torch.equal(flags[0], flags[i])
+        same = (outs[0] == outs[i]).all(1)
+        assert same.all(), f"split {(1, 2, 4)[i]}: {int((~same).sum())} rows differ"
     t0 = 0
     for (rows, kv), base in zip(reqs, bases):
         ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)

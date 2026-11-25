@@ -3081,15 +3081,17 @@ class SelectivePlan:
 def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
                    mode=PUBLISH, recover_all=False):
     """Exact top-k of every row of ``sp`` into ``out`` (Int32 [T, topk], unordered,
-    -1 padded), without host reads. Returns (row_bin, candidates): row r was
+    -1 padded), without host reads. Returns (row_bin, None): row r was
     recomputed by the full path iff row_bin[3 r + 1] != 0 (``recover_all``: every
     row, for tests)."""
     args = (sp, q, q_scale, keys, key_scale, weights_bf16)
     thresholds(*args, ctas=ctas)
     cand = publish(*args, ctas=ctas, mode=mode)
     cand_select(sp, cand, out)
+    # the candidate regions are dead: free them before the recovery's scratch
+    del cand
     recover(*args, out, ctas=ctas, recover_all=recover_all)
-    return sp.row_bin, cand
+    return sp.row_bin, None
 
 
 def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
@@ -3108,9 +3110,11 @@ def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
 
 
 # Key-tile splits of the PUBLISH pass (each one more candidate region copy of
-# (T + 1) x REGION words): at most 2 keeps the selective path's transient within
-# the stock prefill logits reservation (prefill_logits_reserved_bytes).
-PUB_SPLIT_MAX = 2
+# (T + 1) x REGION words). The copies are freed before the recovery allocates its
+# logits scratch, so the transient peak is the larger of the two phases
+# (indexer_step.group_bytes): 4 copies stay below the recovery's scratch at long
+# rows.
+PUB_SPLIT_MAX = 4
 
 
 def _publish_units(items, t, device, ctas=None):

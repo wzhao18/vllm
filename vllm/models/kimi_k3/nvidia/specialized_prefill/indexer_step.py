@@ -36,8 +36,11 @@ SCRATCH_BUDGET = 4 << 30
 def group_bytes(rows: int, pitch: int) -> int:
     """Transient bytes of a group of ``rows`` rows whose widest request has
     ``pitch`` (128-aligned) keys."""
-    per_row = (
-        pidx.REGION * 4 + pidx.SAMPLES * 2 + pitch * 2 + pitch // 8 + pidx.CAND * 4
+    # the PUBLISH phase (sampled logits + the candidate region copies) and the
+    # recovery (logits scratch, bitmap, bound-bin keys) do not overlap: the
+    # candidate regions are freed before the recovery allocates
+    per_row = pidx.SAMPLES * 2 + max(
+        pidx.PUB_SPLIT_MAX * pidx.REGION * 4, pitch * 2 + pitch // 8 + pidx.CAND * 4
     )
     return (rows + 1) * per_row + pitch * 2
 
