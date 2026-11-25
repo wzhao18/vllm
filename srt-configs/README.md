@@ -46,11 +46,11 @@ Code:
   (`--prefill-hrrn`), #39 (`trtllm_gvr2_nondet`) and #40 (`load_same_step`). The configs point at a Lustre tree `k31vr/trees/k31-agentx-dev-pd` holding that
   stack with its compiled extensions, in place of `/opt/k3/ov-p` / `/opt/k3/ov-d` (as the frozen configs do); build it
   like the other trees (sm_107a; #33 pins the DeepSelect CUTLASS v4.8.1 build, #34 needs `nvidia-cudnn-frontend` >= 1.33).
-- Dynamo: `Inferact/dynamo` 9ac6228943 (PR #410, `juntian/k31-rubin-router` = 3dd0744 K3.1 release + active-prefill
-  sums, the Mooncake global-prefix store model, `--router-prefill-cost` with the cached-token coefficient,
-  `--router-decode-balance`). `dynamo.source` pins it: srtctl builds that commit with maturin in the container
-  (`install: true`); the compute nodes need read access to `Inferact/dynamo`. Without it, build the two wheels
-  (`ai_dynamo`, `ai_dynamo_runtime`, aarch64) from that commit elsewhere, `pip install` them in the image and set
+- Dynamo: branch `dynamo-k31-vr` of this repo at bdec0a54ce (same tree as `Inferact/dynamo` 9ac6228943, PR #410:
+  3dd0744 K3.1 release + active-prefill sums, the Mooncake global-prefix store model, `--router-prefill-cost` with the
+  cached-token coefficient, `--router-decode-balance`). `dynamo.source` pins it: srtctl builds that commit with maturin
+  in the container (`install: true`). Without access from the compute nodes, build the two wheels (`ai_dynamo`,
+  `ai_dynamo_runtime`, aarch64) from that commit elsewhere, `pip install` them in the image and set
   `dynamo.install: false`. Every PYTHONPATH here leaves out `/opt/k3/dynamo`, which would shadow the pinned build with
   the image's 1.6.1+k31.
 
@@ -91,9 +91,9 @@ Node placement on our VR200 nodes: keep `vr-r41-cn04` as the frontend / infra no
 frontend, AgentX client). Its GPU0 runs BF16 GEMMs ~9% slower than its peers, and every decode or prefill engine is a
 lockstepped EP group, so one slow GPU sets the step time of the whole group.
 
-Code: this branch with agentx #25-#42, #44 and #45 merged (the refreshed-kernel prefill MegaMoE buckets and the NVFP4
+Code: this branch with agentx #25-#42, #44 to #47 merged (the refreshed-kernel prefill MegaMoE buckets and the NVFP4
 per-route prefill combine, compact NVFP4 expert scales #44, full-model `--dwdp dense` for the checkpoint's MXFP8 linears
-#42).
+#42, the long-prompt NaN fix #47).
 
 Measured on our VR200 nodes (11-24, full model, P DEP8 on 2 nodes + D TP4 x DP4 on 4 nodes, AgentX c370 3600 s,
 DSpark k5 synthetic AL 3.81):
@@ -109,5 +109,7 @@ DSpark k5 synthetic AL 3.81):
 
 GSM8K (gsm8k twin, block rejection, full model): strict 0.9788 / flexible 0.9780 (±0.004; the GVR decode config scored 0.9795 / 0.9788).
 
-Open: the NaN indexer-logit rows above (whole valid length NaN on some long requests in decode) point at an indexer
-K-cache / scale problem or unwritten rows; `balanced` only removes their cost. Under investigation.
+Fixed (#47): the NaN rows came from prefill. The Mamba state pre-copy ran before the Mooncake same-step load of the
+prefix hit had landed, so the prompt was computed on stale KDA state and NaN state reached the decoder. With #47, same
+config: 15.74 req/s, 87.0k tok/s/GPU, TPS p10 / p50 176 / 186, TTFT p50 / p90 2.2 / 5.8 s (first 2383 s), GSM8K
+strict 0.9780 / flexible 0.9773. `balanced` stays: its cost is flat on every row.
