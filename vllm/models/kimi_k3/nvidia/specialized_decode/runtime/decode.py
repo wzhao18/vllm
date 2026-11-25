@@ -1129,7 +1129,8 @@ class SpecializedDecode:
         TP8 / TP16 verify rows' KDA record cores fold the pending commit;
         ``recoverssm.bind_model_state``), called once by the ``KimiK3ModelState``
         that built this decode. No-op for the other records modes."""
-        records = self.sp.records if self.sp is not None else self.records
+        sp = self.sp
+        records = sp.records if sp is not None else getattr(self, "records", "none")
         if records == "deferred":
             from ..recoverssm import bind_model_state
 
