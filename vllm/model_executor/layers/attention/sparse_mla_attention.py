@@ -1240,6 +1240,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         block_size = attn_metadata.block_size
         _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
         block_table = attn_metadata.block_table
+        layer_cache = kv_c_and_k_pe_cache
         if shardq.gathered_context is not None:
             # The prefill rows of a DCP step attend its gathered context.
             kv_c_and_k_pe_cache = shardq.gathered_context.mla_view(kv_c_and_k_pe_cache)
@@ -1301,6 +1302,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
 
         if context is None or context.num_groups == 1:
             out = attend(slice(None))
+            if rank_major is not None:
+                # The next DSA layer's context rows move now, under the
+                # layers in between (rank_major.copy_to_peers).
+                context.after_attend(layer_cache)
         else:
             # A step of several request groups: each group's slice rows attend
             # while the workspace holds that group (the indexer left the last
