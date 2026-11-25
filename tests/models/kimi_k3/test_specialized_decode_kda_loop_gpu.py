@@ -228,7 +228,7 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     kernel = prepared.make_kernel((heads, requests, 0, bias, schedule, q, False), RUBIN)
     stock_kinds = (
         prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
-        prepared.KdaVerifyHalfStock,
+        prepared.KdaVerifyHalfPair,
         # their deferred-verify record forms (the FP32 default)
         prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer, prepared.KdaVerifyHalfDefer,
     )  # fmt: skip
@@ -326,12 +326,13 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
 # HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4), and
 # q4 / odd q (the conv window is written after both halves read its taps: at q4 / q5
 # an early writer raced the other half's tap loads before that fix).
-HALF_SHAPES = [(8, 16), (8, 17), (8, 4), (4, 16), (5, 8)]
+HALF_SHAPES = [(8, 16), (8, 17), (8, 11), (8, 15), (8, 4), (4, 16), (5, 8)]
 
 
 @pytest.mark.parametrize("q,requests", HALF_SHAPES, ids=lambda v: str(v))
 @pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
-def test_half_equals_loopstock(monkeypatch, q, requests, pad):
+@pytest.mark.parametrize("kind", ["halfstock", "halfscratch"])  # DSMEM pair / scratch
+def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)
@@ -341,7 +342,7 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad):
         table[padded] = -1
         accepted[padded] = 0
     projected = projected_rows(requests * q)
-    half = core_of(attention, requests, q, "halfstock", base, monkeypatch)
+    half = core_of(attention, requests, q, kind, base, monkeypatch)
     want = run(
         core_of(attention, requests, q, "loopstock", base, monkeypatch),
         projected, base, table, accepted,
@@ -351,17 +352,22 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad):
         assert_bitwise("output", got[0], want[0])
         assert_bitwise("recurrent state", got[1][1], want[1][1])
         assert_bitwise("conv state", got[1][0], want[1][0])
-    # two arrivals per live item and call, none for a padding request
+    # scratch: two arrivals per live item and call, none for a padding request; the
+    # DSMEM pair never touches the counters
     counts = set(half.halves[(requests, q)][1].tolist())
-    assert counts <= {0, 4} and 4 in counts, counts
+    if kind == "halfscratch":
+        assert counts <= {0, 4} and 4 in counts, counts
+    else:
+        assert counts == {0}, counts
 
 
 def test_half_policy_rows():
-    """q8 B16-17 run HalfStock for an FP32 state; a BF16 state never does."""
-    for requests in (16, 17):
+    """q8 B11-17 run HalfStock (the DSMEM pair) for an FP32 state; a BF16 state never
+    does."""
+    for requests in range(11, 18):
         assert prepared.verify_kernel(requests, 8, RUBIN, False) == "halfstock"
         assert prepared.verify_kernel(requests, 8, RUBIN, True) != "halfstock"
-    for requests in (15, 18, 32, 64):
+    for requests in (9, 10, 18, 32, 64):
         assert prepared.verify_kernel(requests, 8, RUBIN, False) != "halfstock"
 
 

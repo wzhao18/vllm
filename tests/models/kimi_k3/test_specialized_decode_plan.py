@@ -811,6 +811,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
         prepared.KdaVerifyFeed: "feed",
         prepared.KdaVerifyHalfStock: "halfstock",
         prepared.KdaVerifyHalfDefer: "halfstock",
+        prepared.KdaVerifyHalfPair: "halfstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -854,7 +855,7 @@ FP32_Q4_RUNS = [
     (16, 35, "loopstock"), (36, 42, "kdasplit"), (43, 1024, "feed"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 15, "kdasplit"), (16, 17, "halfstock"), (18, 22, "kdasplit"),
+    (1, 10, "kdasplit"), (11, 17, "halfstock"), (18, 22, "kdasplit"),
     (23, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
@@ -899,7 +900,9 @@ def test_kda_fp32_policy_picks_the_measured_best():
     wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
     picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
     picks.update({(4, 41): "kdasplit", (4, 42): "kdasplit", (4, 43): "feed"})
-    picks.update({(4, 48): "feed", (8, 12): "kdasplit", (8, 15): "kdasplit"})
+    # q8 B11-15: HalfPair (DSMEM halves) ahead of FP32_SPLIT_Q since 2026-11-25
+    picks.update({(4, 48): "feed", (8, 12): "halfstock", (8, 15): "halfstock"})
+    picks.update({(8, 10): "kdasplit"})
     picks.update({(8, 16): "halfstock", (8, 17): "halfstock", (8, 18): "kdasplit"})
     picks.update({(8, 23): wide, (8, 48): wide})
     for (q, b), name in picks.items():
@@ -934,7 +937,7 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             kernel = kda_kernel(b, q, False)
             stock = (
                 prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
-                prepared.KdaSplitStock, prepared.KdaVerifyHalfStock,
+                prepared.KdaSplitStock, prepared.KdaVerifyHalfPair,
             )  # fmt: skip
             if prepared.record_protocol(q, False, KDA_HEADS, RUBIN):
                 # their deferred-verify record forms (TP16 q8)
