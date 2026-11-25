@@ -414,6 +414,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     auto valid_of = [&](int c) { return min(kChunk, n - gchunk(c) * kChunk); };
     // ---- V of chunk c -> FP16 (exact) for the PV fragments: 64 rows x 512 dims
     auto cast_v = [&](int c) {
+      if (c >= 0) return;  // ABLATION (timing bound only, wrong output): no V cast
       const uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
       constexpr int kItems = kChunk * 32 / kThreads;  // 4
       const int vrows = (valid_of(c) + 15) & ~15;  // (PV's 16-key steps)
