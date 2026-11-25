@@ -25,6 +25,7 @@ from ..common.host import (
     tensor_maps,
     to_cute,
 )
+from ..common import diagstamp
 from ..common.policy import batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox
@@ -388,6 +389,7 @@ def compile_tail(
             vote=direct and tail_vote(tp, batch, device),
         )  # fmt: skip
         scalars += (vec(3 * CAP * 3584),) if wave.reduce else ()
+        scalars += (fake((112, diagstamp.SLOTS), None, Int64),)  # DIAG stamps
     else:
         front = mode == "front" and rubin(device)
         poll_ns = RUBIN_POLL_NS.get(tp) if front else None
@@ -441,6 +443,7 @@ class MoeTailWeights:
         self.views = (to_cute(self.descriptor, 64), to_cute(gamma, 16))
         device = weight.device.index
         self.codes, early, self.compiles = {}, early_batches(tp, device), {}
+        self.stamps = {}  # DIAG: WaveMoeTail stamp rows per batch
         umma = umma_batches(tp, device)
         if any(published(tp, b, device) and b in umma for b in batches):
             # WaveMoeTail tcgen05: [64 x lines, 64] boxes of the shard, 128B swizzle
@@ -458,6 +461,9 @@ class MoeTailWeights:
             on = mode != "front" and b in umma
             views = self.umma_views if on else views
             self.compiles[b] = (tp, b, device, mode), dict(early=b in early, umma=on)
+            if mode != "front":
+                buf = diagstamp.buffer("tail", ordinal, b, 112, weight.device)
+                self.stamps[b] = to_cute(buf)
             code = compile_tail(*self.compiles[b][0], **self.compiles[b][1])
             self.codes[b] = code, views, shares(tp, b, twoshot, device), twoshot
         shared = any(shares(tp, b, b in twoshots, device) for b in batches)
@@ -475,6 +481,7 @@ class MoeTailWeights:
 
     def run(self, box, expanded, weights, shared, code=None, batch=None):
         batch = batch or weights.shape[0]
+        stamped = code is None and batch in self.stamps
         if code is None:
             code, views, share, twoshot = self.codes[batch]
         else:
@@ -486,6 +493,8 @@ class MoeTailWeights:
         rows += (Int32(box.rank), *self.scalars, Int32(self.wrap or batch))
         if share:
             rows += (flat(box.twoshot.gather if twoshot else box.reduced),)
+        if stamped:  # DIAG: WaveMoeTail codes take the stamp rows last
+            rows += (self.stamps[batch],)
         code(*args, *views, *rows, stream(expanded.device))
 
 
