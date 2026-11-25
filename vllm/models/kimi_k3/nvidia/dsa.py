@@ -14,7 +14,7 @@ and ``weights_proj`` into the merged ``wkv_index``.
 import math
 from collections.abc import Callable
 from functools import partial
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -138,6 +138,10 @@ class KimiK3DSAIndexer(nn.Module):
     upstream deepseek_v2.Indexer pattern).
     """
 
+    # The op follows its MLA layer's ShardQ token split (shardq_layer_name):
+    # MLAAttention opts the layer in at construction when its impl runs ShardQ.
+    supports_shardq: ClassVar[bool] = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -242,8 +246,8 @@ class KimiK3DSAIndexer(nn.Module):
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         # Set by KimiK3DSAAttention to skip scoring dense-MHA prefills.
         self.dense_mha_metadata_layer_name = ""
-        # Set by KimiK3DSAAttention when its MLA layer takes ShardQ steps: the
-        # op then follows that layer's token split.
+        # Set by MLAAttention when its MLA layer takes ShardQ steps: the op
+        # then follows that layer's token split.
         self.shardq_layer_name = ""
         self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
         # PCP gathers the unquantized key inside the op.
@@ -763,12 +767,9 @@ class KimiK3DSAAttention(nn.Module):
         indexer = self.dsa_indexer
         if not indexer.use_pcp:
             indexer.dense_mha_metadata_layer_name = self.mla_attn.mla_attn.layer_name
-        # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op, so the
-        # layer opts in itself, as DeepseekV32Attention does.
-        mla_layer = cast(Any, self.mla_attn.mla_attn)
-        if getattr(mla_layer.impl, "use_shardq", False):
-            mla_layer.use_shardq = True
-            indexer.shardq_layer_name = mla_layer.layer_name
+        # ShardQ (sparse_mla_shard_q): MLAAttention opts the layer in at
+        # construction (KimiK3DSAIndexer.supports_shardq) and sets the
+        # indexer's shardq_layer_name.
 
         offload = vllm_config.offload_config
         self.weights_offloaded = (

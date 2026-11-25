@@ -167,7 +167,7 @@ def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) ->
         vllm_config.scheduler_config.max_num_batched_tokens,
         max(
             dcp_shardq_few_token_rows(vllm_config, decode_query_len),
-            get_dcp_workspace_max_num_tokens(vllm_config),
+            get_dcp_workspace_max_num_tokens(vllm_config, dcp_shardq=True),
         ),
     )
 

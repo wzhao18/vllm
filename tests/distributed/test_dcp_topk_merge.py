@@ -901,6 +901,8 @@ def run_worker(
             n = dcp_merge_local_topk(TOPK, world)
             gate_config = SimpleNamespace(
                 parallel_config=config.parallel_config,
+                # The rescue rows' bound reads dcp_shardq_configured.
+                attention_config=config.attention_config,
                 kernel_config=SimpleNamespace(
                     sparse_indexer_topk_backend="auto", enable_jit_warmup=False
                 ),
