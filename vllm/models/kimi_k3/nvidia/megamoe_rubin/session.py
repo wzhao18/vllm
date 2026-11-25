@@ -278,12 +278,13 @@ def build_kernel(
 
 def reads_compact_scales(cfg: RubinMoeConfig) -> bool:
     """Whether the session's kernel can read compact NVFP4 weight-scale planes: the
-    refreshed inference kernel (src_gp, the prefill dedup variants) without a fused
-    shared expert."""
+    refreshed inference kernel (src_gp, the prefill dedup variants) on 2-CTA M256
+    tiles without a fused shared expert."""
     return (
         cfg.quant_kind == "nvfp4"
         and cfg.kernel_variant in DEDUP_VARIANTS
         and getattr(cfg, "shared", None) is None
+        and cfg.mma_tiler_mnk[0] == 256
     )
 
 

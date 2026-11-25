@@ -16,11 +16,10 @@ from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
 from ......common.ptx_helpers import (
     barrier_sync_unaligned,
     lds128_v4_b32,
-    mbarrier_arrive_release_cluster_on_cta,
-    mbarrier_wait_acquire_cluster,
+    st_async_byte_doubled_to_cta,
     sts128_byte_doubled,
-    tcgen05_fence_after_thread_sync,
     tma_load_1d,
+    tma_load_1d_to_cta,
 )
 from .....helpers.cute_py_helpers import (
     Tcgen05MmaInstruction,
@@ -63,8 +62,10 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
     acc_pipeline_mbarriers_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.acc_pipeline_mbarriers"
     tmem_holding_buffer_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_holding_buffer"
     tmem_deallocation_mbarrier_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_deallocation_mbarrier"
-    # vLLM-local (compact NVFP4 weight scales): one landing barrier per AB stage for the CTA's compact SFA bytes.
+    # vLLM-local (compact NVFP4 weight scales), used in the pair's peer CTA: one landing barrier per AB stage for
+    # both CTAs' compact SFA bytes, and the leader's compact bytes per stage.
     compact_sfa_mbarriers_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.compact_sfa_mbarriers"
+    compact_sfa_staging_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.compact_sfa_staging"
     tmem_allocation_barrier_id: ClassVar[int] = 2
 
     @classmethod
@@ -121,9 +122,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
         # vLLM-local: the weight scale planes hold only the even bytes of the swizzled NVFP4 planes (every per-16
-        # pair equal, an exact MXFP4 cast). Each CTA bulk-loads its compact SFA bytes into the upper half of the
-        # stage's SFA slot and its MMA warp doubles every byte in place before the SMEM -> TMEM copy: the expanded
-        # stage is the TMA-loaded stage of the full planes, bit for bit (_validate_compact_weight_sf).
+        # pair equal, an exact MXFP4 cast). Both CTAs of a 2-CTA pair bulk-load their compact SFA bytes of a k tile
+        # into the PEER CTA (its own: the upper half of its SFA slot; the leader's: a staging slot), on the peer's
+        # barrier. The peer's MMA warp (it issues no MMA) doubles every byte: its own in place, the leader's into
+        # the leader's SFA slot by st.async on the leader's AB barrier (transaction bytes, like a TMA load). The
+        # leader's MMA path is unchanged; the expanded stages are the TMA-loaded stages of the full planes, bit for
+        # bit (_validate_compact_weight_sf, _expand_compact_sfa_peer_tile).
         self.compact_weight_sf = bool(impl_desc.get("compact_weight_sf", False))
 
         self.architecture = "sm_107"
@@ -296,6 +300,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 raise ValueError(f"compact_weight_sf needs {name} {m} divisible by the CTA tile M.")
         if self.cta_tile_m != 128:
             raise ValueError("compact_weight_sf needs 128 weight rows per CTA (one SF atom row block).")
+        if not self.use_2cta_instrs:
+            raise ValueError("compact_weight_sf needs 2-CTA MMA (the pair's peer expands both halves).")
         self.compact_sfa_stage_bytes = self.cta_tile_m * self.mma_tile_k // (2 * self.sf_vec_size)
         # The in-place expansion: each lane reads whole 16-byte words of the compact half.
         if self.compact_sfa_stage_bytes % (32 * 16):
@@ -306,6 +312,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         smem_workspace.register_mbarrier(self.ab_pipeline_mbarriers_region, self.num_ab_pipeline_stages * 2)
         if self.compact_weight_sf:
             smem_workspace.register_mbarrier(self.compact_sfa_mbarriers_region, self.num_ab_pipeline_stages)
+            smem_workspace.register_tensor(
+                self.compact_sfa_staging_region,
+                self.sf_dtype,
+                (self.num_ab_pipeline_stages * self.compact_sfa_stage_bytes,),
+                byte_alignment=128,
+            )
         # Register the 4 B holding word before the 128 B-aligned stage tensors so it lands in the alignment gap.
         smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
 
@@ -392,7 +404,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 max(routed.nbytes, shared.nbytes) for routed, shared in zip(stage_one_regions, shared_stage_one_regions)
             )
         mbarrier_bytes = int(cutlass.Int64.width) // 8
-        ab_stage_cost_bytes = self.ab_stage_payload_bytes + (3 if self.compact_weight_sf else 2) * mbarrier_bytes
+        ab_stage_cost_bytes = self.ab_stage_payload_bytes + 2 * mbarrier_bytes
+        if self.compact_weight_sf:  # the peer's landing barrier and the leader's staged compact bytes
+            ab_stage_cost_bytes += mbarrier_bytes + self.compact_sfa_stage_bytes
         # Accumulator + TMEM-deallocation mbarriers plus the 8 B-aligned TMEM holding word.
         tmem_holding_buffer_bytes = 8
         plan_tail_bytes = (2 * self.num_accumulator_pipeline_stages + 2) * mbarrier_bytes + tmem_holding_buffer_bytes
@@ -885,12 +899,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.is_preferred_cluster = is_fallback_cluster == Boolean(False)
         self.mma_cta_index = cta_coord_in_cluster[0] % self.mma_cta_count
         self.is_leader_cta = self.mma_cta_index == 0
-        self.ab_full_mbarriers = smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base)
-        self.compact_sfa_mbarriers = None
         if cutlass.const_expr(self.compact_weight_sf):
+            self.ab_full_mbarriers = smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base)
             self.compact_sfa_mbarriers = smem_workspace.ptr(self.compact_sfa_mbarriers_region, smem_base)
-            # The pair's leader holds the AB barriers the peer's expanded SFA arrives on.
+            self.compact_sfa_staging = smem_workspace.ptr(self.compact_sfa_staging_region, smem_base)
             self.leader_cta_rank = cta_coord_in_cluster[0] - self.mma_cta_index
+            self.peer_cta_rank = self.leader_cta_rank + Int32(1)
         self.main_vmnk_coord = (
             self.mma_cta_index,
             cta_coord_in_cluster[0] // self.mma_cta_count,
@@ -912,23 +926,23 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
     def create_ab_pipeline(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> pipeline.PipelineAsync:
         """Create the shared two-producer TMA-to-UMMA pipeline.
 
-        Compact weight scales: each CTA's compact SFA bytes land on its own barrier (one arrival, the CTA's TMA-A
-        warp); a 2-CTA pair's peer expands its SFA in place and arrives on the leader's AB barrier (a third
-        producer), the leader expands its own before the SMEM -> TMEM copy."""
-        producers = 2
+        Compact weight scales: the leader's AB barrier also counts the 2C bytes of its expanded SFA the peer
+        st.asyncs (C compact bytes per CTA and stage); the peer's landing barrier takes one arrival (its TMA-A
+        warp) and both CTAs' compact bytes."""
+        tx_count = self.num_tma_load_bytes // 2
         if cutlass.const_expr(self.compact_weight_sf):
-            producers += self.mma_cta_count - 1
+            tx_count = (self.num_tma_load_bytes + 2 * self.compact_sfa_stage_bytes) // 2
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
                 for stage in cutlass.range_constexpr(self.num_ab_pipeline_stages):
                     cute.arch.mbarrier_init(self.compact_sfa_mbarriers + stage, 1)
-        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producers)
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 2)
         return PipelineTmaUmmaMixedCga.create(
             barrier_storage=smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base),
             num_stages=self.num_ab_pipeline_stages,
             producer_group=producer_group,
             num_mma_consumer_warps=1,
-            tx_count=self.num_tma_load_bytes // 2,
+            tx_count=tx_count,
             preferred_cta_layout_vmnk=self.cluster_layout_vmnk,
             fallback_cta_layout_vmnk=self.fallback_cluster_layout_vmnk,
             cta_coord_vmnk=self.main_vmnk_coord,
@@ -1075,16 +1089,27 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 mcast_mask=multicast_mask,
             )
             if cutlass.const_expr(compact_sfa):
+                # Both CTAs' compact bytes land in the peer, on its barrier (whose one arrival is the peer's).
                 compact_barrier = self.compact_sfa_mbarriers + stage_index
+                source = compact_source + cutlass.Int64(k_tile_idx * Int32(compact_bytes))
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(compact_barrier, Int32(compact_bytes))
-                    tma_load_1d(
-                        compact_smem + stage_index * Int32(2 * compact_bytes),
-                        compact_source + cutlass.Int64(k_tile_idx * Int32(compact_bytes)),
-                        compact_barrier,
-                        Int32(compact_bytes),
-                        evict_first=False,
-                    )
+                    if self.mma_cta_index == Int32(0):
+                        tma_load_1d_to_cta(
+                            self.compact_sfa_staging + stage_index * Int32(compact_bytes),
+                            source,
+                            compact_barrier,
+                            Int32(compact_bytes),
+                            self.peer_cta_rank,
+                        )
+                    else:
+                        cute.arch.mbarrier_arrive_and_expect_tx(compact_barrier, Int32(2 * compact_bytes))
+                        tma_load_1d(
+                            compact_smem + stage_index * Int32(2 * compact_bytes),
+                            source,
+                            compact_barrier,
+                            Int32(compact_bytes),
+                            evict_first=False,
+                        )
             else:
                 cute.copy(
                     sfa_atom,
@@ -1708,8 +1733,6 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
-                if cutlass.const_expr(self.compact_weight_sf):
-                    self._expand_compact_sfa_before_mma(ab_pipeline_state)
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
                 for instruction_index in cutlass.range_constexpr(instructions_per_stage):
@@ -1759,8 +1782,6 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
-                if cutlass.const_expr(self.compact_weight_sf):
-                    self._expand_compact_sfa_before_mma(ab_pipeline_state)
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
                 cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
@@ -1788,50 +1809,44 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         return ab_pipeline_state
 
     @cute.jit
-    def _expand_compact_sfa_stage(self, stage_index: Int32) -> None:
-        """The whole warp: double every byte of the stage's compact SFA half (its upper half) into the full
-        stage, in place, then make the bytes visible to the async proxy (tcgen05.cp)."""
-        compact_bytes = self.compact_sfa_stage_bytes
-        lane_bytes = compact_bytes // 32
-        stage = self.sfa_smem_tensor.iterator + stage_index * Int32(2 * compact_bytes)
-        lane = cute.arch.lane_idx()
-        source = stage + Int32(compact_bytes) + lane * Int32(lane_bytes)
-        words = []
-        for chunk in cutlass.range_constexpr(lane_bytes // 16):
-            words.append(lds128_v4_b32(source + Int32(16 * chunk)))
-        # Every lane's compact bytes are in registers before any lane overwrites them.
-        cute.arch.sync_warp()
-        destination = stage + lane * Int32(2 * lane_bytes)
-        for chunk in cutlass.range_constexpr(lane_bytes // 16):
-            word = words[chunk]
-            sts128_byte_doubled(destination + Int32(32 * chunk), word[0], word[1])
-            sts128_byte_doubled(destination + Int32(32 * chunk + 16), word[2], word[3])
-        cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.sync_warp()
-
-    @cute.jit
-    def _expand_compact_sfa_before_mma(self, ab_pipeline_state: pipeline.PipelineState) -> None:
-        """Leader MMA warp, after the stage's AB barrier: the peer's expanded SFA (2-CTA) is visible at cluster
-        scope, this CTA's compact bytes have landed; expand them before the SMEM -> TMEM copy."""
-        stage_index = ab_pipeline_state.index
-        if cutlass.const_expr(self.use_2cta_instrs):
-            mbarrier_wait_acquire_cluster(self.ab_full_mbarriers + stage_index, ab_pipeline_state.phase)
-        cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
-        self._expand_compact_sfa_stage(stage_index)
-        tcgen05_fence_after_thread_sync()
-
-    @cute.jit
     def _expand_compact_sfa_peer_tile(
         self, k_tile_count: Int32, ab_pipeline_state: pipeline.PipelineState
     ) -> pipeline.PipelineState:
-        """Peer MMA warp of a 2-CTA pair (it issues no MMA): expand this CTA's SFA of every k tile of the tile
-        and arrive on the leader's AB barrier of that stage (release at cluster scope)."""
+        """Peer MMA warp of a 2-CTA pair (it issues no MMA), every k tile of the tile: once both CTAs' compact
+        bytes landed, double every byte of its own in place (then make them visible to the async proxy), and of
+        the leader's into the leader's SFA slot by st.async, whose transaction bytes complete the leader's AB
+        barrier for the stage after the peer's own bytes are written."""
+        compact_bytes = self.compact_sfa_stage_bytes
+        lane_bytes = compact_bytes // 32
+        lane = cute.arch.lane_idx()
         for _ in cutlass.range(k_tile_count, unroll=1):
             stage_index = ab_pipeline_state.index
             cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
-            self._expand_compact_sfa_stage(stage_index)
-            with cute.arch.elect_one():
-                mbarrier_arrive_release_cluster_on_cta(self.ab_full_mbarriers + stage_index, self.leader_cta_rank)
+            stage = self.sfa_smem_tensor.iterator + stage_index * Int32(2 * compact_bytes)
+            own = stage + Int32(compact_bytes) + lane * Int32(lane_bytes)
+            leader = self.compact_sfa_staging + stage_index * Int32(compact_bytes) + lane * Int32(lane_bytes)
+            own_words, leader_words = [], []
+            for chunk in cutlass.range_constexpr(lane_bytes // 16):
+                own_words.append(lds128_v4_b32(own + Int32(16 * chunk)))
+                leader_words.append(lds128_v4_b32(leader + Int32(16 * chunk)))
+            # Every lane's compact bytes are in registers before any lane overwrites its own SFA slot.
+            cute.arch.sync_warp()
+            destination = stage + lane * Int32(2 * lane_bytes)
+            for chunk in cutlass.range_constexpr(lane_bytes // 16):
+                word = own_words[chunk]
+                sts128_byte_doubled(destination + Int32(32 * chunk), word[0], word[1])
+                sts128_byte_doubled(destination + Int32(32 * chunk + 16), word[2], word[3])
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_warp()
+            barrier = self.ab_full_mbarriers + stage_index
+            for chunk in cutlass.range_constexpr(lane_bytes // 16):
+                word = leader_words[chunk]
+                st_async_byte_doubled_to_cta(
+                    destination + Int32(32 * chunk), word[0], word[1], barrier, self.leader_cta_rank
+                )
+                st_async_byte_doubled_to_cta(
+                    destination + Int32(32 * chunk + 16), word[2], word[3], barrier, self.leader_cta_rank
+                )
             ab_pipeline_state.advance()
         return ab_pipeline_state
 
@@ -1944,7 +1959,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                         self.num_mma_instructions_per_ab_stage,
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
-            if cutlass.const_expr(self.compact_weight_sf and self.use_2cta_instrs):
+            if cutlass.const_expr(self.compact_weight_sf):
                 if self.mma_cta_index != Int32(0):
                     ab_pipeline_state = self._expand_compact_sfa_peer_tile(k_tile_count, ab_pipeline_state)
 

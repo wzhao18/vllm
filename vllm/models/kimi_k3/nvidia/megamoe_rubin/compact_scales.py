@@ -81,8 +81,12 @@ def expand(compact_plane: torch.Tensor) -> torch.Tensor:
 
 
 def _reads_compact(module) -> bool:
+    """Every bucket on the kernel that reads compact planes (session.reads_compact_scales:
+    the prefill inference kernel, 2-CTA M256 tiles, no fused shared expert)."""
     return all(
-        b.variant in DEDUP_VARIANTS and getattr(b, "shared", None) is None
+        b.variant in DEDUP_VARIANTS
+        and getattr(b, "shared", None) is None
+        and b.knobs.mma_tiler_mnk[0] == 256
         for b in module.buckets
     )
 

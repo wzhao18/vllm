@@ -19,7 +19,10 @@ from vllm.models.kimi_k3.nvidia.megamoe_rubin import compact_scales as S
 from vllm.models.kimi_k3.nvidia.megamoe_rubin import weights as W
 
 K31 = dict(hidden=3584, intermediate=3072)
-PREFILL = SimpleNamespace(variant="inference_dedup_wg2", max_tokens=8192, shared=None)
+M256 = SimpleNamespace(mma_tiler_mnk=(256, 128, 256))
+PREFILL = SimpleNamespace(
+    variant="inference_dedup_wg2", max_tokens=8192, shared=None, knobs=M256
+)
 
 
 def _mx_layer(gen, experts, hidden, intermediate):
@@ -134,10 +137,12 @@ def test_unequal_pair_on_any_rank_keeps_full_planes(one_rank):
 @pytest.mark.parametrize(
     "bucket",
     [
-        SimpleNamespace(variant="genphase", max_tokens=128, shared=None),
-        SimpleNamespace(variant="inference", max_tokens=2048, shared=None),
+        SimpleNamespace(variant="genphase", max_tokens=128, shared=None, knobs=M256),
+        SimpleNamespace(variant="inference", max_tokens=2048, shared=None, knobs=M256),
         SimpleNamespace(variant="inference_dedup_wg2", max_tokens=8192,
-                        shared=(3584, 1536)),
+                        shared=(3584, 1536), knobs=M256),
+        SimpleNamespace(variant="inference_dedup_wg2", max_tokens=8192, shared=None,
+                        knobs=SimpleNamespace(mma_tiler_mnk=(128, 128, 256))),
     ],
 )  # fmt: skip
 def test_bucket_without_a_compact_reader_keeps_full_planes(one_rank, bucket):

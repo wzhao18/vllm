@@ -401,19 +401,27 @@ def sts128_byte_doubled(smem_pointer, word0: Int32, word1: Int32, *, loc=None, i
 
 
 @dsl_user_op
-def mbarrier_arrive_release_cluster_on_cta(mbarrier_pointer, cta_rank, *, loc=None, ip=None) -> None:
-    """vLLM-local: one ``mbarrier.arrive.release.cluster`` on the barrier at this CTA's ``mbarrier_pointer``
-    offset in CTA ``cta_rank`` of the cluster (the thread's prior writes are released at cluster scope)."""
-    mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
+def tma_load_1d_to_cta(
+    destination_smem, source_gmem, mbarrier_smem, num_bytes, cta_rank, *, loc=None, ip=None
+) -> None:
+    """vLLM-local: a 1D GMEM-to-SMEM bulk copy into CTA ``cta_rank`` of the cluster: the destination and the
+    barrier are this CTA's addresses of the same offsets there (the barrier lives in the destination CTA)."""
     llvm.inline_asm(
         None,
-        [mbarrier_address, Int32(cta_rank).ir_value(loc=loc, ip=ip)],
+        [
+            destination_smem.toint(loc=loc, ip=ip).ir_value(),
+            _address_value(source_gmem, loc=loc, ip=ip),
+            num_bytes.ir_value(),
+            mbarrier_smem.toint(loc=loc, ip=ip).ir_value(),
+            Int32(cta_rank).ir_value(loc=loc, ip=ip),
+        ],
         "{\n"
-        "  .reg .b32 remote_mbar;\n"
-        "  mapa.shared::cluster.u32 remote_mbar, $0, $1;\n"
-        "  mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote_mbar];\n"
+        "  .reg .b32 remote_dst, remote_mbar;\n"
+        "  mapa.shared::cluster.u32 remote_dst, $0, $4;\n"
+        "  mapa.shared::cluster.u32 remote_mbar, $3, $4;\n"
+        "  cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [remote_dst], [$1], $2, [remote_mbar];\n"
         "}",
-        "r,r,~{memory}",
+        "r,l,r,r,r,~{memory}",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
@@ -422,33 +430,36 @@ def mbarrier_arrive_release_cluster_on_cta(mbarrier_pointer, cta_rank, *, loc=No
 
 
 @dsl_user_op
-def mbarrier_wait_acquire_cluster(mbarrier_pointer, phase, *, loc=None, ip=None) -> None:
-    """vLLM-local: wait for phase parity ``phase`` of a local mbarrier with cluster-scope acquire (pairs with
-    :func:`mbarrier_arrive_release_cluster_on_cta` of a peer CTA)."""
-    mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
+def st_async_byte_doubled_to_cta(
+    smem_pointer, word0: Int32, word1: Int32, mbarrier_pointer, cta_rank, *, loc=None, ip=None
+) -> None:
+    """vLLM-local (compact NVFP4 weight scales): the 8 bytes of ``word0, word1`` with every byte doubled, as one
+    16-byte ``st.async`` into CTA ``cta_rank`` at this CTA's ``smem_pointer`` offset, completing 16 transaction
+    bytes on that CTA's barrier at the ``mbarrier_pointer`` offset (an async-proxy write, like a TMA load)."""
     llvm.inline_asm(
         None,
-        [mbarrier_address, Int32(phase).ir_value(loc=loc, ip=ip)],
+        [
+            llvm.ptrtoint(T.i32(), smem_pointer.llvm_ptr, loc=loc, ip=ip),
+            Int32(word0).ir_value(),
+            Int32(word1).ir_value(),
+            llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip),
+            Int32(cta_rank).ir_value(loc=loc, ip=ip),
+        ],
         "{\n"
-        "  .reg .pred done;\n"
-        "  wait_loop:\n"
-        "  mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [$0], $1;\n"
-        "  @!done bra wait_loop;\n"
+        "  .reg .b32 a, b, c, d, remote_dst, remote_mbar;\n"
+        "  prmt.b32 a, $1, 0, 0x1100;\n"
+        "  prmt.b32 b, $1, 0, 0x3322;\n"
+        "  prmt.b32 c, $2, 0, 0x1100;\n"
+        "  prmt.b32 d, $2, 0, 0x3322;\n"
+        "  mapa.shared::cluster.u32 remote_dst, $0, $4;\n"
+        "  mapa.shared::cluster.u32 remote_mbar, $3, $4;\n"
+        "  st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [remote_dst], {a, b, c, d}, [remote_mbar];\n"
         "}",
-        "r,r,~{memory}",
+        "r,r,r,r,r,~{memory}",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def tcgen05_fence_after_thread_sync(*, loc=None, ip=None) -> None:
-    """``tcgen05.fence::after_thread_sync``: order later tcgen05 operations after the thread's prior syncs."""
-    llvm.inline_asm(
-        None, [], "tcgen05.fence::after_thread_sync;", "~{memory}", has_side_effects=True, asm_dialect=0,
-        loc=loc, ip=ip,
     )
 
 
@@ -1019,8 +1030,6 @@ __all__ = [
     "ldg_v4_b32",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
-    "mbarrier_arrive_release_cluster_on_cta",
-    "mbarrier_wait_acquire_cluster",
     "movmatrix_b16",
     "nanosleep",
     "read_clock64",
@@ -1038,9 +1047,10 @@ __all__ = [
     "stg_e8m0x8_from_f32",
     "stg_f32",
     "stg_v4_b32",
+    "st_async_byte_doubled_to_cta",
     "sts128_byte_doubled",
-    "tcgen05_fence_after_thread_sync",
     "tma_load_1d",
+    "tma_load_1d_to_cta",
     "f32x2_pack",
     "fma_rn_f32x2_bf16x2",
     "cvt_rn_bf16x2_f32x2",
