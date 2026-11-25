@@ -120,6 +120,20 @@ WAIT_CTAS_PER_SM = 4
 # stream at every wide row; QueryWait stays right before the sparse decode, after
 # the join (its wide grid would take the chain's SMs while it polls).
 WIDE_QUERY_OVERLAP = "65-:fork"
+# Rubin, per heads: rows whose MlaQuery tiles 48 requests per CTA instead of the default
+# 32 (mla.query.WIDE_TOKENS for the DSA query): the grid is 8-CTA clusters x heads x row
+# tiles at one CTA per SM and Rubin holds 22 such clusters at the DSA query's shared
+# memory, so the tile needing the fewest cluster rounds wins (6 heads: 128 rows 24 -> 18
+# clusters, two rounds -> one; 256 rows 48 -> 36, three -> two; 512 rows 96 -> 66, five
+# -> three). The same arithmetic per row.
+WIDE_QUERY_TOKENS = {6: "97-144:48,225-512:48"}
+
+
+def query_tokens(heads, batch, sms):
+    """MlaQuery's requests per CTA at ``batch`` wide rows (0: its default)."""
+    if sms <= GB300_SMS:
+        return 0
+    return batch_table(WIDE_QUERY_TOKENS.get(heads, "")).get(batch, 0)
 OVERLAP_MODES = ("serial", "fork")
 # Rows whose forked indexer chain (wq_b through the sparse decode) runs on the
 # high-priority index stream ("chain"; other rows: the layer's stream). MlaQuery
@@ -235,6 +249,7 @@ def compile_core(
         q_heads=q_heads,
         store_qc=overlap == "serial",
         gather=not query_publishes_only(batch, dcp, overlap),
+        tokens=query_tokens(heads, batch, sms),
     )
     q_args = (projected, qnorm, kvnorm, qb, uk, kv, slots, scalar, scalar, f32(1e-6))
     publish: tuple = ()
