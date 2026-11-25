@@ -570,6 +570,7 @@ class DcpShardQContext:
 
         plan = self.rank_major
         assert plan is not None and self.mla_prefetch is None
+        _check_issue_not_captured()
         buffer = _workspace(self.layout, self.pages, mla_cache.device)
         mla_rows = buffer.storage[: self.pages * self.layout.mla_page_bytes]
         now = torch.cuda.Event()
@@ -716,25 +717,54 @@ def _prefetch_first_now() -> None:
             )
 
 
+def _check_issue_not_captured() -> None:
+    """The copies' sizes and offsets come from the step's plan on the host, so
+    their issue must run on every step: never inside a CUDA graph that vLLM
+    replays for other batches. A DCP ShardQ step is a mixed batch, which never
+    runs in a FULL graph (``dcp_shardq_configured``), and under a PIECEWISE /
+    breakable capture the issue points (the forward start's eager break and the
+    sparse attention op, an eager break) run outside the capture. A one-shot
+    capture of one exact batch (the forward bench, runtime mode NONE) replays
+    that batch's plan and may capture them."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    mode = (
+        get_forward_context().cudagraph_runtime_mode
+        if is_forward_context_available()
+        else CUDAGraphMode.NONE
+    )
+    if mode != CUDAGraphMode.NONE:
+        raise RuntimeError(
+            "DCP ShardQ: the context-row copies would be captured into a "
+            f"{mode.name} CUDA graph, which replays them with another step's plan"
+        )
+
+
 def prefetch_first_context_rows() -> None:
     """At the start of a model forward (before its first layer): issue the
     copies of the first DSA layer's context MLA rows of a rank-major DCP
     ShardQ step (``DcpShardQContext.prefetch_first``), so they run under the
     layers before it. Under a breakable CUDA graph capture (each attention op
-    an eager break) this runs as an eager break of its own: the copies are
-    joined by the first DSA layer's attention, in a later segment."""
+    an eager break) this runs as an eager break of its own on every instance
+    that can plan DCP ShardQ steps, whatever the capture batch: each replay
+    looks the step's contexts up again and issues its plan's copies."""
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
     capture = BreakableCUDAGraphCapture.current()
     if capture is not None and capture._capturing:
-        from vllm.config import CUDAGraphMode
+        from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
         from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.ops.dcp import dcp_shardq_configured
 
-        if (
-            _step_rank_major_contexts()
-            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
-        ):
-            # Replays look the step's contexts up again.
+        config = get_current_vllm_config_or_none()
+        shardq = _RANK_MAJOR_PLANNED or (
+            config is not None and dcp_shardq_configured(config)
+        )
+        mode = get_forward_context().cudagraph_runtime_mode
+        if shardq and mode != CUDAGraphMode.FULL:
             capture.add_eager(_prefetch_first_now)
             return
     _prefetch_first_now()
