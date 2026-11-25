@@ -551,8 +551,8 @@ def row_bin(rows):
 def test_dsa_in_projection_takes_the_tensor_memory_tactics():
     """Rubin TP16: the DSA in-projection (3040 rows, 24 M tiles) stages its weights in
     tensor memory at up to 16 rows (split 4) and 33-64 rows (split 6), and keeps split-K
-    at 17-32 rows, above 64 (F5) and on GB300; the KDA and MLA rows keep their
-    tactics."""
+    at 17-32 rows, above 64 (F5) and on GB300; the MLA rows keep their tactics, the KDA
+    rows theirs except q8 17-32 rows (KDA_SPLITK_Q)."""
     dsa = projection_policies(16, PITCH, DL7_TUNED, sms=212, q=8)
     assert dsa == {m: DSA[row_bin(m)] for m in DL7_TUNED}
     assert dsa[24] == dsa[32] == SPLIT_K[32]
@@ -561,7 +561,14 @@ def test_dsa_in_projection_takes_the_tensor_memory_tactics():
     assert mla == {m: MLA[row_bin(m)] + polled.get(m, ()) for m in DL7_TUNED}
     kda = projection_policies(16, 3216, DL7_TUNED, sms=212, q=8)
     wide_kda = (128, 64, 6, 14, 14)
-    assert kda == {m: (64, 8, 2, 12) if m <= 8 else wide_kda for m in DL7_TUNED}
+    # q8 B3-B4 (17-32 rows): split-K (64, 32, 2, 8), the verify core resident beside it
+    splitk_kda = {24: (64, 32, 2, 8), 32: (64, 32, 2, 8)}
+    assert kda == {
+        m: (64, 8, 2, 12) if m <= 8 else splitk_kda.get(m, wide_kda) for m in DL7_TUNED
+    }
+    # other q keep WIDE_B64 at those rows (KDA_SPLITK_Q is keyed by q)
+    kda_q4 = projection_policies(16, 3216, (24, 32), sms=212, q=4)
+    assert kda_q4 == dict.fromkeys((24, 32), wide_kda)
     wide = projection_policies(16, PITCH, (72, 96, 128), sms=212, q=8)
     assert wide == dict.fromkeys((72, 96, 128), (64, 64, 2, 6))
     gb300 = projection_policies(16, PITCH, DL7_TUNED, sms=152, q=8)
