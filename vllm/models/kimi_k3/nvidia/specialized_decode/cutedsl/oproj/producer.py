@@ -632,38 +632,6 @@ class OprojUmma(OprojProducer):
                     reduce(recv, gather, gather_mc, rank, token, column, True)
 
 
-class OprojReduce:
-    """Two-shot owner reduce as its own lean grid (``LEAN_REDUCE``): 112 CTAs x 32
-    threads, no shared memory, the same chunk per thread as ``OprojUmma.reduce_owned``
-    (chunk 32 cta + lane of this rank's owned [tokens, W] columns, ``reduce``: the TP
-    slots in rank order, multicast to the gather, re-armed). The producer then exits
-    right after its pushes, so its 135-196 KB CTAs free their SMs for the next layer's
-    weight preload while the owners wait for the other ranks' chunks. Args (recv,
-    gather, gather multicast, rank, stream). Same sums, bitwise."""
-
-    def __init__(self, batch, threads=32):
-        self.batch, self.threads = batch, threads  # 112 x 32 threads in all
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, 112 * 32 // self.threads, self.threads)
-
-    @cute.kernel
-    def kernel(self, args):
-        recv, gather, gather_mc, rank = args[:4]
-        tid, _, _, cta = thread()
-        cute.arch.griddepcontrol_launch_dependents()
-        per: Constexpr = recv.shape[2] // 8
-        rounds: Constexpr = -(-self.batch * per // (112 * 32))
-        for j in cutlass.range_constexpr(rounds):
-            g = cta * self.threads + tid + 112 * 32 * j
-            if g < self.batch * per:
-                token, local = g // per, g % per
-                column = rank * recv.shape[2] + local * 8
-                reduce(recv, gather, gather_mc, rank, token, column, True)
-        cute.arch.griddepcontrol_wait()  # the producer done before dependents run
-
-
 @asm()
 def tma_tile(dst, tensor_map, barrier, k0, row0):
     """One 2D box of ``tensor_map`` at (k0, row0) into shared address ``dst``,
