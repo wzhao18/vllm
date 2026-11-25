@@ -2111,7 +2111,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             wrap_into_copy_standard_layout(tmem_half_in_first_load_view[None, 1]),
             wrap_into_copy_standard_layout(up_token_32),
         )
-        if cutlass.const_expr(PR2_PROBE not in ("fc1tmemonly", "epitmemonly")):  # PR2 EXPERIMENT ONLY
+        if cutlass.const_expr(PR2_PROBE not in ("fc1tmemonly", "epitmemonly", "mbe", "be", "me")):  # PR2 EXPERIMENT ONLY
             if cutlass.const_expr(PR2_PROBE == "fc1noact"):  # PR2 EXPERIMENT ONLY: no gated activation math
                 pre_quant_pre_trans = gate_token_32
             else:
@@ -2872,7 +2872,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         loaded = process_pipeline.tmem_acc_load(tmem_subtile_tensor=tmem_subtile_tensor, epi=self)
         iket.range_pop()
 
-        if cutlass.const_expr(PR2_PROBE not in ("fc2tmemonly", "epitmemonly")):  # PR2 EXPERIMENT ONLY
+        if cutlass.const_expr(PR2_PROBE not in ("fc2tmemonly", "epitmemonly", "mbe", "be", "me")):  # PR2 EXPERIMENT ONLY
             iket.range_push("fc2.f2fp_reorder")
             casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val, batch_invariant=self.batch_invariant)
             # reorder returns a bare RMEM fragment in the store's expected pre-store
