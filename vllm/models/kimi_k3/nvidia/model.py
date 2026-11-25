@@ -1351,7 +1351,22 @@ class KimiMoE(nn.Module):
           wait on MegaMoE, so its spin-waits cannot block on them).
 
         Both forms fork and join inside this call (no eager break between), so
-        they are also legal inside breakable CUDA graph segments."""
+        they are also legal inside breakable CUDA graph segments.
+
+        Raises if the shared expert would run a persistent or collective kernel
+        (GEMM-RS/AR, the fused SiTU GEMM) beside the persistent MegaMoE grid, or if
+        an eager break split a breakable capture segment between fork and join."""
+        shared = self.shared_experts
+        if shared.gemm_rs_ar is not None or shared._prefill_situ is not None:
+            raise RuntimeError(
+                "KimiMoE shared-expert overlap: the shared expert runs a persistent "
+                "kernel (GEMM-RS/AR or fused SiTU) that may not share SMs with the "
+                "persistent MegaMoE grid."
+            )
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        capture = BreakableCUDAGraphCapture.current()
+        breaks = None if capture is None else capture.num_eager_breaks
         start, done = self._shared_events
         if self.experts.shared_overlap(hidden_states.shape[0]):
             routed_hidden_states, router_output, topk_ids = (
@@ -1376,6 +1391,11 @@ class KimiMoE(nn.Module):
                 done.record()
             shared_output = self.shared_experts(shared_input)
         done.wait()
+        if capture is not None and capture.num_eager_breaks != breaks:
+            raise RuntimeError(
+                "KimiMoE shared-expert overlap: an eager break inside the MoE layer "
+                "split the breakable CUDA graph segment between fork and join."
+            )
         assert self.routed_output_transform is not None
         return self.routed_output_transform(routed, residual=shared_output)
 
