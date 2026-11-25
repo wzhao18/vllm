@@ -1023,22 +1023,30 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             header = load_words(ws, count=1, mutable=True)
             scalars[0], scalars[1], scalars[2] = (Int32(header[0]), calls, grouped)
         if cutlass.const_expr(len(self.dies) > 0):
-            words: cutlass.Constexpr = (self.grid + 31) // 32
-            if tid < words:  # FC2(B)'s home bits (``pool_homed``)
-                word = load_words(ws + R_BITS + 4 * (24 + tid), count=1, mutable=True)
-                view(sm.iterator, self.off_misc + 2704 + 144, Uint32, 12)[tid] = word[0]
-            self.arrive(sm, workspace, arrival)
-            if (warp == 2) & (lane == 0):
-                info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
-                entry = R_RANKS + 8 * (info[0] * self.grid + info[3])
-                pair = load_words(ws + entry, count=2, mutable=True)
-                ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
-                ranks[0] = Int32(pair[0] & Uint32(65535))
-                ranks[1] = Int32(pair[0] >> Uint32(16))
-                ranks[2] = Int32(pair[1] & Uint32(65535))
-                ranks[3] = Int32(pair[1] >> Uint32(16))
+            self.ready_ranks(sm, workspace, arrival)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
+
+    @cute.jit
+    def ready_ranks(self, sm, workspace, arrival):
+        """``load_ready`` with ``dies``: FC2(B)'s home bits (``pool_homed``), then
+        ``arrive`` and this CTA's four matched ranks for its (die, arrival)."""
+        tid, warp, lane, _ = thread()
+        ws = workspace.iterator + self.ws_ready
+        if tid < (self.grid + 31) // 32:
+            word = load_words(ws + R_BITS + 96 + 4 * tid, count=1, mutable=True)
+            bits = view(sm.iterator, self.off_misc + 2704 + 144, Uint32, 12)
+            bits[tid] = word[0]
+        self.arrive(sm, workspace, arrival)
+        if (warp == 2) & (lane == 0):
+            info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
+            entry = R_RANKS + 8 * (info[0] * self.grid + info[3])
+            pair = load_words(ws + entry, count=2, mutable=True)
+            ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
+            ranks[0] = Int32(pair[0] & Uint32(65535))
+            ranks[1] = Int32(pair[0] >> Uint32(16))
+            ranks[2] = Int32(pair[1] & Uint32(65535))
+            ranks[3] = Int32(pair[1] >> Uint32(16))
 
     @cute.jit
     def matched(self, sm):
@@ -1389,12 +1397,11 @@ class ReadyTable:
     @cute.jit
     def build(self, ids, ready, batch: cutlass.Constexpr[int], sbuf):
         """The last route CTA: the ready region (see the class)."""
-        moe = self.moe
         tid = cute.arch.thread_idx()[0]
         warp, lane = (tid // 32, tid % 32)
         threads: cutlass.Constexpr = self.THREADS
         experts_n: cutlass.Constexpr = 896
-        grid: cutlass.Constexpr = moe.grid
+        grid: cutlass.Constexpr = self.moe.grid
         base_ptr = sbuf.iterator
         masks = view(base_ptr, self.O_MASKS, Uint32, 2 * experts_n)
         base = view(base_ptr, self.O_BASE, Int32, experts_n)
@@ -1449,7 +1456,7 @@ class ReadyTable:
                 start += totals[w]
         if tid == threads - 1:
             scalars[0] = start + count
-        most: cutlass.Constexpr = (moe.capacity + 7) // 8
+        most: cutlass.Constexpr = (self.moe.capacity + 7) // 8
         for j in cutlass.range_constexpr(span):
             e = span * tid + j
             if e < experts_n:
@@ -1474,13 +1481,13 @@ class ReadyTable:
                 rank += Int32(cute.arch.popc(word & below))
                 rows[(base[e] + (rank >> 3)) * 8 + (rank & 7)] = Int16(pair)
         out = ready.iterator
-        if cutlass.const_expr(len(moe.dies) > 0):
-            words: cutlass.Constexpr = (grid + 31) // 32
+        words = (self.moe.grid + 31) // 32
+        if cutlass.const_expr(len(self.moe.dies) > 0):
             bits = view(base_ptr, self.O_BITS, Uint32, 32)
             lists = view(base_ptr, self.O_LISTS, Int16, 2048)
             if warp < words:
-                ranges = moe.partition(distinct, tid)
-                dies = moe.range_dies(ranges, experts, tid)
+                ranges = self.moe.partition(distinct, tid)
+                dies = self.moe.range_dies(ranges, experts, tid)
                 for p in cutlass.range_constexpr(4):
                     ballot = cute.arch.vote_ballot_sync(dies[p])
                     if lane == 0:
