@@ -434,6 +434,16 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     kernel = make_kernel(options, capability, prepared)
     with torch.accelerator.device_index(device):  # (persistent kernels: its SMs)
+        from ..common import l5diag  # DIAG (L5): stamp rings
+
+        if isinstance(kernel, KdaVerifyCols):
+            ctas = kernel.cluster * heads * requests
+            kernel.diag = l5diag.Ring("cols", (requests, tokens), ctas)
+        elif isinstance(kernel, KdaVerifyLoop):
+            from .verify_loop import persistent_ctas
+
+            ctas = persistent_ctas(heads * requests, device)
+            kernel.diag = l5diag.Ring("loop", (requests, tokens), ctas)
         compiled = cute.compile(
             kernel, *args[:13], *scalars, *args[13:], make_fake_stream()
         )

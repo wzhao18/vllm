@@ -33,6 +33,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.arch import store_async_dsmem
 
 from ..attn_res.kernel import BESIDE_SMEM
+from ..common import l5diag
 from ..common.primitives import (
     at,
     float_bits,
@@ -142,6 +143,11 @@ class KdaHeadVerify(KdaHeadWide):
         token, partition = rank // 2, rank % 2  # hop 1: this CTA's token inputs
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        # DIAG (L5): stamp row of this CTA for this launch
+        dblock = head * CLUSTER + rank
+        self.drow = self.diag.row(dblock)
+        l5diag.stamp(self.drow, 0, tid == 128)
+        l5diag.smid(self.drow, tid == 128)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles if staged else stages)
@@ -219,6 +225,7 @@ class KdaHeadVerify(KdaHeadWide):
             cute.arch.cluster_wait()
             if warp_idx == 0:
                 self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                l5diag.stamp(self.drow, 3, tid == 0)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -226,6 +233,7 @@ class KdaHeadVerify(KdaHeadWide):
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                 else:
                     self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+                l5diag.stamp(self.drow, 2, tid == 32)
                 if cutlass.const_expr(self.polled_out):  # after the PDL wait above
                     self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
             elif cutlass.const_expr(staged):
@@ -252,6 +260,7 @@ class KdaHeadVerify(KdaHeadWide):
             coords = (head, rank, slot, offset)
             early = self.verify_early(kt, tensors, coords, slots)
             cute.arch.cluster_wait()
+            l5diag.stamp(self.drow, 1, kt == 0)
             if cutlass.const_expr(staged):  # the other B_ISSUERS - 1 warps of x's tiles
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -261,6 +270,7 @@ class KdaHeadVerify(KdaHeadWide):
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
             wait(bar_in)
+            l5diag.stamp(self.drow, 5, kt == 0)
             inputs, gate_in = self.read_inputs(kt, x_in)
             # this CTA's rounded token inputs, then hop 2
             mine[kt] = inputs[0]
@@ -270,6 +280,7 @@ class KdaHeadVerify(KdaHeadWide):
             mine[320 + kt] = gate_in
             named_barrier(1, 128)
             self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
+            l5diag.stamp(self.drow, 6, kt == 0)
             cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
             if kda_cta:
                 rows = (
@@ -288,6 +299,7 @@ class KdaHeadVerify(KdaHeadWide):
                     kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
                 )
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+        self.diag.bump(dblock, tid == 0)
 
     @cute.jit
     def hop(self, kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop):
@@ -389,6 +401,7 @@ class KdaHeadVerify(KdaHeadWide):
         a = a_log[head]
         cute.arch.cluster_wait()
         ar, beta = self.poll_fa(fa_beta, counter, target, group % T, quarter, head)
+        l5diag.stamp(self.drow, 14, lane == 0)
         cute.arch.griddepcontrol_launch_dependents()
         if (rank < KDA_CTAS) & (slot > 0):
             acc = zeros(4, Float32)
@@ -505,6 +518,7 @@ class KdaHeadVerify(KdaHeadWide):
         else:
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
+            l5diag.stamp(self.drow, 7, kt == 0)
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
             for t in cutlass.range_constexpr(T):
                 inputs[3 * t] = raw_qk[t * 128 + kt]
@@ -558,8 +572,11 @@ class KdaHeadVerify(KdaHeadWide):
             if kt < T:  # the tokens' checkpoint slots, for the rolled loop
                 slot_rows[kt] = slots[0, kt]
             named_barrier(1, 128)  # shared_v, slot_rows
+            l5diag.stamp(self.drow, 8, kt == 0)
             wait(bar_qk)
+            l5diag.stamp(self.drow, 9, kt == 0)
             wait(bar_gate)
+            l5diag.stamp(self.drow, 10, kt == 0)
             # The token loop is a rolled loop (the next token's operands double-buffered
             # in registers): one ~130-instruction body instead of ~1000 instructions of
             # straight-line code fetched once per layer, which the serving neighbours'
@@ -596,6 +613,7 @@ class KdaHeadVerify(KdaHeadWide):
                         history, state, slot_t, head, value_base, lanes
                     )
             out_last = self.query_dot(history, buffers[1][0, None, None])
+            l5diag.stamp(self.drow, 11, kt == 0)
             if group_lane == 0:
                 local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
             # The outputs of every token: thread kt pushes row kt % 16 of token kt // 16
@@ -615,6 +633,7 @@ class KdaHeadVerify(KdaHeadWide):
                     conv_put(conv_page, (channel, i), value)
             if partition < T:  # token ``partition``: the gated RMS norm
                 wait(bar_out)
+                l5diag.stamp(self.drow, 12, kt == 0)
                 raw_o = shared_o[self.vkda.output_position(kt)]
                 sums = cute.make_rmem_tensor(4, Float32)
                 for g in cutlass.range_constexpr(4):
@@ -629,6 +648,7 @@ class KdaHeadVerify(KdaHeadWide):
                     store_bf16_canonical(at(output, partition, qk_channel), result)
                 else:
                     output[partition, qk_channel] = BFloat16(result)
+                l5diag.stamp(self.drow, 13, kt == 0)
                 if partition == 0:
                     for s in cutlass.range_constexpr(2):
                         channel = s * dim + qk_channel
@@ -662,6 +682,7 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
         has_bias=has_bias,
     )  # fmt: skip
     kernel.polled_out = polled
+    kernel.diag = l5diag.Ring("head_verify", heads, CLUSTER * heads)  # DIAG (L5)
     args = (matrix(1), matrix(1), cutlass.Int64(0), *tensors, *scalars)
     args += (cutlass.Int64(0), Int32(0), cutlass.Int64(0), make_fake_stream())
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
