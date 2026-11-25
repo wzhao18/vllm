@@ -47,7 +47,10 @@ pytest.importorskip("cutlass")
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("needs a Rubin GPU (compute capability 10.7)", allow_module_level=True)
 
-from tests.models.kimi_k3.kda_protocol import accepted_states  # noqa: E402
+from tests.models.kimi_k3.kda_protocol import (  # noqa: E402
+    accepted_states,
+    record_input,
+)
 from tests.models.kimi_k3.test_specialized_decode_kda_fp32_gpu import (  # noqa: E402
     FA_ROWS,
     HIDDEN,
@@ -250,6 +253,8 @@ def test_fp32_heads_match_stock(monkeypatch, rows, q, polled, seed):
         polled=(8,) if polled else (), verify=verify,
     )  # fmt: skip
     got_caches = clone(base)
+    if q > 1 and prepared.record_protocol(q, False, 6, (10, 7)):
+        record_input(got_caches[1], table, accepted)  # (the record format)
     head.prepare_caches(got_caches)
     rearm = None
     if polled:
@@ -300,7 +305,10 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q, seed):
     )  # fmt: skip
     assert kernel.stock, type(kernel)
     fold = PreparedKdaInProj64(weight, core, FOLD_TACTIC, tokens=q)
+    records = prepared.record_protocol(q, False, 6, (10, 7))
     got_caches = clone(base)
+    if records:  # (the record format)
+        record_input(got_caches[1], table, accepted)
     fold.prepare_caches(got_caches)
     projected = torch.zeros(rows, PITCH, dtype=torch.bfloat16, device=DEVICE)
     projected[:, 4 * DIM : 4 * DIM + 128].view(torch.int16).fill_(-1)  # FA_SENT
@@ -320,6 +328,8 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q, seed):
     torch.cuda.synchronize()
 
     pair_caches = clone(base)
+    if records:
+        record_input(pair_caches[1], table, accepted)
     pair = torch.empty(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
     core.run(published, pair, caches=pair_caches, slots=table, accepted=accepted)
     torch.cuda.synchronize()

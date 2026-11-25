@@ -686,8 +686,10 @@ class Attention:
             # An FP32 state's verify kernels store the deferred-verify records
             # (kda.verify_defer): the layer's stock verify and the align copies
             # follow the record format (ops/kda_records.py).
-            heads = attention.A_log.numel()
-            records = record_protocol(q, runtime.bf16_state, heads)
+            a_log = getattr(attention, "A_log", None)
+            records = a_log is not None and record_protocol(
+                q, runtime.bf16_state, a_log.numel()
+            )
             if records and not getattr(attention, "use_recoverssm", False):
                 if getattr(attention, "kda_spec_decode_backend", None) == "flashinfer":
                     raise RuntimeError(
