@@ -222,6 +222,7 @@ class KdaInProj64(SplitKTmemGemm64):
         of the owner's 32 channels x 64 tokens (see the module docstring)."""
         mC, prepared, conv_w, bias, conv_state, slots, accepted, scale = out
         dim: cutlass.Constexpr = self.dim
+        self.stamp(22, epi_tid == 0)
         if (row0 // dim == 4) & (row0 % dim < 128):  # F_A rows: polled (sentinel)
             for t in cutlass.range_constexpr(16):
                 totals[t] = _canonical(totals[t])
@@ -231,6 +232,7 @@ class KdaInProj64(SplitKTmemGemm64):
             )
         else:
             self.publish(epi_tid, totals, tile, mC, row0, col0, l_idx)
+        self.stamp(16, epi_tid == 0)
         lane, g = epi_tid % SHARE, epi_tid // SHARE
         section = row0 // dim  # 0 Q, 1 K, 2 V, 3 output gate, 4 F_A / beta
         channel = row0 % dim + lane  # within the section: head * 128 + 32 owner + lane
@@ -259,6 +261,7 @@ class KdaInProj64(SplitKTmemGemm64):
                     window = (taps[1], taps[2], *(xb[8 * rq + t] for t in tokens))
                     for i, value in enumerate(window):
                         conv_put(page, (row, i), value)
+            self.stamp(17, epi_tid == 0)
             kept = [t for t in range(16) if self.kept(t)]
             if cutlass.const_expr(self.stock):
                 for t in kept:
@@ -267,6 +270,7 @@ class KdaInProj64(SplitKTmemGemm64):
                 act = sigmoids([y[t] for t in kept])
                 for i, t in enumerate(kept):
                     y[t] = y[t] * act[i]
+            self.stamp(18, epi_tid == 0)
             if section == 2:
                 for t in cutlass.range_constexpr(16):
                     if cutlass.const_expr(self.kept(t)):
@@ -305,7 +309,9 @@ class KdaInProj64(SplitKTmemGemm64):
             slot = self.norm_parts.iterator + owner * 64 + 16 * g + lane
             for peer in cutlass.range_constexpr(OWNERS):
                 push_float(slot, mine, self.norm_bar, peer)
+        self.stamp(20, (lane == 0) & (g == 0))
         wait(self.norm_bar)
+        self.stamp(21, (lane == 0) & (g == 0))
         for t in cutlass.range_constexpr(16):
             token = 16 * g + t
             if cutlass.const_expr(self.kept(t)):
@@ -652,7 +658,9 @@ class KdaInProj80(KdaInProj64):
         if (row0 // dim == 4) & (row0 % dim < 128):  # F_A rows: polled (sentinel)
             for t in cutlass.range_constexpr(width):
                 totals[t] = _canonical(totals[t])
+        self.stamp(22, epi_tid == 0)
         SplitKTmemGemm64.finish(self, epi_tid, totals, tile, (mC,), row0, col0, l_idx)
+        self.stamp(16, epi_tid == 0)
         lane, g = epi_tid % SHARE, epi_tid // SHARE
         section = row0 // dim  # 0 Q, 1 K, 2 V, 3 output gate, 4 F_A / beta
         channel = row0 % dim + lane
@@ -669,6 +677,7 @@ class KdaInProj80(KdaInProj64):
                 self.conv80(y, xb, tile, lane, base, row, conv_state, 0)
             else:
                 self.conv80(y, xb, tile, lane, base, row, conv_state, 4)
+            self.stamp(17, epi_tid == 0)
             if cutlass.const_expr(self.stock):
                 for t in cutlass.range_constexpr(width):
                     y[t] = triton_silu(y[t])
@@ -676,6 +685,7 @@ class KdaInProj80(KdaInProj64):
                 act = sigmoids([y[t] for t in range(width)])
                 for t in cutlass.range_constexpr(width):
                     y[t] = y[t] * act[t]
+            self.stamp(18, epi_tid == 0)
             if section == 2:
                 for t in cutlass.range_constexpr(width):
                     if base + t < rows:
@@ -743,7 +753,9 @@ class KdaInProj80(KdaInProj64):
             slot = self.norm_parts.iterator + owner * 80 + width * g + lane
             for peer in cutlass.range_constexpr(OWNERS):
                 push_float(slot, mine, self.norm_bar, peer)
+        self.stamp(20, (lane == 0) & (g == 0))
         wait(self.norm_bar)
+        self.stamp(21, (lane == 0) & (g == 0))
         rows = prepared.layout.shape[0]
         for t in cutlass.range_constexpr(width):
             token = width * g + t

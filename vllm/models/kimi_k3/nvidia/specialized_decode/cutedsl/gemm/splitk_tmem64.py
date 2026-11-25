@@ -196,6 +196,9 @@ def _smid_store(address, when):
     return code, "l,r,~{memory}", (Int64(address), Int32(when))
 
 
+STAMP_ADDR = None  # DIAG (bench only): device address of [CTAs][32] u64 %globaltimer stamps, read at trace time
+
+
 class SplitKTmemGemm64(SplitKGemm):
     """``tactic`` (128, N, split, slots), N 64 or 128 token columns (N128: 12 A tiles
     in tensor memory beside a 128-column accumulator, 16 KB x tiles, mailboxes and
@@ -297,7 +300,12 @@ class SplitKTmemGemm64(SplitKGemm):
         split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         n_idx = by // self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if cutlass.const_expr(self.stamps):
+        if cutlass.const_expr(STAMP_ADDR is not None):
+            self.stamps = True
+            grid_x, _, _ = cute.arch.grid_dim()
+            cta = bidx + grid_x * by
+            self.stamp_base = Int64(STAMP_ADDR) + Int64(cta) * 256
+        elif cutlass.const_expr(self.stamps):
             grid_x, _, _ = cute.arch.grid_dim()
             cta = bidx + grid_x * by
             self.stamp_base = mS.iterator.toint() + Int64(cta) * 128
