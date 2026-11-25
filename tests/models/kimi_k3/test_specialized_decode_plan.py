@@ -939,7 +939,7 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             kernel = kda_kernel(b, q, False)
             stock = (
                 prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
-                prepared.KdaSplitStock, prepared.KdaVerifyHalfStock,
+                prepared.KdaSplitStock, prepared.KdaVerifyHalfPair,
             )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
