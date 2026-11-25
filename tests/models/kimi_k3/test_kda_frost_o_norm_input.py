@@ -351,6 +351,9 @@ def test_tp_prefill_mxfp8_o_norm_feeds_gemm_rs(kda_env, core, monkeypatch):
         monkeypatch.setattr(mxfp8_mod, "takes_mxfp8_activation", lambda *linears: mx)
         rs_ar = _FakeMxfp8GemmRsAr()
         layer = _layer(x, c, rs_ar)
+        # the production o_norm runs forward_cuda (kda_norm.supported), whatever
+        # CustomOp dispatch the bare test config picks
+        layer.o_norm._forward_method = layer.o_norm.forward_cuda
         if mx:
             layer.o_proj = lambda a: (_dequant_activation(a) @ x.w_o.float().t(),)
         out = KimiK3DeltaAttention.forward(layer, x.hidden, positions)
