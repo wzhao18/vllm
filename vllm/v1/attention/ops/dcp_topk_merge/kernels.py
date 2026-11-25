@@ -464,7 +464,7 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 @dsl_user_op
 def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
     _asm_void(
-        [Int64(addr), Int64(v)], "st.global.u64 [$0], $1;", "l,l", loc=loc, ip=ip
+        [Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip
     )
 
 
