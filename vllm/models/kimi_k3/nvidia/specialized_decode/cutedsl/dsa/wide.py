@@ -382,7 +382,7 @@ def dsa_on_flashinfer(attention) -> bool:
 
 # The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
 # rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
-WIDE_LOCAL_TOPK = False
+WIDE_LOCAL_TOPK = True
 
 
 def sms_of(device) -> int:
