@@ -668,7 +668,8 @@ class PreparedDsa:
         kv, stride_rows = self.fi.rows(cache, md.block_size)
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
-        sel, counts = self.dsac_rows.rows(*args, q=q)
+        late, self.late_query = self.late_query, None
+        sel, counts = self.dsac_rows.rows(*args, q=q, after_logits=late)
         if join is not None:
             join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
@@ -804,7 +805,7 @@ class PreparedDsa:
                 if wait is not None:
                     wait(*mailbox, stream(self.device))
 
-        if mode == "fork" and late_fork(batch, self.rubin, self.dcp > 1):
+        if mode in ("fork", "front") and late_fork(batch, self.rubin, self.dcp > 1):
             # forked after the merge's logits (overlap.QUERY_FORK_AT); the join
             # forks it first if the step took no merge
             pending = [fork]

@@ -91,7 +91,7 @@ QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
 # keys, ABBA us/layer early -> late fork): M32 41.91 -> 40.46, M64 47.22 -> 45.35,
 # M128 52.56 -> 54.45, M256 75.85 -> 85.45 (MlaQuery, 16 / 35 us there, outlasts the
 # top-k merge): late at 17-64 rows only.
-QUERY_FORK_AT = "17-64:logits"
+QUERY_FORK_AT = "1-64:logits"
 
 
 def late_fork(batch, rubin, dcp):

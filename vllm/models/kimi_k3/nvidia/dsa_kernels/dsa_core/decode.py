@@ -147,11 +147,15 @@ class MergeRows:
         source, _ = self.stage.merge_source(batch)
         return source in ("merge", "exchange")
 
-    def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def rows(
+        self, *args, q: int = 1, after_logits=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
         accepted. The core reads them after its PDL wait, so the merge's rescue
-        releases it early (``release``)."""
-        merged = self.stage.merge_rows(*args, q, release=True)
+        releases it early (``release``). ``after_logits``: as merge_rows'."""
+        merged = self.stage.merge_rows(
+            *args, q, release=True, after_logits=after_logits
+        )
         assert merged is not None, "merge_rows declined a step fits accepted"
         return merged
 
