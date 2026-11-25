@@ -5,13 +5,13 @@ replicated shared expert concurrent with the routed experts, on the stock method
 bound to a stand-in layer (BF16 linears, deterministic router / experts stand-ins:
 the real MegaMoE needs the EP group).
 
-* SM-capped layer (decode, unified serving): the routing chain on the current
-  stream, the shared expert on the side stream.
 * Full-grid layer (P/D prefill workers): the routing chain on the high-priority
-  stream, the shared expert on the current stream.
-* Both: bitwise equal to the serial order, eagerly, inside a whole-step CUDA graph
-  and inside a breakable CUDA graph with eager breaks before and after the layer
-  (the fork and join stay in one segment), over repeated replays.
+  stream, the shared expert on the current stream; bitwise equal to the serial
+  order eagerly, inside a whole-step CUDA graph and inside a breakable CUDA graph
+  with eager breaks before and after the layer (the fork and join stay in one
+  segment), over repeated replays.
+* SM-capped layer (decode, unified serving): never enters _overlapped_forward;
+  forward()'s stock maybe_execute_in_parallel form, unchanged.
 * A shared expert with a persistent kernel (GEMM-RS/AR, fused SiTU) raises.
 
 One GPU, seconds."""
@@ -190,8 +190,7 @@ def test_cuda_graph_replays_bitwise(full_grid, n=256):
     assert torch.equal(out, want)
 
 
-@pytest.mark.parametrize("full_grid", [False, True])
-def test_breakable_graph_keeps_overlap_bitwise(full_grid, n=256):
+def test_breakable_graph_keeps_overlap_bitwise(full_grid=True, n=256):
     """Production prefill steps of <= 2048 instance tokens run in breakable CUDA
     graphs (a segment ends at each eager attention op): the layer forks and joins
     inside one segment, with eager breaks before and after it."""
@@ -224,7 +223,23 @@ def test_persistent_shared_kernel_raises():
     mlp.shared_experts.gemm_rs_ar = object()
     with pytest.raises(RuntimeError, match="persistent"):
         mlp.forward(inputs(512, 0))
-    mlp = layer(False)
+    mlp = layer(True)
     mlp.shared_experts._prefill_situ = object()
     with pytest.raises(RuntimeError, match="persistent"):
         mlp.forward(inputs(16, 0))
+
+
+def test_capped_layer_keeps_the_stock_form():
+    """Decode / unified serving (SM-capped layers) never enter _overlapped_forward:
+    forward() keeps maybe_execute_in_parallel (routing chain on the current stream,
+    shared expert on the side stream), as before this change."""
+    torch.cuda.set_device(DEVICE)
+    mlp = layer(False)
+    mlp._overlapped_forward = None  # calling it would raise
+    h = inputs(64, 9)
+    want = serial(mlp, h)
+    mlp.experts.streams.clear()
+    mlp.shared_experts.streams.clear()
+    assert torch.equal(mlp.forward(h), want)
+    assert mlp.experts.streams == [torch.cuda.current_stream()]
+    assert mlp.shared_experts.streams == [mlp._shared_stream]
