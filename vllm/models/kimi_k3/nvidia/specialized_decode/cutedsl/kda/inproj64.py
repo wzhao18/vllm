@@ -547,6 +547,15 @@ class PreparedKdaInProj64:
 WIDTH80 = 20  # tokens per owner thread at N80 (80 token columns x 32 rows / 128)
 
 
+def _x_at(xb, tile, base, lane, j):
+    """Token base + j of the thread's channel as BF16 (trace-time ``j``): its own
+    register for 0 <= j < 20, else the owner's BF16 tile [tokens][SHARE]."""
+    if 0 <= j < WIDTH80:
+        return xb[j]
+    address = tile + ((base + j) * SHARE + lane) * 2
+    return BFloat16(_ld_shared_bf16(address))
+
+
 class KdaInProj80(KdaInProj64):
     """``KdaInProj64`` at 72-80 verify rows (B9-B10 x q8): ``SplitKTmemGemm64`` with
     one N tile of 80 token columns (``tactic`` (128, 80, split, x's slots); 13 A tiles
@@ -694,10 +703,6 @@ class KdaInProj80(KdaInProj64):
         coeff = [self.pf_coeff[i] for i in range(4)]
         start = self.pf_coeff[4]
 
-        def x_at(j):  # token base + j as BF16: own register or the owner's tile
-            address = tile + ((base + j) * SHARE + lane) * 2
-            return xb[j] if 0 <= j < width else BFloat16(_ld_shared_bf16(address))
-
         own = 0 if phase == 0 else 1  # local request index of prefetch slot 0
         for j in cutlass.range_constexpr(width):
             p = j + phase
@@ -706,7 +711,7 @@ class KdaInProj80(KdaInProj64):
             for i in cutlass.range_constexpr(4):
                 w = t + i
                 # (w < 3 only where t < 3: an own request)
-                term = self.pf_tap[rq - own, w] if w < 3 else x_at(j + i - 3)
+                term = self.pf_tap[rq - own, w] if w < 3 else _x_at(xb, tile, base, lane, j + i - 3)
                 acc = fma(Float32(term), coeff[i], acc)
             y[j] = acc
         for rq in cutlass.range_constexpr(own, 3):
@@ -716,7 +721,7 @@ class KdaInProj80(KdaInProj64):
                 page = conv_state[Int64(self.pf_meta[slot, 2]), None, None]
                 first = 8 * rq - phase
                 window = (self.pf_tap[slot, 1], self.pf_tap[slot, 2])
-                window += tuple(x_at(first + t) for t in range(TOKENS))
+                window += tuple(_x_at(xb, tile, base, lane, first + t) for t in range(TOKENS))
                 for i, value in enumerate(window):
                     conv_put(page, (row, i), value)
 
