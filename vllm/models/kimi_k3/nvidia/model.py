@@ -6,6 +6,7 @@ import math
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 from torch import nn
 
@@ -35,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MegaMoEActivation,
     MegaMoEWeightFormat,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     fused_grouped_topk,
@@ -2919,6 +2921,59 @@ def log_kimi_k3_quant_kinds(model: nn.Module) -> dict[str, int]:
     return kinds
 
 
+# Routed-expert gate/up projection of one expert in the checkpoint, e.g.
+# ``model.layers.3.block_sparse_moe.experts.17.w1.weight_packed``.
+_EXPERT_W13_CKPT_RE = re.compile(
+    r"^(?P<prefix>.*\.experts)\.\d+\.(?P<shard>w1|w3)\."
+    r"(?P<kind>weight_packed|weight|weight_scale)$"
+)
+
+
+class _ExpertReadRows:
+    """``checkpoint_read_rows`` of a Kimi K3 model: the TP rows of each routed
+    expert's gate/up tensors its RoutedExperts weight loader reads (see
+    ``RoutedExperts.checkpoint_read_rows``), so the bulk safetensors reader skips
+    the other ranks' rows. None for every other tensor and for MegaMoE experts."""
+
+    def __init__(self, root: nn.Module, mapper: WeightsMapper | None):
+        self._root = root
+        self._mapper = mapper
+        self._owners: dict[str, Any] = {}
+
+    def _owner(self, prefix: str):
+        if prefix not in self._owners:
+            owner = None
+            try:
+                param = self._root.get_parameter(f"{prefix}.w13_weight")
+            except AttributeError:
+                param = None
+            loader = getattr(param, "weight_loader", None)
+            candidate = getattr(loader, "__self__", None)
+            if isinstance(candidate, RoutedExperts):
+                owner = candidate
+            self._owners[prefix] = owner
+        return self._owners[prefix]
+
+    def __call__(
+        self, name: str, shape: list[int], dtype: torch.dtype
+    ) -> tuple[int, int] | None:
+        m = _EXPERT_W13_CKPT_RE.match(name)
+        if m is None:
+            return None
+        if self._mapper is not None:
+            mapped = self._mapper._map_name(name)
+            if mapped is None:
+                return None
+            m = _EXPERT_W13_CKPT_RE.match(mapped)
+            if m is None:
+                return None
+        owner = self._owner(m["prefix"])
+        if owner is None:
+            return None
+        param_name = "w13_weight_scale" if m["kind"] == "weight_scale" else "w13_weight"
+        return owner.checkpoint_read_rows(param_name, m["shard"], shape, dtype)
+
+
 class KimiLinearForCausalLM(
     nn.Module,
     HasInnerState,
@@ -3320,6 +3375,11 @@ class KimiLinearForCausalLM(
         from .megamoe_rubin.experts import restrict_local_expert_ids
 
         return restrict_local_expert_ids(self, local_expert_ids)
+
+    @property
+    def checkpoint_read_rows(self) -> _ExpertReadRows:
+        """Loader hook: rows of each checkpoint tensor this rank reads."""
+        return _ExpertReadRows(self, None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -3791,6 +3851,11 @@ class KimiK3ForConditionalGeneration(
         from .megamoe_rubin.experts import restrict_local_expert_ids
 
         return restrict_local_expert_ids(self, local_expert_ids)
+
+    @property
+    def checkpoint_read_rows(self) -> _ExpertReadRows:
+        """Loader hook: rows of each checkpoint tensor this rank reads."""
+        return _ExpertReadRows(self, self.hf_to_vllm_mapper)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)

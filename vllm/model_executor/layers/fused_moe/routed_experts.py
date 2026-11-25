@@ -563,6 +563,76 @@ class RoutedExperts(PluggableLayer):
                     expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
         return expert_data
 
+    def _tp_checkpoint_rows(self, size: int, tp_rank: int) -> tuple[int, int] | None:
+        """(start, count) of this TP rank's part of an unsharded checkpoint dim of
+        *size* (the unpadded per-rank size), or None when the rank holds none."""
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+        loaded_per_rank = size // tp_size
+        start_offset = loaded_per_rank * tp_rank
+        available = size - start_offset
+        if available <= 0:
+            return None
+        return start_offset, min(loaded_per_rank, available)
+
+    def checkpoint_read_rows(
+        self, param_name: str, shard_id: str, shape: list[int], dtype: torch.dtype
+    ) -> tuple[int, int] | None:
+        """Rows of dim 0 of one expert's unsharded checkpoint tensor that
+        ``weight_loader`` reads into *param_name* (``w13_weight`` or
+        ``w13_weight_scale``) for *shard_id* on this rank: the gate/up
+        projection's TP slice. None (read the whole tensor) on every path whose
+        loader may touch other rows. Used by the bulk safetensors reader to read
+        only these rows."""
+        if (
+            shard_id not in ("w1", "w3")
+            or len(shape) != 2
+            or param_name not in ("w13_weight", "w13_weight_scale")
+            or type(self).weight_loader is not RoutedExperts.weight_loader
+            or self.moe_config.moe_parallel_config.tp_size == 1
+            or self.moe_config.tp_shard_with_padding
+            or self._fused_shared_expert_quantizer is not None
+            or (self.quant_config and self.quant_config.get_name()) == "gpt_oss_mxfp4"
+        ):
+            return None
+        from vllm.model_executor.layers.quantization.online.moe_base import (
+            OnlineMoEMethodBase,
+        )
+
+        quant_method = self.quant_method
+        if isinstance(quant_method, OnlineMoEMethodBase) or (
+            "ModelOpt" in type(quant_method).__name__
+        ):
+            return None
+        param = getattr(self, param_name, None)
+        if not isinstance(param, torch.nn.Parameter) or getattr(
+            param, "is_transposed", False
+        ):
+            return None
+        # The parameter's loader must be this weight_loader, or the MXFP4 scale
+        # wrapper around it on a dtype it passes through as a view.
+        loader = getattr(param, "weight_loader", None)
+        if getattr(loader, "__self__", None) is self:
+            if getattr(loader, "__func__", None) is not RoutedExperts.weight_loader:
+                return None
+        elif not (
+            getattr(loader, "__qualname__", "").endswith(
+                "get_scale_weight_loader.<locals>.mxfp4_weight_loader"
+            )
+            and dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
+        ):
+            return None
+        if param_name == "w13_weight_scale" and (
+            getattr(param, "quant_method", None)
+            not in (
+                FusedMoeWeightScaleSupported.GROUP.value,
+                FusedMoeWeightScaleSupported.BLOCK.value,
+            )
+            or getattr(quant_method, "weight_scale_refine", None) is not None
+        ):
+            return None
+        rows = self._tp_checkpoint_rows(shape[0], self.moe_config.tp_rank)
+        return rows if rows is not None else (0, 0)
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -586,17 +656,13 @@ class RoutedExperts(PluggableLayer):
             # size.  Compute the offset into the checkpoint weight using
             # the *unpadded* per-rank size so that every TP rank lands at
             # the correct slice.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
-            if available <= 0:
+            rows = self._tp_checkpoint_rows(loaded_weight.shape[shard_dim], tp_rank)
+            if rows is None:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
                 # loading and return early
                 return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            loaded_weight = loaded_weight.narrow(shard_dim, *rows)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -627,17 +693,13 @@ class RoutedExperts(PluggableLayer):
         # Padded TP weights have already been sliced by the grouped loader.
         if not load_full and loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
-            if available <= 0:
+            rows = self._tp_checkpoint_rows(loaded_weight.shape[shard_dim], tp_rank)
+            if rows is None:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
                 # loading and return early
                 return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            loaded_weight = loaded_weight.narrow(shard_dim, *rows)
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
