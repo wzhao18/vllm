@@ -21,7 +21,7 @@ Same streams and events as stock, the same operands, FP32 accumulation and one B
 rounding per GEMM (the beta-add adds the BF16 shared output in FP32 before its one
 rounding, as stock's cuBLAS epilogue); only the GEMM kernels (and so their FP32
 summation order) differ. A layer this path cannot reproduce exactly (quantized or
-packed MoE linears, the online-MXFP8 inputs, a token-sharded or TP-sharded shared
+packed MoE linears, the online-MXFP8 inputs, a TP-sharded shared
 expert, a GEMM-RS/AR epilogue) raises ``Unsupported`` at build: never a stock
 fallback for a planned row."""
 
@@ -139,7 +139,7 @@ def sp_mlp_cause(mlp):
     reproduces, or None."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-    if not getattr(mlp, "use_mega_moe", False) or getattr(mlp, "moe_token_shard", 0):
+    if not getattr(mlp, "use_mega_moe", False):
         return "not MegaMoE on the SP shard"
     if not getattr(mlp, "use_latent_moe", False):
         return "no latent MoE projections"

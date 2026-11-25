@@ -119,7 +119,7 @@ def layer(overlap, seed=0):
         return probs, probs.argmax(-1, keepdim=True)
 
     mlp = types.SimpleNamespace(
-        use_mega_moe=True, moe_token_shard=0, use_latent_moe=True, _packed_moe=None,
+        use_mega_moe=True, use_latent_moe=True, _packed_moe=None,
         routed_expert_down_proj=Linear(LATENT, HIDDEN, g), shared_experts=shared,
         _shared_overlap=overlap, _router=router,
         routed_output_transform=kimi.KimiRoutedOutputTransform(
@@ -258,6 +258,6 @@ def test_unreproducible_layers_raise():
     with pytest.raises(Unsupported, match="packed"):
         sp_mlp.SpMlp(mlp, ROWS, ctx, 7)
     mlp = layer(False, seed=3)
-    mlp.moe_token_shard = 1
+    mlp.use_mega_moe = False
     with pytest.raises(Unsupported, match="not MegaMoE"):
         sp_mlp.SpMlp(mlp, ROWS, ctx, 7)
