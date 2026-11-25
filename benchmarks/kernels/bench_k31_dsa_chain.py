@@ -228,8 +228,9 @@ def build(batch, q, world, local_len, topk):
             torch.empty(cap, 32, device=dev, dtype=bf),
             torch.empty(cap, 64, 512, device=dev, dtype=bf),
         )
-        indexer.dsac = DsacDecode(dev, dsa.HEADS * world)  # the served policy
-        indexer.dsac_layer = 0
+        if dsa.HEADS * world % 32 == 0:  # (the core's head groups)
+            indexer.dsac = DsacDecode(dev, dsa.HEADS * world)  # the served policy
+            indexer.dsac_layer = 0
         runtime = SimpleNamespace(
             dcp=world, tp=world, device=dev, dcp_box=None, dsa_dcp_box=None
         )
