@@ -106,6 +106,9 @@ def main():
     ap.add_argument("--variant-batches", default="1,2,3,4,8")
     ap.add_argument("--width-batches", default="9,16,64,96,120,128,130,192,256")
     ap.add_argument("--budget", type=float, default=0)
+    # cold L2: a memset of this many MB between calls instead of the small separator
+    # (the target forward's place: every drafter weight / markov_w1 row cold in L2)
+    ap.add_argument("--flush-mb", type=int, default=0)
     args = ap.parse_args()
 
     import torch
@@ -160,6 +163,9 @@ def main():
     # separator kernel between calls (the LM head's place)
     scratch = torch.zeros(1024, device=dev)
     sep = lambda: scratch.add_(1.0)  # noqa: E731
+    if args.flush_mb:
+        flush = torch.empty(args.flush_mb << 20, dtype=torch.uint8, device=dev)
+        sep = lambda: flush.zero_()  # noqa: E731
     sep_us = time_graph([sep], calls=256)
     say(f"separator kernel {sep_us:.2f} us (subtracted)")
 
