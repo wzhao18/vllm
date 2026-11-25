@@ -333,6 +333,9 @@ HALF_SHAPES = [(8, 16), (8, 17), (8, 11), (8, 15), (8, 4), (4, 16), (5, 8)]
 @pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
 @pytest.mark.parametrize("kind", ["halfstock", "halfscratch"])  # DSMEM pair / scratch
 def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
+    # the stock-format kernels (HalfPair's DSMEM / HalfStock's scratch exchange) vs
+    # LoopStock; their record form (HalfDefer) is checked by the record-protocol runs
+    monkeypatch.setattr(prepared, "RECORDS", False)
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)
