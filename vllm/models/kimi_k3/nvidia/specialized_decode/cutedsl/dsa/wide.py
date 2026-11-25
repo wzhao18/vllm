@@ -381,8 +381,13 @@ def dsa_on_flashinfer(attention) -> bool:
 
 
 # Wide rows whose #63 merge reads IndexerScoreFp4's logits (MXFP4 indexer cache);
-# the others DeepGEMM's paged MQA logits (both bit for bit the same logits).
-WIDE_SCORER = "65-:1"
+# the others DeepGEMM's paged MQA logits (both bit for bit the same logits). None:
+# beside the forked MlaQuery (side stream) the scorer's SM-wide grid loses to
+# DeepGEMM's in the layer although it wins alone (128 rows 5.95 vs 9.09 us, one
+# GPU): 1-node DSA chain (W4, 6 heads per rank, q8, us per layer, merge rows on
+# the scorer / on DeepGEMM) 128 rows 53.40 / 52.85, 256 76.24 / 74.75, 512 117.12 /
+# 115.65 (L1 round 6, Rhea 136406).
+WIDE_SCORER = ""
 # The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
 # rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
 WIDE_LOCAL_TOPK = False
@@ -735,10 +740,12 @@ class WideDsa:
             pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
         valid = None
         if topk is None:  # the #63 merge's rows (merge_rows), else the stock op
+            # (DcpExchange's steps keep the op, whose decode hook serves them)
             stage = self.indexer_stage
+            source = stage.merge_source(batch)[0] if stage.local_topk else None
             args = self.q_fp8, self.head_w, md, stride_rows, batch
-            merged = stage.merge_rows(*args, q) if stage.local_topk else None
-            if merged is None and self.strict and full_capture():
+            merged = stage.merge_rows(*args, q) if source == "merge" else None
+            if merged is None and source is None and self.strict and full_capture():
                 # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
                 # would capture the stock indexer op and the slot filter.
                 refuse(
