@@ -618,9 +618,9 @@ class PreparedDsa:
         kv, stride_rows = self.fi.rows(cache, md.block_size)
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
-        # (the query's join inside the merge, before its local select: the core's
-        # only graph edge is then the rescue's PDL edge, MergeRows.rows)
-        sel, counts = self.dsac_rows.rows(*args, q=q, join=join)
+        sel, counts = self.dsac_rows.rows(*args, q=q)
+        if join is not None:
+            join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
         impl._prepare_mqa_kernel(self.layer, self.device)
         scales = impl.bmm1_scale, impl.bmm2_scale

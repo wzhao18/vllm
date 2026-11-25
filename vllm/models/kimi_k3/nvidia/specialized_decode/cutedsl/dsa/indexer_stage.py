@@ -143,8 +143,7 @@ class IndexerStage:
         return None, 0
 
     def merge_rows(
-        self, q_fp8, head_w, metadata, stride_rows, batch, q=1, release=False,
-        join=None,
+        self, q_fp8, head_w, metadata, stride_rows, batch, q=1, release=False
     ):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
@@ -156,14 +155,7 @@ class IndexerStage:
         pack faults; no per-step check here (finite query, head weights and
         cached keys keep them finite). ``release``: the consumer (the DSA sparse
         core) reads the rows after its PDL wait, so the merge's rescue launches
-        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode.
-        ``join``: called after the logits and before the merge's first kernel
-        (DeepSelect: a full graph dependency anyway, launched without PDL; or the
-        exchange): the query's join, which on the core's own launch would make it a
-        second, non-programmatic edge that keeps the core from launching early
-        (in-step and 1-node chain: the core started 0.73 us after the rescue's
-        end). Every kernel after it waits on its predecessor before completing,
-        so the core's PDL wait still implies the joined query completed."""
+        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode."""
         from vllm.forward_context import get_forward_context
         from vllm.model_executor.layers.indexer_topk import (
             SparseIndexerTopk,
@@ -184,8 +176,6 @@ class IndexerStage:
         index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
         decode = index_md.decode
         if source == "exchange":
-            if join is not None:
-                join()
             run = DCP_DECODE_TOPK_HOOKS[indexer.k_cache.prefix][1]
             return self.exchange_rows(run, q_fp8, head_w, decode, rows, batch)
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
@@ -210,8 +200,6 @@ class IndexerStage:
             # The logits stay valid until the merge returns (stream order): a
             # saturated rank re-reads its row in the exact merge's second round.
             packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
-            if join is not None:
-                join()
             dcp_topk_merge_rows(
                 logits=logits[:rows],
                 row_ends=ends[:rows],
@@ -229,8 +217,6 @@ class IndexerStage:
         reqs = decode.decode_lens.shape[0]
         seq_lens = decode.seq_lens[:reqs]
         row_ends = SparseIndexerTopk._row_ends(seq_lens, rows // reqs, rows)
-        if join is not None:
-            join()
         dcp_topk_merge_rows(
             logits=logits,
             row_ends=row_ends,
