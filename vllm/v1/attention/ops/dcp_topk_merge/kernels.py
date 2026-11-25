@@ -462,6 +462,21 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _match_any(value: Int32, *, loc=None, ip=None) -> Uint32:
+    """Lanes of the (full) warp holding the same ``value``."""
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Int32(value)],
+            "match.any.sync.b32 $0, $1, 0xffffffff;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
     _asm_void(
         [Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip
@@ -697,13 +712,21 @@ def _make_radix_select(
             nxt = ((p + 1) % 2) * num_bins
             if scalars[3] == Int32(0):
                 prefix = prefix_ptr.load()
+                # Warp-aggregated: a row's candidates crowd into few bins
+                # (pass 0 is sign + exponent), so per-key atomics on one
+                # address serialize; the lowest lane of each bin adds the
+                # count. Keys outside the prefix take a per-lane sentinel.
+                below = (Uint32(1) << recast_val(lane, Uint32)) - Uint32(1)
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
+                    b = Int32(num_bins) + lane
                     if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
                         b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                    peers = _match_any(b)
+                    if b < Int32(num_bins) and (peers & below) == Uint32(0):
                         cute.arch.atomic_add(
                             hist.iterator + (b + Int32(cur)),
-                            Int32(1),
+                            recast_val(cute.arch.popc(peers), Int32),
                             sem="relaxed",
                             scope="cta",
                         )
