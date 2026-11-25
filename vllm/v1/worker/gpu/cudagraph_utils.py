@@ -819,7 +819,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # model outputs. No need to keep track of the hidden states.
                     return None
 
-                store_capture_output(num_tokens, model_output)
+                # Only FULL replays read the stored outputs (run_fullgraph). The
+                # eager warmup of a PIECEWISE size stores nothing: its outputs need
+                # not fit the buffers (aux hidden states of SP-sharded sizes have
+                # num_tokens / TP rows, other sizes num_tokens).
+                if desc.cg_mode != CUDAGraphMode.PIECEWISE:
+                    store_capture_output(num_tokens, model_output)
 
             return forward_fn
 
