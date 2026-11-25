@@ -16,7 +16,7 @@ pytest.importorskip("cutlass")
 
 K, TP, CAP = 7168, 16, 64
 VALID, SPLIT, SHARD, HIDDEN, BOX_ROWS = 56, 64, 224, 384, 512
-CASES = [(16, 8), (32, 24), (64, 4), (64, 24)]  # (rows, SharedDown SMs)
+CASES = [(16, 56), (32, 56), (64, 56), (16, 8), (64, 4), (64, 24)]  # (rows, SharedDown SMs)
 
 
 def _rubin():
