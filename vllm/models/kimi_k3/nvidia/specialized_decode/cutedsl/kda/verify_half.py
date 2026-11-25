@@ -163,17 +163,30 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 for t in cutlass.range_constexpr(T):
                     output[token + t, head * 128 + thread] = BFloat16(0)
         else:
+            # group 0's conv window values (taps 1-2, then the inputs), written only
+            # after the exchange: both halves read the window's taps in their prologues
+            window = (zeros((3, 3), BFloat16), zeros(3 * T, BFloat16))
             if thread < HALF_THREADS:
                 self.half_math(
                     args, (thread, lane, warp, group, j), (item, half, head, token),
                     (offset, conv_slot, slot), (page, state_full, ready, meta),
                     (shared_q, shared_k, shared_decay, shared_v, shared_o, reductions,
                      shared_beta),
+                    window,
                 )  # fmt: skip
             cute.arch.sync_threads()  # this half's outputs of every token in shared_o
             if warp == MESSENGER:
                 self.exchange(scratch, counters, item, half, lane, shared_o)
-            cute.arch.sync_threads()  # the other half's rows merged
+            cute.arch.sync_threads()  # the other half's rows merged; both past the taps
+            if (thread < GROUP) & (half == 0):  # the conv window (one writer)
+                conv_state = args[3]
+                conv_page = conv_state[Int64(conv_slot), None, None]
+                dim: cutlass.Constexpr = H * 128
+                taps, inputs = window
+                for s in cutlass.range_constexpr(3):
+                    values = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
+                    for i, value in enumerate(values):
+                        conv_put(conv_page, (s * dim + head * 128 + thread, i), value)
             if thread < HALF_THREADS:  # this half's tokens: the gated RMS norm
                 first: cutlass.Constexpr = (T + 1) // 2
                 nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
@@ -188,7 +201,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def half_math(self, args, ids, where, rows, staging, shared):
+    def half_math(self, args, ids, where, rows, staging, shared, window):
         """Warps 0-7: the half's state rows, the prologue roles, the token loop and the
         last token's query dots (this half's rows of ``shared_o``)."""
         thread, lane, warp, group, j = ids
@@ -215,7 +228,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
             self.half_prologue(
                 args, thread, token, head, offset, conv_slot, shared, ready,
-                (0, pairs // 2), 1, half == 0,
+                (0, pairs // 2), 1, window,
             )  # fmt: skip
         else:  # group 1: the F_B gate tiles (two a warp), then the other pairs
             for i in cutlass.range_constexpr(2):
@@ -225,7 +238,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 cute.arch.mbarrier_arrive(ready + p)
             self.half_prologue(
                 args, thread - GROUP, token, head, offset, conv_slot, shared,
-                ready, (pairs // 2, pairs), 2, half < 0,
+                ready, (pairs // 2, pairs), 2, None,
             )  # fmt: skip
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -285,7 +298,9 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                       ready, span, barrier_id, window):  # fmt: skip
         """``KdaVerifyLoopStock.loop_prologue`` for channel ``thread`` (0..127) and
         token pairs [span[0], span[1]) on named barrier ``barrier_id`` (each warp
-        group its own); ``window``: also the betas and the conv window (one writer)."""
+        group its own); the betas with the first pair; ``window``: (taps, inputs)
+        register tensors that receive the conv window's taps and inputs (the kernel
+        writes the window after the halves' exchange)."""
         x, weights, bias, conv_state, f_a, beta = args[:6]
         scale = args[14]
         shared_q, shared_k, shared_v, reductions, shared_beta = shared
@@ -341,8 +356,10 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 shared_q[128 * t + thread] = mul_rn(mul_rn(qks[2 * jj], fq), scale)
                 shared_k[128 * t + thread] = mul_rn(qks[2 * jj + 1], fk)
             cute.arch.mbarrier_arrive(ready + p)
-        if window:
-            for s in cutlass.range_constexpr(3):  # the conv window
-                taps_w = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
-                for i, value in enumerate(taps_w):
-                    conv_put(conv_page, (s * dim + channel, i), value)
+        if cutlass.const_expr(window is not None):
+            keep_taps, keep_inputs = window
+            for s in cutlass.range_constexpr(3):
+                for t in cutlass.range_constexpr(3):
+                    keep_taps[s, t] = taps[s, t]
+            for i in cutlass.range_constexpr(3 * T):
+                keep_inputs[i] = inputs[i]

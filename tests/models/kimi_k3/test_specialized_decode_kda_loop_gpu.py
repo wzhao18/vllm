@@ -305,8 +305,9 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
     assert_bitwise("conv state", got[1][0], want[1][0])
 
 
-# HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4) and
-# q4 / odd q (one item on two CTAs at any q and request count).
+# HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4), and
+# q4 / odd q (the conv window is written after both halves read its taps: at q4 / q5
+# an early writer raced the other half's tap loads before that fix).
 HALF_SHAPES = [(8, 16), (8, 17), (8, 4), (4, 16), (5, 8)]
 
 
