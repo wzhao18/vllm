@@ -141,6 +141,19 @@ CENSUS_BYTES = 16
 POOL_LEAD = 3
 
 
+
+@asm(Uint32)
+def diag_ticket(pointer):
+    """DIAG (never merge, B-MOE-13): relaxed GPU-scope atom.add 1, the count before."""
+    return "atom.relaxed.gpu.global.add.u32 $0,[$1],1;", "=r,l,~{memory}", (pointer,)
+
+
+@asm(Uint64)
+def diag_now():
+    """DIAG (never merge, B-MOE-13): %globaltimer."""
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
 class RubinGroupedExpertsKernel(ExpertsKernel):
     """TP16 capacity-64 grouped ``ExpertsKernel`` on packed weights and K64 MMAs.
     ``stages``: 16 KiB weight slots (each with its 2 KiB activation slice; 7 beat
@@ -1190,6 +1203,20 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             if pair >= 0:
                 row = self.staged_word(pair, tile, warp)
                 store_words(workspace.iterator + self.ws_stage + row * 4 + part, chunk)
+                if cutlass.const_expr(getattr(self, "diag_order", 0) != 0):
+                    # DIAG (never merge, B-MOE-13): per (token, 128-col tile, 32-col quarter)
+                    # arrival ticket of slot pair & 15 + its %globaltimer (lane % 4 == 0).
+                    if lane % 4 == 0:
+                        base = Int64(self.diag_order)
+                        q = Int64(pair >> 4) * 112 + Int64(tile * 4 + (warp & 3))
+                        at = Int64(pair) * 112 + Int64(tile * 4 + (warp & 3))
+                        ticket = diag_ticket(base + q * 4)
+                        now = diag_now()
+                        store_words(base + 1048576 + at * 4, (ticket,))
+                        store_words(
+                            base + 8388608 + at * 8,
+                            (Uint32(now & Uint64(4294967295)), Uint32(now >> Uint64(32))),
+                        )
 
     @cute.kernel
     def kernel_maps(self, args, w13_map: GridMap, w2_map: GridMap):
