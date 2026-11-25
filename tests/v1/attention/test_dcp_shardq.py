@@ -265,7 +265,11 @@ def _check_workspace(
     byte still holds it. With a ``rank_major`` plan the MLA rows are
     rank-major (dcp_shardq.rank_major): token t of request q at row
     (t % W) * region_rows + starts[q] + t // W."""
-    workspaces = {"mla": ws_mla, "index": ws_index}
+    workspaces = {
+        name: ws
+        for name, ws in (("mla", ws_mla), ("index", ws_index))
+        if ws is not None
+    }
     expected = {
         name: torch.full_like(_flat(ws), FILL) for name, ws in workspaces.items()
     }
@@ -277,6 +281,8 @@ def _check_workspace(
         tokens = torch.arange(context + new, device="cuda")
         for section in _sections(rep.layout):
             name, offset, row = section
+            if name not in workspaces:
+                continue
             keep = tokens if name == "index" or new_mla_rows else tokens[:context]
             cache, src = rep.token_bytes(q, keep, section)
             if name == "mla" and rank_major is not None:
@@ -294,7 +300,7 @@ def _check_workspace(
                 dst = dst.reshape(-1)
             expected[name][dst] = _flat(cache)[src.reshape(-1)]
             written[name][dst] = True
-    for name, ws in (("mla", ws_mla), ("index", ws_index)):
+    for name, ws in workspaces.items():
         if fill:
             assert torch.equal(_flat(ws), expected[name])
         else:
@@ -1042,6 +1048,144 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
                 assert torch.equal(dcp_out, tp_out)
         finally:
             cleanup_dist_env_and_memory()
+
+
+# (context, new tokens) per request of the prefetch test: several context
+# spans per rank region, one request without context.
+PREFETCH_LENS = [(1000, 300), (513, 64), (0, 70), (4097, 37)]
+PREFETCH_LAYERS = 4
+
+
+def _prefetch_worker(rank, world, init_file):
+    """One rank of a DCP = TP group: a step of PREFETCH_LAYERS DSA layers whose
+    context MLA rows are copied a DSA layer ahead (the first at the forward
+    start). Each layer's caches hold other bytes, and the ranks attend
+    (sleep, then snapshot their workspace) for rank- and layer-dependent
+    times, so a copy into a peer still reading the previous layer, or a read
+    before every peer's copies landed, shows as wrong bytes. Eagerly, then as
+    CUDA graphs (several skews) replayed many times."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.forward_context import create_forward_context, override_forward_context
+
+    torch.accelerator.set_device_index(rank)
+    config = VllmConfig()
+    config.parallel_config.tensor_parallel_size = world
+    config.parallel_config.decode_context_parallel_size = world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        try:
+            layout = _layout("fp8")
+            plan = _build_context(PREFETCH_LENS, layout, world, rank)
+            assert plan.rank_major is not None
+            reps, shards, metadata = [], [], {}
+            for layer in range(PREFETCH_LAYERS):
+                rep = Replicated(PREFETCH_LENS, layout, fill_random=False)
+                torch.manual_seed(100 + layer)
+                rep.mla.random_(0, 256)
+                shard = _shard(rep, world, rank, seed=rank + 7 * layer)
+                name = f"model.layers.{layer}.self_attn.attn"
+                metadata[name] = SimpleNamespace(
+                    shardq=SimpleNamespace(gathered_context=plan),
+                    block_table=shard.mla_table,
+                )
+                config.compilation_config.static_forward_context[name] = (
+                    SimpleNamespace(kv_cache=shard.mla)
+                )
+                reps.append(rep)
+                shards.append(shard)
+            forward_context = create_forward_context(metadata, config)
+            snaps = [torch.empty_like(plan.mla_view(s.mla)) for s in shards]
+
+            def step(skews):
+                with override_forward_context(forward_context):
+                    plan.prefetch_first()
+                    assert len(plan._dsa_layers()) == PREFETCH_LAYERS
+                    for layer, shard in enumerate(shards):
+                        # The indexer's gather (its pack and copies prefetched).
+                        prefetched = plan.mla_prefetch
+                        assert prefetched is not None
+                        assert prefetched[0] == shard.mla.data_ptr()
+                        plan.mla_prefetch = None
+                        plan.mla_in_flight = prefetched[1]
+                        arrive, read = skews[layer]
+                        torch.cuda._sleep(arrive)
+                        plan.wait_mla()
+                        torch.cuda._sleep(read)
+                        snaps[layer].copy_(plan.mla_view(shard.mla))
+                        plan.after_attend(shard.mla)
+                    assert plan.mla_prefetch is None and plan.mla_in_flight is None
+
+            def check():
+                for layer in range(PREFETCH_LAYERS):
+                    _check_workspace(
+                        snaps[layer],
+                        None,
+                        reps[layer],
+                        new_mla_rows=False,
+                        fill=False,
+                        rank_major=plan.rank_major,
+                    )
+
+            gen = np.random.default_rng(rank)
+
+            def skews():
+                return [
+                    (int(gen.integers(0, 200_000)), int(gen.integers(0, 400_000)))
+                    for _ in range(PREFETCH_LAYERS)
+                ]
+
+            # Every peer finished the previous step before the next one starts
+            # (the step's collectives order this in a real forward).
+            for _ in range(3):
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                get_tp_group().barrier()
+                step(skews())
+                torch.accelerator.synchronize()
+                check()
+            stream = torch.cuda.Stream()
+            graphs = []
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        step(skews())
+                    graphs.append(graph)
+            torch.accelerator.synchronize()
+            get_tp_group().barrier()
+            for replay in range(60):
+                for snap in snaps:
+                    snap.fill_(FILL)
+                torch.accelerator.synchronize()
+                get_tp_group().barrier()
+                graphs[replay % len(graphs)].replay()
+                torch.accelerator.synchronize()
+                check()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+def test_context_rows_prefetched_a_layer_ahead(tmp_path):
+    import torch.multiprocessing as mp
+
+    world = min(torch.accelerator.device_count(), 4)
+    mp.spawn(_prefetch_worker, args=(world, str(tmp_path / "dist_init")), nprocs=world)
 
 
 # Requests within the top-k, so every row selects all its keys: the top-k
