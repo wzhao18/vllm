@@ -50,6 +50,7 @@ from ..common.primitives import (
     named_barrier,
     pack_fp8,
     pack_pair,
+    prefetch_bytes,
     redux,
     shared_address,
     situ,
@@ -62,6 +63,7 @@ from ..common.primitives import (
     unpack_bf16,
     view,
 )
+from ..common.primitives import prefetch_map as prefetch_tile
 from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
 from .experts import ExpertsKernel, claim, mx_block, swizzled
 
@@ -442,6 +444,7 @@ class RubinExpertsKernel(ExpertsKernel):
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
         dies=(), static_groups=False, fast_exchange=False, issuers=1, match_fc1=False,
+        warm=False,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
@@ -459,6 +462,11 @@ class RubinExpertsKernel(ExpertsKernel):
         # the die-oblivious partition (bitwise the same outputs). The census word is
         # the M64 kernel's (same offset, re-armed by each call's last arrival).
         self.match_fc1 = match_fc1
+        # warm (grid maps): before the dependency wait each CTA prefetches into L2 one
+        # w13 / w2 box and 256 B of each scale tensor at its 1 / grid fraction of the
+        # layer's weights, so every 2 MiB page of them is translated (and its first
+        # lines cached) before the routes are known.
+        self.warm = warm
         if match_fc1:
             assert dies and fast_exchange
             self.ws_census = (self.workspace_bytes + 15) // 16 * 16
@@ -1223,6 +1231,19 @@ class RubinExpertsKernel(ExpertsKernel):
         self.group_sync(eg)
 
     @cute.jit
+    def warm_pages(self, maps, w13_scales, w2_scales, cta):
+        """``warm``: this CTA's L2 prefetches (one thread)."""
+        rows13, rows2 = (self.experts * self.w13_rows, self.experts * 3584)
+        row = Int64(cta) * rows13 // self.grid // 128 * 128
+        prefetch_tile(maps[0], Int32(row), 0)
+        row = Int64(cta) * rows2 // self.grid // 128 * 128
+        prefetch_tile(maps[1], Int32(row), 0)
+        sizes = (self.w13_scale_bytes, self.w2_scale_bytes)
+        for scales, size in zip((w13_scales, w2_scales), sizes):
+            offset = Int64(cta) * (self.experts * size) // self.grid // 256 * 256
+            prefetch_bytes(scales.iterator + offset, 256)
+
+    @cute.jit
     def ticket(self, workspace):
         """``match_fc1``, warp 2 lane 0 before the dependency wait: this CTA's census
         add (``RubinGroupedExpertsKernel.ticket``); the value before is consumed in
@@ -1549,6 +1570,9 @@ class RubinExpertsKernel(ExpertsKernel):
         before = Uint64(0)
         if cutlass.const_expr(self.match_fc1):
             before = self.ticket(workspace)
+        if cutlass.const_expr(self.warm):
+            if tid == 32:
+                self.warm_pages(maps, w13_scales, w2_scales, cta)
         source = ids
         if cutlass.const_expr(self.polled):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
