@@ -103,7 +103,7 @@ PROJ_ROWS = 32
 # (gathered head, 128 rows) [128 x 512] x [512 x 128] spread over every CTA, K in
 # 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
 TC_ROWS = 16
-TC_STAGES = 4
+TC_STAGES = 5  # 160 KB in flight: a unit streams at bytes in flight / L2 latency
 TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
 # A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
 # a unit's push is in flight while the next one's epilogue writes).
