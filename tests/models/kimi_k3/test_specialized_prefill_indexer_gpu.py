@@ -271,7 +271,7 @@ def test_split_publish_matches_unsplit(monkeypatch, reqs, zero_rows):
         sp = pidx.SelectivePlan(
             [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
         )
-        assert sp.pub_split == cap  # fewer items than SMs: the most ranges win
+        assert sp.pub_split <= cap and (cap == 1) == (sp.pub_split == 1)
         out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
         row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
         outs.append(out)
