@@ -9,7 +9,10 @@ summation order, and leave every row <= 64 on its previous tactic:
 * the MXFP8 tables (shared expert, kda_in) are unchanged: their cold-chain wins (sm_107
   "pre" swap tiles) gave step time back in the step A/B (side-stream / in-step effects)
   and are re-tuned by in-step replay separately;
-* the tables at rows <= 64 (R <= 256) are the previous ones;
+* the tables at rows <= 64 (R <= 256) are the previous ones, except the router |
+  latent rows 33-40 that 8ecdcd18de (D2, 2026-11-23) moved on purpose from two 32-row
+  token tiles (64.32.2.9) to one 64-row tile (64.64.2.6): same split, so the same
+  split summation order, checked bitwise below;
 * split-K shared memory: every table tactic fits the launch's dynamic shared memory;
   an over-limit tactic (64.80.4.5, which faulted with an illegal address) is refused by
   ``split_k_problem`` and by ``PreparedProjection.prepare`` instead of reaching a launch.
@@ -46,6 +49,9 @@ STEP_UP = range(65, 97)
 # The tables before the change (int64.2 15c281dc32)
 OLD_ROUTER_LATENT = "1-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"
 OLD_MX_TUNED = "1-80:fi_cute,81-:scaled_mm"
+# Rows <= 64 that changed later on purpose: 8ecdcd18de (D2) router | latent 33-40.
+D2_ROWS = range(33, 41)
+D2_TACTIC = (64, 64, 2, 6)
 OLD_KDA_IN_PRE = {
     (1, 128): ((128, 64), (1, 1), False, 128),
     (129, 256): ((256, 128), (2, 1), False, 256),
@@ -87,7 +93,9 @@ def test_over_limit_split_k_refused():
 
 def test_tables_unchanged_at_or_below_64():
     new, old = batch_table(sp_mlp.ROUTER_LATENT["*"]), batch_table(OLD_ROUTER_LATENT)
-    assert all(new.get(r) == old.get(r) for r in range(1, 65))
+    changed = [r for r in range(1, 65) if new.get(r) != old.get(r)]
+    assert changed == list(D2_ROWS), changed
+    assert all(new[r] == D2_TACTIC for r in D2_ROWS), [new[r] for r in D2_ROWS]
     assert 64 in sp_mlp.PREWAIT_ROWS
     for nk in ((12288, 7168), (7168, 6144)):
         new = batch_table(mxfp8.MX_TUNED[nk]["*"])
@@ -98,12 +106,14 @@ def test_tables_unchanged_at_or_below_64():
             assert mxfp8.pre_tactic(12448, 7168, r)[0] == tactic
 
 
-def test_router_latent_step_up_rows_bitwise():
+@pytest.mark.parametrize("rows", [STEP_UP, D2_ROWS], ids=["step_up_65_96", "d2_33_40"])
+def test_router_latent_step_up_rows_bitwise(rows):
+    """Every changed router | latent row is bitwise the previous table's tactic."""
     torch.manual_seed(0)
     n, k = 4480, 7168
     w = (torch.randn(n, k, device=DEVICE) * 0.02).bfloat16()
     new, old = batch_table(sp_mlp.ROUTER_LATENT["*"]), batch_table(OLD_ROUTER_LATENT)
-    rows = list(STEP_UP)
+    rows = list(rows)
     a = PreparedProjection(
         w, {r: new[r] for r in rows}, output_dtype=torch.float32
     ).prepare()
