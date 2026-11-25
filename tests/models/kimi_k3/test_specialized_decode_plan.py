@@ -484,6 +484,7 @@ def test_wide_choices_name_the_dsa_seam():
     inproj = dict(
         projection=SimpleNamespace(fallback=SimpleNamespace(kernels=split_k)),
         lt_rows={},
+        inproj_pin=None,  # no ltpin plans: the unpinned notes below
         weight=torch.empty(PITCH, 0),
     )
     decode: Any = object.__new__(SpecializedDecode)
