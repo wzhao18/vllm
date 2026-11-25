@@ -3,6 +3,7 @@
 """Row-sliced bulk reads (``_SafetensorsBulkReader`` with ``read_rows``): the
 declared rows hold the file's bytes, other pages are not read and fault."""
 
+import mmap
 import subprocess
 import sys
 import textwrap
@@ -79,8 +80,9 @@ def test_declared_rows_are_the_file_bytes(checkpoint, rank):
         t.nbytes for n, t in ref.items() if ".w1." in n or ".w3." in n
     )
     assert reader.sliced_tensors == 12
-    # Only whole pages around each rank's rows are read.
-    assert reader.bytes_skipped >= sliced_bytes * (TP - 1) // TP - 12 * 2 * 4096
+    # Only the whole pages around each rank's rows are read.
+    widened = 12 * 2 * mmap.PAGESIZE
+    assert reader.bytes_skipped >= sliced_bytes * (TP - 1) // TP - widened
 
 
 def test_rows_outside_the_declared_range_fault(checkpoint):
