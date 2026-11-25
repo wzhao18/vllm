@@ -151,20 +151,24 @@ def capacity_pages(max_tokens: int, max_reqs: int) -> int:
 
 def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) -> int:
     """Most tokens of a step that keeps the DCP path under DCP ShardQ (whose
-    steps never fall back for a full workspace): its leading decode rows plus fewer than
-    ``sparse_mla_shard_q_min_tokens`` prefill tokens, or a padded step of at
-    most the DCP workspace's tokens."""
-    from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
-
-    scheduler_config = vllm_config.scheduler_config
-    few_tokens = (
-        scheduler_config.max_num_seqs * decode_query_len
-        + vllm_config.attention_config.sparse_mla_shard_q_min_tokens
-        - 1
+    steps never fall back for a full workspace): its leading decode rows plus
+    fewer than ``sparse_mla_shard_q_min_tokens`` prefill tokens
+    (``dcp_shardq_few_token_rows``), or a padded step (a FULL decode graph) of
+    at most the DCP workspace's tokens. On a DCP ShardQ instance the DCP
+    workspace already covers the few-token steps, so this equals
+    ``get_dcp_workspace_max_num_tokens``: every such step fits the direct
+    workspaces."""
+    from vllm.v1.attention.ops.dcp import (
+        dcp_shardq_few_token_rows,
+        get_dcp_workspace_max_num_tokens,
     )
+
     return min(
-        scheduler_config.max_num_batched_tokens,
-        max(few_tokens, get_dcp_workspace_max_num_tokens(vllm_config)),
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        max(
+            dcp_shardq_few_token_rows(vllm_config, decode_query_len),
+            get_dcp_workspace_max_num_tokens(vllm_config),
+        ),
     )
 
 
