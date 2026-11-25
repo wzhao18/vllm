@@ -390,6 +390,20 @@ def reserve_flags(group, world: int, rank: int, device: torch.device) -> _Flags:
     return flags
 
 
+# Streams the copies into the peers alternate between (the side stream first).
+COPY_STREAMS = 2
+_extra_streams: dict[torch.device, list[torch.cuda.Stream]] = {}
+
+
+def _extra_copy_streams(device: torch.device) -> list[torch.cuda.Stream]:
+    streams = _extra_streams.get(device)
+    if streams is None:
+        streams = _extra_streams[device] = [
+            torch.cuda.Stream(device=device) for _ in range(COPY_STREAMS - 1)
+        ]
+    return streams
+
+
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
     stream = _side_streams.get(device)
     if stream is None:
@@ -518,18 +532,30 @@ def copy_to_peers(
             pack(plan, *pack_args)
     if after_layer:
         _wait_words(side, flags, world, rank, reset=True)
-    handle = driver.CUstream(side.cuda_stream)
     region = rank * plan.region_rows
     spans = [
         ((region + int(start)) * row_bytes, int(rows) * row_bytes)
-        for start, rows in zip(plan.starts.tolist(), plan.context_rows[:, rank].tolist())
+        for start, rows in zip(
+            plan.starts.tolist(), plan.context_rows[:, rank].tolist()
+        )
         if rows
     ]
     local = workspace_peer_ptrs[rank]
-    for peer in range(world):
-        if peer == rank:
-            continue
+    # Peers in rotated order (rank + 1 first): at each step every rank copies
+    # into a different peer, instead of all ranks into the same one. The peers
+    # alternate between COPY_STREAMS streams, so the copy engines have the next
+    # copy queued while one completes.
+    streams = [side] + _extra_copy_streams(device)
+    if len(streams) > 1:
+        forked = torch.cuda.Event()
+        forked.record(side)
+        for stream in streams[1:]:
+            stream.wait_event(forked)
+    handles = [driver.CUstream(stream.cuda_stream) for stream in streams]
+    for step in range(1, world):
+        peer = (rank + step) % world
         remote = workspace_peer_ptrs[peer]
+        handle = handles[(step - 1) % len(handles)]
         for offset, nbytes in spans:
             _check(
                 driver.cuMemcpyDtoDAsync(
@@ -539,6 +565,10 @@ def copy_to_peers(
                     handle,
                 )
             )
+    for stream in streams[1:]:
+        joined = torch.cuda.Event()
+        joined.record(stream)
+        side.wait_event(joined)
     with torch.cuda.stream(side):
         RANK_MAJOR_SIGNAL_KERNEL(flags.landed_addrs_gpu, rank, _SET, world)
     done = torch.cuda.Event()
