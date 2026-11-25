@@ -19,14 +19,16 @@ import torch
 from ..common.host import stream, to_cute
 
 HIDDEN = 7168  # the producer's output rows (112 CTAs x 64)
-ROWS = range(9, 65)  # batch rows a producer compiles (the o-projection producer's)
+# Batch rows a producer serves: one ``OprojUmma`` launch (D [64, N <= 128] in tensor
+# memory); above 64 rows it pushes into the wide box (``wide_cap`` rows).
+ROWS = range(9, 129)
 
 
 class TwoShotProducer:
     """``weight`` [7168, K] BF16 (row-major); ``rows``: the batch rows to compile
-    (each above 8 and at most 64). Compile outside graph captures."""
+    (each above 8 and at most 128). Compile outside graph captures."""
 
-    def __init__(self, weight, rows, tp):
+    def __init__(self, weight, rows, tp, wide_cap=0):
         from ..oproj.prepared import compile_oproj
 
         if weight.dim() != 2 or weight.shape[0] != HIDDEN or not weight.is_contiguous():
@@ -35,11 +37,14 @@ class TwoShotProducer:
         assert self.k % 64 == 0 and all(r in ROWS for r in rows)
         self.weight = to_cute(weight)
         with torch.accelerator.device_index(self.device.index):
-            self.codes = {
-                r: compile_oproj("producer_umma", self.k, r, tp, 1, True, False,
-                                 twoshot=True)
-                for r in rows
-            }  # fmt: skip
+            self.codes = {}
+            for r in rows:
+                cap = 64 if r <= 64 else wide_cap
+                assert cap >= r
+                self.codes[r] = compile_oproj(
+                    "producer_umma", self.k, r, tp, 1, True, False, cap=cap,
+                    twoshot=True,
+                )  # fmt: skip
 
     def run_two_shot(self, x, recv, peers, rank):
         """Push this rank's rows of ``x`` [rows, K] @ W.T into slot ``rank`` of their

@@ -52,10 +52,12 @@ from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ..common.gumbel import (
     DRAFT_NOISE_SALT,
-    drafted_value,
+    div_full,
+    gumbel_log,
     request_prefix,
     sampled_key,
     sampled_token,
+    sub_f32,
 )
 from ..common.host import fake
 from ..common.primitives import (
@@ -213,16 +215,14 @@ class MarkovWide:
         keys_all = alloc(smem, Uint64, self.tp * W, 16)  # every rank's keys
         previous = alloc(smem, Int32, W, 16)
         last = alloc(smem, Int32, 4, 16)
-        cached = slots_s = temps_s = seeds_s = prefixes_s = None
+        cached = slots_s = temps_s = seeds_s = noise = None
         if cutlass.const_expr(self.sampled):
             # This position's pre-temperature logits of the CTA's rows per request;
-            # per request: slot (-1: padding), temperature, seed, this position's
-            # murmur3 prefix.
+            # per request: slot (-1: padding), temperature, seed.
             cached = alloc(smem, Uint16, (W, self.rows), 16)
             slots_s = alloc(smem, Int32, W, 16)
             temps_s = alloc(smem, Float32, W, 16)
             seeds_s = alloc(smem, Int64, W, 16)
-            prefixes_s = alloc(smem, Uint32, W, 16)
         first = cta * self.rows
         # Static weights before the PDL wait: this CTA's markov_w2 rows.
         pieces = R // 8  # 16 B chunks per row
@@ -277,21 +277,17 @@ class MarkovWide:
                 for k in cutlass.range_constexpr(4):
                     a[s, k] = frag[k]
         rows = (first + tile_warp * 16 + group, first + tile_warp * 16 + group + 8)
+        if cutlass.const_expr(self.sampled):
+            # Position 0's Gumbel log terms (data-independent of the drafted tokens;
+            # later positions' are computed while the previous keys travel).
+            noise = cute.make_rmem_tensor((self.tiles, 4), Float32)
+            noise.fill(0)
+            self.noise(args, noise, Int32(0), warp, quarter, rows, rank, batch,
+                       temps_s, seeds_s)  # fmt: skip
         maxima = local.iterator + parity * LOCAL_WORDS
         counters = maxima + MAX_STEPS * MAX_WIDTH * 2
         region0 = box.iterator + parity * self.box_words
         for i in cutlass.range(self.steps, unroll=1):  # one copy of the position body
-            if cutlass.const_expr(self.sampled):  # noqa: SIM102
-                if tid < W:
-                    position = Int64(0)
-                    if tid < batch:
-                        position = Int64(args[14][tid * self.steps + i])
-                    # gumbel_sample's position: the predicted token's - 1, salted.
-                    position = position - Int64(1) + Int64(DRAFT_NOISE_SALT)
-                    # spec_step_seed(seed, i): gumbel_sample's seed for cache
-                    # column i (the draft position).
-                    step_seed = seeds_s[tid] ^ (Int64(i) << 32)
-                    prefixes_s[tid] = request_prefix(step_seed, position)
             # This position's base logits: rows (group, group + 8) of the warp tile,
             # requests 8 t + 2 quarter + (0, 1) of every N tile t.
             logits0 = cute.make_rmem_tensor((self.tiles, 4), Uint16)
@@ -322,7 +318,7 @@ class MarkovWide:
                 a_in = a
             sampled_in = (best, best, best)
             if cutlass.const_expr(self.sampled):
-                sampled_in = (cached, temps_s, prefixes_s)
+                sampled_in = (cached, temps_s, noise)
             for t in cutlass.range_constexpr(self.tiles):
                 if cutlass.const_expr(self.halves == 1):
                     self.tile_keys(
@@ -384,6 +380,10 @@ class MarkovWide:
                         column = rank * self.vocab_rank + first + 8 * chunk
                         target = cache.iterator + (row * vocab + Int64(column))
                         store_words(target, words)
+                # and the next position's Gumbel log terms.
+                if i + 1 < self.steps:
+                    self.noise(args, noise, i + 1, warp, quarter, rows, rank, batch,
+                               temps_s, seeds_s)  # fmt: skip
             # Every rank's keys of this position.
             got = cute.make_rmem_tensor((self.per_thread, 4), Uint32)
             got.fill(0)
@@ -458,15 +458,40 @@ class MarkovWide:
         return launch_ordinal
 
     @cute.jit
+    def noise(self, args, noise, i, warp, quarter, rows, rank, batch, temps_s, seeds_s):
+        """``sampled``: draft position ``i``'s Gumbel log terms (``gumbel_log``; the
+        noise is its negation) of the lane's (N tile t, row r, request n) into
+        ``noise[t, 2 r + n]`` (the tiles this warp computes; temperature 0 / padding:
+        unused)."""
+        for t in cutlass.range_constexpr(self.tiles):
+            mine = True
+            if cutlass.const_expr(self.halves > 1):
+                mine = warp // self.row_warps == t % self.halves
+            for n in cutlass.range_constexpr(2):
+                request = 8 * t + 2 * quarter + n
+                if mine & (request < batch):
+                    if temps_s[request] != Float32(0.0):
+                        position = Int64(args[14][request * self.steps + i])
+                        # gumbel_sample's position: the predicted token's - 1, salted.
+                        position = position - Int64(1) + Int64(DRAFT_NOISE_SALT)
+                        # spec_step_seed(seed, i): gumbel_sample's seed for cache
+                        # column i (the draft position).
+                        step_seed = seeds_s[request] ^ (Int64(i) << 32)
+                        prefix = request_prefix(step_seed, position)
+                        for r in cutlass.range_constexpr(2):
+                            index = rank * self.vocab_rank + rows[r]
+                            noise[t, 2 * r + n] = gumbel_log(prefix, index)
+
+    @cute.jit
     def tile_keys(
         self, t: cutlass.Constexpr[int], a, tile, w1s, logits0, lane, warp, rows, rank,
-        best, cached, temps_s, prefixes_s,
+        best, cached, temps_s, noise,
     ):  # fmt: skip
         """N tile ``t``'s keys of the warp's 16 rows into ``best[warp]``: the bias
         (FP32 accumulation over the Markov columns in order: 256-column K halves of 16
         MMA k-steps, A from ``a`` (registers, rank 256) or the staged ``tile``), the
-        logits and their keys (``cached``, ``temps_s``, ``prefixes_s``: ``sampled``
-        only, placeholders otherwise)."""
+        logits and their keys (``cached``, ``temps_s``, ``noise``: ``sampled``
+        only, placeholders otherwise; ``noise``: the position's Gumbel log terms)."""
         group, quarter = lane // 4, lane % 4
         tile_warp = warp % self.row_warps
         matrix_rows = w1s.iterator + (8 * t + lane % 8) * self.pitch
@@ -503,15 +528,13 @@ class MarkovWide:
                 logit = bf16(packed, False)
                 index = rank * self.vocab_rank + rows[r]
                 if cutlass.const_expr(self.sampled):
-                    key = sampled_key(
-                        drafted_value(
-                            logit,
-                            temps_s[8 * t + 2 * quarter + n],
-                            prefixes_s[8 * t + 2 * quarter + n],
-                            index,
-                        ),
-                        index,
-                    )
+                    value = logit
+                    temperature = temps_s[8 * t + 2 * quarter + n]
+                    if temperature != Float32(0.0):
+                        value = sub_f32(
+                            div_full(logit, temperature), noise[t, 2 * r + n]
+                        )
+                    key = sampled_key(value, index)
                     cached[8 * t + 2 * quarter + n, tile_warp * 16 + group + 8 * r] = (
                         Uint16(packed & Uint32(0xFFFF))
                     )
