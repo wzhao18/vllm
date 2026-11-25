@@ -656,7 +656,7 @@ class WaveMoeTail(MoeTail):
         output_mc, par, rank, capacity, eps = args[10:15]
         tid, warp, lane, block = thread()
         # DIAG stamps (S1): CTA row of 16 int64 slots in args[-1].
-        self.stamp_base = args[-1].iterator.toint() + Int64(block) * 128
+        self.stamp_base = args[-1].iterator.toint() + Int64(block) * 384
         self.stamp(0, tid == 0)
         smid_store(self.stamp_base + 9 * 8, Int32(tid == 0))
         if cutlass.const_expr(self.early):
@@ -745,6 +745,7 @@ class WaveMoeTail(MoeTail):
             if lat:
                 self.read_reduced(reduced, par * capacity, xwords, s2, ids)
             self.stamp(2, tid == 0)
+            self.wstamp(16, warp, lane == 0)
         else:
             # Lanes 0..27 of warp t poll token t's latent; owners' lanes 28..31 the RS.
             sq = Float32(0)
@@ -788,6 +789,7 @@ class WaveMoeTail(MoeTail):
             cute.arch.griddepcontrol_launch_dependents()
         cute.arch.cluster_wait()
         self.stamp(3, tid == 0)
+        self.wstamp(24, warp, lane == 0)
         if cutlass.const_expr(n == 1 and self.late_rms):
             self.push_squares(squares, s2[0], bar, (q, warp, lane))
             cute.arch.sync_warp()
@@ -814,6 +816,7 @@ class WaveMoeTail(MoeTail):
                 outs = [sm + self.m * 512 + 1024 * g for g in range(n)]
             self.normalize_groups(squares, (xwords, gx, eps), outs, (warp, lane, lat))
         self.stamp(4, tid == 0)
+        self.wstamp(32, warp, lane == 0)
         if cutlass.const_expr(self.umma):  # x stores -> tcgen05
             cute.arch.fence_proxy("async.shared", space="cta")
             fence_tmem(before=True)
@@ -852,6 +855,11 @@ class WaveMoeTail(MoeTail):
             release_tmem(tmem, self.columns, warp, 0)
         self.stamp(8, tid == 0)
         cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def wstamp(self, first: cutlass.Constexpr[int], warp, when):
+        """DIAG: %globaltimer into slot ``first`` + warp."""
+        stamp_store(self.stamp_base + (Int64(warp) + first) * 8, Int32(when))
 
     @cute.jit
     def stamp(self, slot: cutlass.Constexpr[int], when):

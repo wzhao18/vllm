@@ -16,7 +16,7 @@ from cutlass import Int32, Int64
 from .primitives import asm
 
 ROOT = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/sol16/S1diag"
-SLOTS = 16
+SLOTS = 48  # 0-15 CTA phases (tid 0), 16-23 / 24-31 / 32-39 per warp (lane 0): polled, cluster wait, region end
 AR_CTAS = 7 * 128  # AttnRes stamps: rows <= 128 (B16)
 
 _BUFS: list = []  # (kind, key, rows, tensor, rows dumped)
