@@ -770,24 +770,32 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
     }
     // ---- V (this CTA's latent dims [256 sp, +256)) -> FP16 in place of each KV row's
-    // first 512 bytes: a half-warp per row, every lane's 16 bytes read before any store
-    for (int i = 0; i < 3 * kChunk / 32; ++i) {
-      const int rr = 2 * warp + (lane >> 4) + 32 * i, c = rr / kChunk, r = rr % kChunk;
+    // first 512 bytes: a half-warp per row (6 rows per half-warp), every row's bytes read
+    // before the warp stores any
+    {
+      constexpr int kRowsPer = 3 * kChunk / 32;
       const int j = lane & 15;
-      const bool on = c < nchunks && r < ((validc(c) + 15) & ~15);
-      uint8_t* row = on ? bufc(c) + r * kRowS : nullptr;
-      uint4 w = make_uint4(0, 0, 0, 0);
-      if (on) w = *reinterpret_cast<const uint4*>(row + 256 * sp + 16 * j);
+      uint4 w[kRowsPer];
+      uint8_t* rowp[kRowsPer];
+#pragma unroll
+      for (int i = 0; i < kRowsPer; ++i) {
+        const int rr = 2 * warp + (lane >> 4) + 32 * i, c = rr / kChunk, r = rr % kChunk;
+        const bool on = c < nchunks && r < ((validc(c) + 15) & ~15);
+        rowp[i] = on ? bufc(c) + r * kRowS : nullptr;
+        if (on) w[i] = *reinterpret_cast<const uint4*>(rowp[i] + 256 * sp + 16 * j);
+      }
       __syncwarp();
-      if (on) {
-        const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int i = 0; i < kRowsPer; ++i) {
+        if (rowp[i] == nullptr) continue;
+        const uint32_t ws[4] = {w[i].x, w[i].y, w[i].z, w[i].w};
         uint32_t hh[8];
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
           hh[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
           hh[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
         }
-        uint4* dst = reinterpret_cast<uint4*>(row + 32 * j);
+        uint4* dst = reinterpret_cast<uint4*>(rowp[i] + 32 * j);
         dst[0] = make_uint4(hh[0], hh[1], hh[2], hh[3]);
         dst[1] = make_uint4(hh[4], hh[5], hh[6], hh[7]);
       }
