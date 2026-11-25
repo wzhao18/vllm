@@ -41,13 +41,10 @@ def _run(weight, x, separate):
     projection.compile_projection_tmem.cache_clear()
     if not separate:
         cls.__init__ = barrier_init
-    if not front_first:
-        rows_cls.cluster_tile = cls.cluster_tile
     try:
         prepared = projection.PreparedProjection(weight, {x.shape[0]: TACTIC}).prepare()
     finally:
         cls.__init__ = init
-        rows_cls.cluster_tile = order
         projection.compile_projection_tmem.cache_clear()
     outs = []
     for _ in range(3):
@@ -148,6 +145,8 @@ def _front(kind, rows, n, separate, dev, front_first=True):
     front_rows.compile_front_rows.cache_clear()
     if not separate:
         cls.__init__ = barrier_init
+    if not front_first:
+        rows_cls.cluster_tile = cls.cluster_tile
     try:
         if kind == "tmem":
             code = front.compile_front_tmem(SPLIT, VALID, SHARD, HIDDEN, dev)
@@ -157,6 +156,7 @@ def _front(kind, rows, n, separate, dev, front_first=True):
             )
     finally:
         cls.__init__ = init
+        rows_cls.cluster_tile = order
         front.compile_front_tmem.cache_clear()
         front_rows.compile_front_rows.cache_clear()
     return code
