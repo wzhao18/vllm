@@ -452,7 +452,13 @@ class EplbState:
             f"num_redundant_experts {model.num_redundant_experts} "
             f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}"
         )
-        max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
+        # A logical expert holds at most every physical slot the others leave
+        # free. Sizing the map for MAX_EXPERT_REDUNDANCY regardless cost
+        # layers x logical x 1024 x 8 B (K3.1: 92 x 896 -> 0.63 GiB/GPU of KV).
+        max_slots_per_logical_expert = min(
+            MAX_EXPERT_REDUNDANCY + 1,
+            max(1, physical_expert_capacity - model.num_logical_experts + 1),
+        )
         logical_to_physical_map = torch.full(
             (model.num_logical_experts, max_slots_per_logical_expert),
             -1,
