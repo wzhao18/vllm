@@ -19,6 +19,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op, extract_mlir_values, new_from_mlir_values
 
 ENABLED = os.environ.get("M1_STAMPS", "0") == "1"
+# bisect aid: comma list of the roles that stamp (default all)
+ROLES = tuple(os.environ.get("M1_ROLES", "sched,tokin,tmaa,tmab,mma,epi,tb").split(","))
+
+
+def on(role: str) -> bool:
+    return ENABLED and role in ROLES
 
 SLOTS = 192
 MAXCTA = 256

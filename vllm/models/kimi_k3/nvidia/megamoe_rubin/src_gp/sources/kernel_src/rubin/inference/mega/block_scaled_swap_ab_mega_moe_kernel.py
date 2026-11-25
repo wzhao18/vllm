@@ -881,7 +881,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             + self._shared_name_suffix()
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")
-            + ("_m1st" if self._m1 else "")
+            + ("_m1st" + ("" if len(m1_stamps.ROLES) == 7 else "_" + "_".join(m1_stamps.ROLES)) if self._m1 else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -1691,7 +1691,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self._m1):
                 m1a = m1_stamps.M1Writer(m1_rec, m1_lane0)
                 m1a.init("tmaa")
-                object.__setattr__(self._mainloop, "_m1a", m1a)
+                object.__setattr__(self._mainloop, "_m1a", m1a if m1_stamps.on("tmaa") else None)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_a(
                 fc1_tma_a_tensor=fc1_tma_a_tensor,
@@ -1724,7 +1724,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self._m1):
                 m1b = m1_stamps.M1Writer(m1_rec, m1_lane0)
                 m1b.init("tmab")
-                object.__setattr__(self._mainloop, "_m1b", m1b)
+                object.__setattr__(self._mainloop, "_m1b", m1b if m1_stamps.on("tmab") else None)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_b(
                 fc1_tma_b_tensor=fc1_tma_b_tensor,
@@ -1761,7 +1761,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self._m1):
                 m1m = m1_stamps.M1Writer(m1_rec, m1_lane0)
                 m1m.init("mma")
-                object.__setattr__(self._mainloop, "_m1m", m1m)
+                object.__setattr__(self._mainloop, "_m1m", m1m if m1_stamps.on("mma") else None)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_mma(
                 tmem_allocator=tmem_allocator,
@@ -1778,7 +1778,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self._m1):
                 m1e = m1_stamps.M1Writer(m1_rec, Int32(thread_idx == Int32(0)))
                 m1e.init("epi")
-                object.__setattr__(self.epilogue, "_m1e", m1e)
+                object.__setattr__(self.epilogue, "_m1e", m1e if m1_stamps.on("epi") else None)
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
@@ -1819,7 +1819,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                         m1_rec, Int32(m1_lane0 * Int32(warp_idx == Int32(self.transfer_warp_idx_start)))
                     )
                     m1i.init("tokin")
-                    object.__setattr__(self.token_comm, "_m1i", m1i)
+                    object.__setattr__(self.token_comm, "_m1i", m1i if m1_stamps.on("tokin") else None)
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 # epi_warps pushes the data from the epilogue, but a quantized wire still needs its scale rows pushed
@@ -1846,7 +1846,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                         m1_rec, Int32(m1_lane0 * Int32(warp_idx == Int32(self.token_in_end_warp_idx)))
                     )
                     m1t.init("tb")
-                    object.__setattr__(self.token_comm, "_m1t", m1t)
+                    object.__setattr__(self.token_comm, "_m1t", m1t if m1_stamps.on("tb") else None)
                 if cutlass.const_expr(not self._diag_skip_token_back):
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()
