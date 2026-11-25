@@ -997,7 +997,9 @@ def test_model_picks_experts_class(backend, cls):
     assert kimi_model.mega_moe_experts_cls(cfg) is cls
 
 
-def test_moe_token_shard_accepts_rubin(monkeypatch):
+def test_prefill_worker_sequence_parallel_on_rubin(monkeypatch):
+    """A P/D prefill worker on the Rubin MegaMoE (TP8, EP, DP1) runs sequence
+    parallelism, as every other role does."""
     monkeypatch.setattr(kimi_model, "pd_prefill_worker", lambda cfg: True)
     cfg = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend=KIMI_K3_MEGA_MOE),
@@ -1008,7 +1010,7 @@ def test_moe_token_shard_accepts_rubin(monkeypatch):
             tensor_parallel_size=8,
         ),
     )
-    assert kimi_model.use_moe_token_shard(cfg)
+    assert kimi_model.use_sequence_parallel(cfg)
 
 
 def test_deep_gemm_header_install_skips_rubin(monkeypatch):
