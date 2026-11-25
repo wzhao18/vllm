@@ -92,6 +92,14 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
         "(GPU time per kernel per forward) here. Summarize or compare with "
         "`python -m vllm.benchmarks.forward.profile A.kernels.json [B.kernels.json]`.",
     )
+    parser.add_argument(
+        "--eplb-load",
+        help="With --enable-eplb: a `.npy` of logical expert loads, shape (MoE "
+        "layers, routed experts), e.g. token counts of real traffic. Before the "
+        "cases, EPLB rebalances once from this load (the placement serving's "
+        "dynamic EPLB computes from its load window), then stays fixed. Needs "
+        "synchronous EPLB (`--eplb-config '{\"use_async\": false}'`).",
+    )
     EngineArgs.add_cli_args(parser)
     parser.set_defaults(load_format="dummy", enable_prefix_caching=False)
 
@@ -139,6 +147,67 @@ def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
             ),
         )
     return engine_args
+
+
+def apply_eplb_load(runner, path: str) -> dict[str, Any]:
+    """Rebalance the experts once from the logical loads in ``path``.
+
+    The load goes into EP rank 0's load window at each logical expert's primary
+    physical slot (the initial EPLB map puts logical ``e`` in slot ``e``); the
+    other ranks contribute zeros to the rearrangement's all-reduce. Returns the
+    busiest-rank over mean-rank load, per layer, before and after.
+    """
+    from vllm.distributed.parallel_state import get_ep_group
+
+    state = runner.eplb.state
+    if state is None:
+        raise ValueError("--eplb-load needs --enable-eplb.")
+    if state.is_async:
+        raise ValueError(
+            "--eplb-load rebalances synchronously: pass "
+            '--eplb-config \'{"use_async": false}\'.'
+        )
+    load = torch.from_numpy(np.load(path)).to(torch.int64)
+    ep = get_ep_group()
+    stats: dict[str, Any] = {}
+    matched = 0
+    for key, model_state in state.model_states.items():
+        model = model_state.model
+        window = model_state.expert_load_window
+        window.zero_()
+        shape = (model.num_moe_layers, model.num_logical_experts)
+        if tuple(load.shape) != shape:
+            continue
+        matched += 1
+        if not torch.equal(
+            model_state.physical_to_logical_map[:, : shape[1]].cpu().long(),
+            torch.arange(shape[1]).expand(shape[0], -1),
+        ):
+            raise ValueError("--eplb-load expects the initial EPLB placement.")
+        if ep.rank_in_group == 0:
+            window[0, :, : shape[1]] = load.to(window)
+        stats[key] = {"before": _rank_balance(load, model_state, ep.world_size)}
+    if not matched:
+        raise ValueError(f"--eplb-load {path}: shape {tuple(load.shape)} matches no MoE model.")
+    state.rearrange()
+    torch.accelerator.synchronize()
+    for key, model_state in state.model_states.items():
+        if key in stats:
+            stats[key]["after"] = _rank_balance(load, model_state, ep.world_size)
+            model_state.expert_load_window.zero_()
+    logger.info("EPLB load %s applied: busiest/mean rank load %s", path, stats)
+    return stats
+
+
+def _rank_balance(load: torch.Tensor, model_state, ep_size: int) -> dict[str, float]:
+    """Busiest over mean rank load per layer (mean and max over layers) of the
+    current placement, a logical expert's load split evenly over its replicas."""
+    p2l = model_state.physical_to_logical_map.cpu().long()
+    replicas = torch.zeros_like(load).scatter_add_(1, p2l, torch.ones_like(p2l))
+    per_slot = torch.gather(load.double() / replicas.clamp_min(1), 1, p2l)
+    per_rank = per_slot.reshape(load.shape[0], ep_size, -1).sum(-1)
+    ratio = per_rank.max(-1).values / per_rank.mean(-1).clamp_min(1e-9)
+    return {"mean": round(ratio.mean().item(), 4), "max": round(ratio.max().item(), 4)}
 
 
 def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any]:
@@ -257,6 +326,8 @@ def main(args: argparse.Namespace) -> None:
     world = get_world_group()
     results = []
     with torch.inference_mode(), set_current_vllm_config(runner.vllm_config):
+        if args.eplb_load:
+            apply_eplb_load(runner, args.eplb_load)
         for case in cases:
             result = run_case(runner, case, args)
             gathered: list[Any] = [None] * world.world_size
