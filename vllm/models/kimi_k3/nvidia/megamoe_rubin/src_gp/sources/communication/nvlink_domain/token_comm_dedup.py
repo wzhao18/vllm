@@ -36,6 +36,7 @@ from ....common.utils import ceil_div, round_up
 from ...helpers.dsl_helpers import smem_exclusive_prefix
 from ...helpers.flag_batch import make_flag_batch_tracker
 from ...helpers.iket_compat import iket
+from ....common import m1_stamps
 from ...helpers.software_sync import NvlinkBarrier
 from ...helpers.smem_workspace import SmemWorkspace
 from ...quant_def import CombineFormat, QuantKind
@@ -2162,6 +2163,9 @@ class TokenCommDedup(KernelComponent):
         iket.range_push("token_in.wait_sizes_ready")
         self._router.wait_for_sizes_ready(self._device_workspace)
         iket.range_pop()
+        m1w = getattr(self, "_m1i", None)
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_TOKIN_SIZES, m1_stamps.gtime())
         iket.range_push("token_in.stage_sizes")
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
         owner_expert_begin = self._local_rank * Int32(self.experts_per_rank)
@@ -2190,6 +2194,9 @@ class TokenCommDedup(KernelComponent):
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
         iket.range_pop()
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_TOKIN_META, m1_stamps.gtime())
+            m1pull0 = m1_stamps.clk()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
             vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
@@ -2274,6 +2281,9 @@ class TokenCommDedup(KernelComponent):
                 barrier_id=self.token_in_done_barrier_id, num_threads=2 * self.transfer_thread_count
             ).arrive()
         iket.range_pop()
+        if cutlass.const_expr(m1w is not None):
+            m1w.add(m1_stamps.C_TOKIN_PULL, m1_stamps.clk() - m1pull0)
+            m1w.st(m1_stamps.W_TOKIN_END, m1_stamps.gtime())
         if cutlass.const_expr(
             self.token_back_enabled and self.token_back_mode in ("reuse_dispatch_warps", "hybrid_warps")
         ):
@@ -2533,6 +2543,9 @@ class TokenCommDedup(KernelComponent):
         fill_sequence = Int32(0)
 
         iket.range_push("token_back.work")
+        m1w = getattr(self, "_m1t", None)
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_TB_START, m1_stamps.gtime())
         next_dense_token = global_worker_idx - global_worker_count
         if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
             next_dense_token = Int32(0)
@@ -2562,6 +2575,8 @@ class TokenCommDedup(KernelComponent):
                 if (metadata.is_last_copy != Int32(0)) and (metadata.dst_token_cnt > Int32(1)):
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)
+                    if cutlass.const_expr(m1w is not None):
+                        m1tw0 = m1_stamps.clk()
                     # Fast path: every tile of the experts <= local_expert is done (no load once the prefix is there;
                     # one 32-slot poll otherwise).
                     if completed_slot_prefix < expert_slot_end:
@@ -2592,6 +2607,9 @@ class TokenCommDedup(KernelComponent):
                             iket.range_pop()
                     # Order every lane's acquire before the TMA that reads the completed copies.
                     cute.arch.sync_warp()
+                    if cutlass.const_expr(m1w is not None):
+                        m1tw1 = m1_stamps.clk()
+                        m1w.add(m1_stamps.C_TB_PREFIXWAIT, m1tw1 - m1tw0)
                     fill_sequence = self._reduce_and_push(
                         block_address,
                         metadata.dst_token_cnt,
@@ -2602,11 +2620,15 @@ class TokenCommDedup(KernelComponent):
                         fill_sequence,
                         chunk_bytes,
                     )
+                    if cutlass.const_expr(m1w is not None):
+                        m1w.add(m1_stamps.C_TB_PUSH, m1_stamps.clk() - m1tw1)
                 next_dense_token = self.next_token(next_dense_token)
 
             expert_valid_begin = expert_valid_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_TB_END, m1_stamps.gtime())
 
     @cute.jit
     def _advance_slot_prefix(
@@ -2915,6 +2937,9 @@ class TokenCommDedup(KernelComponent):
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
+        m1w = getattr(self, "_m1i", None)
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_DRAIN_START, m1_stamps.gtime())
         iket.range_push("tail.nvlink_drain")
         self._nvlink_barrier.arrive_and_wait(
             self.transfer_thread_count,
@@ -2925,6 +2950,8 @@ class TokenCommDedup(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_DRAIN_END, m1_stamps.gtime())
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
         global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
         iket.range_push("tail.reset_workspace")
@@ -2941,6 +2968,10 @@ class TokenCommDedup(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
+        if cutlass.const_expr(m1w is not None):
+            m1w.st(m1_stamps.W_TAIL_END, m1_stamps.gtime())
+            m1w.st(m1_stamps.CLK_TAIL, m1_stamps.clk())
+            m1_stamps.finish(self._device_workspace, self.promised_launchable_sm_count, m1w.pred)
         # BUG-E2E-3: every rank has reset its tail span (barrier above): release the next call's routers.
         if self._linear_cta_idx == Int32(0):
             if transfer_thread_idx == Int32(0):
