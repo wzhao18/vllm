@@ -56,10 +56,8 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     RubinExpertsKernel,
-    census_add,
     die_words,
     nth_set,
-    require_below,
     sm_id,
     stage16,
     stamp_at,
@@ -80,6 +78,23 @@ def stage_bits(value):
 
 
 shuffle_bfly, shuffle_up = (cute.arch.shuffle_sync_bfly, cute.arch.shuffle_sync_up)
+
+
+@asm(Uint64)
+def census_add(pointer, increment):
+    """Relaxed GPU-scope ``atom.add.u64`` (the die census): the value before."""
+    return (
+        "atom.relaxed.gpu.global.add.u64 $0,[$1],$2;",
+        "=l,l,l,~{memory}",
+        (pointer, Uint64(increment)),
+    )
+
+
+@asm()
+def require_below(value, bound):
+    """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
+    re-armed (see ``arrive``)."""
+    return "{ .reg .pred p; setp.ge.u32 p,$0,$1; @p trap; }", "r,r", (value, bound)
 
 
 @cute.jit
@@ -136,16 +151,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False, warm=False,
+        dies=(), static_groups=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
-        # ``RubinExpertsKernel.warm``: an L2 prefetch per weight page before the wait.
-        # One GPU, L2 flushed, launched 20 us before its predecessor's end, q4 verify
-        # routes: the last CTA's epilogue at M16 / 32 / 48 / 64 -0.39 / -0.32 / -0.48 /
-        # -0.44 us. OFF: in-step at 16 ranks the prefetch burst lands beside routing and
-        # SharedDown: B2 / B4 / B8 +0.038 / +0.043 / +0.013 ms/step (Hecate ABBA, prod cfg).
-        self.warm = warm
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -923,10 +932,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         die-1 arrivals) << 32 | (earlier arrivals) modulo 2^64. The call's last arrival
         re-arms the word: every CTA of the call has added by then, and the next call's
         CTAs add only once launched, i.e. after every CTA of this call triggered its
-        dependents (after this arrival) or, in the step, after the next layer's front
-        completed (routing releases the experts after the front's completion, which
-        follows this call's); a word that was not re-armed traps (an arrival count of
-        grid or more)."""
+        dependents (after this arrival) or, in the step, after the next layer's routing
+        released them (at its exit, or at M64 after the front's completion; both follow
+        this call's); a word that was not re-armed traps (an arrival count of grid or
+        more)."""
         info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
         if (thread()[1] == 2) & (thread()[2] == 0):
             counts = before + Uint64(1)
@@ -1201,9 +1210,6 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         arrival = None
         if cutlass.const_expr(len(self.dies) > 0):
             arrival = self.ticket(workspace)
-        if cutlass.const_expr(self.warm):
-            if tid == 32:
-                RubinExpertsKernel.warm_pages(self, maps, w13_scales, w2_scales, cta)
         cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)

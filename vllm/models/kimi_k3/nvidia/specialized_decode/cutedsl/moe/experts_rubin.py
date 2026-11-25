@@ -43,14 +43,12 @@ from ..common.primitives import (
     load_tmem,
     load_volatile,
     load_words,
-    mailbox_store,
     multicast_words,
     mx_exponent,
     mx_rescale,
     named_barrier,
     pack_fp8,
     pack_pair,
-    prefetch_bytes,
     redux,
     shared_address,
     situ,
@@ -63,7 +61,6 @@ from ..common.primitives import (
     unpack_bf16,
     view,
 )
-from ..common.primitives import prefetch_map as prefetch_tile
 from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
 from .experts import ExpertsKernel, claim, mx_block, swizzled
 
@@ -265,23 +262,6 @@ def die_words(dies):
     return tuple(sum(bit(32 * w + i) << i for i in range(32)) for w in range(words))
 
 
-@asm(Uint64)
-def census_add(pointer, increment):
-    """Relaxed GPU-scope ``atom.add.u64`` (the die census): the value before."""
-    return (
-        "atom.relaxed.gpu.global.add.u64 $0,[$1],$2;",
-        "=l,l,l,~{memory}",
-        (pointer, Uint64(increment)),
-    )
-
-
-@asm()
-def require_below(value, bound):
-    """Trap unless ``value`` < ``bound`` (unsigned): a census word that was not
-    re-armed (``RubinGroupedExpertsKernel.arrive``)."""
-    return "{ .reg .pred p; setp.ge.u32 p,$0,$1; @p trap; }", "r,r", (value, bound)
-
-
 @asm(Uint32)
 def sm_id():
     return "mov.u32 $0, %smid;", "=r", ()
@@ -326,46 +306,6 @@ def match_rank(bits, grid: cutlass.Constexpr[int], die, k):
             rank = 32 * w + Int32(nth_set(word, index))
         elif rank < 0:
             index -= count
-    return rank
-
-
-@cute.jit
-def match_rank_popc(bits, grid: cutlass.Constexpr[int], die, k):
-    """``match_rank`` without ``fns`` (on the critical path, ``fns`` cost ~0.7 us
-    here): the words loaded once, the hit word found by running popcounts and its
-    n-th set bit by halving popcounts (``experts_rubin64``'s ``matched``). The same
-    rank."""
-    words: cutlass.Constexpr = (grid + 31) // 32
-    masks = [(1 << min(32, grid - 32 * w)) - 1 for w in range(words)]
-    word = [bits[w] & Uint32(masks[w]) for w in range(words)]
-    h1 = Int32(0)
-    for w in cutlass.range_constexpr(words):
-        h1 += Int32(cute.arch.popc(word[w]))
-    own, other = (grid - h1, h1)
-    if die == 1:
-        own, other = (h1, grid - h1)
-    target, index = (die, k)
-    if k >= own:
-        target, index = (1 - die, other - 1 - (k - own))
-    before, hit, base = (Int32(0), Uint32(0), Int32(-1))
-    for w in cutlass.range_constexpr(words):
-        homed = word[w]
-        if target == 0:
-            homed = ~word[w] & Uint32(masks[w])
-        count = Int32(cute.arch.popc(homed))
-        if (index >= before) & (index < before + count):
-            hit, base = (homed, 32 * w + index - before)
-        before += count
-    rank = Int32(-1)
-    if base >= 0:
-        n, position = (base % 32, Int32(0))
-        for width in cutlass.range_constexpr(5):
-            half: cutlass.Constexpr = 16 >> width
-            low = Int32(cute.arch.popc(hit & Uint32((1 << half) - 1)))
-            if n >= low:
-                n, position = (n - low, position + half)
-                hit = hit >> Uint32(half)
-        rank = base - base % 32 + position
     return rank
 
 
@@ -480,35 +420,11 @@ class RubinExpertsKernel(ExpertsKernel):
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
-        dies=(), static_groups=False, fast_exchange=False, warm=True, match_fc1=True,
+        dies=(), static_groups=False, fast_exchange=False,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
-        # warm (grid maps): before the routes are known, one thread per CTA prefetches
-        # into L2 one w13 box, one w2 box and 256 B of each scale tensor at its 1 / grid
-        # fraction of the layer's weights, so every 2 MiB page of them is translated
-        # (and its first lines cached) before the first weight stage. One GPU, L2
-        # flushed, route mailbox filled 40 us after launch, M8 (53 experts): first
-        # weight stage landed 1.70 -> 1.44 us after the routes, last CTA's epilogue
-        # -0.2 us. No effect on values.
-        self.warm = warm and grid_maps
         super().__init__(16, 8, experts, grid, publish, True, False, False, slots)
-        # match_fc1 (``dies`` and ``fast_exchange``): FC1 die matching as the M64
-        # kernel's (``RubinGroupedExpertsKernel.ticket`` / ``arrive`` / ``home_bits``):
-        # each CTA adds itself to the die census before the routes, and the k-th CTA of
-        # die d runs the k-th FC1(A) / FC1(B) partition rank whose middle w13 stage sits
-        # on die d (``match_warp``). Ranks, owners, peer slots and the partial-sum
-        # order are those of the die-oblivious partition: bitwise the same outputs. The
-        # census word is the M64 kernel's (same offset, re-armed by each call's last
-        # arrival).
-        # One GPU, L2 flushed, route mailbox filled 40 us after launch, M8 (53 experts):
-        # the last CTA's epilogue 10.91 -> 10.30 us after the routes (the die-local FC1
-        # stream saves ~1 us); the matching by warp 0 in registers (``match_warp``)
-        # instead of all warps through shared memory and two CTA barriers: first
-        # weight stage landed 1.74 -> 1.34 us after the routes, last epilogue -0.33 us.
-        self.match_fc1 = match_fc1 and bool(dies) and fast_exchange
-        if self.match_fc1:
-            self.ws_census = (self.workspace_bytes + 15) // 16 * 16
         if fast_exchange:
             from .experts_rubin64 import CENSUS_BYTES
 
@@ -579,9 +495,6 @@ class RubinExpertsKernel(ExpertsKernel):
         # At least the unpacked five-slot size: one CTA per SM (two co-resident CTAs
         # would serialize in tcgen05.alloc while waiting on each other's partials).
         self.smem_bytes = max(self.off_misc + 5120, 212096)
-        # match_fc1: census info [4], home bits [2 lists][8 words], matched ranks [2].
-        self.off_match = self.off_misc + 5120
-        assert self.off_match + 96 <= self.smem_bytes
         # ``ExpertsGeometry`` placed the unit queue for five stages; it follows misc.
         self.off_queue = self.off_misc + 4608
         ring = self.parts * stages
@@ -1047,7 +960,6 @@ class RubinExpertsKernel(ExpertsKernel):
         group = Int32(tile >= self.tiles * ranges[1, 0])
         start = (tile - self.tiles * ranges[group, 0]) * 14
         owner = start >= ranges[group, 2]
-        cta = ranges[group, 6]  # the FC1 partition rank (``match_fc1``), else the CTA
         row = (32 * (warp & 3) + lane) * 32
         if not owner:
             slot = self.peer_slot(workspace, parity, group, cta) + row
@@ -1238,87 +1150,6 @@ class RubinExpertsKernel(ExpertsKernel):
                     scale_token
                 )
         self.group_sync(eg)
-
-    @cute.jit
-    def warm_pages(self, maps, w13_scales, w2_scales, cta):
-        """``warm``: this CTA's L2 prefetches (one thread; also the M64 kernel's)."""
-        rows13, rows2 = (self.experts * self.w13_rows, self.experts * 3584)
-        row = Int64(cta) * rows13 // self.grid // 128 * 128
-        prefetch_tile(maps[0], Int32(row), 0)
-        row = Int64(cta) * rows2 // self.grid // 128 * 128
-        prefetch_tile(maps[1], Int32(row), 0)
-        sizes = (self.w13_scale_bytes, self.w2_scale_bytes)
-        for scales, size in zip((w13_scales, w2_scales), sizes):
-            offset = Int64(cta) * (self.experts * size) // self.grid // 256 * 256
-            prefetch_bytes(scales.iterator + offset, 256)
-
-    @cute.jit
-    def ticket(self, workspace):
-        """``match_fc1``, warp 0 lane 0 before its route poll: this CTA's census add
-        (``RubinGroupedExpertsKernel.ticket``); the value before is consumed in
-        ``match_warp``, so the atomic's round trip overlaps the routing."""
-        before = Uint64(0)
-        if (thread()[1] == 0) & (thread()[2] == 0):
-            increment = Uint64(1) + (Uint64(self.die()) << Uint64(32))
-            before = census_add(workspace.iterator + self.ws_census, increment)
-        return before
-
-    @cute.jit
-    def die(self):
-        """This SM's die (``dies``)."""
-        smid = sm_id()
-        word = Uint32(0)
-        for w in cutlass.range_constexpr(len(self.die_bits)):
-            if smid >> 5 == w:
-                word = Uint32(self.die_bits[w])
-        return Int32(word >> (smid & 31) & 1)
-
-    @cute.jit
-    def match_warp(self, sm, workspace, before, distinct):
-        """``match_fc1``, warp 0 right after its dedupe (``route_warp``): this CTA's
-        (FC1(A), FC1(B)) partition ranks into off_match + 80, which the routed
-        barrier publishes. Lane 0 holds the census value (``ticket``) and turns it
-        into (die, k) (the call's last arrival re-arms the word, as
-        ``RubinGroupedExpertsKernel``'s ``arrive``); the warp ballots the die of
-        every rank's middle w13 stage per group (seven rounds of 32 ranks) and
-        matches both lists in registers (``match_rank_popc``): no CTA barrier and
-        no shared-memory bit lists on the way to the first weight stage."""
-        lane = thread()[2]
-        cute.arch.sync_warp()
-        experts = view(sm.iterator, self.off_misc + 1140, Int32, 128)
-        words: cutlass.Constexpr = (self.grid + 31) // 32
-        bits: list = [[], []]
-        for i in cutlass.range_constexpr(words):
-            rank = lane + 32 * i
-            ranges = ExpertsKernel.partition(self, distinct, rank)
-            for group in cutlass.range_constexpr(2):
-                lo, hi = (ranges[group, 2], ranges[group, 3])
-                mid = (lo + hi) // 2
-                tile = 3 * ranges[group, 0] + mid // 14
-                row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
-                address = Int64(row) * 1792 + mid % 14 * 128
-                live = (rank < self.grid) & (lo < hi)
-                home = live & ((address >> 21 & 1) != 0)
-                bits[group].append(Uint32(cute.arch.vote_ballot_sync(home)))
-        counts = before + Uint64(1)
-        low = Int32(Uint32(counts & Uint64(4294967295)))
-        high = Int32(Uint32(counts >> Uint64(32)))
-        arrivals = Uint32(cute.arch.shuffle_sync(low, 0))
-        ones = Uint32(cute.arch.shuffle_sync(high, 0))
-        require_below(arrivals, Uint32(self.grid))
-        die = self.die()
-        k = Int32(arrivals) - Int32(ones)
-        if die == 1:
-            k = Int32(ones)
-        if (lane == 0) & (arrivals == Uint32(self.grid - 1)):
-            base = workspace.iterator + self.ws_census
-            mailbox_store(base, (Uint32(4294967295), Uint32(4294967295)))
-        a = match_rank_popc(bits[0], self.grid, die, k)
-        b = match_rank_popc(bits[1], self.grid, die, k)
-        if lane == 0:
-            ranks = view(sm.iterator, self.off_match + 80, Int32, 2)
-            ranks[0], ranks[1] = (a, b)
-        cute.arch.sync_warp()
 
     @cute.jit
     def match_fc2(self, sm, workspace, experts, distinct):
@@ -1574,12 +1405,6 @@ class RubinExpertsKernel(ExpertsKernel):
             generations = view(workspace.iterator, ws_generation, Int32, self.slots)
         if cutlass.const_expr(self.lean_route):
             self.route_init(sm, counters, generations)
-        if cutlass.const_expr(self.warm):
-            if tid == 32:
-                self.warm_pages(maps, w13_scales, w2_scales, cta)
-        before = Uint64(0)
-        if cutlass.const_expr(self.match_fc1):
-            before = self.ticket(workspace)
         source = ids
         if cutlass.const_expr(self.polled):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
@@ -1613,8 +1438,6 @@ class RubinExpertsKernel(ExpertsKernel):
                 distinct = self.route_warp(sm, source, batch)
                 if lane == 0:
                     shared_distinct[0] = distinct
-                if cutlass.const_expr(self.match_fc1):
-                    self.match_warp(sm, workspace, before, distinct)
                 named_barrier(ROUTED, 384, arrive=True)
             else:
                 named_barrier(ROUTED, 384)
@@ -1631,21 +1454,7 @@ class RubinExpertsKernel(ExpertsKernel):
         if cutlass.const_expr(self.stamp > 0):
             if tid == 0:
                 stamp_at(trace, 0)
-        base = self.partition(distinct, cta)
-        # Column 6: the FC1 partition rank (``owner_sums``' peer slots and order).
-        ranges = cute.make_rmem_tensor((2, 7), Int32)
-        for g in cutlass.range_constexpr(2):
-            for i in cutlass.range_constexpr(6):
-                ranges[g, i] = base[g, i]
-            ranges[g, 6] = cta
-        if cutlass.const_expr(self.match_fc1):
-            matched = view(sm.iterator, self.off_match + 80, Int32, 2)
-            fc1 = (matched[0], matched[1])
-            for g in cutlass.range_constexpr(2):
-                matched = ExpertsKernel.partition(self, distinct, fc1[g])
-                for i in cutlass.range_constexpr(4):
-                    ranges[g, i] = matched[g, i]
-                ranges[g, 6] = fc1[g]
+        ranges = self.partition(distinct, cta)
         shift = Int32(0)
         if cutlass.const_expr(self.rotate):
             shift = ranges[0, 2] % 14
