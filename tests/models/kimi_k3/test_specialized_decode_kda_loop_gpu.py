@@ -77,7 +77,7 @@ LOOP_SHAPES = [
 STOCK_SHAPES = [
     *(pytest.param(q, b, HEADS, False, id=f"q{q}-B{b}") for q, b in (
         (4, 1), (4, 4), (4, 8), (4, 14), (4, 36), (4, 40),
-        (8, 1), (8, 4), (8, 8), (8, 14),
+        (8, 1), (8, 4), (8, 8), (8, 14), (8, 16),
     )),
     *(pytest.param(*p.values, HEADS, False, id=p.id) for p in LOOP_SHAPES),
     pytest.param(4, 8, HEADS, True, id="q4-B8-bias"),
@@ -219,12 +219,13 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     """The production kernel at this shape (``PreparedKda`` with an FP32 state: a
     stock-math kind) against the stock verify."""
     name = prepared.verify_kernel(requests, q, RUBIN, False, 0, heads)
-    assert name in ("loopstock", "feed", "kdasplit"), name
+    assert name in ("loopstock", "feed", "kdasplit", "halfstock"), name
     schedule = prepared.schedule_of(heads, requests, 0, q, RUBIN, False)
     kernel = prepared.make_kernel((heads, requests, 0, bias, schedule, q, False), RUBIN)
     stock_kinds = (
-        prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock
-    )
+        prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
+        prepared.KdaVerifyHalfStock,
+    )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
     slots = requests * q + 1
@@ -302,6 +303,48 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
     assert_bitwise("output", got[0], want[0])
     assert_bitwise("recurrent state", got[1][1], want[1][1])
     assert_bitwise("conv state", got[1][0], want[1][0])
+
+
+# HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4), and
+# q4 / odd q (the conv window is written after both halves read its taps: at q4 / q5
+# an early writer raced the other half's tap loads before that fix).
+HALF_SHAPES = [(8, 16), (8, 17), (8, 4), (4, 16), (5, 8)]
+
+
+@pytest.mark.parametrize("q,requests", HALF_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
+def test_half_equals_loopstock(monkeypatch, q, requests, pad):
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    if pad:  # every third request is padding
+        padded = torch.arange(requests, device=DEVICE) % 3 == 1
+        table[padded] = -1
+        accepted[padded] = 0
+    projected = projected_rows(requests * q)
+    half = core_of(attention, requests, q, "halfstock", base, monkeypatch)
+    want = run(
+        core_of(attention, requests, q, "loopstock", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    for _ in range(2):  # the second call: counters re-armed by the first
+        got = run(half, projected, base, table, accepted)
+        assert_bitwise("output", got[0], want[0])
+        assert_bitwise("recurrent state", got[1][1], want[1][1])
+        assert_bitwise("conv state", got[1][0], want[1][0])
+    # two arrivals per live item and call, none for a padding request
+    counts = set(half.halves[(requests, q)][1].tolist())
+    assert counts <= {0, 4} and 4 in counts, counts
+
+
+def test_half_policy_rows():
+    """q8 B16-17 run HalfStock for an FP32 state; a BF16 state never does."""
+    for requests in (16, 17):
+        assert prepared.verify_kernel(requests, 8, RUBIN, False) == "halfstock"
+        assert prepared.verify_kernel(requests, 8, RUBIN, True) != "halfstock"
+    for requests in (15, 18, 32, 64):
+        assert prepared.verify_kernel(requests, 8, RUBIN, False) != "halfstock"
 
 
 def test_feed_refuses_long_verify():

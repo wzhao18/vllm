@@ -808,6 +808,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyFeed: "feed",
+        prepared.KdaVerifyHalfStock: "halfstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -851,7 +852,7 @@ FP32_Q4_RUNS = [
     (16, 35, "loopstock"), (36, 42, "kdasplit"), (43, 1024, "feed"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 15, "kdasplit"), (16, 17, "loopstock"), (18, 22, "kdasplit"),
+    (1, 15, "kdasplit"), (16, 17, "halfstock"), (18, 22, "kdasplit"),
     (23, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
@@ -897,12 +898,14 @@ def test_kda_fp32_policy_picks_the_measured_best():
     picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
     picks.update({(4, 41): "kdasplit", (4, 42): "kdasplit", (4, 43): "feed"})
     picks.update({(4, 48): "feed", (8, 12): "kdasplit", (8, 15): "kdasplit"})
-    picks.update({(8, 16): wide, (8, 18): "kdasplit", (8, 23): wide, (8, 48): wide})
+    picks.update({(8, 16): "halfstock", (8, 17): "halfstock", (8, 18): "kdasplit"})
+    picks.update({(8, 23): wide, (8, 48): wide})
     for (q, b), name in picks.items():
         assert kind(b, q, RUBIN, False) == name, (q, b)
     q4_kinds = {kind(b, 4, RUBIN, False) for b in range(1, 1025)}
     assert q4_kinds <= {"kdasplit", wide, "feed"}
-    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
+    q8_kinds = {kind(b, 8, RUBIN, False) for b in range(1, 1025)}
+    assert q8_kinds <= {"kdasplit", wide, "halfstock"}
     assert kind(48, 8, RUBIN, True) == "halves"
     assert [kind(b, 4, RUBIN, True) for b in (35, 36, 64, 65)] == ["wide"] + [
         "stream3"
@@ -929,7 +932,7 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             kernel = kda_kernel(b, q, False)
             stock = (
                 prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
-                prepared.KdaSplitStock,
+                prepared.KdaSplitStock, prepared.KdaVerifyHalfStock,
             )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
