@@ -276,7 +276,7 @@ class KdaVerifyHalfDefer(DeferTokens, KdaVerifyHalfStock):
                 c, glane = thread % 64, thread % 32
                 t = first * half + thread // 64
                 if (thread // 64 < first) & (t < T):
-                    gates = zeros(2, gate.element_type)
+                    gates = zeros(2, BFloat16)
                     for h in cutlass.range_constexpr(2):
                         gates[h] = gate[token + t, head * 128 + c + 64 * h]
                     self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
@@ -308,7 +308,7 @@ class KdaVerifyHalfDefer(DeferTokens, KdaVerifyHalfStock):
                     history[r, c, e] = values[e]
         # (no records slot: nothing to fold; never at q >= 2)
         self.fold(history, rec, row0, j, offset * Int32(records > 0))
-        own_gates = zeros(2, gate.element_type)
+        own_gates = zeros(2, BFloat16)
         shared = (shared_q, shared_k, shared_v, reductions, shared_beta)
         if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
             self.half_prologue(
@@ -442,7 +442,7 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.stage(state, page, state_full, meta, live_items, first,
                                live + 1)  # fmt: skip
-                own_gates = zeros(2, gate.element_type)
+                own_gates = zeros(2, BFloat16)
                 if thread < 128:
                     self.loop_prologue(args, thread, token, head, offset, conv_slot,
                                        shared_q, shared_k, shared_v, reductions,

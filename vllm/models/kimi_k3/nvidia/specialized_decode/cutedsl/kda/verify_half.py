@@ -103,7 +103,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
 
     @cute.jit
     def __call__(self, *args):
-        assert args[0].shape[0] // self.tokens * self.heads == self.items
+        assert args[0].shape[0] // self.planes // self.tokens * self.heads == self.items
         ctas = 2 * self.items
         # the halves wait for each other: every CTA must be resident (one per SM)
         assert persistent_ctas(ctas) == ctas, f"KdaVerifyHalfStock: {ctas} CTAs"
@@ -215,9 +215,9 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 c, glane = thread % 64, thread % 32
                 t = first * half + thread // 64
                 if (thread // 64 < first) & (t < T):
-                    gates = zeros(2, gate.element_type)
+                    gates = zeros(2, BFloat16)
                     for h in cutlass.range_constexpr(2):
-                        gates[h] = gate[token + t, head * 128 + c + 64 * h]
+                        gates[h] = self.projected(gate, token + t, head * 128 + c + 64 * h)
                     self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
                                     token, head)  # fmt: skip
         cute.arch.griddepcontrol_launch_dependents()
@@ -245,7 +245,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 values = load_f32x4(pointer, shared=True)
                 for e in cutlass.range_constexpr(4):
                     history[r, c, e] = values[e]
-        own_gates = zeros(2, gate.element_type)
+        own_gates = zeros(2, BFloat16)
         shared = (shared_q, shared_k, shared_v, reductions, shared_beta)
         if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
             self.half_prologue(
@@ -362,10 +362,12 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         inputs = cute.make_rmem_tensor(3 * T, BFloat16)
         for t in cutlass.range_constexpr(T):
             for s in cutlass.range_constexpr(3):
-                inputs[3 * t + s] = x[token + t, s * dim + channel]
+                inputs[3 * t + s] = self.projected(x, token + t, s * dim + channel)
         if cutlass.const_expr(span[0] == 0):
             if thread < T:
-                shared_beta[thread] = triton_sigmoid(Float32(beta[token + thread, head]))
+                shared_beta[thread] = triton_sigmoid(
+                    Float32(self.projected(beta, token + thread, head))
+                )
         for p in cutlass.range_constexpr(span[0], span[1]):
             tokens = [t for t in (2 * p, 2 * p + 1) if t < T]
             qks = []

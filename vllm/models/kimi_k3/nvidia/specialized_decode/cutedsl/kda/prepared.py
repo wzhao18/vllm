@@ -487,9 +487,13 @@ def schedule_of(heads, requests, gate_mode, tokens, capability, bf16_state, rows
 
 
 @cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=False):
+def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=False,
+               planes=1):  # fmt: skip
+    """``planes`` > 1: the in-projection operands are its K-split FP32 partial planes
+    (``KdaVerifyLoop.planes``; the Loop / Half families only)."""
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
-    requests, bf16_state = specs[0][0][0] // tokens, specs[9][2] == torch.bfloat16
+    requests = specs[0][0][0] // planes // tokens
+    bf16_state = specs[9][2] == torch.bfloat16
     capability = torch.cuda.get_device_capability(device)
     rows = specs[9][1][-2:] == (128, 1)
     schedule = schedule_of(
@@ -498,6 +502,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
     options = (heads, requests, gate_mode, has_bias, schedule, tokens, bf16_state)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     kernel = make_kernel(options, capability, prepared)
+    if planes > 1:
+        assert hasattr(kernel, "projected"), f"{type(kernel).__name__}: no planes"
+        kernel.planes = planes
     with torch.accelerator.device_index(device):  # (persistent kernels: its SMs)
         compiled = cute.compile(
             kernel, *args[:13], *scalars, *args[13:], make_fake_stream()
@@ -549,9 +556,12 @@ def decode_conv_weight(weight):
 
 
 class PreparedKda:
-    def __init__(self, attention, policies, conv_dim_first, prepared=()):
+    def __init__(self, attention, policies, conv_dim_first, prepared=(), planes=1):
         """``prepared``: verify policy keys (requests, tokens) that also run on
-        prepared operands."""
+        prepared operands. ``planes`` > 1: ``run``'s ``projected`` is the
+        in-projection's K-split FP32 partial planes [planes * rows, pitch], summed by
+        the core as it loads them (``KdaVerifyLoop.planes``)."""
+        self.planes = planes
         bias, dt = attention.conv1d.bias, attention.dt_bias
         self.heads = attention.A_log.numel()
         self.dim, self.has_bias = self.heads * 128, bias is not None
@@ -590,7 +600,11 @@ class PreparedKda:
         for key, (pitch, mode) in self.policies.items():
             requests, tokens = key if isinstance(key, tuple) else (key, 1)
             batch, meta = requests * tokens, dict(device="meta")
-            projected = torch.empty((batch, pitch), dtype=torch.bfloat16, **meta)
+            projected = torch.empty(
+                (self.planes * batch, pitch),
+                dtype=torch.float32 if self.planes > 1 else torch.bfloat16,
+                **meta,
+            )
             out = torch.empty(batch, self.dim, dtype=torch.bfloat16, **meta)
             accepted = torch.empty(requests, dtype=torch.int32, **meta)
             shape = (requests, tokens) if tokens > 1 else (batch,)
@@ -609,7 +623,7 @@ class PreparedKda:
                 operands += self.halves[key]
             specs = tuple(map(layout, operands))
             options = (self.heads, mode, self.has_bias, self.device.index, tokens)
-            self.kernels[key] = executable(specs, *options)
+            self.kernels[key] = executable(specs, *options, planes=self.planes)
             if key in self.prepared:
                 width = 4 * self.dim + 8
                 prepared = torch.empty((batch, width), dtype=torch.float32, **meta)
@@ -621,7 +635,7 @@ class PreparedKda:
         """``accepted`` [>= B] (verify steps): ``slots`` is [>= B, q] contiguous;
         ``prepared``: the verify operands of ``KdaVerifyPrepared`` (its key must be in
         ``self.prepared``; ``projected``'s F_A rows armed, see the module docstring)."""
-        batch = projected.shape[0]
+        batch = projected.shape[0] // self.planes
         key, rows = batch, batch
         if accepted is not None:
             rows = batch // slots.shape[1]

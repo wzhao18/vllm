@@ -45,6 +45,7 @@ from ..common.primitives import (
     mma_into,
     mul2,
     named_barrier,
+    pack_pair,
     sigmoid,
     wait,
     warp_sum,
@@ -90,7 +91,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
 
     @cute.jit
     def __call__(self, *args):
-        assert args[0].shape[0] // self.tokens * self.heads == self.items
+        rows = args[0].shape[0] // self.planes
+        assert rows // self.tokens * self.heads == self.items
         self.ctas = persistent_ctas(self.items)
         self.most = -(-self.items // self.ctas)  # items per CTA at most
         # thread i < count fills item i's metadata: a CTA takes at most THREADS items
@@ -185,7 +187,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.stage(state, page, state_full, meta, live_items, first,
                                live + 1)  # fmt: skip
-                own_gates = zeros(2, gate.element_type)
+                own_gates = zeros(2, BFloat16)
                 if thread < 128:
                     self.loop_prologue(args, thread, token, head, offset, conv_slot,
                                        shared_q, shared_k, shared_v, reductions,
@@ -252,13 +254,49 @@ class KdaVerifyLoop(KdaVerifyPacked):
         """A recurrence output as the gated norm reads it (KdaSplit: FP32)."""
         return value
 
+    # The in-projection operands (x, f_a, beta, gate: column views of one [rows, pitch]
+    # buffer). ``planes`` 1: the in-projection's BF16 output. ``planes`` P > 1: its P
+    # K-split FP32 partial planes [P * rows, pitch] (plane s = rows [s rows, (s + 1)
+    # rows)), summed here in split order ((p0 + p1) + p2) + ... and rounded once to
+    # BF16 (round to nearest), the in-projection's own exchange sum (WideGemm
+    # ``sum8``), so the operands are bit for bit the exchanged BF16 rows.
+    planes = 1
+
+    @cute.jit
+    def projected(self, view, row, col):
+        """In-projection operand element (row, col) as BF16 (see ``planes``)."""
+        value = view[row, col]
+        if cutlass.const_expr(self.planes > 1):
+            rows: cutlass.Constexpr = self.items // self.heads * self.tokens
+            total = Float32(value)
+            for s in cutlass.range_constexpr(1, self.planes):
+                total = total + Float32(view[row + s * rows, col])
+            value = BFloat16(total)
+        return value
+
+    @cute.jit
+    def projected4(self, view, row, col):
+        """Four consecutive in-projection operand elements as two BF16x2 words."""
+        words = None
+        if cutlass.const_expr(self.planes == 1):
+            words = load_activation_bf16x4(at(view, row, col))
+        else:
+            rows: cutlass.Constexpr = self.items // self.heads * self.tokens
+            totals = [Float32(view[row, col + e]) for e in range(4)]
+            for s in cutlass.range_constexpr(1, self.planes):
+                for e in cutlass.range_constexpr(4):
+                    totals[e] = totals[e] + Float32(view[row + s * rows, col + e])
+            words = (pack_pair(totals[0], totals[1], policy=None),
+                     pack_pair(totals[2], totals[3], policy=None))  # fmt: skip
+        return words
+
     @cute.jit
     def loop_own_gates(self, args, token, head, t, c, own_gates):
         """``load_own_gates`` of item head ``head``."""
         gate = args[11]
         if t < self.tokens:
             for h in cutlass.range_constexpr(2):
-                own_gates[h] = gate[token + t, head * 128 + c + 64 * h]
+                own_gates[h] = self.projected(gate, token + t, head * 128 + c + 64 * h)
 
     @cute.jit
     def loop_prologue(self, args, thread, token, head, offset, conv_slot, shared_q,
@@ -288,8 +326,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
         inputs = cute.make_rmem_tensor(3 * T, BFloat16)
         for t in cutlass.range_constexpr(T):
             for s in cutlass.range_constexpr(3):
-                inputs[3 * t + s] = x[token + t, s * dim + channel]
-        beta_in = beta[token + thread % T, head]
+                inputs[3 * t + s] = self.projected(x, token + t, s * dim + channel)
+        beta_in = self.projected(beta, token + thread % T, head)
         self.loop_own_gates(args, token, head, thread // 64, thread % 64, own_gates)
         for p in cutlass.range_constexpr((T + 1) // 2):
             tokens = [t for t in (2 * p, 2 * p + 1) if t < T]
@@ -353,7 +391,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
         self.loop_own_gates(args, token, head, thread // 64, thread % 64, own_gates)
         fa_row = token + group % T  # the lane's token column
         ar = [
-            load_activation_bf16x4(at(f_a, fa_row, 16 * c + 4 * quarter))
+            self.projected4(f_a, fa_row, 16 * c + 4 * quarter)
             for c in range(8)
         ]
         acc = zeros(4, Float32)
@@ -472,9 +510,11 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
         inputs = cute.make_rmem_tensor(3 * T, BFloat16)
         for t in cutlass.range_constexpr(T):
             for s in cutlass.range_constexpr(3):
-                inputs[3 * t + s] = x[token + t, s * dim + channel]
+                inputs[3 * t + s] = self.projected(x, token + t, s * dim + channel)
         if thread < T:
-            shared_beta[thread] = triton_sigmoid(Float32(beta[token + thread, head]))
+            shared_beta[thread] = triton_sigmoid(
+                Float32(self.projected(beta, token + thread, head))
+            )
         self.loop_own_gates(args, token, head, thread // 64, thread % 64, own_gates)
         for p in cutlass.range_constexpr((T + 1) // 2):
             tokens = [t for t in (2 * p, 2 * p + 1) if t < T]
@@ -534,7 +574,7 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
         self.loop_own_gates(args, token, head, thread // 64, thread % 64, own_gates)
         fa_row = token + group % T  # the lane's token column
         ar = [
-            load_activation_bf16x4(at(f_a, fa_row, 16 * c + 4 * quarter))
+            self.projected4(f_a, fa_row, 16 * c + 4 * quarter)
             for c in range(8)
         ]
         acc = zeros(4, Float32)
