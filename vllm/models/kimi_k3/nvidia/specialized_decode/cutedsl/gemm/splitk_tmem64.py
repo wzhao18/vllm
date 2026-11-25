@@ -561,6 +561,7 @@ class SplitKTmemGemm64(SplitKGemm):
         ``split_rank`` of its owner's mailbox [split][16 quads][SHARE rows][4]
         (``st.async`` after the cluster barrier); owners sum the slots in rank order
         and ``finish``."""
+        self.epilogue_entry(epi_tid, out)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         _fence_tcgen05()
@@ -619,6 +620,11 @@ class SplitKTmemGemm64(SplitKGemm):
             tile = data + self.tile_offset
             self.finish(epi_tid, totals, tile, finish_out, row, col0, l_idx)
             self.stamp(9, epi_tid == 0)
+
+    def epilogue_entry(self, epi_tid, out):
+        """Work of the epilogue warps at their entry, while the MMAs run (default
+        none)."""
+        pass
 
     def finish_inputs(self, epi_tid, out, row0, col0):
         """Epilogue inputs an owner of rows [row0, row0 + share) loads before the

@@ -167,9 +167,16 @@ class KdaInProj64(SplitKTmemGemm64):
         if tid == 0:
             cute.arch.mbarrier_init(self.norm_bar, 1)
         cute.arch.mbarrier_init_fence()
-        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
         out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
         self.body(mA, mB, mC, a_map, out)
+
+    @cute.jit
+    def epilogue_entry(self, epi_tid, out):
+        """The prologue's inputs (``prefetch``), loaded by the epilogue warps while the
+        MMAs run (before: by every thread ahead of the GEMM, whose dependent load chain
+        delayed the Q / K / V CTAs' weight stream ~1.5 us)."""
+        _, _, conv_w, bias, conv_state, slots, accepted, _ = out
+        self.prefetch(epi_tid + 128, conv_w, bias, conv_state, slots, accepted)
 
     @cute.jit
     def prefetch(self, tid, conv_w, bias, conv_state, slots, accepted):
@@ -392,7 +399,6 @@ class KdaInProjQ(KdaInProj64):
         if tid == 0:
             cute.arch.mbarrier_init(self.norm_bar, 1)
         cute.arch.mbarrier_init_fence()
-        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
         out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
         self.body(mA, mB, mC, a_map, out, x_map=x_map)
 
@@ -597,7 +603,6 @@ class KdaInProj80(KdaInProj64):
         if tid == 0:
             cute.arch.mbarrier_init(self.norm_bar, 1)
         cute.arch.mbarrier_init_fence()
-        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
         out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
         self.body(mA, mB, mC, a_map, out)
 
