@@ -52,7 +52,6 @@ from .head import (
     INPUT_BYTES,
     SECTIONS,
     KdaHeadWide,
-    _fence_tcgen05,
     load_bf16x4,
     store_bf16_canonical,
 )
@@ -64,15 +63,6 @@ ROWS = 128 // KDA_CTAS  # state rows per KDA CTA
 
 
 class KdaHeadVerify(KdaHeadWide):
-    # DIRECT: one cluster hop instead of two. The Q / K producers push their FP32
-    # partials of all eight tokens to every KDA CTA (into two of its A ring stages that
-    # no K tile reads after tile ring_free_tile; the KDA CTA releases them to the
-    # producers once those MMAs are done), the V / gate producers push the rows each
-    # KDA CTA owns; every KDA CTA sums the four split ranks in rank order and rounds to
-    # BF16 itself (the same sums as the pair owners', bit for bit).
-    DIRECT = False
-    DIAG_NO_RELEASE = False  # bench diag (unsafe): producers do not wait for the release
-    DIAG_ONE_DEST = False  # bench diag (not exact): each Q / K partial to one KDA CTA
     """``KdaHeadWide`` for one request x ``tokens`` verify tokens; extra operand:
     ``accepted`` [1] after F_B; ``slots`` is [1, >= tokens] (vLLM's spec slots)."""
 
@@ -101,15 +91,6 @@ class KdaHeadVerify(KdaHeadWide):
         # plus KdaHeadWide's alignment slack.
         wide_only = (3 * 128 + 64 + 128) * 4 + 8 * 4 + 4 * 4 + 3 * 8
         used = self.smem_used - wide_only + extra
-        if self.DIRECT:
-            used += KDA_CTAS * 4 + 2 * 8  # release words, two barriers
-            stages, first = self.num_ab_stage, self.k_tiles % self.num_ab_stage
-            assert first + 2 <= stages and self.k_tiles >= stages
-            assert 2 * 128 * cta_k * 2 >= SECTIONS * 2 * T * 128 * 4  # Q / K partials
-            # the last tile reading ring stage first + 1 (stage first is read before it)
-            self.ring_free_tile = (self.k_tiles // stages - 1) * stages + first + 1
-            assert self.ring_free_tile >= tmem_tiles
-            self.free_stage = first
         self.smem_bytes = (used + 2560 + 1023) // 1024 * 1024
         assert self.smem_bytes <= BESIDE_SMEM  # beside an AttnRes CTA
 
@@ -199,18 +180,6 @@ class KdaHeadVerify(KdaHeadWide):
         bar_out = _smem(cutlass.Int64, 1, 8).iterator
         bar_qk = _smem(cutlass.Int64, 1, 8).iterator
         kda_cta = rank < KDA_CTAS
-        free_words, bar_free, bar_part, bar_ring = None, None, None, None
-        recv_qk = None
-        if cutlass.const_expr(self.DIRECT):
-            free_words = _smem(Uint32, KDA_CTAS, 16)
-            bar_free = _smem(cutlass.Int64, 1, 8).iterator
-            bar_part = _smem(cutlass.Int64, 1, 8).iterator
-            bar_ring = _smem(cutlass.Int64, 1, 8).iterator
-            stage_bytes = 128 * self.cta_k * 2
-            recv_qk = cute.make_ptr(
-                Float32, sA.iterator.toint() + self.free_stage * stage_bytes,
-                cute.AddressSpace.smem, assumed_align=1024,
-            )  # fmt: skip
 
         if warp_idx == 0:
             with cute.arch.elect_one():
@@ -222,31 +191,14 @@ class KdaHeadVerify(KdaHeadWide):
                         cute.arch.mbarrier_init(b_full + i, 1)
                 cute.arch.mbarrier_init(bar_mma_epilog, 1)
                 cute.arch.mbarrier_init(bar_tmem_alloc, 160)
-                if cutlass.const_expr(self.DIRECT):
-                    cute.arch.mbarrier_init(bar_ring, 1)
         if tid == 128:
-            if cutlass.const_expr(self.DIRECT):
-                cute.arch.mbarrier_init(bar_free, 1)
-                cute.arch.mbarrier_arrive_and_expect_tx(bar_free, KDA_CTAS * 4)
-                if kda_cta:  # Q / K of 8 tokens x 4 ranks, V rows, the owned gate
-                    part = 2 * SECTIONS * T * 128 * 4 + SECTIONS * T * ROWS * 4
-                    if cutlass.const_expr(self.DIAG_ONE_DEST):
-                        part = T * 128 * 4 + SECTIONS * T * ROWS * 4
-                    part += SECTIONS * 128 * 4
-                    cute.arch.mbarrier_init(bar_part, 1)
-                    cute.arch.mbarrier_arrive_and_expect_tx(bar_part, part)
-            else:
-                cute.arch.mbarrier_init(bar_in, 1)
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    bar_in, SECTIONS * INPUT_BYTES * 2
-                )
-            if cutlass.const_expr(not self.DIRECT):
-                if kda_cta:
-                    # Q / K: 16 CTAs x 64 channels x 2 x T; V: T x 16 rows; gate: 128
-                    hop = 2 * T * 128 * 2 + T * ROWS * 2 + 256
-                    cute.arch.mbarrier_init(bar_hop, 1)
-                    cute.arch.mbarrier_arrive_and_expect_tx(bar_hop, hop)
+            cute.arch.mbarrier_init(bar_in, 1)
+            cute.arch.mbarrier_arrive_and_expect_tx(bar_in, SECTIONS * INPUT_BYTES * 2)
             if kda_cta:
+                # Q / K: 16 CTAs x 64 channels x 2 x T; V: T x 16 rows; gate: 128
+                hop = 2 * T * 128 * 2 + T * ROWS * 2 + 256
+                cute.arch.mbarrier_init(bar_hop, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_hop, hop)
                 cute.arch.mbarrier_init(bar_gate, 1)
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     bar_gate, KDA_CTAS * ROWS * T * 4 + T * 4
@@ -276,18 +228,10 @@ class KdaHeadVerify(KdaHeadWide):
                     self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
                 if cutlass.const_expr(self.polled_out):  # after the PDL wait above
                     self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
-                if cutlass.const_expr(self.DIRECT):
-                    if kda_cta:  # stages free -> each Q / K producer, 4 bytes
-                        lane = cute.arch.lane_idx()
-                        wait(bar_ring)
-                        if lane < KDA_CTAS:
-                            producer = lane % 2 + SECTIONS * (lane // 2)
-                            pointer = free_words.iterator + rank
-                            push_float(pointer, Float32(0), bar_free, producer)
             elif cutlass.const_expr(staged):
                 self.staged_mma_warp(
                     bar_full, bar_empty, b_full, bar_mma_epilog, bar_tmem_alloc, sA, sB,
-                    tmem_base_ptr, ring_free=bar_ring,
+                    tmem_base_ptr,
                 )  # fmt: skip
             else:
                 k_blocks = self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2])
@@ -312,28 +256,21 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
-            if cutlass.const_expr(self.DIRECT):
-                self.push_direct(
-                    kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout,
-                    partial, section, split_rank, x_in, recv_qk, bar_free, bar_part,
-                )  # fmt: skip
-                cute.arch.cluster_arrive_relaxed()  # the one hop issued
-            else:
-                self.push_partials(
-                    kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout,
-                    partial, section, split_rank, x_in, bar_in,
-                )  # fmt: skip
-                wait(bar_in)
-                inputs, gate_in = self.read_inputs(kt, x_in)
-                # this CTA's rounded token inputs, then hop 2
-                mine[kt] = inputs[0]
-                mine[128 + kt] = inputs[1]
-                if kt < 64:
-                    mine[256 + kt] = inputs[2]
-                mine[320 + kt] = gate_in
-                named_barrier(1, 128)
-                self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
-                cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
+            self.push_partials(
+                kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
+                section, split_rank, x_in, bar_in,
+            )  # fmt: skip
+            wait(bar_in)
+            inputs, gate_in = self.read_inputs(kt, x_in)
+            # this CTA's rounded token inputs, then hop 2
+            mine[kt] = inputs[0]
+            mine[128 + kt] = inputs[1]
+            if kt < 64:
+                mine[256 + kt] = inputs[2]
+            mine[320 + kt] = gate_in
+            named_barrier(1, 128)
+            self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
+            cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
             if kda_cta:
                 rows = (
                     shared_q,
@@ -346,8 +283,6 @@ class KdaHeadVerify(KdaHeadWide):
                     slot_rows,
                 )
                 raws = (raw_qk, raw_v, raw_g, bar_hop)
-                if cutlass.const_expr(self.DIRECT):
-                    raws = (recv_qk, x_in, raw_g, bar_part)
                 bars = (bar_gate, bar_out, shared_beta, bar_qk)
                 self.verify_main(
                     kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
@@ -384,108 +319,6 @@ class KdaHeadVerify(KdaHeadWide):
             words = load_words(src, count=4, shared=True)
             dst = cute.make_ptr(Uint8, dst.llvm_ptr, smem, assumed_align=16)
             store_async_dsmem(dst, words, bar_hop, token)
-
-    @cute.jit
-    def push_direct(
-        self, epi_tid, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout,
-        partial, section, split_rank, recv_vg, recv_qk, bar_free, bar_part,
-    ):  # fmt: skip
-        """``DIRECT``: the accumulator -> ``partial``, then this CTA's FP32 partial to
-        the KDA CTAs. Q / K (sections 0 / 1): all 128 rows x 8 tokens to every KDA CTA,
-        row-major ([rank, section, row, token]) so a KDA CTA thread reads its channel's
-        tokens with two 16-byte loads; sent once the KDA CTAs released the ring stages
-        they land in. V: rows [16 r, 16 r + 16) of every token to KDA CTA r
-        ([rank, token, row]); gate: token r's rows to KDA CTA r ([rank, row])."""
-        T: cutlass.Constexpr = self.tokens
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)
-        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
-        _fence_tcgen05()
-        acc_view = cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr), acc_layout
-        )[((None, None), 0, 0, 0)]
-        epi_tile = (self.cta_m, self.cta_n)
-        d_layout = utils.LayoutEnum.from_tensor(partial)
-        load_op = sm100_utils.get_tmem_load_op(
-            (self.cta_m, self.cta_n, self.cta_k), d_layout, BFloat16, self.acc_dtype,
-            epi_tile, False,
-        )  # fmt: skip
-        tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(load_op, acc_view)
-        part_epi = cute.flat_divide(partial, epi_tile)
-        rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, part_epi, epi_tid)
-        rAcc = cute_ext.allocate(
-            self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32
-        )
-        thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
-        cute.arch.mbarrier_wait(bar_mma_epilog, 0)
-        _fence_tcgen05()
-        cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
-        cute.arch.fence_view_async_tmem_load()
-        _fence_tcgen05(before=True)
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)
-        cute_ext.partition_and_copy(thr_t2r, rAcc, part_epi[None, None, 0, 0])
-        named_barrier(3, 128)
-        rows = self.cta_m
-        if section < 2:
-            if cutlass.const_expr(not self.DIAG_NO_RELEASE):
-                wait(bar_free)
-            for m in cutlass.range_constexpr(2):
-                i = epi_tid + 128 * m
-                row, half = i // 2, i % 2
-                values = tuple(partial[row, 4 * half + j] for j in range(4))
-                block = (split_rank * 2 + section) * rows + row
-                dst = recv_qk + cute.assume(block * T + 4 * half, divby=4)
-                if cutlass.const_expr(self.DIAG_ONE_DEST):
-                    push_float(dst, values, bar_part, split_rank * 2 + section)
-                else:
-                    for dest in cutlass.range_constexpr(KDA_CTAS):
-                        push_float(dst, values, bar_part, dest)
-        else:
-            for m in cutlass.range_constexpr(2):
-                i = epi_tid + 128 * m
-                dest, chunk = i // 32, i % 32
-                token, quad = chunk // 4, chunk % 4
-                src_off = token * rows + ROWS * dest + 4 * quad  # V
-                dst_off = (split_rank * T + token) * ROWS + 4 * quad
-                if section == 3:  # gate: token dest's rows
-                    src_off = dest * rows + 4 * chunk
-                    dst_off = SECTIONS * T * ROWS + split_rank * 128 + 4 * chunk
-                src = partial.iterator + cute.assume(src_off, divby=4)
-                dst = recv_vg.iterator + cute.assume(dst_off, divby=4)
-                v4 = load_f32x4(src, shared=True)
-                values = tuple(v4[e] for e in range(4))
-                push_float(dst, values, bar_part, dest)
-
-    @cute.jit
-    def direct_inputs(self, kt, inputs, recv_qk, recv_vg):
-        """``DIRECT``: channel ``kt``'s Q / K of every token, V row kt (kt < 16) and
-        the owned token's gate channel kt: the four split ranks' partials summed in
-        rank order, rounded to BF16 (``KdaHeadWide.read_inputs``)."""
-        T: cutlass.Constexpr = self.tokens
-        for sec in cutlass.range_constexpr(2):
-            sums = cute.make_rmem_tensor(T, Float32)
-            for q in cutlass.range_constexpr(SECTIONS):
-                for h in cutlass.range_constexpr(2):
-                    block = (q * 2 + sec) * 128 + kt
-                    v4 = load_f32x4(recv_qk + block * T + 4 * h, shared=True)
-                    for e in cutlass.range_constexpr(4):
-                        if cutlass.const_expr(q == 0):
-                            sums[4 * h + e] = v4[e]
-                        else:
-                            sums[4 * h + e] = sums[4 * h + e] + v4[e]
-            for t in cutlass.range_constexpr(T):
-                inputs[3 * t + sec] = BFloat16(sums[t])
-        for t in cutlass.range_constexpr(T):
-            inputs[3 * t + 2] = BFloat16(0)
-        if kt < ROWS:
-            for t in cutlass.range_constexpr(T):
-                v = recv_vg[t * ROWS + kt]
-                for q in cutlass.range_constexpr(1, SECTIONS):
-                    v = v + recv_vg[(q * T + t) * ROWS + kt]
-                inputs[3 * t + 2] = BFloat16(v)
-        g = recv_vg[SECTIONS * T * ROWS + kt]
-        for q in cutlass.range_constexpr(1, SECTIONS):
-            g = g + recv_vg[SECTIONS * T * ROWS + q * 128 + kt]
-        return BFloat16(g)
 
     @cute.jit
     def verify_early(self, kt, tensors, coords, slots):
@@ -673,18 +506,14 @@ class KdaHeadVerify(KdaHeadWide):
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
-            gate_owned = BFloat16(0)
-            if cutlass.const_expr(self.DIRECT):
-                gate_owned = self.direct_inputs(kt, inputs, raw_qk, raw_v)
-            else:
+            for t in cutlass.range_constexpr(T):
+                inputs[3 * t] = raw_qk[t * 128 + kt]
+                inputs[3 * t + 1] = raw_qk[(T + t) * 128 + kt]
+                inputs[3 * t + 2] = BFloat16(0)
+            if kt < ROWS:
                 for t in cutlass.range_constexpr(T):
-                    inputs[3 * t] = raw_qk[t * 128 + kt]
-                    inputs[3 * t + 1] = raw_qk[(T + t) * 128 + kt]
-                    inputs[3 * t + 2] = BFloat16(0)
-                if kt < ROWS:
-                    for t in cutlass.range_constexpr(T):
-                        inputs[3 * t + 2] = raw_v[t * ROWS + kt]
-                gate_owned = raw_g[kt]
+                    inputs[3 * t + 2] = raw_v[t * ROWS + kt]
+            gate_owned = raw_g[kt]
             for t in cutlass.range_constexpr(T):  # window: 3 taps, then the inputs
                 for s in cutlass.range_constexpr(3):
                     for i in cutlass.range_constexpr(4):

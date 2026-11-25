@@ -1225,14 +1225,12 @@ class KdaHeadWide(KdaHead):
     @cute.experimental.jit
     def staged_mma_warp(
         self, bar_full, bar_empty, b_full, bar_mma_epilog, bar_tmem_alloc,
-        sA: cute.Tensor, sB: cute.Tensor, tmem_base_ptr, ring_free=None,
+        sA: cute.Tensor, sB: cute.Tensor, tmem_base_ptr,
     ):  # fmt: skip
         """K tiles 0 .. tmem_tiles - 1 to tensor memory as they land (their ring
         stages refill), then every tile's MMAs in K order: A from tensor memory for
         those, from the ring for the rest. Raw tcgen05 with the descriptors cute emits
-        for these SW128 K-major tiles; the accumulator is the first 8 columns.
-        ``ring_free``: also committed after tile ``self.ring_free_tile``'s MMAs (the
-        last reader of the ring stages a caller reuses)."""
+        for these SW128 K-major tiles; the accumulator is the first 8 columns."""
         stages, staged, k_blocks = self.num_ab_stage, self.tmem_tiles, self.cta_k // 16
         a_layout = cute.slice_(sA.layout, (None, None, None, 0))
         b_layout = cute.slice_(sB.layout, (None, None, None, 0))
@@ -1280,9 +1278,6 @@ class KdaHeadWide(KdaHead):
                     a_ring = a_desc + ring_stage * a_step + 2 * kb
                     _mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
                 tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
-                if cutlass.const_expr(ring_free is not None):
-                    if k == self.ring_free_tile:
-                        tcgen05.commit(ring_free, None, self.cta_group)
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)  # the release lands in phase 1
