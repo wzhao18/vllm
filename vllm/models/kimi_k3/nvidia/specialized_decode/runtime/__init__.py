@@ -88,23 +88,19 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
 
 
 def sp_layout(vllm_config) -> bool:
-    """TP4 attention groups (one pipeline stage) over expert-parallel MegaMoE without
-    the MoE token shard: the stock K3 decoder's ``use_sequence_parallel`` at TP4. Any
+    """TP4 attention groups (one pipeline stage) over expert-parallel MegaMoE: the
+    stock K3 decoder's ``use_sequence_parallel`` at TP4. Any
     native MegaMoE backend (DeepGEMM, or Rubin on SM107): the SP step runs the stock
     MoE module on the shard either way. Its DCP is ``sp_topology``'s."""
     from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 
     parallel = vllm_config.parallel_config
-    if not (
+    return (
         parallel.tensor_parallel_size == 4
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
-    ):
-        return False
-    from ...model import use_moe_token_shard
-
-    return not use_moe_token_shard(vllm_config)
+    )
 
 
 def dsa_dp_topology(vllm_config) -> bool:

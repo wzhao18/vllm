@@ -63,18 +63,16 @@ def prefill_moe_policy(
     *,
     tp_size: int,
     sequence_parallel: bool,
-    token_shard: bool,
     max_num_tokens: int,
 ) -> PrefillMoEPolicy | None:
     """The policy of a routed-MoE layer that runs the Rubin MegaMoE on whole DP
-    batches (TP1 wide-EP, no sequence parallelism or token shard) with prefill-sized
+    batches (TP1 wide-EP, no sequence parallelism) with prefill-sized
     batches (more than one sub-call of rows), else None (stock path)."""
     if (
         vllm_config.kernel_config.moe_backend != KIMI_K3_MEGA_MOE
         or max_num_tokens <= PREFILL_MOE_SUBCALL_TOKENS
         or tp_size != 1
         or sequence_parallel
-        or token_shard
     ):
         return None
     return PrefillMoEPolicy(
