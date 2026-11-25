@@ -33,6 +33,7 @@ from ..gemm.splitk_situ import PreparedSitu
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .experts_rubin import ROUTE_WORDS, count_image, image_chunk
+from .experts_rubin64 import IDS_WORDS
 from .experts_runtime import polled, rubin
 from .shared import compile_down, compile_shared, situ, weight_maps
 from .tail_runtime import CAP
@@ -56,6 +57,7 @@ class RouteSitu:
     def __init__(
         self, batch, shared, renorm, early, roles, polled, plan=False, lean=None,
         rcp=False, halves=False, signal=False, sync_copy=False, early_ids=False,
+        ids_box=False,
     ):  # fmt: skip
         # Lean (B>8 by default): few registers, so routing CTAs co-reside with the front
         # and the fused shared expert, polled logits skip the front's completion wait,
@@ -79,8 +81,16 @@ class RouteSitu:
         # signal (halves, image plan): the route role also writes the ids into the
         # experts' route mailbox and each copy CTA counts its image part there, so the
         # experts start before this kernel completes (``RubinExpertsKernel.polled``).
+        # ids_box (lean, 64-row plan): ``signal`` is the grouped experts' ids mailbox
+        # (``experts_rubin64.IDS_WORDS``): the route role writes the ids there as well
+        # (``RubinGroupedExpertsKernel.polled`` reads them); no image count.
+        self.ids_box = ids_box and signal
         self.signal = signal
-        assert not signal or (self.halves and self.lean and plan == "image")
+        self.image_signal = signal and not self.ids_box  # the copy CTAs count the image
+        assert not self.image_signal or (
+            self.halves and self.lean and plan == "image"
+        )
+        assert not self.ids_box or (self.lean and plan is True)
         # sync_copy (one copy CTA per token): every warp's chunks land before any warp
         # stores. The token's row arrives from different ranks at different times; a
         # warp that writes the plan (block maxima and scale words by shuffles) while
@@ -125,7 +135,7 @@ class RouteSitu:
                     if c.const_expr(self.halves):
                         if tid < 224:  # whole warps: the image's block shuffles
                             self.copy_half(mailbox, latent, token, tid, plan)
-                        if c.const_expr(self.signal):
+                        if c.const_expr(self.image_signal):
                             # The CTA's image part, then its count (release), then
                             # the mailbox re-arm (not ahead of the count's release).
                             cute.arch.sync_threads()
@@ -270,7 +280,7 @@ class RouteSitu:
         dst = latent.iterator + token * latent.stride[0] + chunk * 8
         words = [got[0, k] for k in range(4)]
         store_words(dst, words)
-        if c.const_expr(not self.signal):
+        if c.const_expr(not self.image_signal):
             rearm(base)
         if c.const_expr(plan is not None and self.batch > 64):
             # 64-row plans: token t at row t % 64 of block t // 64 (as ``copy``)
@@ -480,7 +490,8 @@ SITU_FUSED_WIDE = {384: "3-8:1"}
 # rows 1 us later), us per layer: -0.24 (B8), -0.05..-0.11 (B5). Bitwise identical.
 # M64 (B8 verify): the merged front kernel triggers at entry, so an entry release
 # brings the 208-CTA grid up beside it; after it: -0.7 us per layer (one-GPU proxy).
-RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,64:1"}
+# M9-63 (merged front, grouped experts): the same release after the front kernel.
+RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,9-64:1"}
 # Those devices, TP16 B3-8 (lean polled routing): each thread's four exact sigmoids
 # share one div.rn fallback branch (``primitives.sigmoids``, bitwise equal on all 2^32
 # inputs) instead of a slow-path region per division, so their fast paths interleave:
@@ -506,8 +517,9 @@ COPY_SYNC_WIDE = {288: "64:1"}
 # kernel it runs, so with the default (132 KB) the routed experts CTAs (212 KB),
 # launched beside routing by PDL, could not start on routing's SMs until it exited.
 # B64 (B8 x q8): routing's 128 CTAs kept the M64 experts (212 KB) off their SMs the
-# same way (2.11 us p50 overlap in the ds16 B8 serving capture).
-ROUTE_CARVEOUT_WIDE = {288: "8:1,64:1"}
+# same way (2.11 us p50 overlap in the ds16 B8 serving capture). M9-63: the experts
+# released after the front (``RELEASE_AFTER_FRONT_WIDE``) come up beside routing too.
+ROUTE_CARVEOUT_WIDE = {288: "8:1,9-64:1"}
 # Those devices, TP16 B3-8 (token-group geometry): the front GEMM issues its register
 # weight loads at entry, ahead of the barrier setup. Issued right before the PDL wait,
 # ptxas schedules the wait first and every weight load after it (SASS: ACQBULK, then the
@@ -632,14 +644,14 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None, wide=False)
 def compile_route(
     batch, shared, renorm, roles, device, polled=False, plan=False, lean=None,
     early=None, rcp=False, halves=False, signal=False, sync_copy=False,
-    early_ids=False, box_rows=64,
+    early_ids=False, box_rows=64, ids_box=False,
 ):  # fmt: skip
     """``box_rows``: the front mailbox's rows (``FrontRows``: its capacity); above 64
     tokens the plan is 64-row blocks of PLAN_BYTES."""
     early = batch <= 2 if early is None else early
     kernel = RouteSitu(
         batch, shared, renorm, early, roles, polled, plan, lean, rcp, halves, signal,
-        sync_copy, early_ids,
+        sync_copy, early_ids, ids_box,
     )  # fmt: skip
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
@@ -649,7 +661,8 @@ def compile_route(
     args += (fake((batch, shared)), *(f32(v) for v in (1, 4, 25)))
     blocks = -(-batch // 64)
     args += (fake((blocks * PLAN_BYTES,), None, c.Uint8),) * bool(plan)
-    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal + (make_fake_stream(),)
+    words = IDS_WORDS if kernel.ids_box else ROUTE_WORDS
+    args += (fake((words,), None, c.Int32),) * signal + (make_fake_stream(),)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
@@ -853,12 +866,23 @@ class SharedFront:
                     f"MoE batch {b}: an entry release of the experts is unsafe with "
                     "the tail's reloading polls; release them after the front GEMM"
                 )
-            early = "front"
             opts = self.route_opts[b]
-            route = self.carved(
-                b, compile_route(*self.route_keys[b], early=early, **opts)
-            )
+            opts["early"] = "front"
+            route = self.carved(b, compile_route(*self.route_keys[b], **opts))
             self.plans[b] = (*plan[:2], route, *plan[3:])
+
+    def poll_ids(self, batch, mailbox):
+        """Routing at ``batch`` also writes the ids into the grouped experts' ids
+        mailbox (``experts_runtime.POLLED64``: the experts poll it); the caller
+        (``moe.prepared``) does this exactly for the rows whose experts poll."""
+        plan = self.plans[batch]
+        opts = dict(self.route_opts[batch], signal=True, ids_box=True)
+        if len(plan[5]) != 1:  # the 64-row plan only (no image plan, no route mailbox)
+            raise RuntimeError(f"MoE batch {batch}: ids mailbox beside another signal")
+        self.route_opts[batch] = opts
+        route = self.carved(batch, compile_route(*self.route_keys[batch], **opts))
+        self.plans[batch] = (*plan[:2], route, *plan[3:5], (*plan[5], to_cute(mailbox)),
+                             *plan[6:])  # fmt: skip
 
     def carved(self, batch, route):
         """``ROUTE_CARVEOUT_WIDE`` batches: the routing kernel with carve-out 100."""

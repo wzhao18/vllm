@@ -56,6 +56,7 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     RubinExpertsKernel,
+    claim_last,
     die_words,
     nth_set,
     sm_id,
@@ -65,6 +66,23 @@ from .experts_rubin import (
 )
 
 shuffle = cute.arch.shuffle_sync
+
+# The grouped kernel's ids mailbox (``RubinGroupedExpertsKernel.polled``): 64 x 16 ids
+# (Int32, armed all ones), then the count of CTAs that read them; Int32 words.
+IDS_COUNT = 64 * 16
+IDS_WORDS = IDS_COUNT + 4
+
+
+@cute.jit
+def poll_id(pointer):
+    """One Lamport id word: polled (relaxed, GPU scope) until it is not all ones."""
+    word = load_words(pointer, count=1, scope="gpu")[0]
+    sgn, sgt = spin_start()
+    while word == Uint32(4294967295):
+        sleep_ns(32)
+        word = load_words(pointer, count=1, scope="gpu")[0]
+        sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
+    return Int32(word)
 
 
 @asm(Uint32, pure=True)
@@ -147,14 +165,20 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     Arguments as ``ExpertsKernel`` plus the w13 / w2 addresses before the stream.
     Numerics: the MMAs sum K64 instead of K32 groups (same E2M1 / MXFP8 / UE8M0 inputs
     and FP32 accumulators, a different grouping inside the MMA).
-    ``static_groups``: ``ExpertsKernel.group_sync``'s constant barrier ids."""
+    ``static_groups``: ``ExpertsKernel.group_sync``'s constant barrier ids.
+    ``polled``: ``ids`` is the routing kernel's ids mailbox (``IDS_WORDS`` Int32: the
+    M x 16 ids, armed all ones, then the CTAs' read count): the CTAs group, partition
+    and start their weight stream before ``griddepcontrol.wait`` (which still orders
+    the plan, the routing weights and the shared rows); the last CTA to have read the
+    ids re-arms them."""
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False,
+        dies=(), static_groups=False, polled=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
+        self.polled = polled
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -230,6 +254,23 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         self.bar_pmeta = self.bar_queue + 128
         self.bar_claims = self.bar_pmeta + 128
         assert self.bar_claims + 28 <= 5120
+
+    @cute.jit
+    def rearm_ids(self, ids, batch, lane):
+        """Warp 0 after the CTA's ids were read: an acq_rel count of the CTAs that read
+        them (word IDS_COUNT); the last CTA's warp re-arms the batch's ids (all ones)
+        and the count (0). Every CTA's reads precede its count (CTA barrier), and the
+        last count sees every earlier one, so the re-arm follows every read; the next
+        write is the next layer's routing kernel, which runs after this grid."""
+        last = Int32(0)
+        if lane == 0:
+            last = Int32(claim_last(ids.iterator + IDS_COUNT) == Uint32(self.grid - 1))
+        last = cute.arch.shuffle_sync(last, 0)
+        if last != 0:
+            for k in cutlass.range(lane * 4, batch * 16, 128, unroll=1):
+                store_words(ids.iterator + k, (Uint32(4294967295),) * 4)
+            if lane == 0:
+                store_words(ids.iterator + IDS_COUNT, (Uint32(0),))
 
     @cute.jit
     def stamp(self, slot: cutlass.Constexpr[int]):
@@ -790,7 +831,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         for k in cutlass.range_constexpr(rounds):
             mine[k] = Int32(0)
             if tid + threads * k < batch * 16:
-                mine[k] = ids[tid + threads * k]
+                if cutlass.const_expr(self.polled):  # Lamport: all ones until written
+                    mine[k] = poll_id(ids.iterator + tid + threads * k)
+                else:
+                    mine[k] = ids[tid + threads * k]
         self.clear(sm)  # while the ids are in flight
         for k in cutlass.range_constexpr(rounds):
             if tid + threads * k < batch * 16:
@@ -798,6 +842,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             scalars[1], scalars[2] = (calls, grouped)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.polled):
+            if warp == 0:  # this CTA read its ids: the last CTA re-arms the mailbox
+                self.rearm_ids(ids, batch, lane)
         for k in cutlass.range_constexpr(rounds):
             pair = tid + threads * k
             if pair < batch * 16:
@@ -1202,7 +1249,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             self.stamp(0)
         tmem_base = self.initialize(sm, maps, batch)
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not self.polled):
+            cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
@@ -1225,6 +1273,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ranges = self.partition(distinct, cta)
         if tid == 0:
             self.stamp(11)
+        if cutlass.const_expr(self.polled):
+            # The producer streams weights at once; every other role reads routing's
+            # or the shared expert's outputs (plan, weights, shared rows) after it.
+            if warp > 0:
+                cute.arch.griddepcontrol_wait()
         if warp == 0:
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
