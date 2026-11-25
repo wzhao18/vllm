@@ -19,25 +19,14 @@ import torch
 from ..common.host import stream, to_cute
 
 HIDDEN = 7168  # the producer's output rows (112 CTAs x 64)
-ROWS = range(9, 129)  # batch rows a producer serves
-# Rows of one o-projection producer launch (``OprojUmma``); above, the rows run as two
-# launches of balanced halves (each pushing its tokens at their own token rows).
-LAUNCH_ROWS = 64
-
-
-def halves(rows):
-    """(first token, rows) of each launch serving ``rows``."""
-    if rows <= LAUNCH_ROWS:
-        return ((0, rows),)
-    first = -(-rows // 2)
-    return ((0, first), (first, rows - first))
+ROWS = range(9, 65)  # batch rows a producer compiles (the o-projection producer's)
 
 
 class TwoShotProducer:
     """``weight`` [7168, K] BF16 (row-major); ``rows``: the batch rows to compile
     (each above 8 and at most 64). Compile outside graph captures."""
 
-    def __init__(self, weight, rows, tp, wide_cap=0):
+    def __init__(self, weight, rows, tp):
         from ..oproj.prepared import compile_oproj
 
         if weight.dim() != 2 or weight.shape[0] != HIDDEN or not weight.is_contiguous():
@@ -46,27 +35,18 @@ class TwoShotProducer:
         assert self.k % 64 == 0 and all(r in ROWS for r in rows)
         self.weight = to_cute(weight)
         with torch.accelerator.device_index(self.device.index):
-            # rows above LAUNCH_ROWS push into the wide box (``wide_cap`` rows)
-            self.codes = {}
-            for r in rows:
-                cap = 64 if r <= LAUNCH_ROWS else wide_cap
-                assert cap >= r
-                self.codes[r] = tuple(
-                    compile_oproj("producer_umma", self.k, n, tp, 1, True, False,
-                                  cap=cap, twoshot=True)
-                    for _, n in halves(r)
-                )  # fmt: skip
+            self.codes = {
+                r: compile_oproj("producer_umma", self.k, r, tp, 1, True, False,
+                                 twoshot=True)
+                for r in rows
+            }  # fmt: skip
 
-    def run_two_shot(self, x, recv, peers, rank, shifted=None):
+    def run_two_shot(self, x, recv, peers, rank):
         """Push this rank's rows of ``x`` [rows, K] @ W.T into slot ``rank`` of their
         owners' ``recv`` [TP, cap, 7168 / TP]; ``peers`` [TP] int64: the owners'
-        receive bases; ``shifted`` (rows above LAUNCH_ROWS): the bases moved to the
-        second launch's first token row."""
+        receive bases."""
         rows = x.shape[0]
         if rows not in self.codes or x.shape[1] != self.k or not x.is_contiguous():
             raise ValueError(f"two-shot producer input {tuple(x.shape)}")
-        recv_view, s = to_cute(recv), stream(self.device)
-        for code, (first, n) in zip(self.codes[rows], halves(rows)):
-            bases = peers if first == 0 else shifted
-            args = (to_cute(x[first : first + n]), self.weight, recv_view)
-            code(*args, to_cute(bases), cutlass.Int32(rank), s)
+        args = (to_cute(x), self.weight, to_cute(recv), to_cute(peers))
+        self.codes[rows](*args, cutlass.Int32(rank), stream(self.device))
