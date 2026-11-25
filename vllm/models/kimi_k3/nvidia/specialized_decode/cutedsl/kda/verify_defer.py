@@ -459,14 +459,16 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                                         own_gates)  # fmt: skip
                     # the other group has read its taps: overwrite the window
                     named_barrier(3, 2 * GROUP)
-                    conv_page = args[3][Int64(conv_slot), None, None]
-                    taps, inputs = window
+                    window_page = args[3][Int64(conv_slot), None, None]
+                    window_taps, window_inputs = window
                     for s in cutlass.range_constexpr(3):
-                        values = (taps[s, 1], taps[s, 2],
-                                  *(inputs[3 * t + s] for t in range(T)))  # fmt: skip
-                        channel = s * H * 128 + head * 128 + thread
-                        for i, value in enumerate(values):
-                            conv_put(conv_page, (channel, i), value)
+                        window_values = (
+                            window_taps[s, 1], window_taps[s, 2],
+                            *(window_inputs[3 * t + s] for t in range(T)),
+                        )  # fmt: skip
+                        window_channel = s * H * 128 + head * 128 + thread
+                        for i, value in enumerate(window_values):
+                            conv_put(window_page, (window_channel, i), value)
                 elif thread < GROUP + 32 * 8:
                     self.loop_gate(args, thread // 32 - 4, lane, head, token,
                                    shared_decay, own_gates)  # fmt: skip
