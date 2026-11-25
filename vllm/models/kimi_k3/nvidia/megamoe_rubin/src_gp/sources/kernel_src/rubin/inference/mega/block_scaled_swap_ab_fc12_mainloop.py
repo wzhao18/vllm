@@ -204,6 +204,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self._configure_shared_kind()
         self._validate_compact_weight_sf()
         self._select_ab_stage_plan()
+        print(f"P8STAGES compact={self.compact_weight_sf} stages={self.num_ab_pipeline_stages} "
+              f"tx={self.ab_stage_tma_bytes} budget={self.mainloop_smem_budget_bytes}", flush=True)
         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
         if self.heterogeneous_shared:
             # Shared tiles override each producer's static expectation (``expected_tx``) with their own bytes.
@@ -1076,7 +1078,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             )
             if cutlass.const_expr(compact_sfa):
                 compact_barrier = self.compact_sfa_mbarriers + stage_index
-                with cute.arch.elect_one():
+                import os as _os
+                if cutlass.const_expr("nobulk" in _os.environ.get("P8X", "")):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(compact_barrier)
+                else:
+                  with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(compact_barrier, Int32(compact_bytes))
                     tma_load_1d(
                         compact_smem + stage_index * Int32(2 * compact_bytes),
@@ -1834,8 +1841,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         and arrive on the leader's AB barrier of that stage (release at cluster scope)."""
         for _ in cutlass.range(k_tile_count, unroll=1):
             stage_index = ab_pipeline_state.index
-            cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
-            self._expand_compact_sfa_stage(stage_index)
+            import os as _os
+            _x = _os.environ.get("P8X", "")
+            if cutlass.const_expr("peernowait" not in _x):
+                cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
+            if cutlass.const_expr("peerfast" not in _x and "peernowait" not in _x):
+                self._expand_compact_sfa_stage(stage_index)
             with cute.arch.elect_one():
                 mbarrier_arrive_release_cluster_on_cta(self.ab_full_mbarriers + stage_index, self.leader_cta_rank)
             ab_pipeline_state.advance()
