@@ -96,7 +96,16 @@ K = 128
 # q4 (k3) from n18 as well: the KdaWide second wave (24 x 18 items > 424) does not
 # depend on q.
 _WIDE_Q = "1-2:split,3-17:wide,18-212:flow,213-:wide"
+# 6 heads (TP16 verify rows under --use-replayssm, ``runtime.providers``): q8, FP32
+# state + conv, 1-GPU in-step chain (AttnRes stand-in -> production in-projection ->
+# core PDL-early -> o-proj stand-in, 69 layers, ABBA), ms per step vs today's
+# q-checkpoint verify at pending 0 / 4 / 8: KdaVerifyLoopRecords B16 -0.285 / -0.098 /
+# -0.035, B32 -0.431 / -0.252 / -0.135, B64 -0.880 / -0.503 / -0.391; KdaFlow B64 p4
+# -0.538 (B16 +0.025, B32 +0.075). B1-B8 not measured in the step: their records
+# replace the KdaHead / fold64 rows (``providers``).
+_TP16_Q8 = "1-63:loop,64-:flow"
 RECORD_KINDS = {
+    6: {"*": _TP16_Q8},
     24: {
         "*": "1-2:split,3-20:wide,21-212:flow,213-:wide",
         4: _WIDE_Q,
