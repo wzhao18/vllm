@@ -83,6 +83,17 @@ def main():
             init(self, *a, **k)
 
         r64.RubinGroupedExpertsKernel.__init__ = traced
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+            experts_vw as vw,
+        )
+
+        vinit = vw.RubinVWExpertsKernel.__init__
+
+        def vtraced(self, *a, **k):
+            k.setdefault("trace", trace.data_ptr())
+            vinit(self, *a, **k)
+
+        vw.RubinVWExpertsKernel.__init__ = vtraced
     built = t.production_experts(t.logical_weights(dev), dev)
     flush = torch.empty(1 << 29, dtype=torch.uint8, device=dev)
     for rows in args.rows:
@@ -155,7 +166,7 @@ def main():
             f"out {digest.hexdigest()[:16]}",
             flush=True,
         )
-        if trace is not None and not rubin and wide is None:
+        if trace is not None and not rubin:
             trace.zero_()
             call()
             torch.cuda.synchronize()
@@ -171,16 +182,23 @@ PHASES = (
 )  # fmt: skip
 
 
+# ``RubinVWExpertsKernel.group``'s extra stamps (15-20) after the dependency wait.
+PHASES_VW = PHASES[:2] + (
+    (15, "g:ids"), (16, "g:masks"), (17, "g:counts"), (18, "g:streams"), (20, "g:subs"),
+    (19, "g:rows"),
+) + PHASES[2:]
+
+
 def phases(trace, rows):
     import torch
 
     words = trace[: 256 * 512].view(torch.int64).view(256, 32, 2).cpu()
-    stamps = words[:, :16, 0]
+    stamps = words[:, :21, 0]
     used = stamps[:, 13] > 0
     stamps = stamps[used]
     t0 = stamps[:, 0].min()
     cells = []
-    for slot, name in PHASES:
+    for slot, name in PHASES if rows <= 64 else PHASES_VW:
         col = stamps[:, slot]
         col = (col[col > 0] - t0).double() / 1000.0
         if col.numel():
