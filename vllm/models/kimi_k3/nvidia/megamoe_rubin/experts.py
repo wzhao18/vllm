@@ -196,16 +196,6 @@ def rubin_bucket_capacities(
 # (bitwise-equal outputs).
 RUBIN_SHARED_OVERLAP_MAX_SMS = 148
 
-# P/D prefill workers under sequence parallelism: steps of at most this many tokens per
-# rank keep the decode-style SM-capped MegaMoE + side-stream shared expert (a small
-# bucket capped at RUBIN_SHARED_OVERLAP_MAX_SMS); larger steps run MegaMoE on the full
-# grid and the shared expert after it. Measured on VR200, TP8+DCP8 NVFP4 prefill EP8
-# (rows per rank, capped-overlap -> full-grid serial step): 128 rows 45.24 -> 46.63 ms,
-# 512 rows 77.72 -> 78.09, 1024 rows 125.10 -> 126.37 (all worse on the full grid);
-# 2048 rows 225.26 -> 218.22, 4096 rows 405.43 -> 385.37 (better). The crossover lies
-# between 1024 and 2048 rows; the small bucket ends at 1024.
-RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS = 1024
-
 
 # additional_config["megamoe_quant"] -> quant kind (FlashInfer's kind names).
 _MEGAMOE_QUANT: dict[str, QuantKind] = {
@@ -804,7 +794,6 @@ class KimiK3MegaMoEExperts(nn.Module):
         max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS,
         *,
         die_local: bool = True,
-        up_to_tokens: int | None = None,
     ) -> None:
         """Cap this layer's persistent grid at ``max_sm_count`` (default
         :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`, the decode SP measurement) so a shared
@@ -812,11 +801,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         ``die_local=False`` keeps the cap where the decode die-local policy would
         take the full grid (the prefill-sized wide-EP layers).
         Every layer of the EP group must make the same call (the bucket keys the
-        shared runtime); it must come before the runtime is built.
-        ``up_to_tokens`` (P/D prefill workers): only a bucket of at most that many
-        tokens per rank is capped; it is added below the main bucket (same variant and
-        knob record, its own capacity-sized arena share), and the main bucket keeps the
-        full grid. :meth:`shared_overlap` says per forward which one runs."""
+        shared runtime); it must come before the runtime is built."""
         if self.kernel_weights is not None:
             raise RuntimeError(
                 f"{self.prefix}: reserve_sms_for_shared_expert after the runtime "
@@ -874,35 +859,31 @@ class KimiK3MegaMoEExperts(nn.Module):
                 die_sm_mask32=mask,
             )
 
-        if up_to_tokens is None:
-            self.buckets = tuple(_placed(bucket) for bucket in self.buckets)
-        else:
-            main = self.buckets[-1]
-            if len(self.buckets) != 1 or not 0 < up_to_tokens < main.max_tokens:
-                raise ValueError(
-                    f"{self.prefix}: a capped {up_to_tokens}-token bucket needs one "
-                    f"larger bucket, got {[b.max_tokens for b in self.buckets]}."
-                )
-            small = dataclasses.replace(main, max_tokens=up_to_tokens)
-            self.buckets = (
-                dataclasses.replace(
-                    small,
-                    knobs=dataclasses.replace(
-                        small.knobs, fallback_cluster_shape_mn=None
-                    ),
-                    max_sm_count=max_sm_count,
-                    die_sm_mask32=None,
-                ),
-                main,
-            )
+        self.buckets = tuple(_placed(bucket) for bucket in self.buckets)
         self.bucket = self.buckets[-1]
         # The overlap runs under sequence parallelism: each TP rank holds a 1/TP
         # shard of its DP batch (sequence_parallel_chunk).
         self.sequence_parallel = True
 
+    def full_grid_beside_shared_expert(self) -> None:
+        """The P/D prefill workers' counterpart of :meth:`reserve_sms_for_shared_expert`:
+        every bucket keeps the full persistent grid (prefill steps are SM-throughput-bound
+        in MegaMoE: TP8+DCP8 NVFP4, 4096 rows per rank, 884 -> 1182 us per layer on the
+        148-SM cap) and the caller overlaps the shared expert by stream priority
+        (``KimiMoE._overlapped_forward``). Same sequence-parallel EP accounting."""
+        if self.kernel_weights is not None:
+            raise RuntimeError(
+                f"{self.prefix}: full_grid_beside_shared_expert after the runtime "
+                "was built."
+            )
+        if any(b.max_sm_count is not None for b in self.buckets):
+            raise RuntimeError(f"{self.prefix}: a bucket is already SM-capped.")
+        self.sequence_parallel = True
+
     def shared_overlap(self, num_tokens: int) -> bool:
         """Whether a forward of ``num_tokens`` tokens on this rank runs on an SM-capped
-        bucket (the caller then runs the shared expert beside it)."""
+        bucket (the caller then runs the shared expert on a side stream beside it);
+        False on a full-grid bucket (the caller overlaps by stream priority)."""
         return self.select_bucket(num_tokens).max_sm_count is not None
 
     def enable_fused_shared(self, hidden: int, intermediate: int) -> bool:

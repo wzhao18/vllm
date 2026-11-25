@@ -130,24 +130,22 @@ def test_kda_segscan_role(kv_role, expected):
 
 
 @pytest.mark.parametrize(
-    "kv_role,max_tokens,expected",
+    "kv_role,expected",
     [
-        ("kv_both", 8192, 1024),  # P/D prefill: capped overlap up to 1024 rows/rank
-        ("kv_producer", 8192, 1024),
-        ("kv_both", 1024, None),  # no larger bucket: the one bucket stays capped
-        ("kv_consumer", 8192, None),  # decode: capped everywhere (unchanged)
-        (None, 8192, None),  # unified serving: unchanged
+        ("kv_both", True),  # P/D prefill: full grid + stream-priority overlap
+        ("kv_producer", True),
+        ("kv_consumer", False),  # decode: SM-capped side-stream overlap (unchanged)
+        (None, False),  # unified serving: unchanged
     ],
 )
-def test_capped_shared_overlap_tokens_by_role(kv_role, max_tokens, expected):
-    """The SM-capped MegaMoE + side-stream shared expert is decided by role and
-    bucket size (no switch): P/D prefill workers run larger steps on the full grid
-    with the stream-priority overlap (KimiMoE._overlapped_forward)."""
+def test_prefill_full_grid_shared_overlap_by_role(kv_role, expected):
+    """The shared-expert overlap form of the sequence-parallel MegaMoE layers is decided
+    by role (no switch): P/D prefill workers keep the full MegaMoE grid
+    (KimiMoE._overlapped_forward's priority form), every other role the 148-SM cap."""
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import experts
-    from vllm.models.kimi_k3.nvidia.model import _capped_shared_overlap_tokens
+    from vllm.models.kimi_k3.nvidia.model import prefill_full_grid_shared_overlap
 
     cfg = _config(kv_role)
     cfg.additional_config = {}
-    assert _capped_shared_overlap_tokens(cfg, max_tokens) == expected
-    assert experts.RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS == 1024
+    assert prefill_full_grid_shared_overlap(cfg) is expected
     assert experts.RUBIN_SHARED_OVERLAP_MAX_SMS == 148
