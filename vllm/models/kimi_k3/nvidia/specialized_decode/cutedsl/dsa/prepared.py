@@ -221,6 +221,30 @@ def exchanged(impl, topk, batch):
     return None if valid is None else (topk[:batch], valid)
 
 
+def fp4_scorer_policy(indexer, shapes, strict) -> list[str]:
+    """Why the MXFP4 DCP scorer (IndexerScoreFp4) cannot serve ``shapes`` (empty:
+    it serves all of them; it is all or none, as stage.fused is one FusedIndexer).
+    NQ-NOFALLBACK: on a target deployment (``strict``) any reason raises, as every
+    step would run DeepGEMM's paged logits instead; elsewhere a warning names it."""
+    reasons = sorted(
+        {
+            f"{rows}x{q}: {reason}"
+            for rows, q in shapes
+            if (reason := fused_indexer_unsupported(indexer, rows, q, fp4=True))
+        }
+    )
+    if reasons and strict:
+        refuse("MXFP4 DCP scorer (IndexerScoreFp4)", "; ".join(reasons))
+    if reasons:
+        logger.warning_once(
+            "Kimi K3.1 MXFP4 DCP scorer (IndexerScoreFp4) off, every shape runs "
+            "DeepGEMM's paged logits: %s",
+            "; ".join(reasons),
+            scope="global",
+        )
+    return reasons
+
+
 class PreparedDsa:
     """One K3.1 DSA layer. ``attention``: the KimiK3DSAAttention; ``pitches``: the
     packed projection pitch per batch; ``queries``: the query lengths q (1 + the
@@ -276,9 +300,7 @@ class PreparedDsa:
         if core != "auto":
             raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
         if dcp is not None and not hasattr(dcp, "mailboxes"):
-            dcp = DsaBox(
-                dcp, pitches, partials, fp8=self.fp8, verify_q=max(queries)
-            )
+            dcp = DsaBox(dcp, pitches, partials, fp8=self.fp8, verify_q=max(queries))
         if dcp is not None and PROJECTED in dcp.mailboxes and not self.fp8:
             raise ValueError(
                 f'Kimi K3.1 specialized DSA: "proj" partials ({dcp.partials}) need '
@@ -371,14 +393,19 @@ class PreparedDsa:
                 "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
                 "the stock sparse_attn_indexer op and the Triton slot filter",
             )
-        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER).
+        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER). On
+        # an MXFP4 indexer cache its scorer (IndexerScoreFp4: DeepGEMM's logits bit
+        # for bit) replaces DeepGEMM's under DCP everywhere, Rubin included; the
+        # merge's DeepSelect + pack keep the local top-N (prepare_cache: run or refuse).
+        fp4 = self.indexer.use_fp4_cache
         rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
-        self.dcp_fused = bool(local_topk) and rubin_fused
+        self.dcp_fused = bool(local_topk) and (rubin_fused or fp4)
         static = (
-            fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
+            fused_indexer_static_unsupported(self.indexer, *s, fp4) for s in self.shapes
         )
-        # The fused indexer reads FP8 keys only (check_index_cache).
-        fused = self.fp8 and not self.indexer.use_fp4_cache
+        # The fused TP indexer reads FP8 keys only (check_index_cache).
+        fused = self.fp8 and not fp4
+        fused = fused or (fp4 and self.dcp_fused)
         if fused and (self.dcp == 1 or self.dcp_fused) and not any(static):
             # The fused indexer's buffers (prepare_cache), shared by every layer,
             # sized for the longest context the KV cache can hold: reserved now, as
@@ -421,6 +448,10 @@ class PreparedDsa:
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
         check_index_cache(self.indexer, unsupported)
+        scorer = self.dcp_fused and self.indexer.use_fp4_cache
+        fp4_unsupported = fp4_scorer_policy(
+            self.indexer, self.shapes if scorer else (), self.strict
+        )
         fused = self.box is None and self.fp8
         fused = fused and not any(unsupported)
         if not fused:  # the late query follows the fused indexer's select
@@ -476,7 +507,19 @@ class PreparedDsa:
             args = self.indexer, self.shapes, self.device, rows
             self.fused = FusedIndexer(*args, hold=hold, page=kv.shape[1])
         stage = self.indexer_stage
-        if self.dcp_fused and not any(unsupported):
+        if scorer:
+            if not fp4_unsupported:
+                # Logits only: DeepSelect + pack take the local top-N
+                # (IndexerLocalTopk, even publishing into the mailbox itself, is
+                # no faster: 1-node chain, L1 round 5 E1).
+                stage.fused = FusedIndexer(
+                    self.indexer,
+                    self.shapes,
+                    self.device,
+                    rows,
+                    local_topk=stage.local_topk,
+                )
+        elif self.dcp_fused and not any(unsupported):
             stage.fused = FusedIndexer(
                 self.indexer,
                 self.shapes,
@@ -486,7 +529,7 @@ class PreparedDsa:
                 packed=True,
             )
         stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
-        self.log_policy(unsupported)
+        self.log_policy(unsupported, fp4_unsupported if scorer else None)
         if unserved and self.strict:
             # NQ-NOFALLBACK: a shape the core's variant table lists but whose rows
             # exchange "proj" partials would quietly run FlashInfer's chain.
@@ -506,7 +549,7 @@ class PreparedDsa:
             )
         return self
 
-    def log_policy(self, unsupported):
+    def log_policy(self, unsupported, fp4_unsupported=None):
         """The per-batch policy at startup (once, global rank 0): per rows x q the
         query overlap, the index front and the sparse core; the DCP merge and the
         fused indexers; the indexer cache and the FP8 scales."""
@@ -519,7 +562,8 @@ class PreparedDsa:
         logger.info_once(
             "Kimi K3.1 specialized DSA (DCP %d, %d SMs): rows x q:overlap/front/core "
             "%s; DCP merge rows N=%d; fused DCP indexer %s; fused TP indexer %s "
-            "(unsupported: %s); indexer cache %s; k_scale %s, q_scale %s",
+            "(unsupported: %s); MXFP4 DCP scorer %s; indexer cache %s; "
+            "k_scale %s, q_scale %s",
             self.dcp,
             torch.cuda.get_device_properties(self.device).multi_processor_count,
             " ".join(shapes),
@@ -527,6 +571,11 @@ class PreparedDsa:
             "on" if stage.fused is not None else "off",
             "on" if self.fused is not None else "off",
             "; ".join(reasons) or "none",
+            "n/a"
+            if fp4_unsupported is None
+            else f"off (unsupported: {'; '.join(fp4_unsupported)})"
+            if fp4_unsupported
+            else "on",
             tuple(self.indexer.k_cache.kv_cache.shape),
             getattr(self.layer, "_k_scale_float", None),
             getattr(self.layer, "_q_scale_float", None),
@@ -552,8 +601,7 @@ class PreparedDsa:
                     f" (mailbox {mailbox:.1f} MiB, W_UV {weights:.1f} MiB per layer)"
                 )
             logger.info_once(
-                "Kimi K3.1 specialized DSA: DcpValue partials %s, "
-                '"proj" at rows %s%s',
+                'Kimi K3.1 specialized DSA: DcpValue partials %s, "proj" at rows %s%s',
                 box.partials,
                 " ".join(map(str, proj)) or "none",
                 memory,
@@ -606,7 +654,7 @@ class PreparedDsa:
             )
         if self.overlaps.get((batch, q)) in LATE:
             return f"FlashInfer {kernel} (late query overlap: the core is not built)"
-        return f"FlashInfer {kernel} (\"proj\" partials: the core does not push them)"
+        return f'FlashInfer {kernel} ("proj" partials: the core does not push them)'
 
     def sparse_dcp_core(self, core, cache, metadata, batch, q, join):
         """The DSA sparse core of a DCP step: this rank's rows of the #63 merge (or of
