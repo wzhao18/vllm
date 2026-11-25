@@ -114,7 +114,7 @@ WIDTH = 7168
 def sp_layer(decoder, step):
     """Raises unless ``decoder`` is a stock layer in the SP layout ``step`` serves:
     its attention a DSA / KDA layer whose o_proj does not reduce (stock reduce-scatters
-    after it), its MLP the stock MegaMoE (expert parallel, no token shard) or dense
+    after it), its MLP the stock MegaMoE (expert parallel) or dense
     module, with a MegaMoE buffer for the step's largest shard."""
     index, attention = decoder.layer_idx, decoder.self_attn
     kind = attention_kind(attention)
@@ -139,7 +139,7 @@ def sp_layer(decoder, step):
     if not decoder.is_moe_layer:
         return
     mlp = decoder.mlp
-    if not getattr(mlp, "use_mega_moe", False) or getattr(mlp, "moe_token_shard", 0):
+    if not getattr(mlp, "use_mega_moe", False):
         raise Unsupported("moe", None, f"{where}: not MegaMoE on the SP shard")
     tokens = getattr(mlp.experts, "max_num_tokens", 0)
     if tokens < step.shard_cap:

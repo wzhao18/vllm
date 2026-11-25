@@ -17,7 +17,6 @@ from vllm.config.kernel import KIMI_K3_MEGA_MOE, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -286,33 +285,21 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
     return not (backend == "latency_specialized" and kv_transfer.is_kv_consumer)
 
 
-# Smallest step (tokens, after CUDA-graph padding) whose token-shard MoE finishes with
-# the fused GEMM-AR (``KimiMoE._token_shard_gemm_ar``). Smaller steps keep the
-# separate all-reduce, which is faster there: on a TP8 prefill worker the fused path
-# cost ~+2 ms per 128-token step and saved ~1 ms per 384-token step.
-TOKEN_SHARD_GEMM_AR_MIN_TOKENS = 288
+def use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    """Whether the decoder runs sequence parallelism: each TP rank owns a 1/TP token
+    shard between the attention blocks (o_proj GEMM-RS, SP all-gather before the
+    next layer's projections) and the routed MoE runs on that shard.
 
-
-def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
-    """Whether the routed MoE runs on token shards over a replicated stream.
-
-    On by policy on the prefill workers of a P/D deployment (``pd_prefill_worker``,
-    where it was measured; decode instances and unified serving keep plain TP or
-    sequence parallelism) with EP + MegaMoE at TP > 1 and DP 1. It replaces full
-    sequence parallelism: attention, AttnRes and the shared experts stay as under
-    plain TP (shared weights TP-sharded), and only the routed experts see one 1/TP
-    token slice per rank (see :meth:`KimiMoE._token_shard_forward`), whose shared
-    down-projection's GEMM-AR adds them in its epilogue from
-    TOKEN_SHARD_GEMM_AR_MIN_TOKENS tokens on.
-    """
+    Expert-parallel MegaMoE (or any DP > 1 EP layout) at TP > 1 in one pipeline
+    stage, for every role: P/D prefill workers (kv_producer / kv_both), decode
+    instances and unified serving alike."""
     parallel_config = vllm_config.parallel_config
+    use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
     return (
-        pd_prefill_worker(vllm_config)
-        and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
+        parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
-        and parallel_config.pipeline_parallel_size == 1
-        and parallel_config.data_parallel_size == 1
         and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
     )
 
 
@@ -360,8 +347,8 @@ def mega_moe_max_num_tokens(
 ) -> int:
     """Most tokens one rank's MegaMoE layer sees in a forward.
 
-    Under sequence parallelism or the MoE token shard each rank's MoE gets
-    only its 1/TP token shard (sp_shard pads to a multiple of the TP size), so
+    Under sequence parallelism each rank's MoE gets only its 1/TP token
+    shard (sp_shard pads to a multiple of the TP size), so
     the symmetric dispatch / combine buffer needs ceil(MNBT / TP) tokens per
     rank, not MNBT. Its combine slots alone are top_k x tokens x latent x 2 B
     (1.9 GB per rank at MNBT 16384). Divide exactly once: dividing again sized
@@ -440,8 +427,8 @@ def dsa_runs_gemm_rs_ar(vllm_config: VllmConfig, run_gemm_rs_ar: bool) -> bool:
 
 
 def _gemm_ar_owns(t: torch.Tensor) -> bool:
-    """Whether ``t`` is a view of the GEMM-AR workspace: the GEMM-AR o_proj and
-    token-shard MoE hand their reduced output back as such a view (no copy; bitwise),
+    """Whether ``t`` is a view of the GEMM-AR workspace: the GEMM-AR o_proj hands
+    its reduced output back as such a view (no copy; bitwise),
     and a layer that keeps it past the next GEMM-AR copies it."""
     from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar
 
@@ -456,7 +443,7 @@ class KimiVecSituAndMul(nn.Module):
     For small inputs (up to 2048 rows of the TP8 shared expert's 768 columns,
     the CUDA-graph range) the CUDA op's one-block-per-row layout keeps more
     threads busy and wins (128-token steps: +7 us per call with the vectorized
-    kernel); larger ones (eager token-shard steps, and hybrid-SP steps' ~2k
+    kernel); larger ones (eager prefill steps, and hybrid-SP steps' ~2k
     rows x 6144 columns of the replicated shared expert: 34.3 -> 24.7 us) take
     the vectorized kernel. The small inputs (every decode step) run the stock
     SituAndMul module itself, through its own dispatch; the vectorized kernel is
@@ -858,13 +845,9 @@ class KimiMoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
-        # Routed MoE on 1/TP token shards over a replicated stream (prefill
-        # workers); exclusive with sequence parallelism.
-        self.moe_token_shard = self.use_mega_moe and use_moe_token_shard(vllm_config)
         # Prefill-worker MegaMoE policy (specialized_prefill.moe); None: stock.
         self._prefill_moe = None
         self._prefill_subcalls = None
-        assert not (self.moe_token_shard and use_sequence_parallel)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -933,28 +916,6 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        # MoE token shard: the shared down-projection's GEMM-AR kernel adds this
-        # rank's routed rows in its epilogue, so the one reduction per MoE layer
-        # runs on the fused multimem path instead of a separate all-reduce.
-        self._token_shard_gemm_ar = None
-        if (
-            self.moe_token_shard
-            and run_gemm_rs_ar
-            and self.shared_experts is not None
-        ):
-            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
-                get_gemm_rs_ar,
-            )
-
-            gemm_rs_ar = get_gemm_rs_ar()
-            if gemm_rs_ar.all_reduce and gemm_rs_ar.can_run(
-                self.shared_experts.down_proj
-            ):
-                gemm_rs_ar.enable_residual()
-                self._token_shard_gemm_ar = gemm_rs_ar
-            else:
-                gemm_rs_ar.warn_incompatible_projection()
-
         self.routed_expert_down_proj: ReplicatedLinear | None
         self.routed_expert_norm: RMSNorm | None
         self.routed_expert_up_proj: ReplicatedLinear | None
@@ -1020,7 +981,7 @@ class KimiMoE(nn.Module):
             max_num_tokens = mega_moe_max_num_tokens(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.tp_size,
-                token_sharded=use_sequence_parallel or self.moe_token_shard,
+                token_sharded=use_sequence_parallel,
             )
             from .specialized_prefill.moe import prefill_moe_policy
 
@@ -1028,7 +989,6 @@ class KimiMoE(nn.Module):
                 vllm_config,
                 tp_size=self.tp_size,
                 sequence_parallel=use_sequence_parallel,
-                token_shard=self.moe_token_shard,
                 max_num_tokens=max_num_tokens,
             )
             self.experts = mega_moe_experts_cls(vllm_config)(
@@ -1127,8 +1087,7 @@ class KimiMoE(nn.Module):
         if fused is None:
             shared = self.shared_experts
             fused = (
-                not self.moe_token_shard
-                and self.use_mega_moe
+                self.use_mega_moe
                 and self.routed_expert_down_proj is not None
                 and isinstance(shared, KimiMLP)
                 and shared.mxfp8_input()
@@ -1151,8 +1110,7 @@ class KimiMoE(nn.Module):
         shared = self.shared_experts
         transform = self.routed_output_transform
         if (
-            self.moe_token_shard
-            or not self.use_mega_moe
+            not self.use_mega_moe
             or self.tp_size != 1
             or transform is None
             or self.routed_expert_down_proj is None
@@ -1325,84 +1283,13 @@ class KimiMoE(nn.Module):
         )
         return routed_hidden_states, router_output, topk_ids
 
-    def _token_shard_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MegaMoE on this rank's 1/TP token slice; ``hidden_states`` replicated.
-
-        The routed path (router, latent down-projection, MegaMoE dispatch / L1 /
-        L2 / combine, latent norm + up-projection) runs on rows
-        ``[rank * chunk, rank * chunk + chunk)`` only, while the TP-sharded
-        shared experts produce their partial for every row. The routed output is
-        accumulated into this rank's rows of that partial, so a single
-        all-reduce sums the shared partials and places every rank's routed rows:
-        one collective per MoE layer instead of the plain TP path's latent and
-        hidden all-reduces, and no replicated routed-side work.
-        """
-        assert self.routed_output_transform is not None
-        assert self.shared_experts is not None
-        num_tokens = hidden_states.shape[0]
-        local = sp_shard(hidden_states)
-        chunk = local.shape[0]
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING:
-            ctx_padding = (
-                get_forward_context().is_padding
-                if is_forward_context_available()
-                else None
-            )
-            if ctx_padding is not None:
-                ctx_padding = ctx_padding[:num_tokens]
-            is_padding = sp_padding_mask(ctx_padding, hidden_states)
-        routed_hidden_states, router_output, topk_ids = (
-            self._maybe_overlap_router_and_down_proj(local)
-        )
-        assert topk_ids is not None
-        routed = self.experts(
-            routed_hidden_states, router_output, topk_ids, is_padding=is_padding
-        )
-        start = get_tensor_model_parallel_rank() * chunk
-        rows = max(0, min(chunk, num_tokens - start))
-        gemm_ar = self._token_shard_gemm_ar
-        if (
-            gemm_ar is not None
-            and num_tokens >= TOKEN_SHARD_GEMM_AR_MIN_TOKENS
-            and gemm_ar.should_run(hidden_states)
-        ):
-            # Shared gate/up + activation, then the shared down-projection's
-            # GEMM-AR adds this rank's routed rows (latent norm + up-projection)
-            # in its epilogue and all-reduces in the same kernel.
-            shared = self.shared_experts
-            gate_up = shared._gate_up(hidden_states)
-            act = shared.act_fn(gate_up)
-            routed_rows = (
-                self.routed_output_transform(routed[:rows]) if rows > 0 else None
-            )
-            # The layer output is consumed by the next layer's AttnRes before
-            # its o_proj GEMM-AR, so a workspace view is safe when aliasing.
-            return gemm_ar.apply(
-                act,
-                shared.down_proj,
-                residual=routed_rows,
-                residual_row0=start,
-                copy_out=False,
-            )
-        # TP-sharded shared experts (reduce_results=False): this rank's partial.
-        output = self.shared_experts(hidden_states)
-        if rows > 0:
-            # Latent norm + up-projection accumulated into this rank's rows in
-            # the GEMM's beta-add epilogue.
-            self.routed_output_transform(
-                routed[:rows], residual=output[start : start + rows]
-            )
-        return tensor_model_parallel_all_reduce(output)
-
     def takes_shared_mxfp8_input(self) -> bool:
         """forward() can take the shared experts' gate_up input as MXFP8
         from the producer of the layer input (``shared_mxfp8_input``): the
         MegaMoE path with online-MXFP8 shared experts that quantizes nothing
         else from the layer input (BF16 router and latent down_proj)."""
         return (
-            not self.moe_token_shard
-            and self.use_mega_moe
+            self.use_mega_moe
             and getattr(self, "_packed_moe", None) is None
             and isinstance(self.shared_experts, KimiMLP)
             and self.shared_experts.mxfp8_input()
@@ -1417,8 +1304,7 @@ class KimiMoE(nn.Module):
         if cap is None:
             t = self.routed_output_transform
             cap = self._resid_capable = (
-                not self.moe_token_shard
-                and self.use_mega_moe
+                self.use_mega_moe
                 and getattr(self, "_packed_moe", None) is None
                 and isinstance(self.shared_experts, KimiMLP)
                 and self.shared_experts.resid_capable()
@@ -1441,10 +1327,6 @@ class KimiMoE(nn.Module):
         (P + S) + R: the same roundings); returns the prefix."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.moe_token_shard:
-            return self._token_shard_forward(hidden_states).view(
-                num_tokens, hidden_size
-            )
         if getattr(self, "_packed_moe", None) is not None:
             return self._packed_forward(hidden_states).view(num_tokens, hidden_size)
         # Online MXFP8: one quantization of the layer input for the latent
@@ -1619,14 +1501,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-            and not use_moe_token_shard(vllm_config)
-        )
+        self.use_sequence_parallel = use_sequence_parallel(vllm_config)
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
             assert kda_config is not None
@@ -2226,14 +2101,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         parallel_config = vllm_config.parallel_config
         # DWDP layout (ParallelConfig.dwdp) before the MegaMoE experts are built.
         dense_dwdp.edwdp.configure(parallel_config)
-        use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-            and not use_moe_token_shard(vllm_config)
-        )
+        self.use_sequence_parallel = use_sequence_parallel(vllm_config)
 
         self.vocab_size = config.vocab_size
 
@@ -3052,8 +2920,7 @@ class KimiLinearForCausalLM(
             prepare_rubin_megamoe(self.model)
         # P/D prefill workers: the shared gate_up GEMM with the SiTU + MXFP8
         # epilogue (not beside a concurrent SM-capped MegaMoE (SP _shared_overlap:
-        # the persistent full-grid GEMM is not capped to the reserved SMs) or on the
-        # token-shard GEMM-AR path (it reads the un-interleaved gate_up rows)), and
+        # the persistent full-grid GEMM is not capped to the reserved SMs)), and
         # the KDA q|k|v in_proj GEMM with the conv + SiLU in its epilogue, at every
         # layout whose shape the kernel supports (kda_conv_in_proj.unsupported_reason).
         from .specialized_prefill import kda_conv_in_proj, shared_situ
@@ -3072,7 +2939,6 @@ class KimiLinearForCausalLM(
                 if (
                     isinstance(module, KimiMoE)
                     and not module._shared_overlap
-                    and not module.moe_token_shard
                     and getattr(module, "_packed_moe", None) is None
                     and isinstance(module.shared_experts, KimiMLP)
                     and not module.shared_experts.shard_sequence_parallel
