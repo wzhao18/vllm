@@ -69,10 +69,12 @@ from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ..common.gumbel import (
     DRAFT_NOISE_SALT,
-    drafted_value,
+    div_full,
+    gumbel_log,
     request_prefix,
     sampled_key,
     sampled_token,
+    sub_f32,
 )
 from ..common.host import architecture, fake
 from ..common.primitives import (
@@ -347,6 +349,11 @@ class MarkovGreedy:
             temps, seeds_r, positions_r = self.request_state(
                 args, requests, tid, slots_s
             )
+            # Position 0's Gumbel noise (data-independent of the drafted tokens;
+            # later positions' noise is computed while the previous keys travel).
+            noise = cute.make_rmem_tensor(4, Float32)
+            noise.fill(0)
+            self.noise(noise, 0, warp, temps, seeds_r, positions_r, rank, rows)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
         self.stamp(stats, cta, tid, 3)
@@ -418,14 +425,6 @@ class MarkovGreedy:
                         self.stamp(stats, cta, tid, 5 + 6 * i)
                 keys = cute.make_rmem_tensor(2, Uint64)
                 keys.fill(0)
-                prefixes = None
-                if cutlass.const_expr(self.sampled):
-                    prefixes = cute.make_rmem_tensor(2, Uint32)
-                    for n in cutlass.range_constexpr(2):
-                        # spec_step_seed(seed, i): gumbel_sample's seed for cache
-                        # column i (the draft position).
-                        step_seed = seeds_r[n] ^ Int64(i << 32)
-                        prefixes[n] = request_prefix(step_seed, positions_r[i, n])
                 for r in cutlass.range_constexpr(2):
                     bias = bf16x2(acc[2 * r], acc[2 * r + 1])
                     for n in cutlass.range_constexpr(2):
@@ -435,10 +434,12 @@ class MarkovGreedy:
                         logit = bf16(packed, False)
                         index = rank * self.vocab_rank + rows[r]
                         if cutlass.const_expr(self.sampled):
-                            key = sampled_key(
-                                drafted_value(logit, temps[n], prefixes[n], index),
-                                index,
-                            )
+                            value = logit
+                            if temps[n] != Float32(0.0):
+                                value = sub_f32(
+                                    div_full(logit, temps[n]), noise[2 * r + n]
+                                )
+                            key = sampled_key(value, index)
                             cached[requests[n], tile_warp * 16 + group + 8 * r] = (
                                 Uint16(packed & Uint32(0xFFFF))
                             )
@@ -467,8 +468,13 @@ class MarkovGreedy:
                 )
                 self.stamp(stats, cta, tid, 7 + 6 * i)
             if cutlass.const_expr(self.sampled):
-                # While the keys travel: the position's logits into the cache.
+                # While the keys travel: the position's logits into the cache and the
+                # next position's Gumbel noise.
                 self.store_cache(args, cached, slots_s, tid, i, first, rank)
+                if cutlass.const_expr(i + 1 < self.steps):
+                    self.noise(
+                        noise, i + 1, warp, temps, seeds_r, positions_r, rank, rows
+                    )
             # Every rank's keys of this position.
             region = box.iterator + parity * (self.parity_bytes // 4) + i * step_words
             if cutlass.const_expr(self.gate):
@@ -555,6 +561,23 @@ class MarkovGreedy:
                 previous = min(max(winners[group], Int32(0)), Int32(w1.shape[0] - 1))
         if (cta == 0) & (tid == 0):
             ordinal[0] = launch_ordinal + 1
+
+    @cute.jit
+    def noise(self, noise, i, warp, temps, seeds_r, positions_r, rank, rows):
+        """``sampled``: the stock Gumbel log term (``gumbel_log``; the noise is its
+        negation) of draft position ``i`` at the lane's (row r, request n) pairs into
+        ``noise[2 r + n]`` (temperature 0 / padding: unused). Data-independent of the
+        drafted tokens: computed off the per-position chain."""
+        if warp < self.row_warps:
+            for n in cutlass.range_constexpr(2):
+                if temps[n] != Float32(0.0):
+                    # spec_step_seed(seed, i): gumbel_sample's seed for cache column i
+                    # (the draft position).
+                    step_seed = seeds_r[n] ^ Int64(i << 32)
+                    prefix = request_prefix(step_seed, positions_r[i, n])
+                    for r in cutlass.range_constexpr(2):
+                        index = rank * self.vocab_rank + rows[r]
+                        noise[2 * r + n] = gumbel_log(prefix, index)
 
     @cute.jit
     def request_state(self, args, requests, tid, slots_s):
