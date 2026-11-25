@@ -544,6 +544,8 @@ class OprojUmmaFold(OprojUmma):
         memory: peers push into them) and its prefetch rows (in the ring)."""
         rows = 4 + self.consumer.nb
         states = []
+        # post()'s poll-helper branch (thread >= 128) is traced, never taken here
+        parts = alloc(smem, Float32, (1, 2, 128, 4))
         for u in range(self.units(batches)):
             offset = self.PF_OFFSET + u * rows * 2048
             if offset + rows * 2048 > ring_bytes:
@@ -555,7 +557,7 @@ class OprojUmmaFold(OprojUmma):
             total = alloc(smem, Float32, 4)
             bars = alloc(smem, cutlass.Uint64, 2, 8)
             pf = view(ring.iterator, offset, Uint32, (rows, 128, 4), (512, 4, 1))
-            states.append((wpre, pre, blk, post, total, bars, pre, pf))  # no parts (1 group)
+            states.append((wpre, pre, blk, post, total, bars, parts, pf))
         return states
 
     def fold_arm(self, states):
