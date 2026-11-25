@@ -448,7 +448,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             if rank >= half:
                 target, job = (1 - die, 2 * half - 1 - rank)
             address = stage.toint()
-            # Two of the warp's units a round (``units``: both units' polls in flight
+            # Two of the warp's units a round (``unit_pair``: both units' polls in flight
             # at once), the same units in the same order.
             for i in range(job, batch * 14, 2 * half):
                 first = self.home_unit(address, homes, i, target)
@@ -456,7 +456,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 more = i + half < batch * 14
                 if more:
                     second = self.home_unit(address, homes, i + half, target)
-                self.units(stage, weights, box, first, second, more, lane)
+                self.unit_pair(stage, weights, box, first, second, more, lane)
         else:
             stride = self.grid * 10
             for unit in range(cta * 10 + warp - 2, batch * 28, 2 * stride):
@@ -464,7 +464,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 second = unit
                 if more:
                     second = unit + stride
-                self.units(stage, weights, box, unit, second, more, lane)
+                self.unit_pair(stage, weights, box, unit, second, more, lane)
 
     @cute.jit
     def home_unit(self, address, homes, i, target):
@@ -480,7 +480,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         return 2 * i + Int32(h != target)
 
     @cute.jit
-    def units(self, stage, weights, box, first, second, more, lane):
+    def unit_pair(self, stage, weights, box, first, second, more, lane):
         """``unit`` on ``first`` and (``more``) ``second`` with one poll loop over
         both units' 32 slots: the second unit's loads in flight with the first's
         (finalize is a chain of L2 round trips, one a unit, after the last FC2 job).
@@ -513,7 +513,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
 
     @cute.jit
     def unit_sum(self, box, source, words, scale, u: cutlass.Constexpr[int], token, column, lane):
-        """``units``' unit ``u``: re-arm, the FMA chains in slot order, the stores."""
+        """``unit_pair``' unit ``u``: re-arm, the FMA chains in slot order, the stores."""
         ones = Uint32(4294967295)
         low = [Float32(0), Float32(0)]
         high = [Float32(0), Float32(0)]
