@@ -219,6 +219,12 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        # DIAG (S1, never merge): this case's last replays' kernel phase stamps.
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            diagstamp,
+        )
+
+        diagstamp.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:

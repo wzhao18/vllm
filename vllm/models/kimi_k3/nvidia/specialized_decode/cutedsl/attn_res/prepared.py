@@ -22,6 +22,7 @@ from ..common.host import (
     stream,
     to_cute,
 )
+from ..common import diagstamp
 from ..common.policy import batch_table
 from .kernel import ClusterAttnRes
 from .sharded import compile_gather, owned
@@ -62,7 +63,7 @@ def rows_tokens(rows):
 def compile_consumer(
     nb, delta, write, final, slots, cap, arch, aux=False, sanitize=False, carveout=None,
     stores_first=False, spread_push=False, poll_warp=False, min_blocks=0, out_mc=False,
-    tokens=1,
+    tokens=1, stamps=False,
 ):  # fmt: skip
     """``carveout`` only keys the cache: consumers with a preferred carve-out get their
     own function (the attribute is per function). ``tokens`` > 1: the token-batched
@@ -74,6 +75,8 @@ def compile_consumer(
         stores_first=stores_first, spread_push=spread_push, poll_warp=poll_warp,
         min_blocks=min_blocks, out_mc=out_mc,
     )  # fmt: skip
+    if stamps:  # DIAG (S1)
+        options["stamps"] = True
     kernel: ClusterAttnRes
     if tokens > 1:
         from .rows import ClusterAttnResRows
@@ -85,7 +88,12 @@ def compile_consumer(
     # The updated prefix row, also stored to an aux stream (row-sharded: multicast).
     args += (cutlass.Int64(0) if out_mc else row,) * aux
     args += (cutlass.Int64(0), cutlass.Int32(0)) if out_mc else ()
+    if stamps:  # DIAG (S1): per-CTA stamp rows, last
+        args += (fake((diagstamp.AR_CTAS, 8), None, cutlass.Int64),)
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
+
+
+_SITES = [0]  # DIAG (S1): AttnRes site ordinal per process
 
 
 class PreparedAttnRes:
@@ -112,6 +120,25 @@ class PreparedAttnRes:
         self.rows_codes: dict = {}  # ROWS_TOKENS: tokens -> (code, aux code or None)
         self.aux: Any = None
         self.shard: Any = None  # row-sharded batches (``bind_sharded``)
+        self._stamped: set = set()  # DIAG (S1): ids of codes taking stamp rows
+        self._stampbufs: dict = {}
+
+    def _stamp_rows(self, rows):
+        """DIAG (S1): this site's stamp buffer for ``rows`` (a shared trash buffer for
+        rows the diagnosis does not keep)."""
+        if not self._stampbufs:
+            site = _SITES[0]
+            _SITES[0] += 1
+            for r in (8, 16, 32, 64, 128):
+                buf = diagstamp.buffer(
+                    "attnres", site, r, diagstamp.AR_CTAS, self.device, 8, 7 * r
+                )
+                self._stampbufs[r] = to_cute(buf)
+            trash = torch.zeros(diagstamp.AR_CTAS, 8, dtype=torch.int64,
+                                device=self.device)
+            self._stampbufs[-1] = (to_cute(trash), trash)
+        got = self._stampbufs.get(rows)
+        return got if got is not None else self._stampbufs[-1][0]
 
     def _compile(self, slots, cap, aux=False, out_mc=False, tokens=1, ring=False):
         arch = architecture(self.device)
@@ -121,17 +148,23 @@ class PreparedAttnRes:
         carveout = None if self.ring_only and not ring else self.carveout
         shape = (*self.key, slots, cap, arch, aux, sanitize, carveout)
         shape += (first, spread)
-        code = compile_consumer(*shape, vote, 0, out_mc, tokens)
+        stamps = slots > 0 and tokens == 1 and not out_mc  # DIAG (S1)
+        code = compile_consumer(*shape, vote, 0, out_mc, tokens, stamps)
         # The register budget keeps one-token CTAs resident beside the in-projection;
         # the token-batched variant has a fraction of their CTAs.
         budget = RUBIN_VOTE_REGISTERS.get(self.key[0]) if vote and tokens == 1 else None
         if budget and kernel_registers(code, self.device.index) > budget:
-            code = compile_consumer(*shape, vote, 64 * 1024 // (128 * budget), out_mc)
+            code = compile_consumer(
+                *shape, vote, 64 * 1024 // (128 * budget), out_mc, 1, stamps
+            )
             what = f"AttnRes ({self.key[0]} blocks, vote poll)"
             check_registers(code, self.device.index, budget, what)
-        if carveout is None:
-            return code
-        return prepare_shared_carveout(code, self.device.index, carveout)
+        if carveout is not None:
+            code = prepare_shared_carveout(code, self.device.index, carveout)
+        if stamps:
+            self._stamped.add(id(code))
+            self._stamp_rows(0)  # allocate at bind time, not under graph capture
+        return code
 
     @classmethod
     def for_target(
@@ -263,6 +296,8 @@ class PreparedAttnRes:
         rows = (prefix, blocks, out) + (() if aux is None else (aux,))
         prefix, blocks, view, *aux = map(dynamic_view, rows)
         args = *self.views, view, *self.eps, *aux
+        if id(code) in self._stamped:  # DIAG (S1)
+            args = (*args, self._stamp_rows(rows[0].shape[0]))
         code(source, prefix, blocks, *args, stream(self.device))
         return out
 

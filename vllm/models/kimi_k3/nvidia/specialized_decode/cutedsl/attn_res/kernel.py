@@ -12,6 +12,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
 from ..common import mx_rows
+from ..common.diagstamp import smid_store, stamp_store
 from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
@@ -92,8 +93,11 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False, out_mx=None, delta_parts=0,
+        out_mc=False, out_mx=None, delta_parts=0, stamps=False,
     ):  # fmt: skip
+        # DIAG (S1): ``stamps``: the last argument is an Int64 [7 x 128, 8] buffer of
+        # per-CTA %globaltimer stamps (rows < 128 only).
+        self.stamps = stamps
         # ``delta_parts`` (slots 0): the delta is the beta-add GEMM's output left as
         # FP32 split-K partials: ``post`` takes (partials [parts * n, 7168] FP32,
         # residual [n, 7168] BF16) and forms the delta as stock's cuBLAS beta-add does
@@ -176,17 +180,32 @@ class ClusterAttnRes:
         delta, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
         rank, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
+        extra = args[9:]
+        if cutlass.const_expr(self.stamps):
+            extra = args[9:-1]
+            cta = Int64(token) * 7 + Int64(rank)
+            self.stamp_base = args[-1].iterator.toint() + cta * 64
+            self.stamp_on = (tid == 0) & (token < 128)
+            self.stamp(0)
+            smid_store(self.stamp_base + 5 * 8, Int32(self.stamp_on))
         bufs = self.setup(cutlass.utils.SmemAllocator())
         cute.arch.cluster_arrive_relaxed()
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (rank, token, tid)
         self.pre(state, bufs, rows, eps, ids)
-        extra = args[9:]
+        self.stamp(1)
         if cutlass.const_expr(self.out_mc):
             output, extra = extra[-2:], extra[:-2]  # (multicast address, row0)
         self.post(state, bufs, delta, rows, output, eps, out_eps, ids, extra)
+        self.stamp(4)
         cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def stamp(self, slot: cutlass.Constexpr[int]):
+        """DIAG: %globaltimer into this CTA's stamp ``slot`` (thread 0, rows < 128)."""
+        if cutlass.const_expr(self.stamps):
+            stamp_store(self.stamp_base + slot * 8, Int32(self.stamp_on))
 
     def state(self):
         """Carried from pre() to post(); the rest reloads so a GEMM can run between."""
@@ -331,6 +350,7 @@ class ClusterAttnRes:
                 # No negative zero, as the framework all-reduce returns (-0 + 0 = +0).
                 for i in cutlass.range_constexpr(8):
                     cur[0, i] = add_rn(cur[0, i], Float32(0))
+        self.stamp(2)
         words = cute.make_rmem_tensor(4, Uint32)
         for j in cutlass.range_constexpr(4):
             lo, hi = cur[0, 2 * j], cur[0, 2 * j + 1]
@@ -352,6 +372,7 @@ class ClusterAttnRes:
         if cutlass.const_expr(self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
+        self.stamp(3)
         if cutlass.const_expr(not self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         result = cute.make_rmem_tensor((1, 8), Float32)

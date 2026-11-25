@@ -16,6 +16,8 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
+from ..common.diagstamp import smid_store, stamp_store
+
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -653,6 +655,10 @@ class WaveMoeTail(MoeTail):
         latent, shared, weight, gamma = args[0:4]
         output_mc, par, rank, capacity, eps = args[10:15]
         tid, warp, lane, block = thread()
+        # DIAG stamps (S1): CTA row of 16 int64 slots in args[-1].
+        self.stamp_base = args[-1].iterator.toint() + Int64(block) * 128
+        self.stamp(0, tid == 0)
+        smid_store(self.stamp_base + 9 * 8, Int32(tid == 0))
         if cutlass.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
         q = cute.arch.block_idx_in_cluster()
@@ -733,10 +739,12 @@ class WaveMoeTail(MoeTail):
             gather = (args[9], rank) if self.twoshot else None
             boxes = (latent, reduced, shared)
             self.poll_inputs(boxes, (par, capacity), ids, places, gather)
+            self.stamp(1, tid == 0)
             if cutlass.const_expr(self.rearm_after):
                 self.rearm_rows(args[0:2], capacity, *ring)
             if lat:
                 self.read_reduced(reduced, par * capacity, xwords, s2, ids)
+            self.stamp(2, tid == 0)
         else:
             # Lanes 0..27 of warp t poll token t's latent; owners' lanes 28..31 the RS.
             sq = Float32(0)
@@ -773,10 +781,13 @@ class WaveMoeTail(MoeTail):
                     else:
                         self.rs_words(sums, owned[0][1], rs_j)
             s2 = [sq]
+            self.stamp(1, tid == 0)
+            self.stamp(2, tid == 0)
         cute.arch.sync_warp()
         if cutlass.const_expr(self.release_polled):
             cute.arch.griddepcontrol_launch_dependents()
         cute.arch.cluster_wait()
+        self.stamp(3, tid == 0)
         if cutlass.const_expr(n == 1 and self.late_rms):
             self.push_squares(squares, s2[0], bar, (q, warp, lane))
             cute.arch.sync_warp()
@@ -802,6 +813,7 @@ class WaveMoeTail(MoeTail):
             if cutlass.const_expr(self.umma):  # x tiles [N, 64] x 4 after W
                 outs = [sm + self.m * 512 + 1024 * g for g in range(n)]
             self.normalize_groups(squares, (xwords, gx, eps), outs, (warp, lane, lat))
+        self.stamp(4, tid == 0)
         if cutlass.const_expr(self.umma):  # x stores -> tcgen05
             cute.arch.fence_proxy("async.shared", space="cta")
             fence_tmem(before=True)
@@ -817,11 +829,14 @@ class WaveMoeTail(MoeTail):
             size = (self.offsets[1] - self.offsets[0]) // 4
             products = view(sm, self.offsets[0], Float32, size)
             self.mma_groups(a, xs, products, owned, bar, ids)
+        self.stamp(5, tid == 0)
         line = (lane, rank, row0, own_token, own_line)
         rms = (squares, bar, eps) if self.late_rms else None
         for s in cutlass.range_constexpr(self.slots):
             if owns(s) & (warp == self.owner_warp + s):
                 self.write_line(owned[s], bar, output_mc, line, s, rms)
+                if cutlass.const_expr(s == 0):
+                    self.stamp(7, lane == 0)
         if cutlass.const_expr(self.late_rms):  # peers' squares land before the exit
             wait(bar)
         if cutlass.const_expr(not (self.early or self.release_polled)):
@@ -835,7 +850,13 @@ class WaveMoeTail(MoeTail):
             self.rearm_rows(args[0:2], capacity, *ring)
         if cutlass.const_expr(self.umma):
             release_tmem(tmem, self.columns, warp, 0)
+        self.stamp(8, tid == 0)
         cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def stamp(self, slot: cutlass.Constexpr[int], when):
+        """DIAG: %globaltimer into this CTA's stamp ``slot`` where ``when``."""
+        stamp_store(self.stamp_base + slot * 8, Int32(when))
 
     @cute.jit
     def lane_sums(self, values):
@@ -1165,8 +1186,12 @@ class WaveMoeTail(MoeTail):
             cute.arch.sync_warp()
             total = self.square_total(squares, own_token, lane)
             inverse = inv_rms(total, eps, m8=True)
+        if cutlass.const_expr(s == 0):
+            self.stamp(10, lane == 0)
         wait(bar + 1)
         cute.arch.sync_warp()
+        if cutlass.const_expr(s == 0):
+            self.stamp(6, lane == 0)
         out = []
         for h in cutlass.range_constexpr(2):
             parts = (cells[64 * p + 2 * lane + h] for p in range(16))
