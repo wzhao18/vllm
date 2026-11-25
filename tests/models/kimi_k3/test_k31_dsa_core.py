@@ -118,11 +118,13 @@ def test_dsa_core_push(splits, heads_per_cta):
         assert bool((other == -0x80000000).all())
 
 
+@pytest.mark.parametrize("kv_ctas", [None, 1])
 @pytest.mark.parametrize("rows", [8, 16])
-def test_dsa_core_dim_split_matches_one_cta(rows):
+def test_dsa_core_dim_split_matches_one_cta(rows, kv_ctas):
     """2x16s3 rows of <= 3 chunks (the pair splitting the latent dims; one pass when
     every tile is its own piece) push bitwise the partial rows and LSEs of one CTA per
-    row (1x16, the per-tile loop) at the trtllm-gen KV CTA split of ``rows`` rows."""
+    row (1x16, the per-tile loop) at the trtllm-gen KV CTA split of ``rows`` rows, and
+    with one KV CTA (both tiles of a row one piece)."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
 
     base = [1, 17, 63, 64, 65, 100, 127, 128, 129, 140, 150, 160, 177, 191, 192, 0]
@@ -152,6 +154,7 @@ def test_dsa_core_dim_split_matches_one_cta(rows):
             rows=rows,
             splits=splits,
             split_min=split_min,
+            kv_ctas=kv_ctas,
             heads_per_cta=16,
         )
         torch.cuda.synchronize()

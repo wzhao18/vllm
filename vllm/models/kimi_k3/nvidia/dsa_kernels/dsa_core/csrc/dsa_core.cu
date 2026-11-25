@@ -738,7 +738,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         float my = fmaxf(y[0], y[1]);
 #pragma unroll
         for (int o = 16; o; o >>= 1) my = fmaxf(my, __shfl_xor_sync(0xffffffffu, my, o));
-        mp1 = fmaxf(-INFINITY, my);
+        // kp == 2: tile 1 continues tile 0's piece (running max max(m_0, tile max))
+        mp1 = fmaxf(kp == 2 ? mp : -INFINITY, my);
         const float base1 = mp1 == -INFINITY ? 0.f : mp1;
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
@@ -752,8 +753,19 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
       __syncwarp();
       if (lane == 0) {
-        piece_fold(h, mp, 0.f + sum, sA, sB);
-        if (nchunks == 3) piece_fold(h, mp1, 0.f + sum1, sMp, sLp);
+        if (kp == 1) {
+          piece_fold(h, mp, 0.f + sum, sA, sB);
+          if (nchunks == 3) piece_fold(h, mp1, 0.f + sum1, sMp, sLp);
+        } else {  // one piece of two tiles: the loop's piece state at its second tile
+          const float lp0 = 0.f + sum;
+          if (nchunks == 3) {
+            const float ap = mp == -INFINITY ? 0.f : exp2f(mp - mp1);
+            sAp[h] = ap;
+            piece_fold(h, mp1, lp0 * ap + sum1, sA, sB);
+          } else {
+            piece_fold(h, mp, lp0, sA, sB);
+          }
+        }
       }
     }
     // ---- V (this CTA's latent dims [256 sp, +256)) -> FP16 in place of each KV row's
@@ -806,8 +818,21 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     for (int j = 0; j < 4; ++j) tacc[j][0] = tacc[j][1] = tacc[j][2] = tacc[j][3] = 0.f;
     pv1(0, sP, kPStr);
     if (nchunks > 1) pv1(1, sP + kChunk, kPStr);
-    acc_fold(sA, sB);
-    if (nchunks == 3) {
+    if (kp == 2 && nchunks == 3) {  // tile 0's P V rescaled to the piece's max, tile 1 added
+      const float r0 = sAp[g8], r1 = sAp[g8 + 8];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        tacc[j][0] *= r0;
+        tacc[j][1] *= r0;
+        tacc[j][2] *= r1;
+        tacc[j][3] *= r1;
+      }
+      pv1(2, sP1, kP1Str);
+      acc_fold(sA, sB);
+    } else {
+      acc_fold(sA, sB);
+    }
+    if (kp == 1 && nchunks == 3) {
 #pragma unroll
       for (int j = 0; j < 4; ++j) tacc[j][0] = tacc[j][1] = tacc[j][2] = tacc[j][3] = 0.f;
       pv1(2, sP1, kP1Str);
@@ -815,15 +840,15 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     }
     if (dbg && tid == 0) dbg[13] = clock64();
   };
-  // S = 2 solo rows with every 128-key tile its own piece (kp == 1) and at most 3 chunks
-  // (2 tiles): one pass instead of the per-tile loop. The chunks are gathered at once
-  // (chunk 2 into the V buffer's space), QK of all of them, the two tiles' softmax
+  // S = 2 solo rows of at most 3 chunks (2 tiles; each its own piece, kp == 1, or one
+  // piece, kp == 2: trtllm-gen's single KV CTA): one pass instead of the per-tile loop.
+  // The chunks are gathered at once (chunk 2 into the V buffer's space), QK of all of them, the two tiles' softmax
   // (each piece's own running max and sum) in one step, V cast to FP16 in place of the
   // KV rows (this CTA's 256 dims; QK is done with them), then P V of tile 0 and of tile
   // 1 back to back and the two pieces folded into the row in the per-tile loop's order
   // with its arithmetic: bitwise the per-tile loop's partial and LSE.
   if constexpr (HG == 16) {
-    if (dsplit && kp == 1 && nchunks >= 1 && nchunks <= 3) {
+    if (dsplit && kp <= 2 && nchunks >= 1 && nchunks <= 3) {
       one_pass();
     } else if (kp > 1) {
       mainloop(std::true_type{});
