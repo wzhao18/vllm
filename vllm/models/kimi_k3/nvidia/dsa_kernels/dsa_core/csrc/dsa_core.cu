@@ -308,7 +308,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
     }
   };
-  if (sp == 0) load_q();
+  load_q();  // (every split: S = 2 rows all need it, solo ones split the latent dims)
   if (tid < HG) {
     sM[tid] = -INFINITY;
     sL[tid] = 0.f;
@@ -334,14 +334,16 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // rows of at most split_min chunks run on split 0 alone (no merge across the cluster;
   // the other splits leave), longer ones on every split: chunks sp, sp + S, ..
   const bool solo = S > 1 && nall <= p.split_min;
-  if (solo && sp > 0) return;
-  if (sp > 0) {
-    load_q();
-    __syncthreads();
-  }
+  // S = 2 solo rows: both CTAs walk every key of the row (QK and softmax computed
+  // alike, so the same P), each converts and multiplies only its half of the latent
+  // dims [256 sp, +256) in P V and pushes them (split 0: the LSE). Per dim the same
+  // arithmetic: bitwise the same partial, half the V conversion per CTA.
+  const bool dsplit = solo && S == 2;
+  if (solo && !dsplit && sp > 0) return;
   const int Se = solo ? 1 : S;
+  const int kspl = solo ? 0 : sp;  // this CTA's key split
   // The row's pieces (trtllm-gen's KV CTAs): kp consecutive 128-key tiles each. This
-  // split's pieces: sp, sp + Se, ..; its local tile i is tile i % kp of its piece
+  // split's pieces: kspl, kspl + Se, ..; its local tile i is tile i % kp of its piece
   // i / kp, each tile two 64-key chunks; local chunk c is chunk c & 1 of local tile
   // c >> 1 (a row's last tile may hold one chunk)
   const int ntiles = (n + kTile - 1) / kTile;
@@ -351,19 +353,19 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   __shared__ int s_gch[kMaxK / kChunk];
   int mytiles, last;  // this split's tiles, the global tile of its last one
   if (kp == 1) {
-    mytiles = ntiles > sp ? (ntiles - sp + Se - 1) / Se : 0;
-    last = (mytiles - 1) * Se + sp;
+    mytiles = ntiles > kspl ? (ntiles - kspl + Se - 1) / Se : 0;
+    last = (mytiles - 1) * Se + kspl;
   } else {
     const int npieces = (ntiles + kp - 1) / kp;
-    const int mypieces = npieces > sp ? (npieces - sp + Se - 1) / Se : 0;
+    const int mypieces = npieces > kspl ? (npieces - kspl + Se - 1) / Se : 0;
     mytiles =
-        mypieces > 0 ? (mypieces - 1) * kp + min(kp, ntiles - ((mypieces - 1) * Se + sp) * kp) : 0;
+        mypieces > 0 ? (mypieces - 1) * kp + min(kp, ntiles - ((mypieces - 1) * Se + kspl) * kp) : 0;
     if (tid < 2 * mytiles) {
       const int i = tid >> 1;
-      s_gch[tid] = 2 * (((i / kp) * Se + sp) * kp + i % kp) + (tid & 1);
+      s_gch[tid] = 2 * (((i / kp) * Se + kspl) * kp + i % kp) + (tid & 1);
     }
     const int i = mytiles - 1;
-    last = ((i / kp) * Se + sp) * kp + i % kp;
+    last = ((i / kp) * Se + kspl) * kp + i % kp;
   }
   int nchunks = 2 * mytiles;
   // (the row's last tile may hold one chunk: only a split's last local one)
@@ -388,7 +390,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // tiles; !P (every piece one tile, the common case) is the per-tile form.
   auto mainloop = [&](auto pieces) {
     constexpr bool P = decltype(pieces)::value;
-    auto gchunk = [&](int c) { return P ? s_gch[c] : 2 * ((c >> 1) * Se + sp) + (c & 1); };
+    auto gchunk = [&](int c) { return P ? s_gch[c] : 2 * ((c >> 1) * Se + kspl) + (c & 1); };
     // slot of row r of this CTA's chunk c
     auto slot_of = [&](int c, int r) { return sIdx[gchunk(c) * kChunk + r]; };
 
@@ -418,12 +420,14 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       uint4 w[kItems];
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
-        const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+        const int i = tid + j * kThreads;  // (dsplit: this CTA's 16 of the 32 16-B columns)
+        const int r = dsplit ? i >> 4 : i >> 5, c16 = dsplit ? 16 * sp + (i & 15) : i & 31;
         if (r < vrows) w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
       }
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
-        const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+        const int i = tid + j * kThreads;
+        const int r = dsplit ? i >> 4 : i >> 5, c16 = dsplit ? 16 * sp + (i & 15) : i & 31;
         if (r >= vrows) continue;
         const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
         uint32_t h[8];
@@ -440,6 +444,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     // ---- tile O += P V of chunk c (P columns [64 (c & 1), +64) of the tile; FP16
     // operands, FP32 accumulation): warp w owns latent dims [32 w, +32)
     auto pv = [&](int c) {
+      if (dsplit && (warp >> 3) != sp) return;  // (the other CTA's latent dims)
       const int valid = valid_of(c);
       // ldmatrix.trans rows: lane l -> key 16 ks + 8 ((l >> 3) & 1) + (l & 7), dims
       // 32 w + 8 (l >> 4) (+ 16 for the second x4)
@@ -748,8 +753,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     }
   }
   __syncthreads();
-  for (int i = tid; i < kGroupHeads * 64; i += kThreads) {
-    const int h = i >> 6, ch = i & 63;
+  for (int i = tid; i < kGroupHeads * (dsplit ? 32 : 64); i += kThreads) {
+    const int h = dsplit ? i >> 5 : i >> 6, ch = dsplit ? 32 * sp + (i & 31) : i & 63;
     const int gh = h0 + h;
     const uint4 v = *reinterpret_cast<const uint4*>(sO + h * kOStr + 8 * ch);
     const int64_t slot = (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
@@ -757,7 +762,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     st_v4(dst, make_uint4(no_neg_zero(v.x), no_neg_zero(v.y), no_neg_zero(v.z),
                           no_neg_zero(v.w)));
   }
-  if (tid < kGroupHeads) {
+  if (tid < kGroupHeads && sp == 0) {  // (S = 2 solo rows: split 0's)
     const int gh = h0 + tid;
     const float l = sL[tid], m = sM[tid];
     float lse = kEmptyLse;

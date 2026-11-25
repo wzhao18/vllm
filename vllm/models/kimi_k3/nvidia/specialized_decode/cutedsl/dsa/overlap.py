@@ -82,6 +82,24 @@ QUERY_OVERLAP = {
 # TP without the fused indexer (the late modes follow its select): the TP table the
 # stack ran before them.
 QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
+# Rubin DCP16 rows whose forked MlaQuery (+ QueryWait) launches once the #63 merge's
+# logits are enqueued (IndexerStage.merge_rows ``after_logits``) instead of beside
+# QueryNorm / IndexFront: the index front (or wq_b, DsaIndex) and the scorer then run
+# without MlaQuery's one-CTA-per-SM grid, and MlaQuery runs beside DeepSelect / pack /
+# select (few CTAs) with slack until the join before the sparse decode (a step
+# without the merge forks it at the join). PreparedDsa (front and fork) and WideDsa.
+# 1-node chain (4 ranks, q8, 8250 local keys, real layer, CUDA graph of 24 layers,
+# ABBA us/layer early -> late fork; outputs bitwise equal, out_digest):
+#   a DCP16 rank's 6 query heads: M8 35.51 -> 34.93, M16 38.54 -> 37.54 (FlashInfer
+#   core at 6 heads), M32 41.88 -> 40.26, M64 46.97 -> 45.16, M128 52.56 -> 54.45,
+#   M256 75.85 -> 85.45 (MlaQuery, 16 / 35 us there, outlasts the top-k merge);
+#   24 heads, DSA sparse core: M8 35.90 -> 30.99, M16 38.16 -> 33.14.
+QUERY_FORK_AT = "1-64:logits"
+
+
+def late_fork(batch, rubin, dcp):
+    """Whether the forked query of ``batch`` rows launches after the logits."""
+    return bool(rubin and dcp) and batch_table(QUERY_FORK_AT).get(batch) == "logits"
 # Index priority per rows (DCP fork / front only; "chain": on, other rows: off): the
 # indexer chain, wq_b through the sparse core, on ``index_stream`` instead of the
 # main stream. The forked MlaQuery (8-CTA clusters, several waves) otherwise takes
