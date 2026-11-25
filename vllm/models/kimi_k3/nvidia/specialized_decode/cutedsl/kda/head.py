@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ..attn_res.kernel import BESIDE_SMEM
+from ..common import l5diag
 from ..common.host import architecture, layout, stream, to_cute
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -1317,6 +1318,8 @@ class KdaHeadWide(KdaHead):
         )
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        if cutlass.const_expr(getattr(self, "drow", None) is not None):  # DIAG (L5)
+            l5diag.stamp(self.drow, 4, epi_tid == 0)
         _fence_tcgen05()
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         cute.arch.fence_view_async_tmem_load()

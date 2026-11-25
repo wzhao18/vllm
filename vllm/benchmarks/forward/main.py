@@ -219,6 +219,12 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        # DIAG (L5, never merge): this case's KDA chain phase stamps.
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            l5diag,
+        )
+
+        l5diag.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:
