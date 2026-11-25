@@ -101,8 +101,8 @@ ROWS = 16
 # chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to
 # -6 us per DSA layer on balanced rows, even with one row at 384 entries.
 VARIANT = {
-    **{q: "1-16:2x16s2" for q in range(2, 8)},  # q2-q7
-    8: "1-16:2x16s2",  # q8: the original entry (928a80c56b), unchanged
+    **{q: "1-16:2x16s3" for q in range(2, 8)},  # q2-q7
+    8: "1-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
 }
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
