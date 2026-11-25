@@ -594,6 +594,10 @@ class SplitKTmemGemm64(SplitKGemm):
             for i in cutlass.range_constexpr(quads):
                 bits = tuple(float_bits(values[4 * i + j]) for j in range(4))
                 _st_shared_v4(slot + i * share * 16, bits)
+        elif live_quads == quads:  # a whole tile: the unpredicated pushes
+            for i in cutlass.range_constexpr(quads):
+                quad = tuple(values[4 * i + j] for j in range(4))
+                push_float(mailbox + i * share * 4, quad, bar_reduce, owner)
         else:
             for i in cutlass.range_constexpr(quads):
                 quad = tuple(values[4 * i + j] for j in range(4))
