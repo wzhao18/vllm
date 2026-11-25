@@ -1432,6 +1432,7 @@ class TestDeviceFaultWatch:
 
         watch = cp_common._DeviceFaultWatch.__new__(cp_common._DeviceFaultWatch)
         watch.device_index = 3
+        watch.polls = 0
         watch.driver = types.SimpleNamespace(CUresult=CUresult)
         replies = iter(CUresult[name] for name in errors)
         watch.query = lambda: next(replies)  # type: ignore[method-assign]
