@@ -90,12 +90,6 @@ struct Plan {
   static constexpr int kQChunks = HG * kRowB / 16;          // 16 B chunks per Q tile
   static constexpr int kQPer = (kQChunks + kThreads - 1) / kThreads;
   static_assert(kSmem + 2048 <= 227 * 1024, "dsa_core shared memory");
-  // the one pass (HG = 16): chunk 2's KV rows, its S [32][kChunk + 2] floats and tile 1's P
-  // [16][kChunk + 8] halves past the plan
-  static constexpr int kX = kSmem;
-  static constexpr int kXBytes = kChunk * kRowS + 32 * (kChunk + 2) * 4 + 16 * (kChunk + 8) * 2;
-  static constexpr int kSmemX = HG == 16 ? kSmem + kXBytes : kSmem;
-  static_assert(kSmemX + 2048 <= 227 * 1024, "dsa_core shared memory (one pass)");
   static_assert(HG * 512 * 4 <= 2 * kChunk * kRowS, "FP32 O staging over the KV buffers");
 };
 
@@ -642,11 +636,13 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   };
   // ---- the one-pass form of S = 2 solo rows (dsplit, kp == 1, <= 3 chunks); HG = 16
   auto one_pass = [&]() {
-    constexpr int kS2Str = kChunk + 2;  // chunk 2's S [32][kS2Str] floats
+    constexpr int kS2Str = kChunk + 4;  // chunk 2's S [32][kS2Str] floats
     constexpr int kP1Str = kChunk + 8;  // tile 1's P [16][kP1Str] halves
-    uint8_t* const xb = smem + PL::kX;  // chunk 2's KV, S, tile 1's P (past the plan)
+    uint8_t* const xb = reinterpret_cast<uint8_t*>(sVh);  // chunk 2's KV, S, tile 1's P
     float* const sS2 = reinterpret_cast<float*>(xb + kChunk * kRowS);
     __half* const sP1 = reinterpret_cast<__half*>(xb + kChunk * kRowS + 32 * kS2Str * 4);
+    static_assert(kChunk * kRowS + 32 * kS2Str * 4 + 16 * kP1Str * 2 <= kChunk * kVStr * 2,
+                  "one-pass chunk 2 in the V buffer's space");
     auto bufc = [&](int c) { return c < 2 ? sKV + c * kChunk * kRowS : xb; };
     auto validc = [&](int c) { return min(kChunk, n - c * kChunk); };
     for (int c = 0; c < nchunks; ++c) {
@@ -698,24 +694,6 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
           sS[(g8 + 8 * (i >> 1)) * str + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
         }
       }
-    }
-    // ---- V of chunks 0 and 1 (this CTA's latent dims [256 sp, +256)) -> FP16 into the V
-    // buffer's halves [256 c, +256) while the other warps finish QK (the KV rows stay)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int i = tid + j * kThreads, c = i >> 10, r = (i >> 4) & 63, c16 = i & 15;
-      if (c >= min(nchunks, 2) || r >= ((validc(c) + 15) & ~15)) continue;
-      const uint4 w = *reinterpret_cast<const uint4*>(bufc(c) + r * kRowS + 256 * sp + 16 * c16);
-      const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
-      uint32_t hh[8];
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        hh[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
-        hh[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
-      }
-      uint4* dst = reinterpret_cast<uint4*>(sVh + r * kVStr + 256 * c + 16 * c16);
-      dst[0] = make_uint4(hh[0], hh[1], hh[2], hh[3]);
-      dst[1] = make_uint4(hh[4], hh[5], hh[6], hh[7]);
     }
     __syncthreads();
     if (dbg && tid == 0) dbg[11] = clock64();
@@ -791,10 +769,10 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         }
       }
     }
-    // ---- V of chunk 2 (dims [256 sp, +256)) -> FP16 in place of its KV rows' first 512
-    // bytes (QK is done with them): a half-warp per row, every lane's 16 bytes read first
-    for (int i = 0; i < kChunk / 32; ++i) {
-      const int r = 2 * warp + (lane >> 4) + 32 * i, c = 2;
+    // ---- V (this CTA's latent dims [256 sp, +256)) -> FP16 in place of each KV row's
+    // first 512 bytes: a half-warp per row, every lane's 16 bytes read before any store
+    for (int i = 0; i < 3 * kChunk / 32; ++i) {
+      const int rr = 2 * warp + (lane >> 4) + 32 * i, c = rr / kChunk, r = rr % kChunk;
       const int j = lane & 15;
       const bool on = c < nchunks && r < ((validc(c) + 15) & ~15);
       uint8_t* row = on ? bufc(c) + r * kRowS : nullptr;
@@ -820,16 +798,15 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     auto pv1 = [&](int c, const __half* pb, int pstr) {
       if ((warp >> 3) != sp) return;  // (the other CTA's latent dims)
       const int valid = validc(c);
-      const int vstr = c < 2 ? kVStr : kRowS / 2;  // (halves)
-      const __half* vb = (c < 2 ? sVh + 256 * c : reinterpret_cast<const __half*>(xb)) +
-                         (((lane >> 3) & 1) * 8 + (lane & 7)) * vstr + 32 * (warp & 7) +
+      const __half* vb = reinterpret_cast<const __half*>(bufc(c)) +
+                         (((lane >> 3) & 1) * 8 + (lane & 7)) * (kRowS / 2) + 32 * (warp & 7) +
                          (lane >> 4) * 8;
 #pragma unroll
       for (int ks = 0; ks < kChunk / 16; ++ks) {
         if (16 * ks >= valid) break;
         uint32_t b[8];
-        ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * vstr);
-        ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * vstr + 16);
+        ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * (kRowS / 2));
+        ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * (kRowS / 2) + 16);
         uint32_t a0, a1, a2, a3;
         ldsm_x4(a0, a1, a2, a3, pb + (lane & 15) * pstr + 16 * ks + (lane >> 4) * 8);
         mma_f16(tacc[0], a0, a1, a2, a3, b[0], b[1]);
@@ -866,11 +843,11 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   };
   // S = 2 solo rows of at most 3 chunks (2 tiles; each its own piece, kp == 1, or one
   // piece, kp == 2: trtllm-gen's single KV CTA): one pass instead of the per-tile loop.
-  // The chunks are gathered at once (chunk 2 past the plan), QK of all of them with V of
-  // chunks 0/1 cast to FP16 into the V buffer meanwhile, the two tiles' softmax in one
-  // step with chunk 2's V cast in place of its KV rows, then P V of tile 0 and of tile 1
-  // back to back and the tiles folded into the row in the per-tile loop's order with its
-  // arithmetic: bitwise the per-tile loop's partial and LSE.
+  // The chunks are gathered at once (chunk 2 into the V buffer's space), QK of all of them, the two tiles' softmax
+  // (each piece's own running max and sum) in one step, V cast to FP16 in place of the
+  // KV rows (this CTA's 256 dims; QK is done with them), then P V of tile 0 and of tile
+  // 1 back to back and the two pieces folded into the row in the per-tile loop's order
+  // with its arithmetic: bitwise the per-tile loop's partial and LSE.
   if constexpr (HG == 16) {
     if (dsplit && kp <= 2 && nchunks >= 1 && nchunks <= 3) {
       one_pass();
@@ -1078,7 +1055,7 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
   const int HG = (int)heads_per_cta;
   auto kernel = HG == 16 ? dsac_kernel<16> : dsac_kernel<32>;
-  const int smem_bytes = HG == 16 ? Plan<16>::kSmemX : Plan<32>::kSmemX;
+  const int smem_bytes = HG == 16 ? Plan<16>::kSmem : Plan<32>::kSmem;
   static bool attr16 = false, attr32 = false;
   bool& attr = HG == 16 ? attr16 : attr32;
   if (!attr) {
@@ -1106,13 +1083,13 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
 // Shared-memory opt-ins of every variant, outside any CUDA graph capture.
 void prepare() {
   C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      Plan<16>::kSmemX));
+                                      Plan<16>::kSmem));
   C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      Plan<32>::kSmemX));
+                                      Plan<32>::kSmem));
 }
 
 int64_t smem_bytes(int64_t heads_per_cta) {
-  return heads_per_cta == 16 ? Plan<16>::kSmemX : Plan<32>::kSmemX;
+  return heads_per_cta == 16 ? Plan<16>::kSmem : Plan<32>::kSmem;
 }
 
 }  // namespace k31dsac
