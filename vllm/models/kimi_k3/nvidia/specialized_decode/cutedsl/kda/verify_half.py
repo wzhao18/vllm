@@ -42,6 +42,7 @@ from ..common.primitives import (
     launch,
     load_f32x4,
     named_barrier,
+    push_float,
     wait,
     warp_sum,
     zeros,
@@ -92,6 +93,14 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
     threads); extra operands after ``accepted``: the layer's FP32 scratch
     [>= items, q x 128] and Int32 counters [>= items] (zeros; re-armed in kernel)."""
 
+    # The halves exchange their outputs through global scratch + an arrival counter
+    # (False) or as a cluster of two over DSMEM (``KdaVerifyHalfPair``).
+    PAIRED = False
+
+    def pair_cluster(self):
+        """Plain Python (outside the DSL's rewriting): the launch's cluster."""
+        return 2 if self.PAIRED else None
+
     @cute.jit
     def __call__(self, *args):
         assert args[0].shape[0] // self.tokens * self.heads == self.items
@@ -103,6 +112,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         launch(
             self.kernel, args, ctas, ALL_THREADS, smem=HALF_SMEM,
             max_number_threads=[ALL_THREADS, 1, 1], min_blocks_per_mp=1,
+            cluster=self.pair_cluster(),
         )  # fmt: skip
 
     @cute.kernel
@@ -128,8 +138,9 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         shared_beta = alloc(smem, Float32, T)
         meta = alloc(smem, Int32, (1, 4 + T))  # LoopStock's per-item metadata
         pairs: cutlass.Constexpr = (T + 1) // 2
-        bars = alloc(smem, cutlass.Int64, pairs + 1, 8).iterator
+        bars = alloc(smem, cutlass.Int64, pairs + 2, 8).iterator
         ready, state_full = bars, bars + pairs
+        pair_bar = bars + pairs + 1  # PAIRED: the other half's outputs landed
 
         taken = accepted[request]
         offset = taken - 1
@@ -143,8 +154,14 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 # group 0's or group 1's 128 prologue threads + the 4 gate warps
                 cute.arch.mbarrier_init(ready + p, GROUP + 128)
             cute.arch.mbarrier_init(state_full, 1)
+            if cutlass.const_expr(self.PAIRED):
+                cute.arch.mbarrier_init(pair_bar, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.PAIRED):
+            if thread == 0:  # the other half's T x 64 FP32 outputs
+                cute.arch.mbarrier_arrive_and_expect_tx(pair_bar, T * HALF_ROWS * 4)
+            cute.arch.cluster_arrive_relaxed()  # pair_bar initialized before any push
         if (thread == 0) & (slot > 0):  # this half's 64 rows of the accepted page
             source = state[Int64(slot), None, None, None]
             cute.arch.mbarrier_arrive_and_expect_tx(state_full, HALF_PAGE)
@@ -175,8 +192,13 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                     window,
                 )  # fmt: skip
             cute.arch.sync_threads()  # this half's outputs of every token in shared_o
-            if warp == MESSENGER:
-                self.exchange(scratch, counters, item, half, lane, shared_o)
+            if cutlass.const_expr(self.PAIRED):
+                cute.arch.cluster_wait()  # the other half's pair_bar is initialized
+                if warp == MESSENGER:
+                    self.exchange_pair(pair_bar, half, lane, shared_o)
+            else:
+                if warp == MESSENGER:
+                    self.exchange(scratch, counters, item, half, lane, shared_o)
             cute.arch.sync_threads()  # the other half's rows merged; both past the taps
             if (thread < GROUP) & (half == 0):  # the conv window (one writer)
                 conv_state = args[3]
@@ -294,6 +316,22 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 shared_o[position] = _load_f32_gpu((other + position).toint())
 
     @cute.jit
+    def exchange_pair(self, pair_bar, half, lane, shared_o):
+        """Warp MESSENGER (PAIRED): this half's rows of ``shared_o`` into the other
+        half's ``shared_o`` at the same positions (DSMEM, completing on its
+        ``pair_bar``), then wait until the other half's rows have landed in ours. The
+        same FP32 values as ``exchange``'s round trip through scratch: bit for bit."""
+        T: cutlass.Constexpr = self.tokens
+        for i in cutlass.range_constexpr(-(-T * HALF_ROWS // 32)):
+            index = lane + 32 * i
+            if index < T * HALF_ROWS:
+                t, row = index // HALF_ROWS, HALF_ROWS * half + index % HALF_ROWS
+                position = t * 128 + self.output_position(row)
+                push_float(shared_o.iterator + position, shared_o[position], pair_bar,
+                           1 - half)  # fmt: skip
+        wait(pair_bar, 0)
+
+    @cute.jit
     def half_prologue(self, args, thread, token, head, offset, conv_slot, shared,
                       ready, span, barrier_id, window):  # fmt: skip
         """``KdaVerifyLoopStock.loop_prologue`` for channel ``thread`` (0..127) and
@@ -363,3 +401,13 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                     keep_taps[s, t] = taps[s, t]
             for i in cutlass.range_constexpr(3 * T):
                 keep_inputs[i] = inputs[i]
+
+
+class KdaVerifyHalfPair(KdaVerifyHalfStock):
+    """``KdaVerifyHalfStock`` with each item's two CTAs launched as a cluster of two:
+    the messenger warps exchange the halves' outputs over DSMEM (st.async completing
+    on the receiver's mbarrier) instead of global scratch + gpu-scope fences and an
+    arrival counter. Same math, outputs bit for bit (the scratch / counter operands
+    stay in the signature, unused)."""
+
+    PAIRED = True
