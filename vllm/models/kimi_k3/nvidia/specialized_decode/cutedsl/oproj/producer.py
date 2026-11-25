@@ -47,6 +47,7 @@ from ..common.primitives import (
     view,
     wait,
 )
+from ..common import diagstamp as ds
 from ..common.twoshot import push, reduce
 
 # ``polled_x="half"``: an element not yet written (kda.head.OUT_SENT)
@@ -289,6 +290,7 @@ class OprojProducer:
         cta,
         trigger_after_wait: cutlass.Constexpr[bool],
         polled_x: cutlass.Constexpr[bool] = False,
+        saddr=None,
     ):
         """``polled_x`` (x_shared only): x is a Lamport buffer (PAIR_SENT words until
         its producer writes them; ``"half"``: every BF16 element is 0xFFFF until it is
@@ -368,6 +370,8 @@ class OprojProducer:
                     xs.iterator + (token * self.x_stride + col) * 4, words
                 )
             cute.arch.sync_threads()
+        if cutlass.const_expr(saddr is not None):
+            ds.stamp(saddr, 2)  # x landed (polled or after the PDL wait)
         if cutlass.const_expr(self.register_x):
             xr.fill(0)
             for nt in cutlass.range_constexpr(NT):
@@ -543,6 +547,8 @@ class OprojUmma(OprojProducer):
         x, weight = args[0], args[1]
         n, stage, stages, columns = self.geometry(x.shape[0])
         tid, warp, _, cta = thread()
+        base, ctr = ds.buffer("umma", x.shape[0])
+        saddr = ds.begin(base, ctr, cta, tid == 0)
         smem = cutlass.utils.SmemAllocator()
         ring = alloc(smem, Uint8, stages * stage, 1024)
         bars = alloc(smem, Uint64, 2 * stages + 1, 8)
@@ -576,6 +582,7 @@ class OprojUmma(OprojProducer):
                 cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + s)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        ds.stamp(saddr, 1)  # PDL wait returned (x ready)
         if warp < 4:
             for kb in cutlass.range_constexpr(self.blocks):
                 slot: Constexpr = kb % stages
@@ -591,15 +598,19 @@ class OprojUmma(OprojProducer):
                     self.load(x, tile + 8192, n, x.shape[0], 0, kb * 64)
                     cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + slot)
             wait(bars.iterator + 2 * stages, 0)
+            ds.stamp(saddr, 2)  # MMAs done
             fence_tmem()
             # The MMAs (async proxy) read the ring the epilogue now overwrites.
             cute.arch.fence_proxy("async.shared", space="cta")
             self.epilogue(args, ring, tmem, cta, n)
+            ds.stamp(saddr, 3)  # partials pushed (RS / one-shot round issued)
             if cutlass.const_expr(self.reduce):
                 self.reduce_owned(args, cta, tid)
+                ds.stamp(saddr, 4)  # owned chunk: 16 sources landed, reduced, gathered
         else:
             self.multiply(ring, bars, tmem, n, stage)
         release_tmem(tmem, columns, warp, 4)
+        ds.stamp(saddr, 7)
         if cutlass.const_expr(self.xmc > 1):  # no CTA leaves while peers' tiles land
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
@@ -697,6 +708,10 @@ class OprojUmmaRows(OprojUmma):
         S: Constexpr = self.stages
         N: Constexpr = self.chunk
         tid, warp, lane, cta = thread()
+        base, ctr = ds.buffer("rows", M)
+        saddr = ds.begin(base, ctr, cta, tid == 0)
+        rbase, rctr = ds.buffer("rowsred", M)
+        raddr = ds.begin(rbase, rctr, cta, tid == 192)
         smem = cutlass.utils.SmemAllocator()
         wring = alloc(smem, Uint8, self.blocks * 8192, 1024)
         xring = alloc(smem, Uint8, S * N * 128, 1024)
@@ -733,6 +748,8 @@ class OprojUmmaRows(OprojUmma):
             cute.arch.cp_async_mbarrier_arrive_noinc(weights)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        ds.stamp(saddr, 1)  # PDL wait returned (x ready)
+        ds.stamp(raddr, 1)
         if warp == 5:
             if lane == 0:
                 self.stream_x(args[-1], xring, full, empty, chunks)
@@ -742,9 +759,12 @@ class OprojUmmaRows(OprojUmma):
         elif warp == 6:
             if cutlass.const_expr(not self.owners):
                 self.reduce_rows(args, pushed, cta, lane, chunks)
+                ds.stamp(raddr, 4)  # owned rows: sources landed, reduced, gathered
         elif warp < 4:
             self.drain_rows(args, tiles, tmem, accfull, accfree, pushed, cta, chunks)
+            ds.stamp(saddr, 3)  # every chunk's partials pushed
         release_tmem(tmem, self.tmem_columns(), warp, 4)
+        ds.stamp(saddr, 7)
 
     def tmem_columns(self):
         """Two D buffers of ``chunk`` FP32 columns (``tmem_stride`` apart)."""

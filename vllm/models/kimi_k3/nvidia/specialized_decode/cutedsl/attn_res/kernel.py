@@ -11,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
+from ..common import diagstamp as ds
 from ..common import mx_rows
 from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
@@ -88,6 +89,8 @@ BESIDE_SMEM = (228 * 1024 - 2 * 1024 - SMEM_BYTES) // 1024 * 1024
 class ClusterAttnRes:
     """``sanitize``: multi-slot sums map -0 to +0 after rounding, as the framework
     all-reduce they replace does (the Rubin dense ring)."""
+
+    saddr = None  # DIAG: this kernel's stamp row (set while tracing ``kernel``)
 
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
@@ -176,16 +179,21 @@ class ClusterAttnRes:
         delta, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
         rank, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
+        base, ctr = ds.buffer("attnres", prefix.shape[0])
+        saddr = ds.begin(base, ctr, token * 7 + rank, tid == 0)
         bufs = self.setup(cutlass.utils.SmemAllocator())
         cute.arch.cluster_arrive_relaxed()
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (rank, token, tid)
         self.pre(state, bufs, rows, eps, ids)
+        ds.stamp(saddr, 1)  # pre-wait half (block statistics exchanged)
+        self.saddr = saddr
         extra = args[9:]
         if cutlass.const_expr(self.out_mc):
             output, extra = extra[-2:], extra[:-2]  # (multicast address, row0)
         self.post(state, bufs, delta, rows, output, eps, out_eps, ids, extra)
+        ds.stamp(saddr, 7)
         cute.arch.griddepcontrol_wait()
 
     def state(self):
@@ -331,6 +339,8 @@ class ClusterAttnRes:
                 # No negative zero, as the framework all-reduce returns (-0 + 0 = +0).
                 for i in cutlass.range_constexpr(8):
                     cur[0, i] = add_rn(cur[0, i], Float32(0))
+        if cutlass.const_expr(self.saddr is not None):
+            ds.stamp(self.saddr, 2)  # delta landed (polled / after the PDL wait)
         words = cute.make_rmem_tensor(4, Uint32)
         for j in cutlass.range_constexpr(4):
             lo, hi = cur[0, 2 * j], cur[0, 2 * j + 1]
@@ -352,6 +362,8 @@ class ClusterAttnRes:
         if cutlass.const_expr(self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
+        if cutlass.const_expr(self.saddr is not None):
+            ds.stamp(self.saddr, 3)  # post statistics exchanged
         if cutlass.const_expr(not self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         result = cute.make_rmem_tensor((1, 8), Float32)

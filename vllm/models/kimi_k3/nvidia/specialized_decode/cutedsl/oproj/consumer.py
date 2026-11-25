@@ -39,6 +39,7 @@ from ..common.primitives import (
     zeros,
 )
 from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
+from ..common import diagstamp as ds
 from ..common.twoshot import reduce
 from .producer import OprojProducer, pack8, tree_reduce
 
@@ -316,7 +317,7 @@ class OprojConsumer:
                 publish_hint(hints.iterator)
 
     @cute.jit
-    def post(self, args, state, block_mix, rank, token):
+    def post(self, args, state, block_mix, rank, token, saddr=None):
         mailbox, prefix, _, _, _, _, output, xmoe, hints, eps, out_eps = args[:11]
         if cutlass.const_expr(self.out_mc):
             output = args[11:13]
@@ -356,6 +357,8 @@ class OprojConsumer:
                         k: cutlass.Constexpr = half * 2 + j
                         part = tuple(map(bits_float, two(words, j)))
                         attn[2 * k], attn[2 * k + 1] = pair_op(two(attn, k), part)
+            if cutlass.const_expr(saddr is not None):
+                ds.stamp(saddr, 4)  # every TP slot landed and summed
             prefix_value = cute.make_rmem_tensor(8, Float32)
             for j in cutlass.range_constexpr(4):
                 rounded = unpack_bf16(pack_pair(*two(attn, j)))
@@ -383,6 +386,8 @@ class OprojConsumer:
             if cutlass.const_expr(xmoe is not None):
                 cute.arch.fence_acq_rel_gpu()
             self.wait_exchange(bars.iterator + 1)
+            if cutlass.const_expr(saddr is not None):
+                ds.stamp(saddr, 5)  # post statistics exchanged
             if tid < self.npost:
                 sums = [Float32(0)] * 4
                 for peer in cutlass.range_constexpr(7):
@@ -412,6 +417,8 @@ class OprojConsumer:
                 value = pair_op(value, two(norm, j), op="mul")
                 final[2 * j], final[2 * j + 1] = value[0], value[1]
             self.publish(output, xmoe, hints, token, h, final)
+            if cutlass.const_expr(saddr is not None):
+                ds.stamp(saddr, 6)  # output (and x_moe) published
 
     @cute.jit
     def __call__(self, *args):
@@ -421,6 +428,8 @@ class OprojConsumer:
     def kernel(self, args):
         rank, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
+        base, ctr = ds.buffer("consumer", args[1].shape[0])
+        saddr = ds.begin(base, ctr, token * 7 + rank, tid == 0)
         state = self.allocate()
         self.setup(state[5])
         cute.arch.griddepcontrol_launch_dependents()
@@ -429,7 +438,9 @@ class OprojConsumer:
         if tid < 128:
             self.prefetch(args, state[7], rank, token)
             maximum, exponent_sum, qpart = self.pre(state, rank, args[9], mix)
-        self.post(args, state, (mix, maximum, exponent_sum, qpart), rank, token)
+        ds.stamp(saddr, 1)  # pre-wait AttnRes half done
+        self.post(args, state, (mix, maximum, exponent_sum, qpart), rank, token, saddr)
+        ds.stamp(saddr, 7)
         cute.arch.griddepcontrol_wait()
 
 
@@ -475,6 +486,8 @@ class OprojFused:
         tid, _, _ = cute.arch.thread_idx()
         cta = cluster * 8 + rank
         active = (cluster < x.shape[0]) & (rank < 7)
+        base, ctr = ds.buffer("fused", x.shape[0])
+        saddr = ds.begin(base, ctr, cta, tid == 0)
         state = self.consumer.allocate()
         smem = self.producer.allocate(x.shape[0])
         self.consumer.setup(state[5])
@@ -487,7 +500,9 @@ class OprojFused:
         maximum, exponent_sum, qpart = Float32(0), Float32(0), Float32(0)
         if group0:
             maximum, exponent_sum, qpart = self.consumer.pre(state, rank, rows[9], mix)
-        self.producer.compute(args, smem, weights, cta, False, self.polled_x)
+        ds.stamp(saddr, 1)  # pre-wait AttnRes half done
+        self.producer.compute(args, smem, weights, cta, False, self.polled_x, saddr)
+        ds.stamp(saddr, 3)  # partials multicast (one-shot round issued)
         # The last publish's threads (``OprojProducer.publish``) and the drain warp.
         _, gt, ng = self.producer.schedule(x.shape[0])
         publishers: cutlass.Constexpr = 8 * min(x.shape[0] - (ng - 1) * gt * 8, gt * 8)
@@ -500,10 +515,11 @@ class OprojFused:
                     cute.arch.fence_acq_rel_gpu()
         if active:
             block_mix = (mix, maximum, exponent_sum, qpart)
-            self.consumer.post(rows, state, block_mix, rank, cluster)
+            self.consumer.post(rows, state, block_mix, rank, cluster, saddr)
             if cutlass.const_expr(self.drain):  # noqa: SIM102 (compile-time)
                 if tid >= 512 - 32:  # the last poll group's last warp
                     named_barrier(self.DRAIN_BARRIER, drainers)
                     cute.arch.fence_acq_rel_gpu()
+        ds.stamp(saddr, 7)
         if cutlass.const_expr(self.polled_x):
             cute.arch.griddepcontrol_wait()
