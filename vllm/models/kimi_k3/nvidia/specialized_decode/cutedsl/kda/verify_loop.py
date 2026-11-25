@@ -271,7 +271,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
             total = Float32(value)
             for s in cutlass.range_constexpr(1, self.planes):
                 total = total + Float32(view[row + s * rows, col])
-            value = BFloat16(total)
+            value = total.to(BFloat16)
         return value
 
     @cute.jit
