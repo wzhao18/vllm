@@ -85,6 +85,7 @@ def _bucket(C, X, entries, tile_n, cap, sms):
 
 @pytest.fixture(scope="module")
 def build():
+    """``get(name)``: (problem, runtime of that one bucket, bucket, full, compact)."""
     C, S, W, X, RubinMegaMoE = _mods()
     torch.cuda.set_device(0)
     device = torch.device("cuda", 0)
@@ -108,11 +109,18 @@ def build():
     compact = full._replace(
         fc1=(full.fc1[0], legs[0]), fc2=(full.fc2[0], legs[1]), compact_sf=True
     )
-    buckets = [_bucket(C, X, entries, *spec) for spec in BUCKETS.values()]
-    moe = RubinMegaMoE(problem, None, buckets)
-    moe.warmup(full, ids_dtypes=(torch.int32,))
-    moe.warmup(compact, ids_dtypes=(torch.int32,))
-    return problem, moe, dict(zip(BUCKETS, buckets)), full, compact
+    cache = {}
+
+    def get(name):
+        if name not in cache:
+            bucket = _bucket(C, X, entries, *BUCKETS[name])
+            moe = RubinMegaMoE(problem, None, [bucket])
+            moe.warmup(full, ids_dtypes=(torch.int32,))
+            moe.warmup(compact, ids_dtypes=(torch.int32,))
+            cache[name] = (problem, moe, bucket, full, compact)
+        return cache[name]
+
+    return get
 
 
 def _routes(n, experts, device, seed):
@@ -139,8 +147,7 @@ def _run(moe, bucket, weights, hidden, ids, wts):
      ("n128_c1024_cap148", 1024)],
 )  # fmt: skip
 def test_compact_scale_planes_give_bitwise_equal_outputs(build, name, n):
-    problem, moe, buckets, full, compact = build
-    bucket = buckets[name]
+    problem, moe, bucket, full, compact = build(name)
     device = torch.device("cuda", 0)
     gen = torch.Generator(device=device).manual_seed(100 + n)
     hidden = torch.randn(n, problem.hidden, generator=gen, device=device)
@@ -157,8 +164,7 @@ def test_compact_scale_planes_give_bitwise_equal_outputs(build, name, n):
 
 def test_compact_kernel_reads_the_compact_planes(build):
     """One compact FC2 scale byte of a routed expert doubled: the output moves."""
-    problem, moe, buckets, full, compact = build
-    bucket = buckets["n128_c2048"]
+    problem, moe, bucket, full, compact = build("n128_c2048")
     device = torch.device("cuda", 0)
     n = 256
     gen = torch.Generator(device=device).manual_seed(9)
