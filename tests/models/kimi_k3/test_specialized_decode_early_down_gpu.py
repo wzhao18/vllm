@@ -101,9 +101,11 @@ def _main():
         gate_up = (torch.randn(2 * HIDDEN, K, generator=gen, device="cuda") * 0.02)
         gate_up = gate_up.bfloat16()
         down = (torch.randn(K, HIDDEN, generator=gen, device="cuda") * 0.02).bfloat16()
-        ptrs = tuple(c.Int64(m.data_ptr()) for m in (weight_map(packed, 128),
-                                                      weight_map(gate_up, 64)))  # fmt: skip
-        maps = to_cute(weight_maps(gate_up, down), 64)
+        # the descriptor tensors stay referenced: a CuTe view / pointer does not hold them
+        front_maps = (weight_map(packed, 128), weight_map(gate_up, 64))
+        ptrs = tuple(c.Int64(m.data_ptr()) for m in front_maps)
+        down_maps = weight_maps(gate_up, down)
+        maps = to_cute(down_maps, 64)
         plain_down = compile_down(TP, rows, dev.index, sms)
         early_down = compile_down(TP, rows, dev.index, sms, writers=writers)
         count = torch.zeros(2, dtype=torch.int32, device=dev)
