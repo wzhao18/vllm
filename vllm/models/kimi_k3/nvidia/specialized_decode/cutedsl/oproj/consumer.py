@@ -555,7 +555,7 @@ class OprojUmmaFold(OprojUmma):
             total = alloc(smem, Float32, 4)
             bars = alloc(smem, cutlass.Uint64, 2, 8)
             pf = view(ring.iterator, offset, Uint32, (rows, 128, 4), (512, 4, 1))
-            states.append((wpre, pre, blk, post, total, bars, None, pf))
+            states.append((wpre, pre, blk, post, total, bars, pre, pf))  # no parts (1 group)
         return states
 
     def fold_arm(self, states):
