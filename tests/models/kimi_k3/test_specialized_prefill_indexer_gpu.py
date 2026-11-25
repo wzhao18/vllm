@@ -249,3 +249,40 @@ def test_selective_topk_long_rows_random(recover_all):
     got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
     ok = (got == ref).all(1)
     assert ok.all(), f"{int((~ok).sum())} rows differ"
+
+
+@pytest.mark.parametrize(
+    "reqs,zero_rows",
+    [
+        # ShardQ-like: two 128-row pieces per request over a long cached prefix
+        ([(128, 30000), (128, 31792)] * 2, ()),
+        # mixed lengths, a short (keep-all) request and all-tied rows (recovered)
+        ([(37, 1000), (300, 9000), (64, 20000)], (5, 6, 7)),
+    ],
+)
+def test_split_publish_matches_unsplit(monkeypatch, reqs, zero_rows):
+    """Key-tile split PUBLISH units (pub_split 2: each item's tiles in two ranges, each
+    into its own candidate region copy, concatenated per key lane) give the unsplit
+    top-k bit for bit, order included, and the same recomputed rows."""
+    q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, zero_rows)
+    outs, flags = [], []
+    for cap in (1, 2):
+        monkeypatch.setattr(pidx, "PUB_SPLIT_MAX", cap)
+        sp = pidx.SelectivePlan(
+            [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
+        )
+        assert sp.pub_split == cap
+        out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
+        row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
+        outs.append(out)
+        flags.append(row_bin[1 : 3 * sp.t : 3].clone())
+    assert torch.equal(flags[0], flags[1])
+    same = (outs[0] == outs[1]).all(1)
+    assert same.all(), f"{int((~same).sum())} rows differ"
+    t0 = 0
+    for (rows, kv), base in zip(reqs, bases):
+        ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
+        got = outs[1][t0 : t0 + rows].to(torch.int64)
+        got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
+        assert (got == ref).all(1).all(), f"request ({rows}, {kv})"
+        t0 += rows

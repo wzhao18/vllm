@@ -45,6 +45,8 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.experimental import primitives as nvvm
 
+from vllm.triton_utils import tl, triton
+
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
     asm,
 )
@@ -358,7 +360,7 @@ class IndexerScore:
         the split's tile range [lo, hi) of the item's (even-rounded) tiles, field 6
         its histogram slot (-1: the whole item, row bounds in the kernel; else the
         rows' histograms go to ``ghist`` slot rows, finished by RowBound)."""
-        assert not split or mode == 0
+        assert not split or mode in (0, PUBLISH)
         self.split = split
         self.mode = mode
         self.ctas = ctas
@@ -860,8 +862,13 @@ class IndexerScore:
                 )
                 # this thread's column of each row's candidate region: word 0
                 # the count, then one word per kept key (tile << 16 | BF16)
-                cand0 = out_a + row_base[row0] * 2 + lt * 4
-                cand1 = out_a + row_base[row1] * 2 + lt * 4
+                # split PUBLISH units (key-tile ranges of one item) write their own
+                # candidate region copy: field 6 = its offset in 16-bit units
+                roff = Int64(0)
+                if cutlass.const_expr(self.split):
+                    roff = Int64(items[item, 6]) * 2
+                cand0 = out_a + row_base[row0] * 2 + roff + lt * 4
+                cand1 = out_a + row_base[row1] * 2 + roff + lt * 4
                 p0 = cand0 + TILE * 4
                 p1 = cand1 + TILE * 4
                 lim0 = cand0 + (SLOTS + 1) * TILE * 4
@@ -913,8 +920,8 @@ class IndexerScore:
                 # publish tile word of the carried stage: (tile << 16) | lt, a
                 # per-thread register (publish2 reads only its high half), one
                 # tile below the pair's newer tile per stage
-                tw = (Uint32(ntp - 2 * n_edge) << Uint32(16)) | Uint32(lt)
-                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                tw = (Uint32(t_hi - 2 * n_edge) << Uint32(16)) | Uint32(lt)
+                for pp in cutlass.range(n_edge, npairs, unroll=1):
                     p0, p1, tw = self.pair_rot(
                         ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
                         hc, sc, tw,
@@ -3059,6 +3066,16 @@ class SelectivePlan:
         self.row_bin = torch.zeros(3 * (t + 1), dtype=torch.int32, device=device)
         self.row_bin[3 * t] = 0x7FC0
         self.s_bin = torch.zeros(3 * (t + 1), dtype=torch.int32, device=device)
+        # PUBLISH work units: with fewer items than a whole number of waves of the
+        # persistent grid, each item's key tiles split into ``pub_split`` ranges
+        # (newest first), each publishing into its own candidate region copy; the
+        # copies are concatenated per key lane in range order (= the unsplit
+        # order) before the select. Exact: the same keys pass the same thresholds.
+        self.pub_split, self.pub_items = _publish_units(
+            self.items.cpu().tolist(), t, device
+        )
+        self.n_pub_items = torch.full((1,), self.pub_items.shape[0], dtype=torch.int32,
+                                      device=device)
 
 
 def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
@@ -3090,14 +3107,83 @@ def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
     )
 
 
+# Key-tile splits of the PUBLISH pass (each one more candidate region copy of
+# (T + 1) x REGION words): at most 2 keeps the selective path's transient within
+# the stock prefill logits reservation (prefill_logits_reserved_bytes).
+PUB_SPLIT_MAX = 2
+
+
+def _publish_units(items, t, device, ctas=None):
+    """(split, units): the PUBLISH items, each cut into ``split`` key-tile ranges
+    when that shortens the persistent grid's makespan (ceil(n split / ctas) / split
+    item-times), as [n split, 7] Int32 (token0, ntok, key0, ntiles, t_lo, t_hi,
+    region offset in 16-bit units), longest first; split 1: the items as they are."""
+    ctas = ctas or torch.cuda.get_device_properties(device).multi_processor_count
+    n = len(items)
+    best, split = None, 1
+    for s in range(1, PUB_SPLIT_MAX + 1):
+        span = -(-n * s // ctas) / s
+        if best is None or span < best - 1e-9:
+            best, split = span, s
+    if split == 1 or n == 0:
+        return 1, torch.tensor(items, dtype=torch.int32, device=device).view(-1, 4)
+    region = (t + 1) * REGION * 2
+    units = []
+    for tok0, ntok, key0, ntiles in items:
+        npairs = (ntiles + (ntiles & 1)) // 2
+        ntp = 2 * npairs
+        for k in range(split):
+            pa = npairs * k // split
+            pb = npairs * (k + 1) // split
+            if pb > pa:  # newest range first: tiles [ntp - 2 pb, ntp - 2 pa)
+                units.append((tok0, ntok, key0, ntiles, ntp - 2 * pb, ntp - 2 * pa,
+                              k * region))
+    units.sort(key=lambda u: -(u[5] - u[4]))
+    return split, torch.tensor(units, dtype=torch.int32, device=device).view(-1, 7)
+
+
+@triton.jit
+def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
+                           slots: tl.constexpr, tile: tl.constexpr):
+    """Per row and key lane: region copies 1.. appended after copy 0's slots, in copy
+    order; a column that reaches ``slots`` keeps count ``slots`` (overflowed: the
+    select flags the row and the exact full path recomputes it)."""
+    row = tl.program_id(0)
+    lane = tl.arange(0, tile)
+    base = cand_ptr + row.to(tl.int64) * row_words
+    total = tl.load(base + lane).to(tl.int32)
+    ovf = total >= slots
+    for k in tl.static_range(1, n_split):
+        src = base + k * region_words
+        c = tl.load(src + lane).to(tl.int32)
+        ovf = ovf | (c >= slots) | (total + c >= slots)
+        for s in range(0, slots):
+            m = (s < c) & (total + s < slots)
+            v = tl.load(src + (1 + s) * tile + lane, mask=m)
+            tl.store(base + (1 + total + s) * tile + lane, v, mask=m)
+        total = total + c
+    tl.store(base + lane, tl.where(ovf, slots, total).to(tl.int32))
+
+
 def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLISH):
     """Scores of every row, keeping the keys at or above its threshold (returns the
     candidate regions)."""
-    cand = torch.empty((sp.t + 1) * REGION, dtype=torch.int32, device=q.device)
-    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items, sp.cand_base,
-          cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
-          n_items=sp.n_items)
-    return cand
+    split = getattr(sp, "pub_split", 1)
+    cand = torch.empty(split * (sp.t + 1) * REGION, dtype=torch.int32, device=q.device)
+    if split == 1:
+        score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items,
+              sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas,
+              mode=mode, n_items=sp.n_items)
+        return cand
+    # a range with no tiles of a row never writes that row's counts
+    cand.view(split, sp.t + 1, REGION)[1:, :, :TILE].zero_()
+    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.pub_items,
+          sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
+          n_items=sp.n_pub_items)
+    _concat_regions_kernel[(sp.t,)](
+        cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, num_warps=4
+    )
+    return cand[: (sp.t + 1) * REGION]
 
 
 def cand_select(sp, cand, out):
