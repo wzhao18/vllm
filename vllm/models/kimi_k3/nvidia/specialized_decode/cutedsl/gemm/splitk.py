@@ -110,6 +110,10 @@ class SplitKGemm:
         # activation warp right after its wait, instead of by the weight warp once
         # every weight tile is requested (possibly before the wait).
         self.trigger_after_wait = False
+        # ``launch_smem``: the dynamic shared memory the launch requests (None: the
+        # SM's capacity, one CTA per SM); ``splitk_smem_bytes(tactic)`` lets CTAs of
+        # the next kernel (PDL) be resident beside this one's.
+        self.launch_smem = None
         self.mma_tiler_mn = (tactic.mma_m, tactic.mma_n)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape = (1, tactic.split_k, 1)
@@ -119,6 +123,12 @@ class SplitKGemm:
             (tactic.split_k - 1) * self.epilog_threads * values_per_thread
         )
         self.expected_transaction_bytes = self.mailbox_elements * 4
+
+    def launch_smem_bytes(self):
+        """Plain Python (outside the DSL's rewriting): the launch's shared memory."""
+        if self.launch_smem is None:
+            return utils.get_smem_capacity_in_bytes("sm_100")
+        return self.launch_smem
 
     @cute.experimental.jit
     def __call__(
@@ -134,7 +144,7 @@ class SplitKGemm:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.launch_smem_bytes()),
             stream=stream,
             use_pdl=True,
         )
