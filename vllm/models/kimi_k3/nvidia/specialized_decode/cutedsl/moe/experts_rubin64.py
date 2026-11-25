@@ -151,14 +151,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False, release=True,
+        dies=(), static_groups=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
-        # release: the CTAs trigger their PDL dependents (the MoE tail) after the
-        # grouping; False: the dependents launch once every CTA exited (no tail CTA
-        # beside a CTA still in its finalize push).
-        self.release = release
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -1222,8 +1218,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         experts = self.tables(sm)[0]
         fence_tmem()
         tmem = tmem_base[0]
-        if cutlass.const_expr(self.release):
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(len(self.dies) > 0):
             ranges = self.matched_ranges(sm, distinct)
         else:

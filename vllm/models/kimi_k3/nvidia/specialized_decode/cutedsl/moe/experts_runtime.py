@@ -384,8 +384,7 @@ def place(routed):
 
 @functools.cache
 def compile_rubin64(
-    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12,
-    release=True,
+    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
 ):  # fmt: skip
     """``compile_experts``' arguments (plan, publish modes incl. two-shot) for
     ``RubinGroupedExpertsKernel``, then the w13 / w2 addresses; ``dies``: the SMs'
@@ -394,7 +393,7 @@ def compile_rubin64(
     (``POOL_ZONE``)."""
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static, release=release,
+        static_groups=static,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
