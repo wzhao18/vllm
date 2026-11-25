@@ -137,7 +137,7 @@ def _main():
             dist.barrier()
             refs.append((box[0, :rows].clone(), h[:rows].clone(), out))
         # early: SharedDown first on the side stream, then the counting front; back to
-        # back (only the per-call join, no host sync); the box is checked per call
+        # back (only the per-call join, no host sync); the box is copied per call
         # the counting front launched once first: its lazy module load waits for the
         # device, i.e. would wait for a SharedDown already polling (``fork_first``)
         warm = torch.zeros(64, HIDDEN, dtype=torch.bfloat16, device=dev)
@@ -168,12 +168,18 @@ def _main():
         torch.cuda.synchronize()
         dist.barrier()
         ok = int(count.abs().sum()) == 0
+        own = (slice(rank * SHARD, (rank + 1) * SHARD),  # latent columns (BF16)
+               slice(3584 + 2 * rank * VALID, 3584 + 2 * (rank + 1) * VALID))  # logits
         for i in range(calls):
             ref_box, ref_h, ref_out = refs[i]
             a = _mailbox_rows(outs[i], 1, rank, rows)
             b = _mailbox_rows(ref_out, 1, rank, rows)
             exact = ref_h.float() @ down.float().t()
-            ok &= torch.equal(got_box[i].view(torch.int16), ref_box.view(torch.int16))
+            # this rank's own front-box columns (the peer's front of another call may
+            # have multicast its columns meanwhile: no barrier between the calls)
+            for cols in own:
+                ok &= torch.equal(got_box[i][:, cols].view(torch.int16),
+                                  ref_box[:, cols].view(torch.int16))  # fmt: skip
             ok &= torch.equal(hs[i][:rows].view(torch.int16), ref_h.view(torch.int16))
             ok &= not a.isnan().any() and torch.equal(a.view(torch.int16), b.view(torch.int16))
             ok &= bool(torch.allclose(a.float(), exact, rtol=1.6e-2, atol=1e-3))
