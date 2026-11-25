@@ -71,6 +71,8 @@ class KdaHeadVerify(KdaHeadWide):
     # KDA CTA owns; every KDA CTA sums the four split ranks in rank order and rounds to
     # BF16 itself (the same sums as the pair owners', bit for bit).
     DIRECT = False
+    DIAG_NO_RELEASE = False  # bench diag (unsafe): producers do not wait for the release
+    DIAG_ONE_DEST = False  # bench diag (not exact): each Q / K partial to one KDA CTA
     """``KdaHeadWide`` for one request x ``tokens`` verify tokens; extra operand:
     ``accepted`` [1] after F_B; ``slots`` is [1, >= tokens] (vLLM's spec slots)."""
 
@@ -228,6 +230,8 @@ class KdaHeadVerify(KdaHeadWide):
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_free, KDA_CTAS * 4)
                 if kda_cta:  # Q / K of 8 tokens x 4 ranks, V rows, the owned gate
                     part = 2 * SECTIONS * T * 128 * 4 + SECTIONS * T * ROWS * 4
+                    if cutlass.const_expr(self.DIAG_ONE_DEST):
+                        part = T * 128 * 4 + SECTIONS * T * ROWS * 4
                     part += SECTIONS * 128 * 4
                     cute.arch.mbarrier_init(bar_part, 1)
                     cute.arch.mbarrier_arrive_and_expect_tx(bar_part, part)
@@ -422,15 +426,19 @@ class KdaHeadVerify(KdaHeadWide):
         named_barrier(3, 128)
         rows = self.cta_m
         if section < 2:
-            wait(bar_free)
+            if cutlass.const_expr(not self.DIAG_NO_RELEASE):
+                wait(bar_free)
             for m in cutlass.range_constexpr(2):
                 i = epi_tid + 128 * m
                 row, half = i // 2, i % 2
                 values = tuple(partial[row, 4 * half + j] for j in range(4))
                 block = (split_rank * 2 + section) * rows + row
                 dst = recv_qk + cute.assume(block * T + 4 * half, divby=4)
-                for dest in cutlass.range_constexpr(KDA_CTAS):
-                    push_float(dst, values, bar_part, dest)
+                if cutlass.const_expr(self.DIAG_ONE_DEST):
+                    push_float(dst, values, bar_part, split_rank * 2 + section)
+                else:
+                    for dest in cutlass.range_constexpr(KDA_CTAS):
+                        push_float(dst, values, bar_part, dest)
         else:
             for m in cutlass.range_constexpr(2):
                 i = epi_tid + 128 * m
