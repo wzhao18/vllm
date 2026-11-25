@@ -97,10 +97,12 @@ PROJECTED = "proj"
 # GB300 DcpValue at 320 rows: 16 -> 64.7 us, 32 -> 55.7, 64 -> 54.6, but 64 loses
 # 1-2 us at 80-160 rows).
 PROJ_ROWS = 32
-# "proj" above PROJ_ROWS rows: the projection on tcgen05 (kind::f16, BF16 in, FP32
+# "proj" above TC_ROWS rows (every DSA "proj" batch: DSA_PARTIALS serves "proj" from
+# 17 rows): the projection on tcgen05 (kind::f16, BF16 in, FP32
 # accumulation; the legacy mma.sync path runs at a quarter of its rate): units of
 # (gathered head, 128 rows) [128 x 512] x [512 x 128] spread over every CTA, K in
 # 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
+TC_ROWS = 16
 TC_STAGES = 4
 TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
 # A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
@@ -115,8 +117,11 @@ TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) <<
 
 def projects_on_tc(batch):
     """Whether a DSA "proj" DcpValue of ``batch`` rows projects on tcgen05 itself
-    (dcp_stage then passes the gathered W_UV, not the bmm's value rows)."""
-    return batch > PROJ_ROWS
+    (dcp_stage then passes the gathered W_UV, not the bmm's value rows). At 17-32
+    rows too: the preprojected path's stock W_UV bmm is a separate dependent kernel
+    (cuBLAS, 4.6 us on the DCP16 B4 critical path) and the tcgen05 grid has one
+    128-row unit per gathered head from 1 to 128 rows."""
+    return batch > TC_ROWS
 
 
 @asm()
