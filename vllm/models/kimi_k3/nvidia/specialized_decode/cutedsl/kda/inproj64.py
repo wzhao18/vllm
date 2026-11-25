@@ -630,18 +630,26 @@ class KdaInProj80(KdaInProj64):
             first = (WIDTH80 * g + 7) // 8
             count = 3 - g % 2
             requests = accepted.layout.shape[0]
+            # every request's loads issued unconditionally (clamped index, masked
+            # after), so the three dependent chains overlap (in branches they ran one
+            # after another: Q/K/V CTAs entered the GEMM ~1.9 us after the others)
             for rq in cutlass.range_constexpr(3):
                 request = first + rq
-                if (rq < count) & (request < requests):
-                    offset = accepted[request] - 1
-                    live = Int32(slots[request, offset] > 0)
-                    meta[rq, 0] = offset
-                    meta[rq, 1] = live
-                    meta[rq, 2] = slots[request, 0] * live
-                    if live != 0:
-                        page = conv_state[Int64(meta[rq, 2]), None, None]
-                        for j in cutlass.range_constexpr(3):
-                            tap[rq, j] = conv_tap(page, row, offset + j)
+                own = (rq < count) & (request < requests)
+                safe = cutlass.min(request, requests - 1)
+                offset = accepted[safe] - 1
+                live = Int32(slots[safe, offset] > 0) * Int32(own)
+                meta[rq, 0] = offset
+                meta[rq, 1] = live
+                meta[rq, 2] = slots[safe, 0] * live
+            for rq in cutlass.range_constexpr(3):  # (slot 0 when not live: a real page)
+                page = conv_state[Int64(meta[rq, 2]), None, None]
+                for j in cutlass.range_constexpr(3):
+                    tap[rq, j] = conv_tap(page, row, meta[rq, 0] + j)
+            for rq in cutlass.range_constexpr(3):
+                if meta[rq, 1] == 0:
+                    for j in cutlass.range_constexpr(3):
+                        tap[rq, j] = BFloat16(0)
         self.pf_tap, self.pf_coeff, self.pf_meta = tap, coeff, meta
 
     @cute.experimental.jit
