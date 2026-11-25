@@ -726,6 +726,9 @@ class OprojUmmaRows(OprojUmma):
         saddr = ds.begin(base, ctr, cta, tid == 0)
         rbase, rctr = ds.buffer("rowsred", M)
         raddr = ds.begin(rbase, rctr, cta, tid == 192)
+        # DIAG (STAMP arm, TPC U2): the MMA warp's lane 0: entry / PDL / W landed
+        wbase, wctr = ds.buffer("rowsw", M)
+        waddr = ds.begin(wbase, wctr, cta, tid == 128)
         smem = cutlass.utils.SmemAllocator()
         wring = alloc(smem, Uint8, self.blocks * 8192, 1024)
         xring = alloc(smem, Uint8, S * N * 128, 1024)
@@ -768,8 +771,12 @@ class OprojUmmaRows(OprojUmma):
             if lane < self.issuers:  # issuing lanes (``stream_x``)
                 self.stream_x(args[-1], xring, full, empty, chunks, lane)
         elif warp == 4:
+            ds.stamp(waddr, 1)  # PDL wait returned (MMA warp)
+            wait(weights, 0)  # (multiply_rows' first wait, same order)
+            ds.stamp(waddr, 2)  # W_o tile landed in shared memory
             sync = (full, empty, weights, accfull, accfree)
             self.multiply_rows(wring, xring, sync, tmem, chunks)
+            ds.stamp(waddr, 3)  # last MMA issued
         elif warp == 6:
             if cutlass.const_expr(not self.owners):
                 self.reduce_rows(args, pushed, cta, lane, chunks)

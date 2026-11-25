@@ -235,6 +235,15 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 base = Int64(self.trace) + 262144 + (Int64(cta) * 16 + warp) * 128
                 diag_red(base + slot * 8, now)
 
+    @cute.jit
+    def dcount(self):
+        """DIAG (STAMP arm): lane 0 counts this warp's calls at trace + 768 KiB +
+        (16 cta + warp) * 8 (in-step: the regions accumulate over every call)."""
+        if cutlass.const_expr(self.trace != 0):
+            _, warp, lane, cta = thread()
+            if lane == 0:
+                diag_red(Int64(self.trace) + 786432 + (Int64(cta) * 16 + warp) * 8, Uint64(1))
+
     def tables(self, sm, window=True):
         """Streams' experts, then the sub-units' eight Int16 pair rows (as words)."""
         experts = view(sm.iterator, self.off_tables, Int32, self.streams)
@@ -671,6 +680,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         as the 64-row kernel handles a unit."""
         eg = (thread()[1] - 4) // 4
         self.dset(14)
+        self.dcount()
         c_all = self.dclk()
         full = view(sm.iterator, self.off_misc + self.bar_accfull, Uint64, 16)
         empty = view(sm.iterator, self.off_misc + self.bar_accempty, Uint64, 16)

@@ -7,6 +7,7 @@ and must use different parities on successive calls. TP8 B5+ and TP16 B9+ run th
 one-wave WaveMoeTail over latent rows published by the routed experts and shards
 pushed by WaveMoeTail.push."""
 
+from ..common import diagstamp as ds
 from functools import reduce
 from operator import or_
 
@@ -653,6 +654,11 @@ class WaveMoeTail(MoeTail):
         latent, shared, weight, gamma = args[0:4]
         output_mc, par, rank, capacity, eps = args[10:15]
         tid, warp, lane, block = thread()
+        # DIAG (STAMP arm, TPC U3): tid 0 phases; owner warp lane 0: last push issued
+        dbase, dctr = ds.buffer("wavetail", self.batch)
+        saddr = ds.begin(dbase, dctr, block, tid == 0)
+        pbase, pctr = ds.buffer("wavepush", self.batch)
+        paddr = ds.begin(pbase, pctr, block, tid == 32 * self.owner_warp)
         if cutlass.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
         q = cute.arch.block_idx_in_cluster()
@@ -774,9 +780,11 @@ class WaveMoeTail(MoeTail):
                         self.rs_words(sums, owned[0][1], rs_j)
             s2 = [sq]
         cute.arch.sync_warp()
+        ds.stamp(saddr, 1)  # inputs polled (latent / RS landed)
         if cutlass.const_expr(self.release_polled):
             cute.arch.griddepcontrol_launch_dependents()
         cute.arch.cluster_wait()
+        ds.stamp(saddr, 2)  # cluster barrier passed
         if cutlass.const_expr(n == 1 and self.late_rms):
             self.push_squares(squares, s2[0], bar, (q, warp, lane))
             cute.arch.sync_warp()
@@ -817,11 +825,13 @@ class WaveMoeTail(MoeTail):
             size = (self.offsets[1] - self.offsets[0]) // 4
             products = view(sm, self.offsets[0], Float32, size)
             self.mma_groups(a, xs, products, owned, bar, ids)
+        ds.stamp(saddr, 3)  # partial products done
         line = (lane, rank, row0, own_token, own_line)
         rms = (squares, bar, eps) if self.late_rms else None
         for s in cutlass.range_constexpr(self.slots):
             if owns(s) & (warp == self.owner_warp + s):
                 self.write_line(owned[s], bar, output_mc, line, s, rms)
+        ds.stamp(paddr, 4)  # owner warp: its line pushed (last push issued)
         if cutlass.const_expr(self.late_rms):  # peers' squares land before the exit
             wait(bar)
         if cutlass.const_expr(not (self.early or self.release_polled)):
@@ -836,6 +846,7 @@ class WaveMoeTail(MoeTail):
         if cutlass.const_expr(self.umma):
             release_tmem(tmem, self.columns, warp, 0)
         cute.arch.griddepcontrol_wait()
+        ds.stamp(saddr, 7)
 
     @cute.jit
     def lane_sums(self, values):

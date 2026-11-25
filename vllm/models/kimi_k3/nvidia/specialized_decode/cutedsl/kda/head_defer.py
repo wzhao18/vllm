@@ -18,6 +18,7 @@ fold), so no CTA still reads them. Everything else is the stock heads' code.
 
 import cutlass
 import cutlass.cute as cute
+from ..common import diagstamp as ds
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
@@ -554,6 +555,10 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         request, block = rank // KDA_CTAS, rank % KDA_CTAS  # this CTA's KDA role
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        # DIAG (STAMP arm, KDA U1): epilogue lane kt 0 (tid 128) phase stamps,
+        # CTA key head * CLUSTER + rank
+        dbase, dctr = ds.buffer("kdahead", mB.shape[0])
+        saddr = ds.begin(dbase, dctr, head * CLUSTER + rank, tid == 128)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles)
@@ -649,7 +654,9 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset, request, block)
             early = self.multi_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            ds.stamp(saddr, 1)  # early state / conv rows loaded
             cute.arch.cluster_wait()
+            ds.stamp(saddr, 2)  # cluster barrier passed
             # the other B_ISSUERS - 1 warps of x's tiles
             b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -658,6 +665,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
+            ds.stamp(saddr, 3)  # in-proj partials pushed (MMA epilogue done)
             if cutlass.const_expr(self.rows_total == CLUSTER):  # one row per CTA
                 wait(bar_in)
                 self.round_owned(kt, x_in, mine)
@@ -670,6 +678,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                 self.round_owned(kt, x_in, mine)
                 named_barrier(1, 128)
                 self.multi_hop(kt, rank // T, rank % T, mine, raw_qk, raw_v, bar_hop)
+            ds.stamp(saddr, 4)  # in-proj rows reduced + hop 1 issued
             cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
             rows = (
                 shared_q, shared_k, shared_decay, shared_v, shared_o, reductions,
@@ -680,11 +689,14 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             self.multi_main(
                 kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
             )
+            ds.stamp(saddr, 5)  # recurrence + outputs (multi_main) done
             if cutlass.const_expr(T < KDA_CTAS):  # noqa: SIM102 (owners: the norm)
                 if rank < self.rows_total:
                     owned = (mine, shared_o, bar_out, output, norm_w, accepted)
                     self.owned_norm(kt, owned, slots, head, rank, eps)
+        ds.stamp(saddr, 6)  # owned norm done
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+        ds.stamp(saddr, 7)
 
 
     @cute.jit

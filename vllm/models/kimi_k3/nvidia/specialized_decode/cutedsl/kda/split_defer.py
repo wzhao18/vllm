@@ -16,6 +16,7 @@ barrier, which every CTA's token-0 outputs arrive on, i.e. after its fold)."""
 
 import cutlass
 import cutlass.cute as cute
+from ..common import diagstamp as ds
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
@@ -63,10 +64,15 @@ class KdaSplitDefer(RecoverKdaSplit):
             9:17
         ]
         T: cutlass.Constexpr = self.tokens
-        if cutlass.const_expr(not self.early):
-            cute.arch.griddepcontrol_wait()
         thread, _, _ = cute.arch.thread_idx()
         partition, head, token = cute.arch.block_idx()
+        # DIAG (STAMP arm, KDA U2): thread 0 phase stamps, CTA key (token, head, part)
+        nparts, nheads, _ = cute.arch.grid_dim()
+        dkey = (token * nheads + head) * nparts + partition
+        dbase, dctr = ds.buffer("kdasplit", x.shape[0])
+        saddr = ds.begin(dbase, dctr, dkey, thread == 0)
+        if cutlass.const_expr(not self.early):
+            cute.arch.griddepcontrol_wait()
         request, token = token, token * T
         taken = args[17][request]
         offset = taken - 1
@@ -109,6 +115,7 @@ class KdaSplitDefer(RecoverKdaSplit):
             if cutlass.const_expr(not self.early):
                 self.setup(barrier, gate_barrier, partition, thread)
                 cute.arch.cluster_wait()
+            ds.stamp(saddr, 1)  # setup / cluster barrier passed
             if thread >= 128:
                 if cutlass.const_expr(self.early):
                     cute.arch.cluster_arrive_relaxed()
@@ -160,8 +167,10 @@ class KdaSplitDefer(RecoverKdaSplit):
                     if pending > 0:
                         wait(rec_barrier, 0, scope="cta")
                         self.fold(history, rec, pending, value_base, group, group_lane)
+                ds.stamp(saddr, 2)  # state rows + taps loaded (+ early fold)
 
                 cute.arch.griddepcontrol_wait()
+                ds.stamp(saddr, 3)  # PDL wait returned (in-proj rows ready)
                 inputs = cute.make_rmem_tensor(3 * T, BFloat16)
                 betas, gates = [], []
                 for t in cutlass.range_constexpr(T):
@@ -265,6 +274,7 @@ class KdaSplitDefer(RecoverKdaSplit):
                     values = cute.make_tensor(pointer, cute.make_layout(self.rows))
                     return kr, qr, decays, values, betas[t]
 
+                ds.stamp(saddr, 4)  # conv + q/k normalized (late fold done)
                 record_page = page(records)
                 ready = operands(0)
                 for t in cutlass.range_constexpr(T):
@@ -294,6 +304,7 @@ class KdaSplitDefer(RecoverKdaSplit):
                         if cutlass.const_expr(t == 0):  # the one state store: slot 0
                             span = (start, stop)
                             self.store_rows(history, state_row, span, lanes, slot > 0)
+                ds.stamp(saddr, 5)  # recurrence over T tokens done, state stored
                 if thread < self.rows:
                     channel = 2 * dim + value_channel
                     window = (
@@ -334,6 +345,7 @@ class KdaSplitDefer(RecoverKdaSplit):
                                 )
                                 for i, value in enumerate(window):
                                     conv_page[channel, i] = conv_type(value)
+                ds.stamp(saddr, 7)  # outputs normalized + written (exit)
 
     @cute.jit
     def key_records(self, record_page, head, thread, shared_k, shared_decay):

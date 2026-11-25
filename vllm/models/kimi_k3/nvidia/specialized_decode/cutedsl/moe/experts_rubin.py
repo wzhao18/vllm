@@ -62,7 +62,10 @@ from ..common.primitives import (
     view,
 )
 from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
+from ..common import diagstamp as ds
 from .experts import ExpertsKernel, claim, mx_block, swizzled
+
+DIAG_RING = 2048  # DIAG (STAMP arm): gridid-keyed M8 stamp rows per CTA
 
 shuffle = cute.arch.shuffle_sync
 # Image plan (capacity 8): the experts' SMEM latent image as written by the routing
@@ -415,6 +418,8 @@ class RubinExpertsKernel(ExpertsKernel):
     kernel advances: the workspace is shared across batch sizes, so an odd number of
     other experts calls between two of this kernel's would otherwise hand it a parity
     whose images and slots its previous call left written."""
+
+    diag_ring = 0  # DIAG (STAMP arm): ring base (``ds.raw_buffer``) or 0
 
     def __init__(
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
@@ -1246,7 +1251,7 @@ class RubinExpertsKernel(ExpertsKernel):
             for s in cutlass.range(lo, hi, unroll=1):
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
                 self.sync(full.iterator + parts * slot, phase, True)
-                if cutlass.const_expr(self.stamp > 0):
+                if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
                     if (lane == 0) & (uses + (slot + phase) == 0):
                         stamp_at(trace, 7)
                 weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
@@ -1279,7 +1284,7 @@ class RubinExpertsKernel(ExpertsKernel):
                         part=None if parts == 1 else part,
                     )
                 cute.arch.sync_warp()
-                if cutlass.const_expr(self.stamp > 0):
+                if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
                     if (lane == 0) & (uses + (slot + phase) == 0):
                         stamp_at(trace, 5)
                 if last:
@@ -1410,8 +1415,17 @@ class RubinExpertsKernel(ExpertsKernel):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
         else:
             cute.arch.griddepcontrol_wait()
-        trace = workspace.iterator + self.stamp + cta * 128
-        if cutlass.const_expr(self.stamp > 0):
+        if cutlass.const_expr(self.diag_ring != 0):
+            # DIAG (STAMP arm): the benchmark stamps into a %gridid-keyed ring
+            # [DIAG_RING, grid, 128 B] (slot 6: the gridid), not the workspace.
+            gid = Int64(ds.gridid())
+            row = (gid & (DIAG_RING - 1)) * self.grid + Int64(cta)
+            trace = Int64(self.diag_ring) + row * 128
+            if tid == 0:
+                ds.st64(trace + 96, gid)
+        else:
+            trace = workspace.iterator + self.stamp + cta * 128
+        if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
             if tid == 0:
                 stamp_at(trace, 4)
         if cutlass.const_expr(self.polled):
@@ -1451,7 +1465,7 @@ class RubinExpertsKernel(ExpertsKernel):
         own = call_count
         if cutlass.const_expr(self.fast_exchange):
             own = view(sm.iterator, self.off_misc + 4880, Int32, 1)[0]
-        if cutlass.const_expr(self.stamp > 0):
+        if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
             if tid == 0:
                 stamp_at(trace, 0)
         ranges = self.partition(distinct, cta)
@@ -1487,7 +1501,7 @@ class RubinExpertsKernel(ExpertsKernel):
                     ready = sm.iterator + self.off_misc + self.bar_xready
                     ready = cute.recast_ptr(ready, dtype=Uint64)
                     self.quantize_x(sm, raw_x, ready, batch, shift)
-                    if cutlass.const_expr(self.stamp > 0):
+                    if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
                         if tid == 64:
                             stamp_at(trace, 6)
             if warp == 1:
@@ -1527,6 +1541,6 @@ class RubinExpertsKernel(ExpertsKernel):
                 self.epilogue(
                     sm, workspace, output, tmem, ranges, batch, own & 1, scalars
                 )
-        if cutlass.const_expr(self.stamp > 0):
+        if cutlass.const_expr(self.stamp > 0 or self.diag_ring != 0):
             if (lane == 0) & ((warp < 2) | (warp == 4)):
                 stamp_at(trace, 1 + warp - 2 * Int32(warp == 4))

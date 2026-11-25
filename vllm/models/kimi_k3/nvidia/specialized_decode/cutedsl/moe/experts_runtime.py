@@ -37,6 +37,8 @@ from .experts_rubin import (
 )
 from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
+from ..common import diagstamp as ds
+from .experts_rubin import DIAG_RING
 from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
 logger = init_logger(__name__)
@@ -193,6 +195,10 @@ def compile_rubin(
     scalars = (c.Int32(batch), *map(c.Float32, (100, 0.25, 0.04)), *box)
     scalars += (c.Int64(0), c.Int64(0))  # the w13 / w2 addresses
     with torch.accelerator.device_index(device):
+        # DIAG (STAMP arm): M8 phase stamps into a gridid-keyed ring (dumped per case)
+        moe.diag_ring = ds.raw_buffer(
+            "m8", grid, DIAG_RING * grid * 128, reset=False
+        )
         return cute.compile(moe, *tensors, *scalars, make_fake_stream())
 
 
@@ -289,9 +295,13 @@ def compile_wide(
     partial latent's address (``publish`` "twoshot": the wide tail's receive slots
     [3 x 16, ``cap``, 224], the owners' bases and this rank's slot instead), then the
     w13 / w2 addresses."""
+    trace = 0
+    if width != 8:  # DIAG (STAMP arm): VW per-warp regions (trace + 256 KiB) in-step
+        with torch.accelerator.device_index(device):
+            trace = ds.raw_buffer("vw", batch, 1 << 20)
     moe = wide_kernel(
         experts, grid, slots, batch, width, publish=publish, dies=dies,
-        static_groups=static, pool=pool,
+        static_groups=static, pool=pool, trace=trace,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
