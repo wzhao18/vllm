@@ -83,6 +83,9 @@ SMEM_DEFAULT = 227 * 1024
 
 
 class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
+    # DIAG (never merge): the finalize poll's back-off (ns); benchmarks set it per instance.
+    diag_backoff = 64
+
     """``RubinGroupedExpertsKernel`` at ``capacity`` (a multiple of 64, at most
     ``WIDE_MAX``) token rows; ``publish`` False or "local" (module docstring)."""
 
@@ -484,7 +487,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 bad |= (pair[0] == ones) | (pair[1] == ones)
             ready = cute.arch.vote_all_sync(not bad)
             if not ready:
-                sleep_ns(64)
+                sleep_ns(self.diag_backoff)
             sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         low = [Float32(0), Float32(0)]
         high = [Float32(0), Float32(0)]
