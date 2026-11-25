@@ -53,7 +53,7 @@ def ticket(address):
     return "atom.global.add.u32 $0,[$1],1;", "=r,l,~{memory}", (Int64(address),)
 
 
-EXPERT_ROWS = 8192  # grouped experts: CTA-call rows of 16 x 16 B, ring by ticket
+EXPERT_ROWS = 32768  # grouped experts: CTA-call rows of 16 x 16 B, ring by ticket
 _RING: dict = {}
 
 
