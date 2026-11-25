@@ -65,7 +65,7 @@ from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
 from .indexer import supports as fused_indexer_unsupported
 from .indexer_stage import IndexerStage
-from .overlap import QueryWait, index_stream, side_stream
+from .overlap import QueryWait, index_stream, late_fork, side_stream
 from .query_stage import compile_norm, index_pin, is_rubin
 from .query_stage import index_policies as query_index_policies
 from .r1 import DsaBox
@@ -545,6 +545,7 @@ class WideDsa:
         # cache IndexerScoreFp4 scores them (DeepGEMM's logits bit for bit). Its
         # owned-row outputs are shared by every DSA layer (merge_buffers).
         self.rubin = sms_of(self.device) > GB300_SMS
+        self.late_query = None  # the pending late query fork (forked_core)
         self.strict = target_topology(self.rubin, self.dcp, self.dcp, max(queries))
         stage_rows = rows if self.fp8 else 0
         buffers = merge_buffers(self.device, rows, self.topk) if self.fp8 else None
@@ -755,7 +756,8 @@ class WideDsa:
             source = stage.merge_source(batch)[0] if stage.local_topk else None
             args = self.q_fp8, self.head_w, md, stride_rows, batch
             merge = source == "merge" and batch in self.merged
-            merged = stage.merge_rows(*args, q) if merge else None
+            late, self.late_query = self.late_query, None
+            merged = stage.merge_rows(*args, q, after_logits=late) if merge else None
             if merged is None and source is None and self.strict and full_capture():
                 # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
                 # would capture the stock indexer op and the slot filter.
@@ -887,15 +889,35 @@ class WideDsa:
         box = self.boxes[batch]
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
-        side.wait_stream(main)
         qc = to_cute(self.qc[:batch])
         norm = self.norms[batch]
-        norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
-        with torch.cuda.stream(side):
-            mq(*q_args, *publish, stream(self.device))
+        # the late query fork (overlap.QUERY_FORK_AT): MlaQuery launches once the
+        # merge's logits are enqueued, else (no merge) at the join
+        pending = []
+
+        def fork():
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                mq(*q_args, *publish, stream(self.device))
+
+        def launch():
+            if pending:
+                pending.pop()()
+
+        if late_fork(batch, self.rubin, self.dcp > 1):
+            norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
+            pending.append(fork)
+            self.late_query = launch
+        else:
+            side.wait_stream(main)
+            norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
+            with torch.cuda.stream(side):
+                mq(*q_args, *publish, stream(self.device))
         mailbox = publish[0]
 
         def join():
+            launch()
+            self.late_query = None
             joining = torch.cuda.current_stream(self.device)
             joining.wait_stream(side)
             query_wait(mailbox, stream(self.device))

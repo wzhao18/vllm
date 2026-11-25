@@ -160,7 +160,15 @@ class IndexerStage:
         return None, 0
 
     def merge_rows(
-        self, q_fp8, head_w, metadata, stride_rows, batch, q=1, release=False
+        self,
+        q_fp8,
+        head_w,
+        metadata,
+        stride_rows,
+        batch,
+        q=1,
+        release=False,
+        after_logits=None,
     ):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
@@ -172,7 +180,9 @@ class IndexerStage:
         pack faults; no per-step check here (finite query, head weights and
         cached keys keep them finite). ``release``: the consumer (the DSA sparse
         core) reads the rows after its PDL wait, so the merge's rescue launches
-        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode."""
+        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode.
+        ``after_logits``: called once the logits are enqueued (the late query fork,
+        overlap.QUERY_FORK_AT)."""
         from vllm.forward_context import get_forward_context
         from vllm.model_executor.layers.indexer_topk import (
             SparseIndexerTopk,
@@ -221,6 +231,8 @@ class IndexerStage:
             # The logits stay valid until the merge returns (stream order): a
             # saturated rank re-reads its row in the exact merge's second round.
             packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
+            if after_logits is not None:
+                after_logits()
             dcp_topk_merge_rows(
                 logits=logits[:rows],
                 row_ends=ends[:rows],
@@ -234,6 +246,8 @@ class IndexerStage:
                 valid[rows:].zero_()
             return slots, valid
         logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+        if after_logits is not None:
+            after_logits()
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
         reqs = decode.decode_lens.shape[0]
