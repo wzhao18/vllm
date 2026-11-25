@@ -27,9 +27,10 @@ def _mailbox_rows(boxes, parity, rank, rows):
     return torch.cat(parts, dim=1)
 
 
-@pytest.mark.parametrize("sms", [8, 12, 16])
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("sms", [8, 12, 16, 56])
 @pytest.mark.parametrize("rows", [8])
-def test_shared_down_matches_splitk_down(sms, rows):
+def test_shared_down_matches_splitk_down(sms, rows, staged):
     from cutlass import Int32
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
@@ -63,7 +64,7 @@ def test_shared_down_matches_splitk_down(sms, rows):
     ]
     peers = torch.tensor([b.data_ptr() for b in boxes], dtype=torch.int64, device=dev)
     maps = weight_maps(gate_up, down)
-    code = compile_down(TP, rows, dev.index, sms)
+    code = compile_down(TP, rows, dev.index, sms, staged)
     for parity, rank in ((0, 3), (1, 11)):  # both ring halves, two source ranks
         code(
             to_cute(h), to_cute(maps, 64), to_cute(peers), Int32(parity), Int32(rank),
@@ -77,6 +78,71 @@ def test_shared_down_matches_splitk_down(sms, rows):
         torch.testing.assert_close(got, expect, rtol=1.6e-2, atol=1e-3)
         # -0 made +0 (the RS sums must not see a negative zero from this rank)
         assert not torch.signbit(got[got == 0]).any()
+
+
+@pytest.mark.parametrize("sms", [32, 56])
+def test_staged_down_behind_situ(sms):
+    """Staged SharedDown launched by PDL right behind the SiTU GEMM that writes h (as
+    ``SharedFront.shared_expert`` at 8 rows), back to back over fresh inputs without a
+    sync: every call's mailbox rows bitwise equal the unstaged kernel's on that h."""
+    from cutlass import Int32
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.splitk_situ import (
+        PreparedSitu,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import front
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.shared import (
+        compile_down,
+        weight_maps,
+    )
+
+    dev, rows = torch.device("cuda"), 8
+    hidden = 6144 // TP
+    g = torch.Generator(device=dev).manual_seed(sms)
+    gate_up = (torch.randn(2 * hidden, 7168, device=dev, generator=g) * 0.02).bfloat16()
+    down = (torch.randn(7168, hidden, device=dev, generator=g) * 0.02).bfloat16()
+    tactics = f"{front.SHARED_TACTICS[hidden][0]},{front.SHARED_WIDE[hidden][0]}"
+    situ = PreparedSitu(gate_up, {rows: front.batch_table(tactics)[rows]}, 4.0, 25.0)
+    maps = to_cute(weight_maps(gate_up, down), 64)
+    staged = compile_down(TP, rows, dev.index, sms, True)
+    plain = compile_down(TP, rows, dev.index, sms)
+
+    def boxes():
+        return [
+            torch.full((2 * TP * CAP * (7168 // TP),), float("nan"), device=dev).bfloat16()
+            for _ in range(TP)
+        ]
+
+    calls = 6
+    xs = [torch.randn(rows, 7168, device=dev, generator=g).bfloat16() for _ in range(calls)]
+    hs = [torch.empty(rows, hidden, device=dev, dtype=torch.bfloat16) for _ in range(calls)]
+    got = [boxes() for _ in range(calls)]
+    peers = [
+        torch.tensor([b.data_ptr() for b in bx], dtype=torch.int64, device=dev) for bx in got
+    ]
+    for i in range(calls):  # back to back, PDL edges SiTU -> SharedDown
+        situ.run(xs[i], hs[i])
+        staged(
+            to_cute(hs[i]), maps, to_cute(peers[i]), Int32(i & 1), Int32(5), Int32(CAP),
+            stream(dev),
+        )  # fmt: skip
+    torch.cuda.synchronize()
+    for i in range(calls):
+        ref = boxes()
+        rp = torch.tensor([b.data_ptr() for b in ref], dtype=torch.int64, device=dev)
+        plain(
+            to_cute(hs[i]), maps, to_cute(rp), Int32(i & 1), Int32(5), Int32(CAP),
+            stream(dev),
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        a = _mailbox_rows(got[i], i & 1, 5, rows)
+        b = _mailbox_rows(ref, i & 1, 5, rows)
+        assert not a.isnan().any(), f"call {i}: mailbox rows left unwritten"
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"call {i}"
 
 
 def test_situ_split_table_rows():

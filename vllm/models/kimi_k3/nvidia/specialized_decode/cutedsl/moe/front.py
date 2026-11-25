@@ -548,10 +548,16 @@ SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
 # the TP16 shard, so SharedDown on GB300's 3-6 SMs outlasts the experts there too).
 SPLITS_WIDE = {8: ("", "13-63:8,64:4"), 16: ("", "13-63:8,64:4")}
 # Rubin TP16 verify batches of at most 8 rows whose shared down rows run ``SharedDown``
-# on this many SMs beside the routed experts, behind the gate/up GEMM's SiTU epilogue
-# (``SITU_FUSED_WIDE``), instead of a split-K down GEMM the routed experts wait for
-# (they then pushed the shared rows themselves: ``tail_runtime.RUBIN_EXPERTS_PUSH``).
-SITU_SPLIT_WIDE = {16: ("", "8:12")}
+# on this many SMs, behind the gate/up GEMM's SiTU epilogue (``SITU_FUSED_WIDE``),
+# instead of a split-K down GEMM the routed experts wait for (they then pushed the
+# shared rows themselves: ``tail_runtime.RUBIN_EXPERTS_PUSH``). Staged: SharedDown
+# launches by PDL behind the SiTU GEMM, before routing releases the experts (after the
+# front GEMM), streams its W while the SiTU runs and leaves its SMs ~2 us after h; the
+# experts keep a grid of every SM (``moe.prepared``) and their last CTAs start there.
+# B1 MoE layer proxy (in-step h / routing times), us per layer vs the experts joining
+# the split-K down: 12 SMs beside the experts (grid 200) -0.50; staged on 32 / 56 / 80
+# / 112 SMs -0.88 / -0.94 / -0.87 / -0.79 (no shared expert at all: -1.50).
+SITU_SPLIT_WIDE = {16: ("", "8:56")}
 
 
 def split_table(tp, verify, wide):
@@ -748,7 +754,7 @@ class SharedFront:
         for b in batches:
             if situ_split.get(b) and b in fuse:
                 self.split[b] = situ_split[b]
-                self.situ_down[b] = compile_down(tp, b, dev, situ_split[b])
+                self.situ_down[b] = compile_down(tp, b, dev, situ_split[b], True)
         if fused or self.situ_down:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
             self.fused = to_cute(self.maps, 64), to_cute(counters) if fused else None
