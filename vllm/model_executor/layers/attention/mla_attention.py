@@ -1562,8 +1562,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         steps with more MQA rows in chunks of that many rows. Under DCP ShardQ
         these are the dense-MHA steps (and decode-only steps of long decode
         rows), whose MQA rows are the MLA builder's decode rows: up to
-        max_num_seqs x 1024 of them."""
+        max_num_seqs x 1024 of them.
+
+        A DCP ShardQ layer's passes also stay within the direct DCP
+        workspaces (``get_dcp_workspace_max_num_tokens``; the manager raises
+        past them instead of taking the NCCL fallback), so its chunks are at
+        most that many rows too."""
         row_cap = getattr(self.impl, "dcp_path_max_rows", None)
+        manager = self.dcp_manager
+        strict = manager is not None and manager.strict_direct_rows
+        if strict:
+            assert manager is not None
+            row_cap = (
+                manager.max_num_tokens
+                if row_cap is None
+                else min(row_cap, manager.max_num_tokens)
+            )
         if (
             row_cap is None
             or num_mqa_tokens <= row_cap
@@ -1577,6 +1591,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.dcp_decode_o_exchange is not None
             and num_mqa_tokens == num_tokens
             and attn_metadata.num_prefills == 0
+            and not strict
         ):
             # A model's decode exchange takes the whole step.
             return None
@@ -1805,6 +1820,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Let per-backend impls do their own weight packing first (no-op
         # unless overridden), mirroring Attention.process_weights_after_loading.
         self.impl.process_weights_after_loading(act_dtype)
+
+        if self.dcp_manager is not None:
+            # ShardQ is final now (a model may opt the layer in after
+            # construction): a DCP ShardQ layer's DCP-path passes fit the
+            # direct workspaces (_dcp_mqa_row_cap), so its manager raises
+            # instead of taking the NCCL fallback past them.
+            self.dcp_manager.strict_direct_rows = self.use_shardq
 
         if self.is_amx_bmm_enabled:
             # AMXMLAImpl already packed its own W_UK/W_UV above, for both

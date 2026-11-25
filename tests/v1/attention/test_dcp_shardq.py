@@ -1713,10 +1713,13 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
     ``index_format``).
 
     Its memory profile run (the layer without attention metadata) runs the DCP
-    path's collectives at the profile's size, beyond the direct workspace, so
-    the NCCL A2A connects its peers and allocates its buffers there, and warms
-    the A2A's Triton kernels: a later step that keeps the DCP path (here, one
-    that overflows the gathered-context workspace) compiles none of them.
+    path's collectives at the largest DCP-path step, which under DCP ShardQ
+    fits the direct workspaces (get_dcp_workspace_max_num_tokens): no NCCL A2A
+    over the DCP group, whose buffers the profile would have to account. A
+    later step that keeps the DCP path (here, one that overflows the
+    gathered-context workspace) runs in row chunks of that size on the direct
+    workspaces, takes no NCCL A2A and compiles none of its kernels; a pass past
+    the direct workspaces raises.
     """
     from tests.v1.attention.utils import create_vllm_config
     from vllm.config import CUDAGraphMode, set_current_vllm_config
@@ -1838,16 +1841,19 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                     dtype=torch.bfloat16,
                 ),
             )
-            # The NCCL query gather and A2A of the largest step that can still
-            # take the DCP path (the scheduler keeps whole prefill steps within
-            # the ShardQ workspace): every local head's query, and every head's
-            # partial outputs (and LSEs), of every token.
+            # The largest step that can still take the DCP path (the scheduler
+            # keeps whole prefill steps within the ShardQ workspace) fits the
+            # direct workspaces: the profile warms no NCCL A2A.
             fallback_tokens = dcp.dcp_fallback_max_tokens(
                 config, DeepseekV32IndexerMetadataBuilder.get_decode_threshold(config)
             )
-            assert gather_sizes
-            assert max(gather_sizes) >= fallback_tokens * local_heads * 512
-            assert a2a_sizes and max(a2a_sizes) >= fallback_tokens * LAYER_HEADS * 512
+            assert fallback_tokens == get_dcp_workspace_max_num_tokens(config)
+            direct = layer.dcp_manager.direct_a2a
+            if direct is not None:
+                assert direct.max_num_tokens == fallback_tokens
+                assert not a2a_sizes, a2a_sizes
+            # As process_weights_after_loading does for a ShardQ layer.
+            layer.dcp_manager.strict_direct_rows = layer.use_shardq
             torch.accelerator.synchronize()
 
             compiled: list[str] = []
@@ -1907,21 +1913,23 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                 index_metadata,
             )
             _layer_forward(layer, q, kv_c, k_pe, shard.mla, metadata)
-            # The step combined its outputs with the NCCL A2A.
-            assert len(a2a_sizes) > num_a2a
-            # Another number of requests and an odd number of tokens: with 4
-            # local heads, the A2A buffers' per-rank stride is then not a
-            # multiple of 16 elements.
-            num_seqs, odd_tokens = 5, num_tokens - 1
-            assert odd_tokens % 2 == 1 and odd_tokens > num_seqs
-            layer.dcp_manager.combine(
-                torch.zeros(odd_tokens, LAYER_HEADS, 512, device="cuda").bfloat16(),
-                torch.zeros(odd_tokens, LAYER_HEADS, device="cuda"),
-                seq_lens=torch.ones(num_seqs, dtype=torch.int32, device="cuda"),
-                query_start_loc=torch.tensor(
-                    [0, 1, 2, 3, 4, odd_tokens], dtype=torch.int32, device="cuda"
-                ),
-            )
+            if direct is not None:
+                # The step ran in row chunks on the direct workspaces.
+                assert len(a2a_sizes) == num_a2a, a2a_sizes[num_a2a:]
+                # A pass past them raises instead of taking the NCCL A2A.
+                odd_tokens = direct.max_num_tokens + 1
+                with pytest.raises(RuntimeError, match="DCP ShardQ"):
+                    layer.dcp_manager.combine(
+                        torch.zeros(
+                            odd_tokens, LAYER_HEADS, 512, device="cuda"
+                        ).bfloat16(),
+                        torch.zeros(odd_tokens, LAYER_HEADS, device="cuda"),
+                        seq_lens=torch.ones(1, dtype=torch.int32, device="cuda"),
+                        query_start_loc=torch.tensor(
+                            [0, odd_tokens], dtype=torch.int32, device="cuda"
+                        ),
+                    )
+                assert len(a2a_sizes) == num_a2a
             torch.accelerator.synchronize()
             monitoring[0] = False
             assert not [c for c in compiled if "_dcp_a2a" in c], compiled
@@ -1975,10 +1983,11 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
     step's peak memory stays below the profile run's, and its output is bit
     for bit the single pass's, which peaks far above it.
 
-    With ``capture_size`` (the CUDA graph capture bound, as served) the DCP
-    workspace and the chunks are that many rows, so the chunks gather and
-    combine through the direct symmetric-memory workspace while the single
-    pass, beyond it, takes the NCCL fallback; without, both take NCCL."""
+    Under DCP ShardQ the DCP workspace and the chunks are the few-token rows
+    whatever ``capture_size`` (the CUDA graph capture bound, as served), so
+    the chunks gather and combine through the direct symmetric-memory
+    workspace while the single pass (a non-strict manager here), beyond it,
+    takes the NCCL fallback."""
     from tests.v1.attention.utils import create_vllm_config
     from vllm.config import CUDAGraphMode, set_current_vllm_config
     from vllm.distributed import (
@@ -2047,15 +2056,12 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             registry.warmup()
             row_cap = layer.impl.dcp_path_max_rows
             # max_num_seqs x the indexer's decode threshold (1 token without
-            # speculation) + the ShardQ minimum - 1 = 32 x 1 + 1023, or the
-            # DCP workspace (the capture bound) if larger.
+            # speculation) + the ShardQ minimum - 1 = 32 x 1 + 1023: the DCP
+            # workspace's rows, whatever the capture bound.
             assert row_cap == trtllm_gen_lse_max_rows(config, True)
-            assert row_cap == max(1055, capture_size or 0)
+            assert row_cap == 1055
             direct = layer.dcp_manager.direct_a2a
-            if capture_size is not None:
-                assert direct is not None and direct.max_num_tokens == row_cap
-            else:
-                assert direct is None or direct.max_num_tokens < row_cap
+            assert direct is not None and direct.max_num_tokens == row_cap
             assert num_mqa == 30000 > 14 * row_cap
 
             def run(q, kv_c, k_pe, kv_cache, metadata, out) -> int:
@@ -2130,20 +2136,17 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             layer.impl.dcp_path_max_rows = row_cap
 
             assert torch.isfinite(chunked).all()
-            if capture_size is None:
-                assert torch.equal(chunked, out)
-            else:
-                # The chunks combine in the direct workspace, the single pass
-                # with the NCCL A2A fallback: two combine kernels whose bf16
-                # rounding differs (on any inputs), here on ~0.15% of the
-                # outputs. Through the NCCL A2A the chunks match bit for bit.
-                err = (chunked.float() - out.float()).norm() / out.float().norm()
-                assert err < 1e-3, err
-                single = out.clone()
-                direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
-                run(*step, out)
-                direct.max_num_tokens = direct_rows
-                assert torch.equal(out, single)
+            # The chunks combine in the direct workspace, the single pass
+            # with the NCCL A2A fallback: two combine kernels whose bf16
+            # rounding differs (on any inputs), here on ~0.15% of the
+            # outputs. Through the NCCL A2A the chunks match bit for bit.
+            err = (chunked.float() - out.float()).norm() / out.float().norm()
+            assert err < 1e-3, err
+            single = out.clone()
+            direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
+            run(*step, out)
+            direct.max_num_tokens = direct_rows
+            assert torch.equal(out, single)
             # Below the profile run's claim; the single pass is far above it.
             gib = 1 << 30
             print(
@@ -2162,8 +2165,8 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
 @pytest.mark.parametrize(
     "capture_size",
     [
-        pytest.param(None, id="nccl_collectives"),
-        pytest.param(2048, id="direct_collectives"),
+        pytest.param(None, id="no_capture_bound"),
+        pytest.param(2048, id="capture_bound_2048"),
     ],
 )
 def test_dense_mha_step_runs_the_dcp_path_in_row_chunks(capture_size, tmp_path):

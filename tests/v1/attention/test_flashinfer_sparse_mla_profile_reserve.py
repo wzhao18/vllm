@@ -213,12 +213,17 @@ def test_lse_max_rows():
         assert fi.trtllm_gen_lse_max_rows(cfg(512), dcp_shardq=True) == 512
 
 
-@pytest.mark.parametrize("capture_size, rows", [(2048, 2048), (0, 1279)])
-def test_dcp_fallback_rows_at_c512_prefill(capture_size, rows):
+@pytest.mark.parametrize(
+    "shardq, capture_size, rows",
+    [(True, 2048, 1279), (True, 0, 1279), (False, 2048, 2048), (False, 0, 1279)],
+)
+def test_dcp_fallback_rows_at_c512_prefill(shardq, capture_size, rows):
     """dcp_fallback_max_tokens (unpatched) at the Kimi K3.1 C512 prefill config
-    (max_num_seqs 64, 3 speculative tokens, sparse_mla_shard_q_min_tokens 1024,
-    max_cudagraph_capture_size 2048): the larger of 64 x 4 + 1024 - 1 = 1279
-    few-token rows and the 2048-token padded (FULL decode graph) steps."""
+    (max_num_seqs 64, 3 speculative tokens, sparse_mla_shard_q_min_tokens 1024):
+    64 x 4 + 1024 - 1 = 1279 few-token rows. Under DCP ShardQ the capture
+    bound does not enter (PIECEWISE graphs run attention eagerly; FULL graphs
+    are decode-only, at most 64 x 4 rows); without it a 2048-token capture
+    bound pads DCP-path steps to 2048 rows."""
     from vllm.v1.attention.ops.dcp_shardq.context import dcp_fallback_max_tokens
 
     cfg = SimpleNamespace(
@@ -229,7 +234,10 @@ def test_dcp_fallback_rows_at_c512_prefill(capture_size, rows):
         num_speculative_tokens=3,
         compilation_config=SimpleNamespace(max_cudagraph_capture_size=capture_size),
     )
-    with patch("vllm.v1.attention.ops.dcp.max_decode_query_len", return_value=4):
+    with (
+        patch("vllm.v1.attention.ops.dcp.max_decode_query_len", return_value=4),
+        patch("vllm.v1.attention.ops.dcp.dcp_shardq_configured", return_value=shardq),
+    ):
         assert dcp_fallback_max_tokens(cfg, 4) == rows
 
 
@@ -375,6 +383,9 @@ def _slab_rows(cfg, dcp_shardq=False):
             "vllm.v1.attention.ops.dcp.max_decode_query_len",
             return_value=1 + cfg.num_speculative_tokens,
         ),
+        # These configs leave out the fields the predicate reads; none of
+        # them is a DCP ShardQ instance (test_dcp_workspace_rows.py covers it).
+        patch("vllm.v1.attention.ops.dcp.dcp_shardq_configured", return_value=False),
     ):
         return fi.trtllm_gen_lse_slab_rows(cfg, dcp_shardq)
 
