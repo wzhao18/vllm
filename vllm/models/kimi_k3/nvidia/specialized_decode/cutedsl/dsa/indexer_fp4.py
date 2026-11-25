@@ -824,15 +824,6 @@ class IndexerScoreFp4:
             taddr = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16)
             out_base = logits.iterator.toint()
             pitch = Int64(self.pitch)
-            if cutlass.const_expr(self.topn):
-                # Requests without keys (CUDA-graph padding): empty B' rows.
-                width = self.topn + self.topn // 32
-                for rq in cutlass.range(bid, requests, self.ctas, unroll=1):
-                    if sStart[rq + 1] == sStart[rq]:
-                        for i in cutlass.range(tidx, Q * width, 32 * PRODUCER, unroll=1):
-                            out[rq * Q + i // width, i % width] = Int32(0)
-                        if tidx < Q:
-                            valid[rq * Q + tidx] = Int32(0)
             while g < hi:
                 req, k0, ntile, g, r = _next_item(sStart, requests, g, r, hi)
                 row0 = Int64(req * Q) * pitch
