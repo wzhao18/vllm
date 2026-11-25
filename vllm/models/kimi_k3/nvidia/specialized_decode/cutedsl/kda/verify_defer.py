@@ -33,6 +33,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from ..common.primitives import (
     alloc,
     at,
+    bits_float,
     copy_g2s,
     fma2,
     load_f32x4,
@@ -52,9 +53,28 @@ from .verify_half import (
 from .verify_loop import PAGE_BYTES, K, KdaVerifyLoopStock
 from .verify_packed import CHUNKS
 from .window import conv_put
+from vllm.v1.worker.mamba_utils import (
+    RECORD_DECAY_ROW,
+    RECORD_TAG_BITS,
+    RECORD_TAG_ROW,
+    RECORD_V_ROW,
+)
+
+
+@cute.jit
+def put_tag(record_page, head):
+    """The head's format tag (one thread, with the k / decay records)."""
+    record_page[head, TAG_ROW, 0] = bits_float(TAG_BITS)
 
 DECAY_ROW = 8  # record page rows: k 0 .. q - 2, decay 8 .., corrections 16 ..
 V_ROW = 16
+# The format tag (word 0 of row TAG_ROW, a NaN payload): written with the k / decay
+# records, read by the record-format readers outside these kernels (stock verify,
+# align copies: vllm.v1.worker.mamba_utils RECORD_TAG_ROW), whose untagged slot 1 is
+# the stock format.
+TAG_ROW = RECORD_TAG_ROW
+TAG_BITS = RECORD_TAG_BITS
+assert (DECAY_ROW, V_ROW) == (RECORD_DECAY_ROW, RECORD_V_ROW)
 RECORD_ROWS = V_ROW + 7  # rows staged with the state page (q <= 8)
 RECORD_BYTES = RECORD_ROWS * 128 * 4
 
@@ -239,6 +259,8 @@ class KdaVerifyHalfDefer(DeferTokens, KdaVerifyHalfStock):
                     record_page[head, DECAY_ROW + t - 1, thread] = shared_decay[
                         128 * t + thread
                     ]
+                if thread == 0:
+                    put_tag(record_page, head)
             if (thread < GROUP) & (half == 0):  # the conv window (one writer)
                 conv_state = args[3]
                 conv_page = conv_state[Int64(conv_slot), None, None]
@@ -461,6 +483,8 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                         record_page[head, DECAY_ROW + tt - 1, thread] = shared_decay[
                             128 * tt + thread
                         ]
+                    if thread == 0:
+                        put_tag(record_page, head)
                 cute.arch.sync_threads()
                 t, c, glane = thread // 64, thread % 64, thread % 32
                 if t < T:

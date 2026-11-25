@@ -39,7 +39,7 @@ from .head_multi import KdaHeadMulti
 from .head import store_bf16_canonical
 from .head_verify import KDA_CTAS, ROWS, KdaHeadVerify
 from .kernel import sigmoids
-from .verify_defer import DECAY_ROW, V_ROW
+from .verify_defer import DECAY_ROW, V_ROW, put_tag
 from .window import conv_put, conv_tap
 
 
@@ -81,6 +81,8 @@ class HeadRecords:
         for u in cutlass.range_constexpr(1, self.tokens):
             record_page[head, u - 1, kt] = shared_k[128 * u + kt]
             record_page[head, DECAY_ROW + u - 1, kt] = shared_decay[128 * u + kt]
+        if kt == 0:
+            put_tag(record_page, head)
 
     @cute.jit
     def head_fold(self, history, record_page, head, pending, value_base, group,

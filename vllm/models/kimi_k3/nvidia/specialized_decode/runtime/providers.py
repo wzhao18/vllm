@@ -682,6 +682,16 @@ class Attention:
             prepared = ((8, q),) if folded else ()
             dim_first = is_conv_state_dim_first()
             self.core = PreparedKda(attention, policies, dim_first, prepared=prepared)
+            # An FP32 state's verify kernels store the deferred-verify records
+            # (kda.verify_defer): the layer's stock verify and the align copies
+            # follow the record format (ops/kda_records.py).
+            if q > 1 and not runtime.bf16_state and not attention.use_recoverssm:
+                if attention.kda_spec_decode_backend == "flashinfer":
+                    raise RuntimeError(
+                        "Kimi K3 decode: the KDA record protocol (FP32 state) needs "
+                        "the native stock verify, not FlashInfer's packed decode"
+                    )
+                attention.state_records = True
             if folded:
                 self.fold64 = PreparedKdaInProj64(
                     weight, self.core, tactics[64][:4], tokens=q

@@ -31,7 +31,7 @@ from ..common.primitives import (
 )
 from .recover import KdaSplit as RecoverKdaSplit
 from .recover import advance, mul_rn, reciprocal, sqrt_approx
-from .verify_defer import DECAY_ROW, RECORD_BYTES, RECORD_ROWS, V_ROW
+from .verify_defer import DECAY_ROW, RECORD_BYTES, RECORD_ROWS, V_ROW, put_tag
 from .window import conv_tap
 
 
@@ -341,6 +341,8 @@ class KdaSplitDefer(RecoverKdaSplit):
         for u in cutlass.range_constexpr(1, self.tokens):
             record_page[head, u - 1, thread] = shared_k[128 * u + thread]
             record_page[head, DECAY_ROW + u - 1, thread] = shared_decay[128 * u + thread]
+        if thread == 0:
+            put_tag(record_page, head)
 
     @cute.jit
     def fold(self, history, rec, pending, value_base, group, group_lane):

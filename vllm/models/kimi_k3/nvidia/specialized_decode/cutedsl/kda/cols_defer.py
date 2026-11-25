@@ -27,7 +27,7 @@ from ..common.primitives import (
     zeros,
 )
 from .verify import BETA, GATE, V, KdaVerifyCols
-from .verify_defer import DECAY_ROW, RECORD_BYTES, RECORD_ROWS, V_ROW
+from .verify_defer import DECAY_ROW, RECORD_BYTES, RECORD_ROWS, V_ROW, put_tag
 
 
 class KdaVerifyColsDefer(KdaVerifyCols):
@@ -177,6 +177,8 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                         record_page[head, DECAY_ROW + u - 1, thread] = shared_decay[
                             128 * u + thread
                         ]
+                    if thread == 0:
+                        put_tag(record_page, head)
 
     @cute.jit
     def cols_fold(self, history, rec, pending, value_base, warp, lane):

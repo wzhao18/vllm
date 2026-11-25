@@ -664,6 +664,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
         self.use_recoverssm = self.cache_config.use_kda_recoverssm
+        # The deferred-verify state protocol (ops/kda_records.py): set by the
+        # specialized decode when its verify kernels store records (an FP32 state).
+        # The stock verify then reads and writes the record format and the align
+        # copies fold (vllm/v1/worker/mamba_utils.py record_state_heads).
+        self.state_records = False
         if self.cache_config.use_replayssm and not self.use_recoverssm:
             raise ValueError(
                 "Kimi-K3 supports --use-replayssm only with speculative decoding"
@@ -1293,6 +1298,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if attn_metadata_raw is None:
             return
 
+        from vllm.models.kimi_k3.nvidia.ops.kda_records import materialize
         from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
             chunk_kda_with_fused_gate,
             fused_recurrent_kda,
@@ -1342,6 +1348,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and m.num_prefills == 0
             and m.num_decodes == 0
         ):
+            # (stock-format checkpoints: never under the record protocol)
+            assert not self.state_records
             assert self.decode_conv1d_weight is not None
             assert self.decode_norm_weight is not None
             assert spec_state_indices_tensor is not None
@@ -1505,6 +1513,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
                     for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
                 )
+                if self.state_records:  # the accepted state into slot 0
+                    materialize(
+                        recurrent_state,
+                        spec_state_indices_tensor,
+                        num_accepted_tokens,
+                        m.num_spec_decodes,
+                    )
                 core_attn_out_spec, _ = fused_recurrent_kda(
                     q=q_spec,
                     k=k_spec,
@@ -1519,6 +1534,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     out=spec_out,
+                    records=self.state_records,
                 )
 
         # Prefill or plain-decode path.
