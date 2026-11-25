@@ -144,9 +144,9 @@ def test_index_policies_wide_rows():
     assert policies[64] == (64, 64, 1, 4)
     assert policies[72] == policies[96] == policies[128] == (64, 64, 2, 6)
     assert 256 not in policies and 768 not in policies
-    # Rubin: one K pass per CTA from 33 rows on (measured table), still none above 128
+    # Rubin: one K pass per CTA from 17 rows on (measured table), still none above 128
     rubin = index_policies([8, 32, 64, 72, 128, 256], rubin=True)
-    assert rubin[8] == (128, 8, 3, 4) and rubin[32] == (64, 32, 2, 6)
+    assert rubin[8] == (128, 8, 3, 4) and rubin[32] == (64, 32, 1, 8)
     assert rubin[64] == rubin[72] == rubin[128] == (64, 64, 1, 7)
     assert 256 not in rubin
 

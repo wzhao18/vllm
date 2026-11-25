@@ -43,7 +43,9 @@ def gate_columns(heads):
 RUBIN_INDEX_TACTICS = {
     8: (128, 8, 3, 4),
     16: (64, 16, 2, 6),
-    32: (64, 32, 2, 6),
+    # 32 rows: (64, 32, 2, 6) wins chained but loses in the step (its doubled grid
+    # takes SMs from the concurrent MlaQuery / QueryWait): keep one K pass.
+    32: (64, 32, 1, 8),
     64: (64, 64, 1, 7),
     128: (64, 64, 1, 7),
 }
@@ -53,11 +55,18 @@ def is_rubin(device):
     return torch.cuda.get_device_capability(device) == (10, 7)
 
 
+# wq_b rows above the split-K table whose pinned cuBLASLt algorithm also wins in the
+# TP16 decode step (the 256-row pin is faster alone but slower in the step, beside
+# the concurrent MlaQuery).
+INDEX_PIN_ROWS = (512,)
+
+
 def index_pin(weight, batches, rubin):
-    """Rubin wq_b rows above the split-K table that have a pinned cuBLASLt algorithm
+    """Rubin wq_b rows in ``INDEX_PIN_ROWS`` with a pinned cuBLASLt algorithm
     (``ltpin``, measured at exactly these rows): one LtPin over them, else None (the
     other rows above 128 run torch.mm, as the stock ``wq_index``)."""
-    rows = [b for b in batches if b > 128 and b in pinned_rows("wq_b")] if rubin else []
+    pinned = pinned_rows("wq_b")
+    rows = [b for b in batches if b in INDEX_PIN_ROWS and b in pinned] if rubin else []
     if not rows:
         return None
     return LtPin("wq_b", *weight.shape, rows, device=weight.device)

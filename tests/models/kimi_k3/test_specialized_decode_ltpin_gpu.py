@@ -92,7 +92,7 @@ def test_tp16_dispatch_rows():
     wq = _rand((4096, 1536), 0.02, 1)
     rows = [64, 128, 256, 320, 384, 512]
     assert index_pin(wq, rows, rubin=False) is None
-    assert sorted(index_pin(wq, rows, rubin=True).plans) == [256, 384, 512]
+    assert sorted(index_pin(wq, rows, rubin=True).plans) == [512]
     split_k = SimpleNamespace(kernels={64: None, 128: None})
     for kind, n in (("kda", 3216), ("dsa", 3040)):
         w = _rand((n, 7168), 0.02, 2)
