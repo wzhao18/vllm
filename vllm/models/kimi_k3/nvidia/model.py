@@ -126,6 +126,7 @@ from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.mxfp8 import (
     PackedMxfp8Linear,
     can_pack_mxfp8,
+    is_mxfp8_linear,
     takes_mxfp8_activation,
 )
 from vllm.models.kimi_k3.nvidia.ops import (
@@ -328,6 +329,39 @@ def use_sequence_parallel(vllm_config: VllmConfig) -> bool:
         and parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
         and (use_mega_moe or parallel_config.data_parallel_size > 1)
+    )
+
+
+def shared_expert_weight_dtype(shared: nn.Module) -> str:
+    """The replicated shared expert's weight format, for the startup layout line:
+    MXFP8 (the NVFP4 checkpoint's ModelOpt MXFP8 group, or online MXFP8), BF16
+    (unquantized, e.g. the MXFP4-hl checkpoint), else the quant method's name."""
+    linear = shared.gate_up_proj
+    if is_mxfp8_linear(linear):
+        return "MXFP8"
+    if isinstance(linear.quant_method, UnquantizedLinearMethod):
+        return "BF16"
+    return type(linear.quant_method).__name__
+
+
+def pd_prefill_moe_layout_line(
+    vllm_config: VllmConfig, shared: nn.Module
+) -> str | None:
+    """The P/D prefill worker's startup INFO line naming its MoE layout (SP+EP; no
+    token shard, no fallback), the replicated shared experts' weight format (whose
+    memory sets the KV capacity) and where the KV token capacity is reported (vLLM's
+    'GPU KV cache size: N tokens' line, logged once the KV cache is sized after model
+    load). None on other roles / layouts. Logging only."""
+    if not (pd_prefill_worker(vllm_config) and use_sequence_parallel(vllm_config)):
+        return None
+    parallel = vllm_config.parallel_config
+    tp = parallel.tensor_parallel_size
+    ep = tp * parallel.data_parallel_size
+    return (
+        f"Kimi K3 P/D prefill MoE layout: SP+EP (TP{tp} sequence-parallel token "
+        f"shards, EP{ep} MegaMoE, replicated shared experts); shared-expert weights "
+        f"{shared_expert_weight_dtype(shared)}; KV token capacity: see the 'GPU KV "
+        "cache size: N tokens' line (logged after the KV cache is sized)."
     )
 
 
@@ -943,6 +977,10 @@ class KimiMoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        if self.shared_experts is not None:
+            layout = pd_prefill_moe_layout_line(vllm_config, self.shared_experts)
+            if layout is not None:
+                logger.info_once(layout)
 
         self.routed_expert_down_proj: ReplicatedLinear | None
         self.routed_expert_norm: RMSNorm | None
