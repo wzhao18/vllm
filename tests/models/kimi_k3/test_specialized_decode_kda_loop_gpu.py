@@ -224,7 +224,7 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     kernel = prepared.make_kernel((heads, requests, 0, bias, schedule, q, False), RUBIN)
     stock_kinds = (
         prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
-        prepared.KdaVerifyHalfStock,
+        prepared.KdaVerifyHalfPair,
     )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
@@ -313,7 +313,8 @@ HALF_SHAPES = [(8, 16), (8, 17), (8, 4), (4, 16), (5, 8)]
 
 @pytest.mark.parametrize("q,requests", HALF_SHAPES, ids=lambda v: str(v))
 @pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
-def test_half_equals_loopstock(monkeypatch, q, requests, pad):
+@pytest.mark.parametrize("kind", ["halfstock", "halfscratch"])  # DSMEM pair / scratch
+def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)
@@ -323,7 +324,7 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad):
         table[padded] = -1
         accepted[padded] = 0
     projected = projected_rows(requests * q)
-    half = core_of(attention, requests, q, "halfstock", base, monkeypatch)
+    half = core_of(attention, requests, q, kind, base, monkeypatch)
     want = run(
         core_of(attention, requests, q, "loopstock", base, monkeypatch),
         projected, base, table, accepted,
@@ -333,9 +334,13 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad):
         assert_bitwise("output", got[0], want[0])
         assert_bitwise("recurrent state", got[1][1], want[1][1])
         assert_bitwise("conv state", got[1][0], want[1][0])
-    # two arrivals per live item and call, none for a padding request
+    # scratch: two arrivals per live item and call, none for a padding request; the
+    # DSMEM pair never touches the counters
     counts = set(half.halves[(requests, q)][1].tolist())
-    assert counts <= {0, 4} and 4 in counts, counts
+    if kind == "halfscratch":
+        assert counts <= {0, 4} and 4 in counts, counts
+    else:
+        assert counts == {0}, counts
 
 
 def test_half_policy_rows():

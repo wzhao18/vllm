@@ -815,7 +815,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyFeed: "feed",
-        prepared.KdaVerifyHalfStock: "halfstock",
+        prepared.KdaVerifyHalfPair: "halfstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",

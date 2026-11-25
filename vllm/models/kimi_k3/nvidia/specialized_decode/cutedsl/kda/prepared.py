@@ -22,7 +22,7 @@ from .kernel import KdaSplit
 from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
 from .verify_feed import KdaVerifyFeed
-from .verify_half import KdaVerifyHalfStock
+from .verify_half import KdaVerifyHalfPair, KdaVerifyHalfStock
 from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
 from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
@@ -224,10 +224,11 @@ FP32_VERIFY_WIDE: dict = {
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
 WIDE_KINDS = (
     KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
-    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfStock,
+    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfPair,
+    KdaVerifyHalfStock,
 )
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
-              "loop", "loopstock", "feed", "halfstock")
+              "loop", "loopstock", "feed", "halfstock", "halfscratch")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
 # staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
 # constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
@@ -263,8 +264,13 @@ FP32_FEED_KIND = 8
 # instruction issue and checkpoint store rates, warps 0-3 +2.7 us of prologue);
 # two CTAs per item halve each SM's share. Keyed by q and heads (TP16's 6; other
 # head counts, e.g. the SP decode's 24, keep their rows).
+# The halves run as a cluster of two and exchange their outputs over DSMEM
+# (``KdaVerifyHalfPair``, bitwise): 1-GPU KDA chain (carve-out-100 AttnRes stand-in ->
+# in-projection 64.64.2.6 -> verify -> o-proj stand-in, 69 layers, us per layer) q8 B16
+# 25.82 -> 24.18 vs the global scratch + arrival counter exchange (10, "halfscratch").
 FP32_HALF: dict = {(10, 7): {8: {6: "16-17:1"}}}
 FP32_HALF_KIND = 9
+HALF_KINDS = (9, 10)  # kinds that take the scratch + counter operands
 # FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
 # at the geometry given ("early.lanes.occupancy.cluster", as SPEC_SCHEDULE), in place
 # of FP32_VERIFY_WIDE / FP32_FEED's kernel and on top of DEVICE_SPEC_SCHEDULE(_Q)'s
@@ -543,7 +549,7 @@ class PreparedKda:
             capability = torch.cuda.get_device_capability(self.device)
             bf16_state = caches[1].dtype == torch.bfloat16
             kind = wide_kind(requests, tokens, capability, bf16_state, mode, self.heads)
-            if kind == FP32_HALF_KIND and tokens > 1 and key not in self.prepared:
+            if kind in HALF_KINDS and tokens > 1 and key not in self.prepared:
                 items, device = requests * self.heads, self.device
                 self.halves[key] = (
                     torch.zeros(items, 2 * tokens * 128, dtype=torch.float32, device=device),
