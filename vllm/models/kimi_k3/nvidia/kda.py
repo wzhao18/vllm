@@ -82,6 +82,7 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
     CheckpointRows,
     contiguous_rows,
+    split_in_proj,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -1106,9 +1107,26 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             )[:3]
             beta = contiguous_rows(beta)
             g1 = self.f_b_proj(f_a)[0]
+        elif (
+            qa is not None
+            and self._prefill_conv_in_proj is not None
+            and (pending := sp_all_gather.take_pending(qa)) is not None
+        ):
+            # Overlapped SP gather without the fused conv GEMM (CUDA-graph
+            # capture, mixed batches): the "ag" q|k|v GEMM + cuBLAS g|f_a|beta;
+            # the conv runs in _forward as on the stock path.
+            mixed_qkv, projected_rest = split_in_proj(
+                self._prefill_conv_in_proj, qa, pending
+            )
+            g_proj_states, f_a, beta = projected_rest.split(
+                [self.local_projection_size, self.head_dim, self.local_num_heads],
+                dim=-1,
+            )[:3]
+            beta = contiguous_rows(beta)
+            g1 = self.f_b_proj(f_a)[0]
         else:
-            # A pending overlapped SP gather (no fused GEMM took it) completes
-            # before the stock in_proj reads the rows.
+            # A pending overlapped SP gather nobody took completes before the
+            # stock in_proj reads the rows.
             sp_all_gather.complete_pending()
             projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
             split_sizes = [

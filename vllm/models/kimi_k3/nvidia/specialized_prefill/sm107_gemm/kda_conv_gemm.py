@@ -225,6 +225,58 @@ def cluster_rows(tactic) -> int:
     return cta_m * cm
 
 
+class AgPlainGemm:
+    """BF16 ``x @ W.T`` (plain epilogue) in the "ag" form: the rows of ``x``
+    from peers land while it runs (``ag_wait``; the overlapped SP all-gather).
+    CUDA-graph capturable: every flag it reads is device-side."""
+
+    def __init__(self, weight_nk, scale, tactic):
+        self.weight, self.scale = weight_nk, scale
+        self.tactic = ag_tactic(tactic)
+        self.n, self.k = weight_nk.shape
+        self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
+        self._compiled = None
+
+    _ZCONV = None
+
+    @classmethod
+    def _zconv(cls):
+        # conv_out .. conv_norm, conv_nseq/top/nsteps, sched_ctr/die_map,
+        # conv_ckpt/halo: unused by the plain epilogue.
+        z64, z32 = cutlass.Int64(0), cutlass.Int32(0)
+        return (z64,) * 5 + (z32,) * 3 + (z64,) * 4
+
+    def __call__(self, x, x_scale, out, ag):
+        from cutlass.cute.runtime import from_dlpack
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
+        args = (*args, from_dlpack(self.alpha))
+        zc = self._zconv()
+        if self._compiled is None:
+            key = ("agplain", self.tactic, x.device.index, self.n, self.k)
+            self._compiled = _COMPILED.get(key)
+            if self._compiled is None:
+                gemm = _Kernel(self.tactic)
+                cl = self.tactic[1]
+                mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+                layouts = (
+                    OperandMajorMode.K,
+                    OperandMajorMode.K,
+                    cutlass_utils.LayoutEnum.ROW_MAJOR,
+                )
+                self._compiled = cute.compile(
+                    gemm, *args, layouts, problem, mac, stream, lambda v: v,
+                    tail[0], None, *tail[1:], True,
+                    None, None, cutlass.Int64(0), cutlass.Int64(0), None, *zc, *_ag_args(ag),
+                )  # fmt: skip
+                _COMPILED[key] = self._compiled
+        self._compiled(
+            *args, problem, stream, *tail, cutlass.Int64(0), cutlass.Int64(0), *zc, *_ag_args(ag)
+        )
+        ag.launch_pushers()
+
+
 def shape_tactic(n: int, tactic):
     """``tactic`` fitted to an ``n``-column problem, or ValueError.
 

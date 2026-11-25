@@ -190,6 +190,47 @@ def _worker(local_rank: int, world_size: int, port: int, q: mp.Queue):
                     sp_ag.complete_pending()
                     torch.accelerator.synchronize()
                     assert torch.equal(oqa2.data.view(torch.uint8), ref_bytes), (it, rows)
+            # CUDA graph: capture [overlapped gather -> "ag" q|k|v GEMM], replay
+            # with new shards (varying plan, same rows), exact against the
+            # stock gather + the plain GEMM each time.
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+                AgPlainGemm,
+                PlainGemm,
+            )
+
+            wsf = ws.view(torch.uint8).reshape(-1)
+            agp = AgPlainGemm(wq, wsf, gemm.tactic)
+            ref_gemm = PlainGemm(wq, wsf, tactic=gemm.tactic)
+            rows = 2048
+            m = rows * world_size
+            x = _shard(900, local_rank, rows, device)
+            sqa = qa_of(x)
+            out_g = torch.empty(m, 3 * P, dtype=torch.bfloat16, device=device)
+            for _ in range(2):  # eager warm-up (compile) of the captured sequence
+                o = sp_ag.kimi_sp_all_gather_mxfp8_overlapped(sqa, m, cl)
+                agp(o.data, o.scale.view(torch.uint8).reshape(-1), out_g, sp_ag.take_pending(o))
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                o = sp_ag.kimi_sp_all_gather_mxfp8_overlapped(sqa, m, cl)
+                agp(o.data, o.scale.view(torch.uint8).reshape(-1), out_g, sp_ag.take_pending(o))
+            torch.accelerator.synchronize()
+            say("captured")
+            for rep in range(4):
+                x = _shard(1000 + rep, local_rank, rows, device)
+                nqa = qa_of(x)
+                sqa.data.copy_(nqa.data)
+                sqa.scale.copy_(nqa.scale)
+                _sleep_us(30 if local_rank == rep % world_size else 0)
+                graph.replay()
+                torch.accelerator.synchronize()
+                got = out_g.clone()
+                ref_qa = sp_ag.kimi_sp_all_gather_mxfp8(nqa, m)
+                ref = torch.empty_like(out_g)
+                ref_gemm(ref_qa.data, ref_qa.scale.view(torch.uint8).reshape(-1), ref)
+                torch.accelerator.synchronize()
+                assert torch.equal(got, ref), (rep, (got != ref).sum())
+                say(f"replay {rep} exact")
             q.put(None)
         except Exception as e:  # noqa: BLE001
             import traceback

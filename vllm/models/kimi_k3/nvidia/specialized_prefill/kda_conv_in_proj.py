@@ -94,6 +94,7 @@ class PrefillKdaConvInProj:
         self.layer = layer
         self.p = layer.local_projection_size
         self._gemm = None
+        self._ag_plain = None
 
     def prepare(self, max_num_seqs: int) -> None:
         """After weight loading, before any forward: views of the q|k|v and
@@ -148,6 +149,15 @@ class PrefillKdaConvInProj:
             self._gemm(
                 x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID,
                 ag=_LocalAg(ctr.data_ptr(), rows // cluster_rows(ag_tactic(self._gemm.tactic))),
+            )  # fmt: skip
+            # The graph-capturable form (no conv epilogue): q|k|v columns only.
+            from .sm107_gemm.kda_conv_gemm import AgPlainGemm
+
+            self._ag_plain = AgPlainGemm(self._gemm.weight, self._gemm.scale, self._gemm.tactic)
+            qkv = torch.empty(rows, nq, dtype=torch.bfloat16, device=dev)
+            self._ag_plain(
+                x, sx, qkv,
+                _LocalAg(ctr.data_ptr(), rows // cluster_rows(ag_tactic(self._gemm.tactic))),
             )  # fmt: skip
             torch.cuda.synchronize(dev)
             sp_ag.enable_overlap(idle, cluster_rows(ag_tactic(self._gemm.tactic)))
@@ -240,6 +250,30 @@ class PrefillKdaConvInProj:
         if rest.shape[-1] != self.rest_cols:
             rest = rest[:, : self.rest_cols]  # drop the in_proj padding rows
         return planes, rest, ckpt_rows
+
+
+def split_in_proj(conv_in_proj: "PrefillKdaConvInProj", qa, ag):
+    """The in_proj of a pending overlapped SP gather where the fused conv GEMM
+    does not run (CUDA-graph capture, mixed batches): the "ag" sm_107 GEMM
+    over the q|k|v columns (raw, pre-conv: the KDA break runs the conv) while
+    the pushers land the peers' rows, then cuBLAS over g|f_a|beta. Returns
+    ``(q|k|v [T, 3P], g|f_a|beta [T, rest])``; the same split and kernels as
+    the eager fused path, without its conv epilogue."""
+    self = conv_in_proj
+    assert self._ag_plain is not None
+    m = qa.data.shape[0]
+    qkv = torch.empty(m, 3 * self.p, dtype=torch.bfloat16, device=qa.data.device)
+    self._ag_plain(qa.data, qa.scale.view(torch.uint8).reshape(-1), qkv, ag)
+    rest = torch._scaled_mm(
+        qa.data,
+        self.w_rest.t(),
+        scale_a=qa.scale.view(torch.float8_e8m0fnu),
+        scale_b=self.s_rest.view(torch.float8_e8m0fnu),
+        out_dtype=torch.bfloat16,
+    )
+    if rest.shape[-1] != self.rest_cols:
+        rest = rest[:, : self.rest_cols]
+    return qkv, rest
 
 
 class _LocalAg(NamedTuple):
