@@ -509,8 +509,9 @@ class PreparedDsa:
         stage = self.indexer_stage
         if scorer:
             if not fp4_unsupported:
-                # Logits only: DeepSelect + pack take the local top-N (the fused
-                # local select is slower than them on Rubin).
+                # Logits only: DeepSelect + pack take the local top-N
+                # (IndexerLocalTopk, even publishing into the mailbox itself, is
+                # no faster: 1-node chain, L1 round 5 E1).
                 stage.fused = FusedIndexer(
                     self.indexer,
                     self.shapes,

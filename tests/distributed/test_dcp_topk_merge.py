@@ -241,6 +241,98 @@ def _check_cases(group, ws, n: int) -> None:
             _assert_rows(group, ids2, rows_out, valid_out, req_id, block_table)
 
 
+def _check_published(group, ws, n: int) -> None:
+    """A producer that multicasts its B' rows into the round-1 mailbox itself
+    (the fused DCP indexer's IndexerLocalTopk, ``published=``): the merge runs no
+    pack kernel and selects exactly what the DeepSelect + pack path selects; so
+    does the select with the rescue folded in (``release=``)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
+        IndexerLocalTopk,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge import packed_row_words
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge_rows,
+        dcp_topk_round1_mailbox,
+    )
+
+    if n >= 1024:  # IndexerLocalTopk's scanned counts (LOCAL_ABOVE_BITS)
+        return
+    world, rank = group.world_size, group.rank_in_group
+    box = dcp_topk_round1_mailbox(TOPK, n)
+    assert box is not None
+    long = [100_000, 40_000, 9_000, 70_123, 150_000, 6_000]
+    cases = [
+        ("normal", [100_000, 40_000, 9_000, 70_123, 2_049, 1, 0, world * 66_000], []),
+        ("sat1", long, [world - 1]),
+        ("short", [300, 1_000, 3_000, 9_000, 20_000, 120], [0]),
+    ]
+    for seed, (name, lengths, sat) in enumerate(cases):
+        num_rows = len(lengths)
+        logits, ends = _make_case(lengths, seed=seed + 100)
+        if sat:
+            logits = _boost(logits, sat, slice(None), world)
+        local, local_end = _shard(logits, ends, world, rank)
+        pitch = local.shape[1]
+        req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+        block_table = _block_table(num_rows, int(local_end.max()))
+        results = []
+        # Rows <= SMs: the rescue inside the select ("folded": release=).
+        for mode in ("logits", "published", "folded"):
+            rows_out = torch.full(
+                (num_rows, TOPK), -7, dtype=torch.int32, device="cuda"
+            )
+            valid_out = torch.full((num_rows,), -7, dtype=torch.int32, device="cuda")
+            ids = torch.full_like(rows_out, -7)
+            packed = None
+            if mode == "published":
+                packed = torch.zeros(
+                    (num_rows, packed_row_words(n)), dtype=torch.int32, device="cuda"
+                )
+                counts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+                args = (
+                    to_cute(local.view(torch.int16).reshape(-1)),
+                    to_cute(local_end, 4),
+                    to_cute(packed, 4),
+                    to_cute(counts, 4),
+                    to_cute(box.ordinals[:num_rows], 4),
+                    cutlass.Int64(box.box_mc),
+                    cutlass.Int32(box.rank),
+                    cutlass.Int32(box.max_rows),
+                    stream(torch.device("cuda")),
+                )
+                select = IndexerLocalTopk(num_rows, n, pitch, world)
+                cute.compile(select, *args)(*args)
+            dcp_topk_merge_rows(
+                logits=local,
+                row_ends=local_end,
+                packed=packed,
+                published=packed is not None,
+                release=mode == "folded",
+                local_topk=n,
+                topk=TOPK,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=_BLOCK,
+                stride_rows=_BLOCK,
+                dcp_rank=rank,
+                rows_out=rows_out,
+                valid_out=valid_out,
+                ids_out=ids,
+            )
+            _assert_exact(ids, logits, ends)
+            _assert_same_on_every_rank(group, ids, f"{name}/{mode}")
+            _assert_rows(group, ids, rows_out, valid_out, req_id, block_table)
+            results.append(_as_lists(ids))
+        assert results[0] == results[1] == results[2], name
+
+
 def _check_nonfinite(group, n: int) -> None:
     """NaN / +-inf logits: ids stay in range, never select a NaN, agree on
     every rank, and rows without a NaN keep the exact top-K."""
@@ -1040,6 +1132,7 @@ def run_worker(
                 _check_error_after_publish(group, n)
                 return
             if mailbox:
+                _check_published(group, ws, n)
                 _check_exchange_ab(group, ws, n)
                 _check_late_publisher(group, n)
                 _check_graph_stress(group, ws, n, stress_replays)
