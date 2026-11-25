@@ -22,6 +22,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
     at,
+    copy_g2s,
     fma,
     load_f32x4,
     named_barrier,
@@ -31,6 +32,9 @@ from ..common.primitives import (
     zeros,
 )
 from . import head_multi, head_verify
+from .head import CLUSTER, INPUT_BYTES, SECTIONS
+from .head_multi import TOKEN_INPUTS
+from .head_verify import _smem, cute_ext, sm100_utils, utils
 from .head_multi import KdaHeadMulti
 from .head import store_bf16_canonical
 from .head_verify import KDA_CTAS, ROWS, KdaHeadVerify
@@ -80,54 +84,223 @@ class HeadRecords:
 
     @cute.jit
     def head_fold(self, history, record_page, head, pending, value_base, group,
-                  group_lane):  # fmt: skip
+                  group_lane, kt, staging):  # fmt: skip
         """The ``pending`` accepted tokens 1 .. pending into the thread's row (pass 0)
-        from the records in global memory (before the PDL wait), ``rolled_update``'s
-        decay and update instructions; the next token's records load while this one
-        folds."""
+        before the PDL wait, ``rolled_update``'s decay and update instructions. The
+        k / decay record rows of the pending tokens are cp.async-staged into
+        ``staging`` (the q / k buffers: their remote q / k arrive only after every
+        KDA CTA's hop, i.e. after this fold), the row's corrections loaded up front."""
         vk = self.vkda
-        chunks: cutlass.Constexpr = vk.chunks
-        ops = cute.make_rmem_tensor((2, 2, chunks, 4), Float32)  # [buffer, k | decay]
-        vs = cute.make_rmem_tensor(2, Float32)
+        stage_k, stage_d = staging
         row = value_base + group % ROWS
-        for i in cutlass.range_constexpr(2):  # tokens 1 and 2 (clamped: valid rows)
-            self.fold_load(ops, vs, i, i, record_page, head, row, group_lane)
-        for pair in cutlass.range((pending + 1) // 2, unroll=1):
-            for b in cutlass.range_constexpr(2):  # (constant buffer indices)
-                i = 2 * pair + b
-                if i < pending:
-                    for j in cutlass.range_constexpr(chunks):
-                        for e in cutlass.range_constexpr(4):
-                            history[0, j, e] *= ops[b, 1, j, e]
-                    v_new = vs[b]
-                    for j in cutlass.range_constexpr(chunks):
-                        for e in cutlass.range_constexpr(4):
-                            history[0, j, e] = fma(
-                                ops[b, 0, j, e], v_new, history[0, j, e],
-                                ftz=vk.fast_math,
-                            )  # fmt: skip
-                    following = cutlass.select_(i + 2 < 6, i + 2, Int32(6))
-                    self.fold_load(ops, vs, b, following, record_page, head, row,
-                                   group_lane)  # fmt: skip
-
-    @cute.jit
-    def fold_load(self, ops, vs, b, i, record_page, head, row, group_lane):
-        vk = self.vkda
-        for j in cutlass.range_constexpr(vk.chunks):
-            column = 4 * (group_lane + vk.lanes_per_row * j)
-            k4 = load_f32x4(at(record_page, head, i, column))
-            d4 = load_f32x4(at(record_page, head, DECAY_ROW + i, column))
-            for e in cutlass.range_constexpr(4):
-                ops[b, 0, j, e] = k4[e]
-                ops[b, 1, j, e] = d4[e]
-        vs[b] = record_page[head, V_ROW + i, row]
+        for which in cutlass.range_constexpr(2):  # k rows 0 .., decay rows 8 ..
+            target = (stage_k, stage_d)[which]
+            for c in cutlass.range_constexpr(2):
+                index = kt + 128 * c
+                if index < 7 * 32:
+                    r, column = index // 32, 4 * (index % 32)
+                    if r < pending:
+                        source = at(record_page, head, DECAY_ROW * which + r, column)
+                        copy_g2s(target.iterator + r * 128 + column, source)
+        cute.arch.cp_async_commit_group()
+        vs = [record_page[head, V_ROW + i, row] for i in range(7)]
+        cute.arch.cp_async_wait_group(0)
+        named_barrier(4, 128)  # every thread's staged chunks
+        for i in cutlass.range_constexpr(7):
+            if i < pending:
+                for j in cutlass.range_constexpr(vk.chunks):
+                    column = 4 * (group_lane + vk.lanes_per_row * j)
+                    d4 = load_f32x4(stage_d.iterator + i * 128 + column, shared=True)
+                    for e in cutlass.range_constexpr(4):
+                        history[0, j, e] *= d4[e]
+                for j in cutlass.range_constexpr(vk.chunks):
+                    column = 4 * (group_lane + vk.lanes_per_row * j)
+                    k4 = load_f32x4(stage_k.iterator + i * 128 + column, shared=True)
+                    for e in cutlass.range_constexpr(4):
+                        history[0, j, e] = fma(
+                            k4[e], vs[i], history[0, j, e], ftz=vk.fast_math
+                        )
+        named_barrier(4, 128)  # the staging buffers read before anyone reuses them
 
 
 class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
     """``KdaHeadVerify`` under the deferred protocol (module docstring)."""
 
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, a_map: cutlass.Int64,
+        conv_w: cute.Tensor, bias: cute.Tensor, conv_state: cute.Tensor,
+        fa_beta: cute.Tensor, a_log: cute.Tensor, dt_bias: cute.Tensor,
+        slots: cute.Tensor, state: cute.Tensor, output: cute.Tensor,
+        norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
+        lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
+        target: Int32, out_rearm: cutlass.Int64,
+    ):  # fmt: skip
+        T: cutlass.Constexpr = self.tokens
+        stages, staged = self.num_ab_stage, self.tmem_tiles > 0
+        ab_dtype = mA.element_type
+        majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            ab_dtype, ab_dtype, *majors, self.acc_dtype, self.cta_group,
+            self.mma_tiler_mn,
+        )  # fmt: skip
+        mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+        rank, head, _ = cute.arch.block_idx()
+        section, split_rank = rank % SECTIONS, rank // SECTIONS
+        row0 = section * self.dim + head * 128
+        token, partition = rank // 2, rank % 2  # hop 1: this CTA's token inputs
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tid, _, _ = cute.arch.thread_idx()
+
+        a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
+        b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles if staged else stages)
+        sA = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*a_shape))
+        sB = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_b(*b_shape))
+        acc_layout = cute_ext.make_tmem_layout_acc(
+            tiled_mma, self.mma_tiler_mn, acc_stage=1
+        )
+        bar_full = _smem(cutlass.Int64, stages, 8).iterator
+        bar_empty = _smem(cutlass.Int64, stages, 8).iterator
+        b_full = _smem(cutlass.Int64, self.k_tiles if staged else 1, 8).iterator
+        bar_mma_epilog = _smem(cutlass.Int64, 1, 8).iterator
+        bar_tmem_alloc = _smem(cutlass.Int64, 1, 8).iterator
+        tmem_base_ptr = _smem(cutlass.Int32, 1, 4).iterator
+        tile_layout = cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m))
+        partial = _smem(Float32, None, 128, tile_layout)
+        x_in = _smem(Float32, SECTIONS * INPUT_BYTES // 2, 128)
+        # hop 2 (BF16): raw Q, K [T, 128], this KDA CTA's V rows [T, 16], the owned
+        # token's output gate [128]; this CTA's rounded token inputs [448]
+        raw_qk = _smem(BFloat16, 2 * T * 128, 128)
+        raw_v = _smem(BFloat16, T * ROWS, 16)
+        raw_g = _smem(BFloat16, 128, 16)
+        mine = _smem(BFloat16, 448, 16)
+        shared_q = _smem(Float32, T * 128, 16)
+        shared_k = _smem(Float32, T * 128, 16)
+        shared_decay = _smem(Float32, T * 128, 16)
+        shared_v = _smem(Float32, T * ROWS, 16)
+        shared_o = _smem(Float32, 128, 16)
+        local_o = _smem(Float32, T * ROWS, 16)
+        slot_rows = _smem(Int32, T, 16)
+        reductions = _smem(Float32, 8, 16)
+        shared_beta = _smem(Float32, 8, 16)
+        bar_in = _smem(cutlass.Int64, 1, 8).iterator
+        bar_hop = _smem(cutlass.Int64, 1, 8).iterator
+        bar_gate = _smem(cutlass.Int64, 1, 8).iterator
+        bar_out = _smem(cutlass.Int64, 1, 8).iterator
+        bar_qk = _smem(cutlass.Int64, 1, 8).iterator
+        kda_cta = rank < KDA_CTAS
+
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                for i in range(stages):
+                    cute.arch.mbarrier_init(bar_full + i, 1 if staged else 2)
+                    cute.arch.mbarrier_init(bar_empty + i, 1)
+                if cutlass.const_expr(staged):
+                    for i in range(self.k_tiles):
+                        cute.arch.mbarrier_init(b_full + i, 1)
+                cute.arch.mbarrier_init(bar_mma_epilog, 1)
+                cute.arch.mbarrier_init(bar_tmem_alloc, 160)
+        if tid == 128:
+            cute.arch.mbarrier_init(bar_in, 1)
+            cute.arch.mbarrier_arrive_and_expect_tx(bar_in, SECTIONS * INPUT_BYTES * 2)
+            if kda_cta:
+                # Q / K: 16 CTAs x 64 channels x 2 x T; V: T x 16 rows; gate: 128
+                hop = 2 * T * 128 * 2 + T * ROWS * 2 + 256
+                cute.arch.mbarrier_init(bar_hop, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_hop, hop)
+                cute.arch.mbarrier_init(bar_gate, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    bar_gate, KDA_CTAS * ROWS * T * 4 + T * 4
+                )
+                cute.arch.mbarrier_init(bar_out, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_out, 512)
+                # every KDA CTA's normalized q / k of its token (DISTRIBUTED_QK)
+                cute.arch.mbarrier_init(bar_qk, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_qk, KDA_CTAS * 2 * 128 * 4)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM traffic
+
+        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        tiles = (split_rank * k_tile_count, k_tile_count)
+        offset = accepted[0] - 1
+        slot = slots[0, offset]
+        if warp_idx < 3:
+            cute.arch.cluster_wait()
+            if warp_idx == 0:
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            elif warp_idx == 1:
+                b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
+                b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                if cutlass.const_expr(staged):
+                    self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
+                else:
+                    self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+                if cutlass.const_expr(self.polled_out):  # after the PDL wait above
+                    self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
+            elif cutlass.const_expr(staged):
+                self.staged_mma_warp(
+                    bar_full, bar_empty, b_full, bar_mma_epilog, bar_tmem_alloc, sA, sB,
+                    tmem_base_ptr,
+                )  # fmt: skip
+            else:
+                k_blocks = self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2])
+                self.mma_warp(
+                    bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc, tiled_mma, sA,
+                    sB, tmem_base_ptr, acc_layout, k_blocks, tiles[1],
+                )  # fmt: skip
+            cute.arch.cluster_arrive_relaxed()
+        elif warp_idx == 3:
+            gate_args = (fa_beta, a_log, dt_bias, f_b, lower_bound, counter, target)
+            self.verify_gate(
+                gate_args, (head, rank, slot), shared_decay, shared_beta, bar_gate
+            )
+            cute.arch.cluster_arrive_relaxed()
+        else:
+            kt = tid - 128
+            tensors = (conv_w, bias, conv_state, state, output, norm_w)
+            coords = (head, rank, slot, offset)
+            early = self.verify_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            cute.arch.cluster_wait()
+            if cutlass.const_expr(staged):  # the other B_ISSUERS - 1 warps of x's tiles
+                b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
+                b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+            self.push_partials(
+                kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
+                section, split_rank, x_in, bar_in,
+            )  # fmt: skip
+            wait(bar_in)
+            inputs, gate_in = self.read_inputs(kt, x_in)
+            # this CTA's rounded token inputs, then hop 2
+            mine[kt] = inputs[0]
+            mine[128 + kt] = inputs[1]
+            if kt < 64:
+                mine[256 + kt] = inputs[2]
+            mine[320 + kt] = gate_in
+            named_barrier(1, 128)
+            self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
+            cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
+            if kda_cta:
+                rows = (
+                    shared_q,
+                    shared_k,
+                    shared_decay,
+                    shared_v,
+                    shared_o,
+                    reductions,
+                    local_o,
+                    slot_rows,
+                )
+                raws = (raw_qk, raw_v, raw_g, bar_hop)
+                bars = (bar_gate, bar_out, shared_beta, bar_qk)
+                self.verify_main(
+                    kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+                )
+        cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+
+
     @cute.jit
-    def verify_early(self, kt, tensors, coords, slots):
+    def verify_early(self, kt, tensors, coords, slots, staging):
         """Loads before the cluster sync (KDA CTAs): state rows from the accepted slot,
         conv taps and weights of channel ``kt`` (and V row 16 r + kt), the norm
         weight."""
@@ -153,7 +326,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
         if (rank < KDA_CTAS) & (slot > 0) & (pending > 0):  # the fold (pre-wait)
             record_page = state[Int64(records), None, None, None]
             self.head_fold(history, record_page, head, pending, value_base, group,
-                           group_lane)  # fmt: skip
+                           group_lane, kt, staging)  # fmt: skip
         taps = zeros((3, 3), BFloat16)
         coeff = zeros((3, 4), conv_w.element_type)
         accum = zeros(3 * self.tokens, Float32)
@@ -352,8 +525,166 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         super().__init__(*args, **kwargs)
         assert self.tokens == KDA_CTAS, "KdaHeadMultiDefer: q8 (one token per KDA CTA)"
 
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, a_map: cutlass.Int64,
+        conv_w: cute.Tensor, bias: cute.Tensor, conv_state: cute.Tensor,
+        fa_beta: cute.Tensor, a_log: cute.Tensor, dt_bias: cute.Tensor,
+        slots: cute.Tensor, state: cute.Tensor, output: cute.Tensor,
+        norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
+        lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
+        target: Int32, out_rearm: cutlass.Int64,
+    ):  # fmt: skip
+        T: cutlass.Constexpr = self.tokens
+        stages = self.num_ab_stage
+        ab_dtype = mA.element_type
+        majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            ab_dtype, ab_dtype, *majors, self.acc_dtype, self.cta_group,
+            self.mma_tiler_mn,
+        )  # fmt: skip
+        mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+        rank, head, _ = cute.arch.block_idx()
+        section, split_rank = rank % SECTIONS, rank // SECTIONS
+        row0 = section * self.dim + head * 128
+        request, block = rank // KDA_CTAS, rank % KDA_CTAS  # this CTA's KDA role
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tid, _, _ = cute.arch.thread_idx()
+
+        a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
+        b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles)
+        sA = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*a_shape))
+        sB = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_b(*b_shape))
+        acc_layout = cute_ext.make_tmem_layout_acc(
+            tiled_mma, self.mma_tiler_mn, acc_stage=1
+        )
+        bar_full = _smem(cutlass.Int64, stages, 8).iterator
+        bar_empty = _smem(cutlass.Int64, stages, 8).iterator
+        b_full = _smem(cutlass.Int64, self.k_tiles, 8).iterator
+        bar_mma_epilog = _smem(cutlass.Int64, 1, 8).iterator
+        bar_tmem_alloc = _smem(cutlass.Int64, 1, 8).iterator
+        tmem_base_ptr = _smem(cutlass.Int32, 1, 4).iterator
+        tile_layout = cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m))
+        partial = _smem(Float32, None, 128, tile_layout)
+        x_in = _smem(Float32, SECTIONS * TOKEN_INPUTS, 128)
+        raw_qk = _smem(BFloat16, 2 * T * 128, 128)
+        raw_v = _smem(BFloat16, T * ROWS, 16)
+        mine = _smem(BFloat16, TOKEN_INPUTS, 16)
+        shared_q = _smem(Float32, T * 128, 16)
+        shared_k = _smem(Float32, T * 128, 16)
+        shared_decay = _smem(Float32, T * 128, 16)
+        shared_v = _smem(Float32, T * ROWS, 16)
+        shared_o = _smem(Float32, 128, 16)
+        local_o = _smem(Float32, T * ROWS, 16)
+        slot_rows = _smem(Int32, T, 16)
+        reductions = _smem(Float32, 8, 16)
+        shared_beta = _smem(Float32, 8, 16)
+        bar_in = _smem(cutlass.Int64, 1, 8).iterator
+        bar_hop = _smem(cutlass.Int64, 1, 8).iterator
+        bar_gate = _smem(cutlass.Int64, 1, 8).iterator
+        bar_out = _smem(cutlass.Int64, 1, 8).iterator
+        bar_qk = _smem(cutlass.Int64, 1, 8).iterator
+
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                for i in range(stages):
+                    cute.arch.mbarrier_init(bar_full + i, 1)
+                    cute.arch.mbarrier_init(bar_empty + i, 1)
+                for i in range(self.k_tiles):
+                    cute.arch.mbarrier_init(b_full + i, 1)
+                cute.arch.mbarrier_init(bar_mma_epilog, 1)
+                cute.arch.mbarrier_init(bar_tmem_alloc, 160)
+        if tid == 128:
+            cute.arch.mbarrier_init(bar_in, 1)  # 4 splits x 4 sections x 128 rows
+            cute.arch.mbarrier_arrive_and_expect_tx(bar_in, SECTIONS * TOKEN_INPUTS * 4)
+            # Q / K of the request's T tokens x 128 channels; V: T x 16 rows
+            cute.arch.mbarrier_init(bar_hop, 1)
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                bar_hop, 2 * T * 128 * 2 + T * ROWS * 2
+            )
+            cute.arch.mbarrier_init(bar_gate, 1)
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                bar_gate, KDA_CTAS * ROWS * T * 4 + T * 4
+            )
+            cute.arch.mbarrier_init(bar_out, 1)
+            cute.arch.mbarrier_arrive_and_expect_tx(bar_out, 512)
+            cute.arch.mbarrier_init(bar_qk, 1)
+            # the normalized q / k of the request's tokens (KDA CTA j: token j)
+            qk_bytes = min(T, KDA_CTAS) * 2 * 128 * 4
+            cute.arch.mbarrier_arrive_and_expect_tx(bar_qk, qk_bytes)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM traffic
+
+        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        tiles = (split_rank * k_tile_count, k_tile_count)
+        offset = accepted[request] - 1
+        slot = slots[request, offset]
+        if warp_idx < 3:
+            cute.arch.cluster_wait()
+            if warp_idx == 0:
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            elif warp_idx == 1:
+                b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
+                b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
+                if cutlass.const_expr(self.polled_out):  # after the PDL wait above
+                    self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
+            else:
+                self.staged_mma_multi(
+                    bar_full, bar_empty, b_full, bar_mma_epilog, bar_tmem_alloc, sA, sB,
+                    tmem_base_ptr,
+                )  # fmt: skip
+            cute.arch.cluster_arrive_relaxed()
+        elif warp_idx == 3:
+            gate_args = (fa_beta, a_log, dt_bias, f_b, lower_bound, counter, target)
+            coords = (head, rank, slot, request, block)
+            self.multi_gate(gate_args, coords, shared_decay, shared_beta, bar_gate)
+            cute.arch.cluster_arrive_relaxed()
+        else:
+            kt = tid - 128
+            tensors = (conv_w, bias, conv_state, state, output, norm_w)
+            coords = (head, rank, slot, offset, request, block)
+            early = self.multi_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            cute.arch.cluster_wait()
+            # the other B_ISSUERS - 1 warps of x's tiles
+            b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
+            b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+            self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+            self.push_tokens(
+                kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
+                section, split_rank, x_in, bar_in,
+            )  # fmt: skip
+            if cutlass.const_expr(self.rows_total == CLUSTER):  # one row per CTA
+                wait(bar_in)
+                self.round_owned(kt, x_in, mine)
+                named_barrier(1, 128)
+                self.multi_hop(
+                    kt, request, rank % KDA_CTAS, mine, raw_qk, raw_v, bar_hop
+                )
+            elif rank < self.rows_total:  # CTAs past the token rows own none
+                wait(bar_in)
+                self.round_owned(kt, x_in, mine)
+                named_barrier(1, 128)
+                self.multi_hop(kt, rank // T, rank % T, mine, raw_qk, raw_v, bar_hop)
+            cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
+            rows = (
+                shared_q, shared_k, shared_decay, shared_v, shared_o, reductions,
+                local_o, slot_rows,
+            )  # fmt: skip
+            raws = (raw_qk, raw_v, mine, bar_hop)
+            bars = (bar_gate, bar_out, shared_beta, bar_qk)
+            self.multi_main(
+                kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+            )
+            if cutlass.const_expr(T < KDA_CTAS):  # noqa: SIM102 (owners: the norm)
+                if rank < self.rows_total:
+                    owned = (mine, shared_o, bar_out, output, norm_w, accepted)
+                    self.owned_norm(kt, owned, slots, head, rank, eps)
+        cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+
+
     @cute.jit
-    def multi_early(self, kt, tensors, coords, slots):
+    def multi_early(self, kt, tensors, coords, slots, staging):
         """``KdaHeadVerify.verify_early`` for this CTA's request and row block."""
         conv_w, bias, conv_state, state, output, norm_w = tensors
         head, rank, _, offset, request, block = coords
@@ -377,7 +708,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         if (slot > 0) & (pending > 0):  # the fold (pre-wait)
             record_page = state[Int64(records), None, None, None]
             self.head_fold(history, record_page, head, pending, value_base, group,
-                           group_lane)  # fmt: skip
+                           group_lane, kt, staging)  # fmt: skip
         taps = zeros((3, 3), BFloat16)
         coeff = zeros((3, 4), conv_w.element_type)
         accum = zeros(3 * self.tokens, Float32)
