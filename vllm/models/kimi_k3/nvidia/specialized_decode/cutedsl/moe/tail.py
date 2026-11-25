@@ -16,7 +16,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
-from ..common.diagstamp import smid_store, stamp_store
+from ..common.diagstamp import clock_store, smid_store, stamp_store
 
 from ..common.primitives import (
     acquire_tensormap,
@@ -658,6 +658,7 @@ class WaveMoeTail(MoeTail):
         # DIAG stamps (S1): CTA row of 16 int64 slots in args[-1].
         self.stamp_base = args[-1].iterator.toint() + Int64(block) * 384
         self.stamp(0, tid == 0)
+        clock_store(self.stamp_base + 42 * 8, Int32(tid == 0))
         smid_store(self.stamp_base + 9 * 8, Int32(tid == 0))
         if cutlass.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
@@ -789,6 +790,7 @@ class WaveMoeTail(MoeTail):
             cute.arch.griddepcontrol_launch_dependents()
         cute.arch.cluster_wait()
         self.stamp(3, tid == 0)
+        clock_store(self.stamp_base + 40 * 8, Int32(tid == 0))
         self.wstamp(24, warp, lane == 0)
         if cutlass.const_expr(n == 1 and self.late_rms):
             self.push_squares(squares, s2[0], bar, (q, warp, lane))
@@ -816,6 +818,7 @@ class WaveMoeTail(MoeTail):
                 outs = [sm + self.m * 512 + 1024 * g for g in range(n)]
             self.normalize_groups(squares, (xwords, gx, eps), outs, (warp, lane, lat))
         self.stamp(4, tid == 0)
+        clock_store(self.stamp_base + 41 * 8, Int32(tid == 0))
         self.wstamp(32, warp, lane == 0)
         if cutlass.const_expr(self.umma):  # x stores -> tcgen05
             cute.arch.fence_proxy("async.shared", space="cta")

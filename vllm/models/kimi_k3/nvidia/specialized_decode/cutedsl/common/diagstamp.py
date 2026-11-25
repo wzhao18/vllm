@@ -36,6 +36,13 @@ def smid_store(address, when):
     return code, "l,r,~{memory}", (Int64(address), Int32(when))
 
 
+@asm()
+def clock_store(address, when):
+    code = "{ .reg .u64 t; .reg .pred p; setp.ne.b32 p, $1, 0; "
+    code += "mov.u64 t, %clock64; @p st.global.u64 [$0], t; }"
+    return code, "l,r,~{memory}", (Int64(address), Int32(when))
+
+
 def buffer(kind, key, rows, ctas, device, slots=SLOTS, used=None):
     t = torch.zeros(ctas, slots, dtype=torch.int64, device=device)
     _BUFS.append((kind, key, rows, t, used or ctas))
