@@ -18,6 +18,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Uint32
 
+from ..common import diagstamp as ds
 from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
@@ -128,6 +129,8 @@ class ClusterAttnResRows(ClusterAttnRes):
         rank, group, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         bufs = self.setup(cutlass.utils.SmemAllocator())
+        sbase, sctr = ds.buffer("arrows", prefix.shape[0])
+        saddr = ds.begin(sbase, sctr, group * 7 + rank, tid == 0)  # DIAG (TPC-2)
         cute.arch.cluster_arrive_relaxed()
         cute.arch.griddepcontrol_launch_dependents()
         T: cutlass.Constexpr = self.tokens
@@ -136,10 +139,13 @@ class ClusterAttnResRows(ClusterAttnRes):
         rows, ids = (prefix, blocks, norm, query, out_norm), (rank, group, tid)
         first = group * T
         self.pre_rows(mixture, scal, bufs, rows, eps, ids, first)
+        ds.stamp(saddr, 1)  # DIAG: pre-wait half (block statistics exchanged, mixture)
         args9 = args[9:]
         self.post_rows(
-            mixture, scal, bufs, delta, rows, output, eps, out_eps, ids, first, args9
+            mixture, scal, bufs, delta, rows, output, eps, out_eps, ids, first, args9,
+            saddr,
         )
+        ds.stamp(saddr, 7)
         cute.arch.griddepcontrol_wait()
 
     @cute.jit
@@ -193,7 +199,7 @@ class ClusterAttnResRows(ClusterAttnRes):
     @cute.jit
     def post_rows(
         self, mixture, scal, bufs, delta, rows, output, eps: Float32, out_eps: Float32,
-        ids, first, aux,
+        ids, first, aux, saddr=None,
     ):  # fmt: skip
         """Per token: add the delta, update prefix (and its ``aux`` copies) and saved
         block; the tokens' post statistics in one exchange (the final boundary: a
@@ -258,7 +264,11 @@ class ClusterAttnResRows(ClusterAttnRes):
                         values[k + 3] = dot8(mixture, t, mixture, t)
                 row = tuple(news[t, j] for j in range(4))
                 self.store_rows(row, prefix, blocks, aux, token, col)
+        if cutlass.const_expr(saddr is not None):
+            ds.stamp(saddr, 2)  # DIAG: every token's delta landed, prefix/blocks stored
         self.exchange(values, T * self.npost, self.kpost_t, bufs, 1, ids)
+        if cutlass.const_expr(saddr is not None):
+            ds.stamp(saddr, 3)  # DIAG: post statistics exchanged
         fins = zeros(self.kfin_t, Float32)
         results = cute.make_rmem_tensor((T, 8), Float32)
         for t in cutlass.range_constexpr(T):
@@ -313,3 +323,5 @@ class ClusterAttnResRows(ClusterAttnRes):
                     bf16x2(results[t, 2 * j], results[t, 2 * j + 1]) for j in range(4)
                 )
                 store_words(at(output, token, col), words)
+        if cutlass.const_expr(saddr is not None):
+            ds.stamp(saddr, 6)  # DIAG: outputs stored
