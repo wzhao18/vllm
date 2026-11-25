@@ -909,12 +909,11 @@ class SharedFront:
         """``batch``'s grouped experts start on the route-done count (``done``:
         ``experts_runtime.route_done``; ``RubinGroupedExpertsKernel.routed``): routing
         counts every CTA past its last store and releases the experts once its route
-        CTAs hold their logits (early "poll"), with the whole-SM carve-out so their
-        CTAs become resident beside it."""
+        CTAs hold their logits (early "poll"; one GPU, the calibrated front stand-in:
+        the whole-SM carve-out changes nothing, so the table's own)."""
         views, front, _, situ, args, extra, code = self.plans[batch]
         opts = {**self.route_opts[batch], "early": "poll", "routed": True}
-        route = compile_route(*self.route_keys[batch], **opts)
-        route = prepare_shared_carveout(route, self.device.index, 100)
+        route = self.carved(batch, compile_route(*self.route_keys[batch], **opts))
         extra = (*extra, to_cute(done))
         self.plans[batch] = views, front, route, situ, args, extra, code
 

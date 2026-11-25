@@ -943,9 +943,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     @cute.jit
     def wait_routed(self, workspace):
         """``routed``: thread 0 acquires the routing kernel's full count (every
-        routing store: ids, weights, plan), counts this CTA as seen, and the call's
-        last CTA re-arms both words; then a CTA barrier (the acquire, before every
-        thread's reads). The other inputs: the weights and scales are static; this
+        routing store: ids, weights, plan), then a CTA barrier (the acquire, before
+        every thread's reads); ``rearm_routed`` at the CTA's end. The other inputs: the weights and scales are static; this
         kernel's workspace words were last written by earlier calls, which completed
         before this layer's front GEMM passed its dependency wait, i.e. before routing
         saw its logits. The kernels still running (the front GEMM's gate/up tiles and
@@ -961,10 +960,17 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if not ready:
                     sleep_ns(32)
                 sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
-            # acq_rel: every other CTA's acquire precedes the last one's re-arm
-            if Int32(claim_last(word + 4)) == self.grid - 2:
-                store_words(word, (Uint32(4294967295), Uint32(4294967295)))
         cute.arch.sync_threads()
+
+    @cute.jit
+    def rearm_routed(self, workspace):
+        """``routed``, thread 0 at the CTA's end (off the start's path: 200 CTAs on one
+        word serialize): count this CTA as having seen the route-done count; the call's
+        last CTA re-arms both words (acq_rel: every other CTA's acquire of the count
+        precedes it)."""
+        word = workspace.iterator + self.ws_census + ROUTED_WORDS
+        if Int32(claim_last(word + 4)) == self.grid - 2:
+            store_words(word, (Uint32(4294967295), Uint32(4294967295)))
 
     @cute.jit
     def arrive(self, sm, workspace, before):
@@ -1311,6 +1317,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         release_tmem(tmem, 512, warp, 3)
         if tid == 0:
             self.stamp(13)
+            if cutlass.const_expr(self.routed):
+                self.rearm_routed(workspace)
             counters[cta] = call_count + 1
             if cta < self.slots - self.grid:
                 counters[self.grid + cta] = call_count + 1
