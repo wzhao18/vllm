@@ -1161,6 +1161,9 @@ class _FakeWs:
     def tail_reset_bytes(self, space):
         return self._tail
 
+    def byte_alignment(self, name):
+        return 16
+
 
 def _fake_kernel(tail, shared_size=256):
     local = [
@@ -1196,8 +1199,11 @@ def test_narrow_kernel_shares_the_local_state(monkeypatch):
         assert 32768 + ww.offset(name) == wn.offset(name)
     with pytest.raises(RuntimeError, match="shared"):
         S.narrow_local_offsets(wide, _fake_kernel(16896 + 32768, shared_size=512))
-    with pytest.raises(RuntimeError, match="128-aligned"):
-        S.narrow_local_offsets(wide, _fake_kernel(16896 + 48))
+    # a 16-byte multiple keeps the regions' 16-byte alignment (narrow base 16-aligned)
+    assert S.narrow_local_offsets(wide, _fake_kernel(16896 + 48)) == (48, 0)
+    assert S.narrow_local_align((48, 0)) == 16 and S.narrow_local_align((32768, 0)) == 128
+    with pytest.raises(RuntimeError, match="alignment"):
+        S.narrow_local_offsets(wide, _fake_kernel(16896 + 8))
     moved = _fake_kernel(16896 + 32768)
     moved._device_workspace._r["local"][3] = ("phase", 16896 + 32768 + 32, 4,
                                              "zero_on_first_allocate")  # fmt: skip
