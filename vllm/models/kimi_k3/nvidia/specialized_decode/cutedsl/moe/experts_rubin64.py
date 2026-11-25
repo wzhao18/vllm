@@ -151,10 +151,16 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False,
+        dies=(), static_groups=False, early_routes=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
+        # early_routes: the routes (``ids``) are complete before the predecessor grid
+        # (replicated router: routed on x landing, before the latent lands). Grouping,
+        # partition and the producer's weight stream (FC1 ring fill) run before the
+        # dependency wait; every other warp (latent gather, MMAs, epilogue, finalize)
+        # waits for the predecessor (the latent plan) as before.
+        self.early_routes = early_routes
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -1210,7 +1216,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         arrival = None
         if cutlass.const_expr(len(self.dies) > 0):
             arrival = self.ticket(workspace)
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not self.early_routes):
+            cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
@@ -1230,6 +1237,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ranges = self.partition(distinct, cta)
         if tid == 0:
             self.stamp(11)
+        if cutlass.const_expr(self.early_routes):
+            if warp != 0:  # the producer streams; the latent's consumers wait
+                cute.arch.griddepcontrol_wait()
+        if tid == 32:
+            self.stamp(15)
         if warp == 0:
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
