@@ -7,11 +7,10 @@ Per (tag, rows) a device ring ``[RING, CTAS, SLOTS]`` int64 plus a per-CTA call
 counter. A stamping thread takes ``call = atomicAdd(counter[cta], 1)`` at kernel
 entry and writes %globaltimer into ``ring[call % RING, cta, slot]``; every CTA of a
 grid runs once per call, so ``call`` numbers the launches identically on every CTA
-and every rank (all ranks replay the same graph). Dumped at exit with torch.save to
-``$OA_DIAG_DIR/<job>.<step>/rank<SLURM_PROCID>.pt``. Buffers are allocated at trace
+and every rank (all ranks replay the same graph). Dumped after each bench case by ``dump``
+(``$OA_DIAG_DIR/<job>.<step>/<case>.rank<SLURM_PROCID>.pt``). Buffers are allocated at trace
 time on the current device; pointers are baked into the compiled kernels."""
 
-import atexit
 import os
 
 import cutlass
@@ -40,23 +39,25 @@ def st64(addr, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (addr, value)
 
 
-def _dump():
+def dump(case):
+    """Save every (tag, rows) ring + counter to
+    ``$OA_DIAG_DIR/<job>.<step>/<case>.rank<R>.pt`` (called by the forward bench
+    after each case; nq_step exits with os._exit, so no atexit hook)."""
     out = os.environ.get(
         "OA_DIAG_DIR", "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/sol16/OA/diag"
     )
     run = os.environ.get("SLURM_JOB_ID", "j") + "." + os.environ.get("SLURM_STEP_ID", "s")
     os.makedirs(f"{out}/{run}", exist_ok=True)
     rank = os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0"))
-    data = {k: (s.cpu(), c.cpu()) for k, (s, c) in _BUFS.items()}
-    torch.save(data, f"{out}/{run}/rank{rank}.pt")
+    torch.cuda.synchronize()
+    data = {f"{k[0]}:{k[1]}": (s.cpu(), c.cpu()) for k, (s, c) in _BUFS.items()}
+    torch.save(data, f"{out}/{run}/{case}.rank{rank}.pt")
 
 
 def buffer(tag, rows):
     """(ring address, counter address) of (tag, rows) as Python ints (trace time)."""
     key = (tag, int(rows))
     if key not in _BUFS:
-        if not _BUFS:
-            atexit.register(_dump)
         dev = torch.cuda.current_device()
         ring = torch.zeros(RING, CTAS, SLOTS, dtype=torch.int64, device=dev)
         ctr = torch.zeros(CTAS, dtype=torch.int32, device=dev)

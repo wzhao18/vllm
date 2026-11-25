@@ -219,6 +219,13 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        # DIAG (OA, never merge): this case's last replays' o-proj/AttnRes stamps
+        # (nq_step leaves with os._exit, so an atexit dump never runs).
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            diagstamp,
+        )
+
+        diagstamp.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:
