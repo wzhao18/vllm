@@ -451,7 +451,10 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
     with torch.accelerator.device_index(device):  # (persistent kernels: its SMs)
         from ..common import l5diag  # DIAG (L5): stamp rings
 
-        if isinstance(kernel, KdaVerifyCols):
+        if isinstance(kernel, KdaVerifyHalfStock):
+            ctas = 2 * heads * requests
+            kernel.diag = l5diag.Ring("half", (requests, tokens), ctas)
+        elif isinstance(kernel, KdaVerifyCols):
             ctas = kernel.cluster * heads * requests
             kernel.diag = l5diag.Ring("cols", (requests, tokens), ctas)
         elif isinstance(kernel, KdaVerifyLoop):

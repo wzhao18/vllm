@@ -33,6 +33,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
+from ..common import l5diag
 from ..common.primitives import (
     alloc,
     asm,
@@ -118,6 +119,10 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         token = request * T
         lane, warp = thread % 32, thread // 32
         group, j = lane // 8, lane % 8
+        drow = self.diag.row(cta)  # DIAG (L5)
+        self.drow = drow
+        l5diag.stamp(drow, 0, thread == 0)
+        l5diag.smid(drow, thread == 0)
 
         smem = cutlass.utils.SmemAllocator()
         page = alloc(smem, Float32, HALF_ROWS * K, align=1024)
@@ -175,9 +180,11 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                     window,
                 )  # fmt: skip
             cute.arch.sync_threads()  # this half's outputs of every token in shared_o
+            l5diag.stamp(drow, 6, thread == 256)
             if warp == MESSENGER:
                 self.exchange(scratch, counters, item, half, lane, shared_o)
             cute.arch.sync_threads()  # the other half's rows merged; both past the taps
+            l5diag.stamp(drow, 7, thread == 0)
             if (thread < GROUP) & (half == 0):  # the conv window (one writer)
                 conv_state = args[3]
                 conv_page = conv_state[Int64(conv_slot), None, None]
@@ -198,7 +205,10 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                         gates[h] = gate[token + t, head * 128 + c + 64 * h]
                     self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
                                     token, head)  # fmt: skip
+        l5diag.stamp(drow, 11, thread == 0)
         cute.arch.griddepcontrol_launch_dependents()
+        l5diag.stamp(drow, 8, thread == 0)
+        self.diag.bump(cta, thread == 0)
 
     @cute.jit
     def half_math(self, args, ids, where, rows, staging, shared, window):
@@ -216,6 +226,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         local0 = 8 * warp + group  # this thread's rows in the staged half page
         row0 = HALF_ROWS * half + local0
         wait(state_full, 0, scope="cta")
+        l5diag.stamp(self.drow, 1, thread == 0)
         history = zeros((2, CHUNKS, 4), Float32)
         for r in cutlass.range_constexpr(2):
             for c in cutlass.range_constexpr(CHUNKS):
@@ -236,15 +247,20 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                                shared_decay, own_gates)  # fmt: skip
             for p in cutlass.range_constexpr(pairs):
                 cute.arch.mbarrier_arrive(ready + p)
+            l5diag.stamp(self.drow, 3, thread == 128)
             self.half_prologue(
                 args, thread - GROUP, token, head, offset, conv_slot, shared,
                 ready, (pairs // 2, pairs), 2, None,
             )  # fmt: skip
+        l5diag.stamp(self.drow, 2, thread == 0)
+        l5diag.stamp(self.drow, 9, thread == 128)
         cute.arch.griddepcontrol_launch_dependents()
 
         for t in cutlass.range_constexpr(T):
             if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
                 cute.arch.mbarrier_wait(ready + t // 2, 0)
+                if cutlass.const_expr(t == 0):
+                    l5diag.stamp(self.drow, 4, thread == 0)
             self.loop_token(history, t, group, j, row0, shared_q, shared_k,
                             shared_decay, shared_v, shared_beta, shared_o,
                             state, meta, 0, head)  # fmt: skip
@@ -260,6 +276,8 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             row = row0 + 4 * (j // 4)
             position = (T - 1) * 128 + self.output_position(row)
             shared_o[position] = self.round_out(owned)
+        l5diag.stamp(self.drow, 5, thread == 0)
+        l5diag.stamp(self.drow, 10, thread == 128)
 
     @cute.jit
     def exchange(self, scratch, counters, item, half, lane, shared_o):
@@ -276,6 +294,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             scratch[item, half * size + index] = shared_o[index]
         _fence()
         cute.arch.sync_warp()
+        l5diag.stamp(self.drow, 13, lane == 0)
         counter = (counters.iterator + item).toint()
         if lane == 0:
             old = _arrive_release(counter)
@@ -284,6 +303,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             while Int32(seen - target) < 0:
                 seen = _acquire_u32(counter)
         cute.arch.sync_warp()
+        l5diag.stamp(self.drow, 12, lane == 0)
         _fence()
         other = scratch.iterator + Int64(item) * (2 * size) + (1 - half) * size
         for i in cutlass.range_constexpr(-(-T * HALF_ROWS // 32)):
