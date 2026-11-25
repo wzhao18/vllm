@@ -876,6 +876,107 @@ def test_dense_mha_step_mqa_rows_beyond_the_lse_slab():
     assert torch.equal(lse, ref_lse)
 
 
+# The DCP path's most rows per launch at Kimi K3.1 C512 prefill under DCP
+# ShardQ (dcp_path_max_rows: dcp_fallback_max_tokens).
+DCP_PATH_ROWS = 2048
+
+
+def _dcp_path_cubins_worker(rank):
+    """In a fresh process (no cubin loaded yet): the DCP ShardQ warmup of the
+    trtllm-gen DCP path loads cubins, after which the layer's DCP-path launch
+    (``_forward_mqa_kernel``, K3.1's 96 gathered heads padded to 128, LSE)
+    of every row count up to ``DCP_PATH_ROWS``, on real inputs, loads none."""
+    try:
+        from vllm.utils import jit_monitor
+        from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
+
+        device = torch.device("cuda", 0)
+        workspace = fims._get_workspace_buffer(
+            device,
+            fims.compute_trtllm_sparse_mla_workspace_bytes(
+                fims._DEFAULT_WORKSPACE_BUFFER_SIZE, 8, NUM_HEADS // 8, DCP_PATH_ROWS
+            ),
+        )
+        heads = fims.trtllm_gen_query_heads(NUM_HEADS)
+        fims._reserve_kv_counters(device, DCP_PATH_ROWS, heads)
+        loads: list[str] = []
+
+        def record(*, backend, event, fn_name, count=1, **_):
+            if backend == "FlashInfer cubin" and count:
+                loads.append(fn_name)
+
+        jit_monitor._handle_jit_event = record
+        jit_monitor.activate()
+
+        fims.TRTLLM_GEN_DCP_PATH_CUBINS.warmup(
+            max_rows=DCP_PATH_ROWS,
+            num_heads=heads,
+            dtype=torch.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            topk_capacity=TOPK,
+            topk_lens=False,
+        )
+        # The multi-CTA KV split forms (few rows) and the others.
+        warmed = set(loads)
+        assert any("MultiCtasKv" in name for name in warmed), warmed
+        assert any("MultiCtasKv" not in name for name in warmed), warmed
+        loads.clear()
+
+        impl = _flashinfer_impl("fp8", "trtllm", 8)
+        impl._workspace_buffer = workspace
+        num_pages = 2 * TOPK // PAGE
+        kv_cache = (torch.randn(num_pages, PAGE, 576, device="cuda") / 4).to(
+            torch.float8_e4m3fn
+        )
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        q = _fp8_query(DCP_PATH_ROWS, NUM_HEADS)
+        topk = torch.randint(
+            0,
+            num_pages * PAGE,
+            (DCP_PATH_ROWS, TOPK),
+            generator=gen,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        valid = torch.randint(
+            1,
+            TOPK + 1,
+            (DCP_PATH_ROWS,),
+            generator=gen,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for rows in range(1, DCP_PATH_ROWS + 1):
+            out, lse = impl._forward_mqa_kernel(
+                q[:rows],
+                kv_cache,
+                topk[:rows],
+                valid[:rows],
+                layer=SCALES,
+                block_size=PAGE,
+                is_decode=True,
+            )
+            assert lse is not None and out.shape == (rows, NUM_HEADS, 512)
+        torch.accelerator.synchronize()
+        assert not loads, sorted(set(loads))
+    except BaseException:
+        _exit_failed_rank()
+
+
+def test_dcp_shardq_warmup_loads_every_dcp_path_cubin():
+    """A DCP ShardQ step keeps the DCP path for its leading decode rows (and
+    the planner leaves few-token and padded steps on it): launches of any row
+    count up to dcp_path_max_rows, whose trtllm-gen kernel (multi-CTA KV split
+    or not, tile and swap-AB form) FlashInfer picks by row count and loads on
+    first use. The warmup loads all of them: no launch after it loads a
+    cubin."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(_dcp_path_cubins_worker, nprocs=1)
+
+
 def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
     """One rank of a DCP = TP group: the production gather, indexer and
     attention over the gathered context against TP ShardQ over the replicated
