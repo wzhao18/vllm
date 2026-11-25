@@ -463,9 +463,7 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
-    _asm_void(
-        [Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip
-    )
+    _asm_void([Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -786,11 +784,9 @@ def _make_radix_select(
                     scalars[3] = Int32(1)
                     scalars[0] = scalars[0] + incl
                 cute.arch.sync_threads()
-                if cutlass.const_expr(stamps):
+                if cutlass.const_expr(stamps):  # noqa: SIM102
                     if tid == Int32(0):
-                        _st_i64(
-                            dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1)
-                        )
+                        _st_i64(dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1))
 
         cut = prefix_ptr.load()
         last = scalars[2]
@@ -805,7 +801,7 @@ def _make_radix_select(
                             sel_min = score
                         sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
 
-        if cutlass.const_expr(stamps):
+        if cutlass.const_expr(stamps):  # noqa: SIM102
             if tid == Int32(0):
                 _st_i64(dbg + Int64(row) * Int64(64) + Int64(32), _globaltimer())
         if cutlass.const_expr(emit_ids):
@@ -1379,7 +1375,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             lane = cute.arch.lane_idx()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             dbg_row = dbg + Int64(row) * Int64(64)
-            if cutlass.const_expr(stamps):
+            if cutlass.const_expr(stamps):  # noqa: SIM102
                 if tid == Int32(0):
                     _st_i64(dbg_row, _globaltimer())
             smem = cutlass.memory.SmemAllocator()
@@ -1408,11 +1404,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 ordinal = ordinals[row]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
-                if cutlass.const_expr(stamps):
+                if cutlass.const_expr(stamps):  # noqa: SIM102
                     if tid == Int32(0):
                         _st_i64(dbg_row + Int64(8), _globaltimer())
                 cute.arch.griddepcontrol_wait()
-                if cutlass.const_expr(stamps):
+                if cutlass.const_expr(stamps):  # noqa: SIM102
                     if tid == Int32(0):
                         _st_i64(dbg_row + Int64(16), _globaltimer())
                 if cutlass.const_expr(early or (fold and not hold)):

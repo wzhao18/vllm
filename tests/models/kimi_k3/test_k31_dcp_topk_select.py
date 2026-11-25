@@ -5,7 +5,11 @@ torch reference of its contract: the top-K of the gathered candidates under (bf1
 score desc, global id asc), written as global ids and as this rank's physical KV
 rows in the kernel's fixed emission order (thread-major over the CTA's register
 keys), plus the owned count. Tie-heavy rows (quantized scores) exercise the gid
-radix passes; rows with fewer than K candidates keep all of them."""
+radix passes; rows with fewer than K candidates keep all of them. ``dist``:
+relu rows (exact zeros: score range > 512 ord16 values, the 9 + 7 bit score
+passes), tail rows (each rank's top-N of 8250 logits: a narrow range, the one
+score pass on ord16 - min) and rows spanning exactly 511 / 512 ord16 values
+(either side of that switch)."""
 
 import pytest
 import torch
@@ -30,14 +34,30 @@ def _ord16(x: torch.Tensor) -> torch.Tensor:
     return torch.where(neg, (~bits) & 0xFFFF, bits | 0x8000)
 
 
-def _case(rows: int, levels: int, seed: int, short: int = -1):
+def _case(rows: int, levels: int, seed: int, short: int = -1, dist: str = "relu"):
     """Gathered [W, rows, N + N/32] int32 words, and per (rank, row, slot) the
     candidate's ord16 and global id (-1: empty slot)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    score = torch.randn((W, rows, N), generator=gen, device="cuda")
-    if levels:
-        score = torch.floor(score * levels) / levels
-    score = torch.relu(score + 0.3).to(torch.bfloat16)
+    if dist == "tail":
+        score = torch.randn((W, rows, 8250), generator=gen, device="cuda")
+        score = score.topk(N, dim=2).values
+        if levels:
+            score = torch.floor(score * levels) / levels
+        score = score.to(torch.bfloat16)
+    elif dist.startswith("span"):
+        # ord16 in [0xC000, 0xC000 + span] (bf16 2.0 .. ~4-8), both ends hit
+        span = int(dist[4:])
+        o = 0xC000 + torch.randint(
+            0, span + 1, (W, rows, N), generator=gen, device="cuda"
+        )
+        o[0, :, 0] = 0xC000
+        o[1, :, 0] = 0xC000 + span
+        score = (o - 0x8000).to(torch.int16).view(torch.bfloat16)
+    else:
+        score = torch.randn((W, rows, N), generator=gen, device="cuda")
+        if levels:
+            score = torch.floor(score * levels) / levels
+        score = torch.relu(score + 0.3).to(torch.bfloat16)
     base = torch.randint(0, 1 << 17, (W, rows, 1), generator=gen, device="cuda")
     # distinct local ids per (rank, row): a rank's candidates are distinct tokens
     local = (base + torch.arange(N, device="cuda") * 641) % (1 << 17)
@@ -85,17 +105,31 @@ def _reference(o16, gid, rank, block_table, stride_rows):
 
 
 @pytest.mark.parametrize(
-    "rows,levels,short",
-    [(8, 0, -1), (8, 4, -1), (8, 1, 100), (64, 16, -1), (129, 2, 50), (512, 0, -1)],
+    "rows,levels,short,dist",
+    [
+        (8, 0, -1, "relu"),
+        (8, 4, -1, "relu"),
+        (8, 1, 100, "relu"),
+        (64, 16, -1, "relu"),
+        (129, 2, 50, "relu"),
+        (512, 0, -1, "relu"),
+        (8, 0, -1, "tail"),
+        (64, 8, -1, "tail"),
+        (129, 0, 50, "tail"),
+        (16, 0, -1, "span511"),
+        (16, 0, -1, "span512"),
+    ],
 )
-def test_select_matches_reference(rows, levels, short):
+def test_select_matches_reference(rows, levels, short, dist):
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         _DCP_TOPK_SELECT_KERNEL,
         _RowsOutput,
     )
 
     rank, stride_rows = 5, 64
-    packed, o16, gid = _case(rows, levels, seed=rows * 7 + levels, short=short)
+    packed, o16, gid = _case(
+        rows, levels, seed=rows * 7 + levels, short=short, dist=dist
+    )
     blocks = (1 << 17) // BLOCK + 1
     gen = torch.Generator(device="cuda").manual_seed(3)
     block_table = torch.randint(
