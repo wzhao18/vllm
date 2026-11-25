@@ -406,7 +406,7 @@ def test_fp8_query_and_cache_insert(batch, gap, k_scale):
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 
 
-@pytest.mark.parametrize("batch", [128, 256, 512])
+@pytest.mark.parametrize("batch", [128, 384, 512])
 def test_fp8_query_48_row_tiles_bitwise(batch):
     """WideDsa's 48-request MlaQuery tiles (wide.WIDE_QUERY_TOKENS: 6 heads, a DCP16
     rank's query on Rubin) write the same FP8 query rows, q_c rows and FP8 KV rows as

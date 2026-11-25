@@ -124,9 +124,11 @@ WIDE_QUERY_OVERLAP = "65-:fork"
 # 32 (mla.query.WIDE_TOKENS for the DSA query): the grid is 8-CTA clusters x heads x row
 # tiles at one CTA per SM and Rubin holds 22 such clusters at the DSA query's shared
 # memory, so the tile needing the fewest cluster rounds wins (6 heads: 128 rows 24 -> 18
-# clusters, two rounds -> one; 256 rows 48 -> 36, three -> two; 512 rows 96 -> 66, five
-# -> three). The same arithmetic per row.
-WIDE_QUERY_TOKENS = {6: "97-144:48,225-512:48"}
+# clusters, two rounds -> one; 512 rows 96 -> 66, five -> three). The same arithmetic
+# per row (outputs bitwise equal). DSA chain (4 ranks, q8, 6 heads, 8250 local keys,
+# CUDA graph of 24 layers, ABBA us/layer 32 -> 48): M128 53.19 -> 52.55, M256 76.10 ->
+# 76.60 (three rounds -> two, but slower: 256 rows keep 32), M512 114.63 -> 109.92.
+WIDE_QUERY_TOKENS = {6: "97-144:48,257-512:48"}
 
 
 def query_tokens(heads, batch, sms):
