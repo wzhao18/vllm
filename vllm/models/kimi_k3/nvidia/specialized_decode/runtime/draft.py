@@ -1189,13 +1189,22 @@ GQA_PROJECTIONS_WIDE = {
                 (1792, 7168): (128, 64, 6, 14, 14),
             },
         ),
-        # 65-128 rows: the same tensor-memory tactics over two 64-token N tiles (the
-        # two-shot chain's qkv / context K/V / SiLU-fused gate/up instead of cuBLAS).
+        # 65-128 rows (the two-shot chain instead of cuBLAS): qkv / context K/V on one
+        # tensor-memory N tile of 96 / 128 tokens (13 / 12 staged A tiles, 4 x slots);
+        # the SiLU-fused gate/up on the 64-token tactic over two N tiles.
+        (
+            96,
+            {
+                (512, 7168): (128, 96, 6, 4, 13),
+                (640, 7168): (128, 96, 6, 4, 13),
+                (1792, 7168): (128, 64, 6, 14, 14),
+            },
+        ),
         (
             128,
             {
-                (512, 7168): (128, 64, 6, 14, 14),
-                (640, 7168): (128, 64, 6, 14, 14),
+                (512, 7168): (128, 128, 6, 4, 12),
+                (640, 7168): (128, 128, 6, 4, 12),
                 (1792, 7168): (128, 64, 6, 14, 14),
             },
         ),
