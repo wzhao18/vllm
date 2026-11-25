@@ -1072,15 +1072,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             ab_pipeline_state.advance()
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-            cute.copy(
-                a_atom,
-                global_a_slice[(None, k_tile_idx)],
-                partitioned_smem_a[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=a_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
             if cutlass.const_expr(compact_sfa):
+                # Issued before the weight tile: the peer expands these bytes before the leader can use the stage.
                 # Both CTAs' compact bytes land in the peer's SFA slot (leader: lower half, peer: upper half), on
                 # the peer's barrier (whose one arrival is the peer's).
                 compact_barrier = self.compact_sfa_mbarriers + stage_index
@@ -1103,7 +1096,15 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                             Int32(compact_bytes),
                             evict_first=False,
                         )
-            else:
+            cute.copy(
+                a_atom,
+                global_a_slice[(None, k_tile_idx)],
+                partitioned_smem_a[(None, stage_index)],
+                tma_bar_ptr=tma_barrier,
+                tma_desc_ptr=a_descriptor_ptr,
+                mcast_mask=multicast_mask,
+            )
+            if cutlass.const_expr(not compact_sfa):
                 cute.copy(
                     sfa_atom,
                     global_sfa_slice[(None, k_tile_idx)],
