@@ -101,11 +101,6 @@ ALONE_SMEM = 170 * 1024
 # 6 MMAs done, 7 cluster barrier passed, 8 every partial received, 9 output stored,
 # 10 / 11 first / last ring A tile landed, 12 %smid.
 STAMPS = 13
-# Warps issuing x's K tiles after the PDL wait (``x_warp64``: tiles k = part mod parts).
-# One TMA issuer completes one barrier stage at a time (hwdb INDEX 39 / 53b): 14 x
-# tiles of 8 KB from one thread took ~1.2 us after the weight ring drained (MoE front,
-# 32-64 rows, one node, in a PDL graph behind an o-projection stand-in).
-X_ISSUERS = 2
 
 
 @asm()
@@ -355,10 +350,9 @@ class SplitKTmemGemm64(SplitKGemm):
             if cutlass.const_expr(self.stamps):
                 _smid_store(self.stamp_base + 12 * 8, cute.arch.lane_idx() == 0)
 
-        # Warps 1 and 3 load x's K tiles (2-D x: odd tiles from warp 3; a 3-D x map:
-        # warp 1 alone, warp 3 idle); warps 4-7 run the epilogue. One more cluster
-        # barrier phase: the mailboxes are free (the epilogue's arrival follows its
-        # CTA's MMAs); warps 0-3 pass it after their roles.
+        # Warp 3 is idle; warps 4-7 run the epilogue. One more cluster barrier phase:
+        # the mailboxes are free (the epilogue's arrival follows its CTA's MMAs);
+        # warps 0-3 pass it after their roles.
         if warp_idx == 0:
             self.weight_warp64(bar_full, bar_empty, a_full, ring, data, a_map,
                                bidx * self.cta_m, first)  # fmt: skip
@@ -370,20 +364,9 @@ class SplitKTmemGemm64(SplitKGemm):
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
             cute.arch.mbarrier_wait(bar_drained, 0)
             if cutlass.const_expr(x_map is None):
-                xs = (b_full, b_empty, b_tile, sB, b_map, first, tiles)
-                self.x_warp64(*xs, 0, X_ISSUERS)
+                self.x_warp64(b_full, b_empty, b_tile, sB, b_map, first, tiles)
             else:
                 self.x_warp3d(b_full, b_empty, ring, x_map, first, tiles, n_idx)
-            _cluster_phases()
-        elif warp_idx == 3:
-            if cutlass.const_expr(x_map is None and X_ISSUERS > 1):
-                b_tile = cute.local_tile(
-                    mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx)
-                )
-                b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
-                cute.arch.mbarrier_wait(bar_drained, 0)
-                xs = (b_full, b_empty, b_tile, sB, b_map, first, tiles)
-                self.x_warp64(*xs, 1, X_ISSUERS)
             _cluster_phases()
         elif warp_idx == 2:
             self.staged_mma_warp64(
@@ -451,18 +434,15 @@ class SplitKTmemGemm64(SplitKGemm):
     def x_warp64(
         self, b_full, b_empty, g_tile: cute.Tensor, s_tile: cute.Tensor,
         cta_v_map: cute.Layout, first: cutlass.Int32, tiles: cutlass.Int32,
-        part: cutlass.Constexpr[int] = 0, parts: cutlass.Constexpr[int] = 1,
     ):  # fmt: skip
-        """Loads x's K tiles part, part + parts, .. after the PDL wait (``parts``
-        warps, each an independent TMA issuer), each tile on its own barrier; tile
+        """Loads x's K tiles after the PDL wait, each on its own barrier; tile
         k >= slots waits for the MMAs of tile k - slots (its slot's previous tile)."""
         tile_bytes = cute.size_in_bytes(
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(part == 0):
-            self.stamp(3, cute.arch.lane_idx() == 0)
-        for k_tile in cutlass.range(part, tiles, parts, unroll=1):
+        self.stamp(3, cute.arch.lane_idx() == 0)
+        for k_tile in cutlass.range(tiles, unroll=1):
             slot = k_tile % self.slots
             if k_tile >= self.slots:
                 cute.arch.mbarrier_wait(b_empty + k_tile - self.slots, 0)
