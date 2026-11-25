@@ -288,9 +288,55 @@ def build(batch, q, world, local_len, topk):
                 q=q,
             )
 
+    def check():
+        """Wide rows: the merge's rows of this step (merge_rows, after an eager
+        layer filled the indexer query) against the stock op's global top-k
+        filtered to this rank's rows (the path it replaces), as per-row sets."""
+        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+        stage = getattr(p0, "indexer_stage", None)
+        if not wide or stage is None or not stage.local_topk:
+            return None
+        run(p0)
+        torch.accelerator.synchronize()
+        stride_rows = flat_kv_row_view(mla, md.block_size)[1]
+        args = p0.q_fp8, p0.head_w, md, stride_rows, batch
+        slots, valid = (t.clone() for t in stage.merge_rows(*args, q))
+        topk = p0.indexer_core(projected, batch)
+        impl, counts = p0.impl, p0.impl.dcp_local_topk_counts
+        p0.impl.dcp_local_topk_counts = None
+        try:
+            # dcp_core's filter branch on the op's ids (no decode: wait unused)
+            from vllm.v1.attention.backends.mla.sparse_utils import (
+                triton_filter_and_convert_dcp_index,
+            )
+
+            ref, ref_valid = triton_filter_and_convert_dcp_index(
+                md.req_id_per_token[:batch],
+                md.block_table,
+                topk[:batch],
+                dcp_size=world,
+                dcp_rank=rank,
+                cp_kv_cache_interleave_size=p0.indexer.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=md.block_size,
+                BLOCK_STRIDE_ROWS=stride_rows,
+                NUM_TOPK_TOKENS=topk.shape[1],
+                return_valid_counts=True,
+            )
+        finally:
+            impl.dcp_local_topk_counts = counts
+        bad = 0
+        for r in range(batch):
+            n, m = int(valid[r]), int(ref_valid[r])
+            a = torch.sort(slots[r, :n]).values
+            b = torch.sort(ref[r, :m]).values
+            bad += int(n != m or not torch.equal(a, b))
+        return dict(rows_mismatch=bad, mean_count=float(valid.float().mean()))
+
     return SimpleNamespace(
-        config=config, context=context, layers=layers, run=run, info=info
-    )
+        config=config, context=context, layers=layers, run=run, info=info,
+        check=check,
+    )  # fmt: skip
 
 
 DBG = {}
@@ -343,6 +389,8 @@ def bench(case, args, rank):
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     with set_current_vllm_config(case.config), case.context:
         case.info = case.info()
+        if args.check:
+            case.info["check"] = case.check()
         for i in range(4):  # eager warm-up (compiles), both parities
             case.run(case.layers[i % 2])
         torch.accelerator.synchronize()
@@ -404,6 +452,7 @@ def main():
     ap.add_argument("--tag", default="chain")
     ap.add_argument("--out", default="")
     ap.add_argument("--dsac-dbg", action="store_true")
+    ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])

@@ -380,6 +380,9 @@ def dsa_on_flashinfer(attention) -> bool:
     return isinstance(attention.mla_attn.mla_attn.impl, FlashInferMLASparseImpl)
 
 
+# Wide rows whose #63 merge reads IndexerScoreFp4's logits (MXFP4 indexer cache);
+# the others DeepGEMM's paged MQA logits (both bit for bit the same logits).
+WIDE_SCORER = "65-:1"
 # The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
 # rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
 WIDE_LOCAL_TOPK = False
@@ -544,7 +547,9 @@ class WideDsa:
                 "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
                 "the stock sparse_attn_indexer op and the Triton slot filter",
             )
-        self.scorer = bool(local_topk) and self.indexer.use_fp4_cache
+        scored = batch_table(WIDE_SCORER) if WIDE_SCORER else {}
+        self.scored = [s for s in self.shapes if s[0] in scored]
+        self.scorer = bool(local_topk and self.scored) and self.indexer.use_fp4_cache
         if self.scorer:
             from .prepared import kv_cache_blocks
 
@@ -560,13 +565,13 @@ class WideDsa:
         check_index_cache(self.indexer)
         stage = self.indexer_stage
         if self.scorer:
-            unsupported = fp4_scorer_policy(self.indexer, self.shapes, self.strict)
+            unsupported = fp4_scorer_policy(self.indexer, self.scored, self.strict)
             if not unsupported:
                 # Logits only: the merge's DeepSelect + pack take the local top-N
                 # (packs per WIDE_LOCAL_TOPK rows: IndexerLocalTopk's B' rows).
                 stage.fused = FusedIndexer(
                     self.indexer,
-                    self.shapes,
+                    self.scored,
                     self.device,
                     max(self.pitches),
                     local_topk=stage.local_topk,

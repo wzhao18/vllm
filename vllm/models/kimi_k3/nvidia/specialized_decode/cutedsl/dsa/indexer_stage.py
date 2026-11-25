@@ -213,7 +213,11 @@ class IndexerStage:
             release=release,
         )
         fused = self.fused
-        if fused is not None and decode.seq_lens.numel() == rows:
+        if (
+            fused is not None
+            and decode.seq_lens.numel() == rows
+            and (batch, q) in fused.kernels
+        ):
             # The logits stay valid until the merge returns (stream order): a
             # saturated rank re-reads its row in the exact merge's second round.
             packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
