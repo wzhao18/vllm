@@ -1631,6 +1631,9 @@ class RubinExpertsKernel(ExpertsKernel):
             ranges[g, 6] = cta
         if cutlass.const_expr(self.match_fc1):
             fc1 = self.matched_fc1(sm, workspace, before, distinct, experts)
+            if cutlass.const_expr(self.stamp > 0):
+                if tid == 0:
+                    stamp_at(trace, 6)
             for g in cutlass.range_constexpr(2):
                 matched = ExpertsKernel.partition(self, distinct, fc1[g])
                 for i in cutlass.range_constexpr(4):
