@@ -775,6 +775,10 @@ class MooncakeLookupResult:
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
     known_prefix_tokens: int = 0
+    # Full-attention-only store hit when it runs deeper than ``hit_length``
+    # (a shared prefix whose Mamba state is not stored): the shared-prefix
+    # junction. 0 = none. Carried on the wire as a sentinel tail entry.
+    attn_hit_length: int = 0
 
 
 @dataclass

@@ -51,17 +51,23 @@ RESP_ERR: bytes = b"\x00"
 
 # group_id (u32), boundary_tokens (u32).
 TAIL_KEY_BOUNDARY_ENTRY_SIZE: int = 8
+# Tail entry group_id that carries ``attn_hit_length`` instead of a boundary.
+ATTN_HIT_SENTINEL_GROUP: int = 0xFFFFFFFF
 
 
 def encode_lookup_response(result: MooncakeLookupResult) -> bytes:
     hit_length = result.hit_length.to_bytes(4, "big")
-    if not result.tail_key_boundaries:
+    attn = result.attn_hit_length if result.attn_hit_length > result.hit_length else 0
+    if not result.tail_key_boundaries and not attn:
         return hit_length
 
     payload = bytearray(hit_length)
     for boundary in result.tail_key_boundaries:
         payload.extend(boundary.group_id.to_bytes(4, "big"))
         payload.extend(boundary.num_tokens.to_bytes(4, "big"))
+    if attn:
+        payload.extend(ATTN_HIT_SENTINEL_GROUP.to_bytes(4, "big"))
+        payload.extend(attn.to_bytes(4, "big"))
     return bytes(payload)
 
 
@@ -74,11 +80,14 @@ def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
         return MooncakeLookupResult(hit_length)
 
     boundaries = []
+    attn_hit_length = 0
     for offset in range(4, len(payload), TAIL_KEY_BOUNDARY_ENTRY_SIZE):
-        boundaries.append(
-            TailKeyBoundary(
-                group_id=int.from_bytes(payload[offset : offset + 4], "big"),
-                num_tokens=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
-            )
-        )
-    return MooncakeLookupResult(hit_length, tuple(boundaries))
+        group_id = int.from_bytes(payload[offset : offset + 4], "big")
+        num_tokens = int.from_bytes(payload[offset + 4 : offset + 8], "big")
+        if group_id == ATTN_HIT_SENTINEL_GROUP:
+            attn_hit_length = num_tokens
+            continue
+        boundaries.append(TailKeyBoundary(group_id=group_id, num_tokens=num_tokens))
+    return MooncakeLookupResult(
+        hit_length, tuple(boundaries), attn_hit_length=attn_hit_length
+    )
