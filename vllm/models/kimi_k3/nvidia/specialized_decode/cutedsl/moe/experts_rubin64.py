@@ -543,6 +543,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             for s in cutlass.range(lo, hi, unroll=1):
                 slot = count % stages
                 self.sync(full.iterator + slot, count // stages & 1, True)
+                if (lane == 0) & (count == 0):
+                    self.stamp(18)  # DIAG: first FC1 stage full
+                if (lane == 0) & (count == stages):
+                    self.stamp(19)  # DIAG: stage ``stages`` (the first refill) full
                 weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
                 released = shared_address(empty.iterator + slot)
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
@@ -875,6 +879,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         scale = self.off_xsf + lane // 8 * 128 + (lane & 7) * 16
         sources = cute.make_rmem_tensor(5, Int32)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        if lane == 0:
+            self.stamp(17)  # DIAG: the gather warp enters (ranking done)
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
             ks, r = (lo % 14, lo // 14 % 3)
@@ -891,6 +897,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     src = PLAN_XSF + sources[4] + (2 * ks + lane // 8) * 16
                     copy_g2s(sm.iterator + scale + slot * 256, ws + src)
                 cute.arch.cp_async_mbarrier_arrive_noinc(full.iterator + slot)
+                if (lane == 0) & (issued == 0):
+                    self.stamp(16)  # DIAG: first x slice issued
                 slot, issued = (slot + 1, issued + 1)
                 if slot == stages:
                     slot, phase = (Int32(0), phase ^ 1)
