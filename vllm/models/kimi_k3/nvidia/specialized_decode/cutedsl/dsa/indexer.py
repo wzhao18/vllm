@@ -58,6 +58,7 @@ from ..common.primitives import (
     smem_words,
     store_shared_words,
 )
+from .index import fp4_query_views, is_fp4_cache
 
 PAGE = 64  # keys per indexer cache block
 DIM = 128
@@ -1413,13 +1414,18 @@ class IndexerLocalTopk:
       4  each thread's count of candidates above it and ties at it, block-
          scanned -> their slots."""
 
-    def __init__(self, rows: int, n: int, pitch: int):
+    def __init__(self, rows: int, n: int, pitch: int, world: int = 0):
         assert n % 32 == 0 and n < 1 << LOCAL_ABOVE_BITS and pitch % 512 == 0
         self.rows, self.n, self.pitch = rows, n, pitch
+        # world > 0: also multicast each B' row into the #63 merge's round-1
+        # mailbox (dcp_topk_round1_mailbox; the pack kernel's layout), so the
+        # merge runs no pack kernel.
+        self.world = world
 
     @cute.jit
-    def __call__(self, logits, row_ends, out, valid, s):
-        self.kernel(logits, row_ends, out, valid).launch(
+    def __call__(self, logits, row_ends, out, valid, ordinals, box_mc, rank, rows, s):
+        args = logits, row_ends, out, valid, ordinals, box_mc, rank, rows
+        self.kernel(*args).launch(
             grid=(self.rows, 1, 1),
             block=(SELECT_THREADS, 1, 1),
             stream=s,
@@ -1497,8 +1503,42 @@ class IndexerLocalTopk:
                             count += c
         return count, state
 
+    @cute.jit
+    def publish(self, out, row, ordinals, box_mc, rank, max_rows, tid):
+        """Multicast B' row ``row`` (``out``, written by this CTA before the
+        barrier) into this rank's slot of every rank's round-1 mailbox: the N
+        words, the bit plane as marked half-words, marks to the 16-byte end."""
+        from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+            box_words,
+            multimem_st_v4,
+        )
+
+        N, mark = self.n, Uint32(0x10000)
+        words = box_words(N)
+        parity = ordinals[row] & Int32(1)
+        slot = (
+            (Int64(parity) * Int64(max_rows) + Int64(row)) * Int64(self.world)
+            + Int64(rank)
+        ) * Int64(words * 4)
+        for c in cutlass.range(tid, words // 4, SELECT_THREADS, unroll=1):
+            v = [Int32(0), Int32(0), Int32(0), Int32(0)]
+            for e in cutlass.range_constexpr(4):
+                i = c * 4 + e
+                w = mark
+                if i < N:
+                    w = Uint32(out[row, i])
+                elif i < N + 2 * (N // 32):
+                    plane = Uint32(out[row, N + (i - N) // 2])
+                    if (i - N) % 2 == 1:
+                        plane = plane >> Uint32(16)
+                    w = mark | (plane & Uint32(0xFFFF))
+                v[e] = Int32(w)
+            multimem_st_v4(box_mc + slot + Int64(c) * Int64(16), *v)
+
     @cute.kernel
-    def kernel(self, logits, row_ends, out, valid):
+    def kernel(
+        self, logits, row_ends, out, valid, ordinals, box_mc, box_rank, max_rows
+    ):
         N = self.n
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -1660,6 +1700,9 @@ class IndexerLocalTopk:
                 out[row, N + tid] = Int32(plane[tid])
             if tid == 0:
                 valid[row] = Int32(N)
+        if cutlass.const_expr(self.world > 0):
+            cute.arch.sync_threads()  # the row's words and plane, block-visible
+            self.publish(out, row, ordinals, box_mc, box_rank, max_rows, tid)
 
     @cute.jit
     def list_pass(
@@ -1746,28 +1789,33 @@ def reserve(indexer, device, max_rows, local_topk=0, blocks=None):
     return logits, tops, out, valid, ends, pitch
 
 
-def static_unsupported(indexer, rows, q) -> str | None:
+def static_unsupported(indexer, rows, q, fp4=False) -> str | None:
     """Why the fused indexer cannot run this layer's (rows, q), from what is known
-    before the KV cache exists (None: it can, if its cache layout does)."""
+    before the KV cache exists (None: it can, if its cache layout does); ``fp4``:
+    the MXFP4 DCP scorer, which has no select of the top-k."""
     from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
     if not mqa_logits_use_mx_scales():
         return "needs the SM100 MX-scaled indexer cache"
-    if indexer.topk_tokens % SELECT_THREADS or indexer.topk_tokens > 4096:
+    topk = indexer.topk_tokens
+    if not fp4 and (topk % SELECT_THREADS or topk > 4096):
         return f"top-k {indexer.topk_tokens}"
     if not 1 <= q <= 8 or rows % q or rows // q > MAX_REQUESTS:
         return f"rows {rows} q {q}"
     return None
 
 
-def supports(indexer, rows, q) -> str | None:
-    """Why the fused indexer cannot run this layer (None: it can)."""
-    reason = static_unsupported(indexer, rows, q)
+def supports(indexer, rows, q, fp4=False) -> str | None:
+    """Why the fused indexer cannot run this layer (None: it can); ``fp4``: its
+    MXFP4 DCP scorer (IndexerScoreFp4)."""
+    reason = static_unsupported(indexer, rows, q, fp4)
     cache = indexer.k_cache.kv_cache
+    entry = DIM // 2 + DIM // 32 if fp4 else DIM + 4
     if reason is None and (
-        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != DIM + 4
+        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != entry
     ):
-        reason = f"indexer cache {tuple(cache.shape)} (needs FP8 [blocks, 64, 132])"
+        what = f"{'MXFP4' if fp4 else 'FP8'} [blocks, 64, {entry}]"
+        reason = f"indexer cache {tuple(cache.shape)} (needs {what})"
     return reason
 
 
@@ -1787,33 +1835,50 @@ def compile_indexer(
     packed=False,
     release=True,
     page=PAGE,
+    fp4=False,
+    world=0,
 ):
     """The score and select kernels of one (rows, q) for an indexer cache layout
     (every DSA layer's is the same). DCP (``pitch``): DeepGEMM-layout logits and,
     ``packed``, the local top-``topk`` select into B' rows (else none).
-    ``page``: the MLA cache's tokens per block (TP select)."""
-    score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
+    ``page``: the MLA cache's tokens per block (TP select). ``fp4``: an MXFP4
+    indexer cache (DCP only: IndexerScoreFp4)."""
     fp8 = cutlass.Float8E4M3FN
     with torch.accelerator.device_index(device):
-        query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
         weights = fake((rows * HEADS,), (1,), torch.bfloat16)
-        key_view = fake(*keys, fp8)
         scale_view = fake(*scales, torch.int32)
         table = Int64(0), Int32(0), Int32(0)
         ends = fake((rows,), (1,), torch.int32, 4)
         scratch = fake(logits, (1,), cutlass.Int16)
-        tops = fake(tops, (1,), cutlass.Int16)
         s = make_fake_stream()
-        args = query, weights, key_view, scale_view, *table, ends, scratch, tops, s
-        score_kernel = cute.compile(score, *args)
+        if fp4:
+            from .indexer_fp4 import IndexerScoreFp4
+
+            assert pitch, "the MXFP4 scorer writes DeepGEMM's layout (DCP) only"
+            score = IndexerScoreFp4(rows, q, ctas, pitch)
+            query = fake((rows * HEADS, DIM // 2), (DIM // 2, 1), torch.uint8)
+            q_sf = fake((rows * HEADS,), (1,), torch.int32)
+            key_view = fake(*keys, torch.uint8)
+            args = query, q_sf, weights, key_view, scale_view, *table, ends, scratch
+            score_kernel = cute.compile(score, *args, s)
+        else:
+            score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
+            query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
+            key_view = fake(*keys, fp8)
+            tops = fake(tops, (1,), cutlass.Int16)
+            args = query, weights, key_view, scale_view, *table, ends, scratch, tops, s
+            score_kernel = cute.compile(score, *args)
         if pitch:
             if not packed:
                 return score_kernel, None
             width = topk + topk // 32
             out = fake((rows, width), (width, 1), torch.int32, 4)
             valid = fake((rows,), (1,), torch.int32, 4)
-            local = IndexerLocalTopk(rows, topk, pitch)
-            return score_kernel, cute.compile(local, scratch, ends, out, valid, s)
+            local = IndexerLocalTopk(rows, topk, pitch, world)
+            ordinals = fake((rows,), (1,), torch.int32, 4)
+            box = Int64(0), Int32(0), Int32(0)
+            args = scratch, ends, out, valid, ordinals, *box, s
+            return score_kernel, cute.compile(local, *args)
         select = IndexerSelect(rows, q, topk, logical=ids, release=release, page=page)
         out = fake((rows, topk), (topk, 1), torch.int32, 4)
         valid = fake((rows,), (1,), torch.int32, 4)
@@ -1848,16 +1913,19 @@ class FusedIndexer:
         self.indexer, self.device, self.page = indexer, device, page
         self.topk = local_topk or indexer.topk_tokens
         self.packed = packed and local_topk > 0
+        # MXFP4 keys: [64 x 64 B E2M1 | 64 x UE8M0 x4] per page (DCP only).
+        self.fp4 = is_fp4_cache(cache)
+        assert not self.fp4 or local_topk, "MXFP4 fused indexer: DCP only"
+        key_bytes = DIM // 2 if self.fp4 else DIM
         blocks, unit = cache.shape[0], cache.stride(0)
-        self.keys = torch.as_strided(cache, (PAGE, DIM, blocks), (DIM, 1, unit)).view(
-            torch.float8_e4m3fn
-        )
+        keys = torch.as_strided(cache, (PAGE, key_bytes, blocks), (key_bytes, 1, unit))
+        self.keys = keys if self.fp4 else keys.view(torch.float8_e4m3fn)
         words = cache.view(torch.int32)
         self.scales = torch.as_strided(
             words,
             (blocks, PAGE),
             (unit // 4, 1),
-            storage_offset=words.storage_offset() + PAGE * DIM // 4,
+            storage_offset=words.storage_offset() + PAGE * key_bytes // 4,
         )
         if local_topk:  # a rank's keys of a context (interleave 1)
             self.max_local_len = -(-indexer.max_model_len // indexer.dcp_world_size)
@@ -1865,6 +1933,14 @@ class FusedIndexer:
         self.logits, self.tops, self.out, self.valid, self.ends, self.pitch = buffers
         self.ctas = torch.cuda.get_device_properties(device).multi_processor_count
         self.ids: torch.Tensor | None = None
+        # The packed select publishes the #63 merge's round-1 rows itself.
+        self.box = None
+        if self.packed:
+            from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+                dcp_topk_round1_mailbox,
+            )
+
+            self.box = dcp_topk_round1_mailbox(indexer.topk_tokens, local_topk)
         self.kernels = {shape: self.compile(*shape) for shape in shapes}
 
     def compile(self, rows, q):
@@ -1876,7 +1952,14 @@ class FusedIndexer:
         packed = self.packs(rows)
         args += (self.device.index, self.ids is not None, self.pitch, packed)
         release = (rows, q) not in self.hold
-        return compile_indexer(*args, release=release, page=self.page)
+        world = self.box.world_size if self.box is not None and packed else 0
+        return compile_indexer(
+            *args, release=release, page=self.page, fp4=self.fp4, world=world
+        )
+
+    def publishes(self, rows):
+        """Whether ``run_dcp`` multicasts its B' rows into the merge's mailbox."""
+        return self.box is not None and self.packs(rows)
 
     def packs(self, rows):
         """DCP: whether ``run_dcp`` selects the B' rows itself: one CTA per row
@@ -1913,6 +1996,21 @@ class FusedIndexer:
             self.ends[: ends.shape[0]].copy_(ends)
             ends = self.ends
         ends = ends[:rows]
+        if self.fp4:
+            # DsaIndex's MXFP4 query of this ``rows``-row step (fp4_query_views).
+            packed, q_sf = fp4_query_views(q_fp8, rows, rows)
+            score(
+                to_cute(packed.reshape(rows * HEADS, DIM // 2)),
+                to_cute(q_sf.reshape(-1), 4),
+                to_cute(head_w[:rows].reshape(-1)),
+                to_cute(self.keys),
+                to_cute(self.scales),
+                *self._table(index_table),
+                to_cute(ends, 4),
+                to_cute(self.logits),
+                stream(self.device),
+            )
+            return ends
         query = torch.as_strided(
             q_fp8[:rows].view(torch.float8_e4m3fn),
             (rows * HEADS, DIM, 1),
@@ -1965,12 +2063,21 @@ class FusedIndexer:
             return None, logits, ends
         _, select = self.kernels[rows, q]
         out, valid = self.out[:rows], self.valid[:rows]
-        s = stream(self.device)
+        box = self.box
+        if box is not None:
+            assert rows <= box.max_rows, (rows, box.max_rows)
+            ordinals = to_cute(box.ordinals[:rows], 4)
+            mailbox = Int64(box.box_mc), Int32(box.rank), Int32(box.max_rows)
+        else:
+            ordinals = to_cute(valid, 4)  # placeholders (world 0)
+            mailbox = Int64(0), Int32(0), Int32(0)
         select(
             to_cute(self.logits),
             to_cute(ends, 4),
             to_cute(out, 4),
             to_cute(valid, 4),
-            s,
+            ordinals,
+            *mailbox,
+            stream(self.device),
         )
         return out, logits, ends
