@@ -16,7 +16,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
-from ..common.diagstamp import clock_store, smid_store, stamp_store
+from ..common.diagstamp import clock_store, mio_keep, smid_store, stamp_store
 
 from ..common.primitives import (
     acquire_tensormap,
@@ -1087,6 +1087,7 @@ class WaveMoeTail(MoeTail):
                 pending |= self.poll_row(values, r, base + r * stride)
         sgn, sgt = spin_start()
         while pending != 0:
+            mio_keep(pending)  # DIAG arm: MIO busy while polling
             sleep_ns(Uint32(self.poll_ns))
             again = Uint32(0)
             for r in cutlass.range_constexpr(self.groups):

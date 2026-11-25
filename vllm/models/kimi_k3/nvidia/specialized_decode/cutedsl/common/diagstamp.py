@@ -43,6 +43,14 @@ def clock_store(address, when):
     return code, "l,r,~{memory}", (Int64(address), Int32(when))
 
 
+@asm()
+def mio_keep(value):
+    """DIAG: two SHFLs and one LDS (smem offset 0, read only): keeps the SM's MIO path busy in a poll loop."""
+    code = "{ .reg .b32 t; .reg .b32 u; shfl.sync.idx.b32 t, $0, 0, 31, -1; "
+    code += "shfl.sync.idx.b32 t, t, 1, 31, -1; ld.shared.u32 u, [0]; }"
+    return code, "r,~{memory}", (Int32(value),)
+
+
 def buffer(kind, key, rows, ctas, device, slots=SLOTS, used=None):
     t = torch.zeros(ctas, slots, dtype=torch.int64, device=device)
     _BUFS.append((kind, key, rows, t, used or ctas))
