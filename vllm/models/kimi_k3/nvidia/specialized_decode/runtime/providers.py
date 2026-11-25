@@ -29,6 +29,7 @@ from ..cutedsl.kda.head import (
     polled_out_batches,
 )
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
+from ..cutedsl.kda.prepared import record_protocol
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.mla.dcp import PAIR_SENT, DcpBox, polled_output
@@ -682,6 +683,20 @@ class Attention:
             prepared = ((8, q),) if folded else ()
             dim_first = is_conv_state_dim_first()
             self.core = PreparedKda(attention, policies, dim_first, prepared=prepared)
+            # An FP32 state's verify kernels store the deferred-verify records
+            # (kda.verify_defer): the layer's stock verify and the align copies
+            # follow the record format (ops/kda_records.py).
+            a_log = getattr(attention, "A_log", None)
+            records = a_log is not None and record_protocol(
+                q, runtime.bf16_state, a_log.numel()
+            )
+            if records and not getattr(attention, "use_recoverssm", False):
+                if getattr(attention, "kda_spec_decode_backend", None) == "flashinfer":
+                    raise RuntimeError(
+                        "Kimi K3 decode: the KDA record protocol (FP32 state) needs "
+                        "the native stock verify, not FlashInfer's packed decode"
+                    )
+                attention.state_records = True
             if folded:
                 self.fold64 = PreparedKdaInProj64(
                     weight, self.core, tactics[64][:4], tokens=q
