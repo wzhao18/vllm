@@ -891,8 +891,10 @@ class WideDsa:
         qc = to_cute(self.qc[:batch])
         norm = self.norms[batch]
         norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
-        with torch.cuda.stream(side):
-            mq(*q_args, *publish, stream(self.device))
+        late = batch in self.prioritized
+        if not late:
+            with torch.cuda.stream(side):
+                mq(*q_args, *publish, stream(self.device))
         mailbox = publish[0]
 
         def join():
@@ -902,6 +904,10 @@ class WideDsa:
 
         def chain():
             self.run_index(q_args[0], index_slots, batch, index)
+            if late:  # MlaQuery forked after wq_b + DsaIndex (no SM contention)
+                side.wait_stream(torch.cuda.current_stream(self.device))
+                with torch.cuda.stream(side):
+                    mq(*q_args, *publish, stream(self.device))
             args = cache, None, metadata, batch, box, join, projected, q
             return self.dcp_core(*args)
 
