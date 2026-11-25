@@ -284,7 +284,7 @@ RING_PROJECTIONS = {
 # two-shot producers (cutedsl.draft.producer: the target's tcgen05 o-projection
 # producer pushing its BF16 rows to the column owners) and polled sites, per TP, on
 # Rubin.
-TWO_SHOT_PRODUCERS = {16: "8-64:1"}
+TWO_SHOT_PRODUCERS = {16: "8-128:1"}
 # TWO_SHOT_PRODUCERS batches whose gate/up GEMM runs with silu_and_mul in its
 # epilogue at the PROJECTIONS_WIDE tactic of the rows (cutedsl.gemm.splitk_situ
 # SplitKSiluMul for the M tile 64 tactics, gemm.splitk_situ64 for the tensor-memory
@@ -747,7 +747,7 @@ class DraftFastPath:
                 if pushed and all(plain_layer(layer) for layer in layers):
                     producers = [
                         tuple(
-                            TwoShotProducer(weight, pushed, tp)
+                            TwoShotProducer(weight, pushed, tp, prepared_ar.wide_cap)
                             for weight in (
                                 layer.self_attn.o_proj.weight,
                                 layer.mlp.down_proj.weight,
@@ -1968,7 +1968,7 @@ class GqaDraftFastPath(DraftFastPath):
             return
         producers = [
             tuple(
-                TwoShotProducer(weight, pushed, tp)
+                TwoShotProducer(weight, pushed, tp, prepared_ar.wide_cap)
                 for weight in (
                     layer.self_attn.o_proj.weight,
                     layer.mlp.down_proj.weight,

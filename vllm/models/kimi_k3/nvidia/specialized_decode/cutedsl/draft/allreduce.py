@@ -810,6 +810,7 @@ class PreparedDraftAr:
         # by rows (``prepare_producers``).
         self.producers: list[tuple] = []
         self.two_producers: list[tuple] = []  # ``set_two_shot_producers``
+        self.shifted: dict[tuple, torch.Tensor] = {}  # wide two-shot second launches
         self.two_gate_up: list = []  # ``prepare_two_gate_up``
         self.gate_up: list = []
         self.polled: dict[int, object] = {}
@@ -899,12 +900,22 @@ class PreparedDraftAr:
         partial row chunks to the column owners themselves
         (``run_two_shot(x, recv, peers, slot)``, common.twoshot.push): those rows'
         sites become ``polled``."""
+        from .producer import halves
+
         self.two_producers = list(producers)
         for r in rows:
             assert r in self.two_rows
+            cap = self.wide_cap if r in self.wide_two else TWO_CAP
             self.polled[r] = compile_two_shot(
-                r, self.tp, self.tp, self.device.index, True, r in self.early_two
-            )
+                r, self.tp, self.tp, self.device.index, True, r in self.early_two,
+                cap=cap,
+            )  # fmt: skip
+            if r in self.wide_two:  # the second launch's owners' bases, per parity
+                first = halves(r)[1][0]
+                for parity in (0, 1):
+                    recv, peers = self.wide_box.views(parity)[:2]
+                    shift = first * recv.stride(1) * recv.element_size()
+                    self.shifted[(r, parity)] = peers + shift
 
     def prepare_two_gate_up(self, layers, tactics):
         """The two-shot rows' gate/up GEMMs with silu_and_mul in their epilogue for
@@ -976,6 +987,11 @@ class PreparedDraftAr:
     def publish(self, producer, x, parity):
         """``producer``'s partial rows of ``x`` into this rank's slot of ``parity``."""
         rows = x.shape[0]
+        if rows in self.wide_two:
+            recv, peers = self.wide_box.views(parity)[:2]
+            shifted = self.shifted[(rows, parity)]
+            producer.run_two_shot(x, recv, peers, self.rank, shifted)
+            return
         if rows in self.two_rows:
             recv, peers = self.two.views(parity)[:2]
             producer.run_two_shot(x, recv, peers, self.rank)
