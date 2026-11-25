@@ -17,7 +17,9 @@ the MMAs of the tile before it in its slot). The M128 N64 K16 MMAs read A from
 tensor memory (35.6 cycles vs 49.8 from shared memory, ``notes/gemm64.md``).
 
 Reduce-scatter over the cluster in one DSMEM hop: once every rank's MMAs are done
-(a cluster barrier: the owners' mailboxes reuse the A slots and x's slots), each
+(a cluster barrier: the owners' mailboxes reuse the A slots and x's slots; with
+``separate`` mailboxes, past them in the shared memory a lone CTA leaves unused,
+each rank pushes as soon as its own MMAs are done), each
 epilogue thread pushes its accumulator row (one TMEM lane, 64 token columns) to the
 owner of its 128 / ``owners`` row share (16-byte ``st.async``); owners sum the
 partials in rank order, ((p0 + p1) + p2) + ..., round once to BF16 and store their
@@ -246,6 +248,15 @@ class SplitKTmemGemm64(SplitKGemm):
         assert self.mailbox_bytes <= self.tile_offset
         assert data >= self.tile_offset + self.n * self.share * 4
         used = data + (2 * self.num_ab_stage + 2 * self.k_tiles + 6) * 8 + 4
+        # separate: the mailboxes in their own shared memory, when it fits below the
+        # lone CTA's request (ALONE_SMEM, unchanged): no rank's partials can land in
+        # a peer's A or x slots, so the cluster barrier between the MMAs and the
+        # pushes (every rank's MMAs done) goes (MoE front, 16-rank stamps: 0.4 us
+        # from the last CTA's MMAs to the barrier). Same pushes, sums and stores.
+        box = (used + 1023) // 1024 * 1024 + self.mailbox_bytes
+        self.separate = alone and (box + 2048 + 1023) // 1024 * 1024 <= ALONE_SMEM
+        if self.separate:
+            used = box
         self.smem_bytes = (used + 2048 + 1023) // 1024 * 1024
         if alone:  # ``alone`` False: few CTAs, beside small-smem predecessors
             self.smem_bytes = max(self.smem_bytes, ALONE_SMEM)
@@ -327,6 +338,9 @@ class SplitKTmemGemm64(SplitKGemm):
         bar_tmem_alloc = _smem(cutlass.Int64, 1, 8).iterator
         bar_reduce = _smem(cutlass.Int64, 1, 8).iterator
         tmem_base_ptr = _smem(cutlass.Int32, 1, 4).iterator
+        box = data  # the owners' mailboxes
+        if cutlass.const_expr(self.separate):
+            box = Int32(_smem(cutlass.Uint8, self.mailbox_bytes, 1024).iterator.toint())
 
         if warp_idx == 0:
             with cute.arch.elect_one():
@@ -358,7 +372,8 @@ class SplitKTmemGemm64(SplitKGemm):
                                bidx * self.cta_m, first)  # fmt: skip
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(bar_drained)
-            _cluster_phases()
+            if cutlass.const_expr(not self.separate):
+                _cluster_phases()
         elif warp_idx == 1:
             b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx))
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -367,20 +382,23 @@ class SplitKTmemGemm64(SplitKGemm):
                 self.x_warp64(b_full, b_empty, b_tile, sB, b_map, first, tiles)
             else:
                 self.x_warp3d(b_full, b_empty, ring, x_map, first, tiles, n_idx)
-            _cluster_phases()
+            if cutlass.const_expr(not self.separate):
+                _cluster_phases()
         elif warp_idx == 2:
             self.staged_mma_warp64(
                 bar_full, bar_empty, a_full, b_full, b_empty, bar_mma_epilog,
                 bar_tmem_alloc, ring, data, tmem_base_ptr, tiles,
             )  # fmt: skip
-            _cluster_phases()
+            if cutlass.const_expr(not self.separate):
+                _cluster_phases()
         elif warp_idx == 3:
-            _cluster_phases()
+            if cutlass.const_expr(not self.separate):
+                _cluster_phases()
         else:
             self.reduce_scatter64(
                 cute.arch.thread_idx()[0] - 128, bar_mma_epilog, bar_tmem_alloc,
                 tmem_base_ptr, data, bar_reduce, split_rank, out,
-                bidx * self.cta_m, n_idx * self.cta_n, l_idx,
+                bidx * self.cta_m, n_idx * self.cta_n, l_idx, box,
             )  # fmt: skip
 
     def issue_a(self, dst, barrier, a_map, k0, row0):
@@ -547,7 +565,7 @@ class SplitKTmemGemm64(SplitKGemm):
     def reduce_scatter64(
         self, epi_tid: cutlass.Int32, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr,
         data: Int32, bar_reduce, split_rank: cutlass.Int32, out,
-        row0: cutlass.Int32, col0: cutlass.Int32, l_idx: cutlass.Int32,
+        row0: cutlass.Int32, col0: cutlass.Int32, l_idx: cutlass.Int32, box: Int32,
     ):  # fmt: skip
         """Accumulator row ``epi_tid`` (64 FP32 token columns) -> slot
         ``split_rank`` of its owner's mailbox [split][16 quads][SHARE rows][4]
@@ -571,15 +589,16 @@ class SplitKTmemGemm64(SplitKGemm):
         if (epi_tid == 0) & (split_rank < self.owners):
             expected = (split - 1) * slot_bytes
             cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
-        _cluster_arrive()  # this CTA's MMAs are done: its slots may take partials
-        _cluster_wait()
+        if cutlass.const_expr(not self.separate):
+            _cluster_arrive()  # this CTA's MMAs are done: its slots may take partials
+            _cluster_wait()
         self.stamp(7, epi_tid == 0)
         # The epilogue's own inputs, loaded under the reduce-scatter (None: none;
         # after the cluster barrier, whose release would wait for the loads).
         early = self.finish_inputs(epi_tid, out, row0 + split_rank * self.share, col0)
         finish_out = out if early is None else (*out, early)
         owner, r = self.owner_of(epi_tid, row0)
-        slot = data + (split_rank * quads * share + r) * 16  # at the owner's address
+        slot = box + (split_rank * quads * share + r) * 16  # at the owner's address
         mailbox = cute.make_ptr(Float32, slot, cute.AddressSpace.smem, assumed_align=16)
         if owner == split_rank:
             for i in cutlass.range_constexpr(quads):
@@ -600,7 +619,7 @@ class SplitKTmemGemm64(SplitKGemm):
             for s in cutlass.range_constexpr(split):
                 for v in cutlass.range_constexpr(width // 4):
                     offset = ((s * quads + width // 4 * g + v) * share + rr) * 16
-                    words = _ld_shared_v4(data + offset)
+                    words = _ld_shared_v4(box + offset)
                     for j in cutlass.range_constexpr(4):
                         part = bits_float(words[j])
                         if cutlass.const_expr(s == 0):
