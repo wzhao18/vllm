@@ -660,6 +660,10 @@ class RubinMoeWeights(NamedTuple):
     view (``float4_e2m1fn_x2``) of K-major physical ``(E, N, K/2)`` storage, the scale
     the per-expert flattened 32x4x4-swizzled plane (``float8_e4m3fn`` for NVFP4,
     ``float8_e8m0fnu`` for MXFP4). The NVFP4 scalars are ``(E,)`` fp32, None for MX.
+
+    ``compact_sf``: NVFP4 scale planes as their even bytes only (half the columns),
+    valid when every per-16 pair is equal; the kernel expands them itself
+    (``compact_scales``).
     """
 
     quant_kind: str
@@ -669,6 +673,7 @@ class RubinMoeWeights(NamedTuple):
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
     report: ConversionReport | None = None
+    compact_sf: bool = False
 
 
 def _aligned_k_major_view(data_u8: torch.Tensor) -> torch.Tensor:
@@ -1049,6 +1054,12 @@ def validate_kernel_weights(
     fc1_shape, fc2_shape, fc1_sf, fc2_sf = kernel_weight_shapes(
         quant_kind, experts, hidden, intermediate
     )
+    if weights.compact_sf:
+        if quant_kind != "nvfp4":
+            raise ValueError(
+                f"compact scale planes are NVFP4-only, got {quant_kind!r}."
+            )
+        fc1_sf, fc2_sf = fc1_sf // 2, fc2_sf // 2
     sf_dtype = torch.float8_e4m3fn if quant_kind == "nvfp4" else torch.float8_e8m0fnu
     for name, (weight, scale), wshape, sf_numel in (
         ("fc1", weights.fc1, fc1_shape, fc1_sf),

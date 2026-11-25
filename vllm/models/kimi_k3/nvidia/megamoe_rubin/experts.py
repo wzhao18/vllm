@@ -57,7 +57,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from . import dwdp, scale_staging
+from . import compact_scales, dwdp
 from .config import (
     DEDUP_VARIANTS,
     SHIPPED_KNOBS,
@@ -516,11 +516,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
         self.prefill_worker = pd_prefill_worker(vllm_config)
-        # NVFP4 scale planes kept compact and expanded one layer ahead (set by
-        # prepare_rubin_megamoe when every pair is equal: scale_staging).
-        self.compact_scales = scale_staging.wanted(vllm_config, self.prefill_worker)
-        self.scale_staging: scale_staging.ScaleStaging | None = None
-        self.moe_ordinal = -1
+        # NVFP4 scale planes kept compact, read by the kernel (prepare_rubin_megamoe
+        # compacts them when every pair is equal: compact_scales).
+        self.compact_scales = compact_scales.wanted(vllm_config, self.prefill_worker)
         model_config = getattr(vllm_config, "model_config", None)
         text_config = getattr(model_config, "hf_text_config", None)
         # MoE layers of the model: an upper bound for the die-local budget check
@@ -1109,14 +1107,11 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{self.prefix}: EPLB needs the kernel-layout experts; run "
                 "process_weights_after_loading first."
             )
-        fc1_sf, fc2_sf = w.fc1[1], w.fc2[1]
-        if self.scale_staging is not None:  # the staging slots are re-expanded
-            fc1_sf, fc2_sf = self.scale_staging.legs[self.moe_ordinal]
         tensors = [
             w.fc1[0].permute(0, 2, 1),  # logical (E, K/2, N) of K-major storage
-            fc1_sf,
+            w.fc1[1],  # full or compact scale planes, as the kernel reads them
             w.fc2[0].permute(0, 2, 1),
-            fc2_sf,
+            w.fc2[1],
             *(t for t in (w.fc1_alpha, w.fc2_alpha, w.fc1_norm_const) if t is not None),
         ]
         views = []
@@ -1131,18 +1126,6 @@ class KimiK3MegaMoEExperts(nn.Module):
 
     def update_expert_map(self) -> None:
         pass
-
-    # -- compact scale planes ---------------------------------------------------------
-
-    def wait_scales(self) -> None:
-        """Before this layer's kernel launch: its scale planes are expanded."""
-        if self.scale_staging is not None:
-            self.scale_staging.before_kernel(self.moe_ordinal)
-
-    def prefetch_next_scales(self) -> None:
-        """After this layer's kernel launch: expand the next MoE layer's planes."""
-        if self.scale_staging is not None:
-            self.scale_staging.after_kernel(self.moe_ordinal)
 
     # -- forward ----------------------------------------------------------------------
 
@@ -1238,7 +1221,6 @@ class KimiK3MegaMoEExperts(nn.Module):
         expert_dwdp = dwdp.get()
         if expert_dwdp is not None:
             expert_dwdp.before_experts(self)
-        self.wait_scales()
         num_tokens = hidden_states.shape[0]
         # Static per captured CUDA graph size (shape-only + host DP metadata).
         bucket = self.select_bucket(num_tokens)
@@ -1303,7 +1285,6 @@ class KimiK3MegaMoEExperts(nn.Module):
             eplb=eplb,
             **extra,
         )
-        self.prefetch_next_scales()
         if drop_shared:
             y = y[0]
         if shared_experts is not None:
@@ -1348,7 +1329,7 @@ def prepare_rubin_megamoe(model: nn.Module) -> int:
     for module in experts:
         module.process_weights_after_loading()
     if experts:
-        scale_staging.install(experts, get_ep_group().cpu_group)
+        compact_scales.install(experts, get_ep_group().cpu_group)
     warmed: set[int] = set()
     for module in experts:
         runtime = module.get_runtime()

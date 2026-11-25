@@ -135,6 +135,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             "combine_dedup": OptionalRequirement(bool),
             **shared_kernel_impl_requirements(),
             "epilogue_warpgroups": OptionalRequirement(int),
+            "compact_weight_sf": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -211,6 +212,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         self.combine_dedup = bool(impl_desc.get("combine_dedup", False))
+        # vLLM-local: fc1/fc2_weight_sf are the compact planes (the even bytes of the swizzled NVFP4 planes, every
+        # per-16 pair equal); the mainloop expands them in SMEM (BlockScaledSwapAbFc12Mainloop.compact_weight_sf).
+        self.compact_weight_sf = bool(impl_desc.get("compact_weight_sf", False))
         # Diagnostic only (MEGA_DIAG_SKIP_TOKEN_BACK=1): combine warps do nothing, so the timed kernel is
         # MMA + epilogue + dispatch alone. Output is wrong; run with MEGA_TIMING_ONLY=1.
         self._diag_skip_token_back = os.environ.get("MEGA_DIAG_SKIP_TOKEN_BACK", "0") == "1"
@@ -229,6 +233,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             # compiled into the scheduler gate.
             self.home_expert_count = self.local_expert_count
         self._resolve_shared_expert(problem_desc, impl_desc)
+        if self.compact_weight_sf and (self.shared_expert or self.comm_clusters > 0):
+            raise ValueError("compact_weight_sf supports neither a fused shared expert nor communication clusters.")
         if self.shared_expert and self.comm_clusters > 0:
             raise ValueError("shared_expert is not supported with the communication CTA split (comm_clusters > 0).")
         self.epilogue_warpgroups = impl_desc.get("epilogue_warpgroups", 1)
@@ -853,6 +859,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             + f"_{'dedup' if self.combine_dedup else 'nodedup'}"
             # Only the non-default value changes the name, so existing compiled kernels keep their keys.
             + ("_epiwarpgroups2" if self.two_epilogue_warpgroups else "")
+            + ("_compactsfa" if self.compact_weight_sf else "")
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
             + ("_diagskiptb" if self._diag_skip_token_back else "")
             + (
@@ -912,6 +919,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
         fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
         fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
+        if self.compact_weight_sf:
+            fc1_weight_sf_columns //= 2
+            fc2_weight_sf_columns //= 2
         # TopkReduce and the in-kernel REDG both take their output dtype from this tensor.
         output_dtype = cutlass.BFloat16
 
@@ -1187,18 +1197,22 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         )
         padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
         expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
+        if cutlass.const_expr(self.compact_weight_sf):
+            expected_fc1_weight_sf_columns = expected_fc1_weight_sf_columns // 2
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
         ):
             if cutlass.const_expr(fc1_weight_sf.shape[1] != expected_fc1_weight_sf_columns):
                 raise ValueError("fc1_weight_sf has an incompatible column count.")
-        fc1_sfa = cute.make_tensor(
-            fc1_weight_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
-                sf_vec_size,
-            ),
-        )
+        fc1_sfa = None
+        if cutlass.const_expr(not self.compact_weight_sf):
+            fc1_sfa = cute.make_tensor(
+                fc1_weight_sf.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
+                    sf_vec_size,
+                ),
+            )
 
         experts_fc2, intermediate_fc2, hidden_fc2 = fc2_weight.shape
         fc2_a = cute.make_tensor(
@@ -1212,18 +1226,26 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         padded_fc2_hidden = cute.round_up(hidden_fc2, 128)
         padded_fc2_intermediate = cute.round_up(intermediate_fc2, sf_vec_size * 4)
         expected_fc2_weight_sf_columns = padded_fc2_hidden * padded_fc2_intermediate // sf_vec_size
+        if cutlass.const_expr(self.compact_weight_sf):
+            expected_fc2_weight_sf_columns = expected_fc2_weight_sf_columns // 2
         if cutlass.const_expr(
             isinstance(fc2_weight_sf.shape[1], int) and isinstance(expected_fc2_weight_sf_columns, int)
         ):
             if cutlass.const_expr(fc2_weight_sf.shape[1] != expected_fc2_weight_sf_columns):
                 raise ValueError("fc2_weight_sf has an incompatible column count.")
-        fc2_sfa = cute.make_tensor(
-            fc2_weight_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_fc2_hidden), cutlass.Int32(padded_fc2_intermediate), cutlass.Int32(experts_fc2)),
-                sf_vec_size,
-            ),
-        )
+        fc2_sfa = None
+        if cutlass.const_expr(not self.compact_weight_sf):
+            fc2_sfa = cute.make_tensor(
+                fc2_weight_sf.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (
+                        cutlass.Int32(padded_fc2_hidden),
+                        cutlass.Int32(padded_fc2_intermediate),
+                        cutlass.Int32(experts_fc2),
+                    ),
+                    sf_vec_size,
+                ),
+            )
         fc2_sfb = cute.make_tensor(
             fc1_output_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
@@ -1284,6 +1306,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             fc2_sfa=fc2_sfa,
             fc2_sfb=fc2_sfb,
         )
+        if cutlass.const_expr(self.compact_weight_sf):
+            # No SFA TMA atoms: the TMA-A warp bulk-loads the compact planes' bytes itself.
+            fc1_tma_sfa_tensor, fc2_tma_sfa_tensor = fc1_weight_sf, fc2_weight_sf
 
         (fc1_output_tma_atom, fc1_output_tma_tensor, fc2_output_tma_atom, fc2_output_tma_tensor) = (
             self.epilogue.prepare_tma_store_params(fc1_output_gemm, fc2_output)
@@ -1424,11 +1449,11 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         fc1_tma_a_tensor: cute.Tensor,
         fc1_tma_a_atom: cute.CopyAtom,
         fc1_tma_sfa_tensor: cute.Tensor,
-        fc1_tma_sfa_atom: cute.CopyAtom,
+        fc1_tma_sfa_atom: Optional[cute.CopyAtom],
         fc2_tma_a_tensor: cute.Tensor,
         fc2_tma_a_atom: cute.CopyAtom,
         fc2_tma_sfa_tensor: cute.Tensor,
-        fc2_tma_sfa_atom: cute.CopyAtom,
+        fc2_tma_sfa_atom: Optional[cute.CopyAtom],
         fc1_tma_b_tensor: cute.Tensor,
         fc1_tma_b_atom_or_pair: TmaAtomOrPair,
         fc1_tma_sfb_tensor: cute.Tensor,
@@ -1808,11 +1833,11 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         fc1_tma_a_tensor: cute.Tensor,
         fc1_tma_a_atom: cute.CopyAtom,
         fc1_tma_sfa_tensor: cute.Tensor,
-        fc1_tma_sfa_atom: cute.CopyAtom,
+        fc1_tma_sfa_atom: Optional[cute.CopyAtom],
         fc2_tma_a_tensor: cute.Tensor,
         fc2_tma_a_atom: cute.CopyAtom,
         fc2_tma_sfa_tensor: cute.Tensor,
-        fc2_tma_sfa_atom: cute.CopyAtom,
+        fc2_tma_sfa_atom: Optional[cute.CopyAtom],
         fc1_tma_b_tensor: cute.Tensor,
         fc1_tma_b_atom_or_pair: TmaAtomOrPair,
         fc1_tma_sfb_tensor: cute.Tensor,

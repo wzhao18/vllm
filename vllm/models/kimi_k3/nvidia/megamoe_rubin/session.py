@@ -128,11 +128,17 @@ def _src(cfg: RubinMoeConfig):
     return pkg
 
 
-def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
+def build_kernel(
+    cfg: RubinMoeConfig,
+    epilogue_warpgroups: int | None = None,
+    compact_weight_sf: bool = False,
+):
     """FlashInfer ``Sm107BlockScaledSymmBuffer._build_kernel`` (BF16 combine, SiTU).
 
     ``epilogue_warpgroups``: None or 1 (the a368c5f66 kernels have one epilogue
-    warpgroup; the S2 variant of the previous drop is gone)."""
+    warpgroup; the S2 variant of the previous drop is gone). ``compact_weight_sf``:
+    the kernel reads compact NVFP4 weight-scale planes (``compact_scales``; the
+    refreshed inference kernel only, ``reads_compact_scales``)."""
     import cutlass
     from cutlass.cute.nvgpu import OperandMajorMode
 
@@ -255,6 +261,12 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     if cfg.kernel_variant in DEDUP_VARIANTS:
         impl_fields["combine_dedup"] = True
         impl_fields["token_back_ready_granularity"] = "expert"
+    if compact_weight_sf:
+        if not reads_compact_scales(cfg):
+            raise ValueError(
+                f"the {cfg.kernel_variant} kernel does not read compact scale planes."
+            )
+        impl_fields["compact_weight_sf"] = True
     kernel_cls = {  # src_gp exports at the package root
         "genphase": lambda: src.RubinInferenceGenphaseMegaMoE,
         "inference_dedup": lambda: src.RubinInferenceMegaMoE,
@@ -262,6 +274,17 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         "inference": lambda: src.sources.RubinInferenceMegaMoE,
     }[cfg.kernel_variant]()
     return kernel_cls(problem_desc, ImplDesc(impl_fields))
+
+
+def reads_compact_scales(cfg: RubinMoeConfig) -> bool:
+    """Whether the session's kernel can read compact NVFP4 weight-scale planes: the
+    refreshed inference kernel (src_gp, the prefill dedup variants) without a fused
+    shared expert."""
+    return (
+        cfg.quant_kind == "nvfp4"
+        and cfg.kernel_variant in DEDUP_VARIANTS
+        and getattr(cfg, "shared", None) is None
+    )
 
 
 def build_kernels(cfg: RubinMoeConfig) -> dict[bool, Any]:
@@ -369,7 +392,10 @@ class RubinMegaMoeSession:
         self.name = self.kernel.name()
         self.names = {s2: k.name() for s2, k in self.kernels.items()}
         self._carved = False
-        self.compiled: dict[tuple[bool, bool], Any] = {}
+        self.compiled: dict[tuple[bool, bool, bool], Any] = {}
+        # The kernel for compact weight-scale planes (RubinMoeWeights.compact_sf), built
+        # on first use: same workspace, its own compiled variants.
+        self._compact_kernel: Any = None
         self._norm_bound: OrderedDict[tuple, dict] = OrderedDict()
         self._bound: OrderedDict[tuple, tuple[dict, RubinMoeWeights]] = OrderedDict()
         self._out_bound: OrderedDict[tuple, Any] = OrderedDict()
@@ -580,17 +606,17 @@ class RubinMegaMoeSession:
             kwargs.update(self._shared_kwargs(shared))
         if use_s2 is None:
             use_s2 = self.use_s2(None)
-        variant = (use_s2, rmsnorm is not None)
+        variant = (use_s2, rmsnorm is not None, bool(w.compact_sf))
         if rmsnorm is not None and self.cfg.kernel_variant in DEDUP_VARIANTS:
             raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))
         if variant not in self.compiled:
-            kernel = self.kernels[use_s2]
+            kernel, name = self._kernel(use_s2, w.compact_sf)
             import cutlass
 
             ckey = compile_cache_key(
-                self.cfg, self.names[use_s2], cutlass.__version__, self.device.index
+                self.cfg, name, cutlass.__version__, self.device.index
             ) + (variant[1],)
             compiled = _COMPILED.get(ckey)
             if compiled is None:
@@ -601,6 +627,19 @@ class RubinMegaMoeSession:
                 _COMPILED[ckey] = compiled
             self.compiled[variant] = compiled
         return kwargs
+
+    def _kernel(self, use_s2: bool, compact_sf: bool) -> tuple[Any, str]:
+        """(kernel object, name) for full or compact weight-scale planes."""
+        if not compact_sf:
+            return self.kernels[use_s2], self.names[use_s2]
+        if self._compact_kernel is None:
+            kernel = build_kernel(self.cfg, compact_weight_sf=True)
+            if _workspace_layout(kernel) != _workspace_layout(self.kernel):
+                raise RuntimeError(
+                    "the compact-scale kernel changed the workspace layout."
+                )
+            self._compact_kernel = kernel
+        return self._compact_kernel, self._compact_kernel.name()
 
     def _shared_kwargs(self, shared: "FusedSharedArgs") -> dict:
         """The fused shared expert's launch arguments (cached by pointers): the MXFP8
@@ -683,7 +722,7 @@ class RubinMegaMoeSession:
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
         self._stamp_issued()
-        self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
+        self.compiled[(use_s2, rmsnorm is not None, bool(w.compact_sf))](**kwargs)
 
     # Host "issued" stamp (MEGAMOEFIX 2026-11-22, VENDOR.md S9): this rank's count of launches of this session,
     # written into its [issued, entered] progress word in the symmetric arena by a 4-byte H2D copy on a side

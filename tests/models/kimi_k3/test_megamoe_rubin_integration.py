@@ -958,14 +958,18 @@ def test_nvfp4_refuses_math_it_cannot_run(monkeypatch, ep, small_bucket, case):
 
 
 def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
-    """additional_config megamoe_compact_scales: an NVFP4 export with paired per-16
-    scales loads, compacts every layer (prepare_rubin_megamoe's install), launches
-    each layer on its own expanded planes and hands EPLB the compact planes."""
-    from vllm.models.kimi_k3.nvidia.megamoe_rubin import scale_staging as S
+    """additional_config megamoe_compact_scales on a P/D prefill worker: an NVFP4
+    export with paired per-16 scales loads, compacts every layer (the install of
+    prepare_rubin_megamoe), launches each layer on its own compact planes (flagged
+    for the kernel that reads them) and hands EPLB the same compact planes."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import compact_scales as S
 
     ep.world_size, ep.rank_in_group = 2, 1
     cfg = _vllm_config()
     cfg.additional_config = {"megamoe_compact_scales": True}
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
+    )
     seen = []
 
     class Runtime:
@@ -975,6 +979,7 @@ def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
             )
 
         def forward(self, hidden, ids, weights, kw, **_):
+            assert kw.compact_sf
             seen.append(planes(kw).clone())
             return torch.zeros(hidden.shape[0], hidden.shape[1], dtype=torch.bfloat16)
 
@@ -985,7 +990,8 @@ def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
     modules, want = [], []
     for layer in (3, 5):
         module = _nvfp4_experts(cfg, ep=ep, prefix=f"model.layers.{layer}.mlp.experts")
-        assert module.compact_scales
+        assert module.compact_scales and module.prefill_worker
+        assert [b.variant for b in module.buckets] == [X.RUBIN_DEDUP_VARIANT]
         shards = _nvfp4_shards(torch.Generator().manual_seed(layer))
         for key, t in shards.items():
             if key[2] == "weight_scale":  # an MXFP4 cast: equal per-16 pairs
@@ -994,9 +1000,10 @@ def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
         _load_through_mapping(module, shards, f"model.layers.{layer}.mlp")
         monkeypatch.setattr(module, "get_runtime", lambda: Runtime())
         module.process_weights_after_loading()
-        want.append(planes(module.kernel_weights))
+        full = planes(module.kernel_weights)
+        want.append(full.view(full.shape[0], -1, 2)[..., 0])
         modules.append(module)
-    assert S.install(modules, None) is modules[0].scale_staging is not None
+    assert S.install(modules, None)
     for module in modules:
         module(torch.zeros(3, 128, dtype=torch.bfloat16), torch.rand(3, 2),
                torch.zeros(3, 2, dtype=torch.int32))  # fmt: skip
@@ -1004,6 +1011,7 @@ def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
     views = modules[1].get_expert_weights()
     # (4 experts, half of the 256 x 8 FC1 / 128 x 8 FC2 per-16 planes)
     assert len(views) == 7 and (views[1].shape, views[3].shape) == ((4, 1024), (4, 512))
+    assert views[1].data_ptr() == modules[1].kernel_weights.fc1[1].data_ptr()
 
 
 def test_mxfp4_layer_refuses_nvfp4_scales(ep, small_bucket):

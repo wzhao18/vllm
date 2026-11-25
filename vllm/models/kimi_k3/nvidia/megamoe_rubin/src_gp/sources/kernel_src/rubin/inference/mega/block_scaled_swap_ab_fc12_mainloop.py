@@ -13,7 +13,15 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import Boolean, Int32
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
-from ......common.ptx_helpers import barrier_sync_unaligned
+from ......common.ptx_helpers import (
+    barrier_sync_unaligned,
+    lds128_v4_b32,
+    mbarrier_arrive_release_cluster_on_cta,
+    mbarrier_wait_acquire_cluster,
+    sts128_byte_doubled,
+    tcgen05_fence_after_thread_sync,
+    tma_load_1d,
+)
 from .....helpers.cute_py_helpers import (
     Tcgen05MmaInstruction,
     make_smem_layouts,
@@ -55,6 +63,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
     acc_pipeline_mbarriers_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.acc_pipeline_mbarriers"
     tmem_holding_buffer_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_holding_buffer"
     tmem_deallocation_mbarrier_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_deallocation_mbarrier"
+    # vLLM-local (compact NVFP4 weight scales): one landing barrier per AB stage for the CTA's compact SFA bytes.
+    compact_sfa_mbarriers_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.compact_sfa_mbarriers"
     tmem_allocation_barrier_id: ClassVar[int] = 2
 
     @classmethod
@@ -83,6 +93,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             "use_2cta_instrs": bool,
             "mainloop_smem_budget_bytes": int,
             "num_accumulator_consumer_warps_per_cta": int,
+            "compact_weight_sf": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -109,6 +120,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
+        # vLLM-local: the weight scale planes hold only the even bytes of the swizzled NVFP4 planes (every per-16
+        # pair equal, an exact MXFP4 cast). Each CTA bulk-loads its compact SFA bytes into the upper half of the
+        # stage's SFA slot and its MMA warp doubles every byte in place before the SMEM -> TMEM copy: the expanded
+        # stage is the TMA-loaded stage of the full planes, bit for bit (_validate_compact_weight_sf).
+        self.compact_weight_sf = bool(impl_desc.get("compact_weight_sf", False))
 
         self.architecture = "sm_107"
         self.mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -186,6 +202,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         self._configure_shared_kind()
+        self._validate_compact_weight_sf()
         self._select_ab_stage_plan()
         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
         if self.heterogeneous_shared:
@@ -258,9 +275,37 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             if self.intermediate_gateup_size % 2 != 0:
                 raise ValueError("intermediate_gateup_size must be even.")
 
+    def _validate_compact_weight_sf(self) -> None:
+        """Static preconditions of compact weight scales (raises; the caller then keeps the full planes)."""
+        self.compact_sfa_stage_bytes = 0
+        if not self.compact_weight_sf:
+            return
+        if self.quant_kind != QuantKind.nvfp4:
+            raise ValueError(f"compact_weight_sf needs NVFP4 (per-16 E4M3 scales), got {self.quant_kind}.")
+        if self.shared_enabled:
+            raise ValueError("compact_weight_sf does not support a fused shared expert.")
+        if not (isinstance(self.hidden_size, int) and isinstance(self.intermediate_gateup_size, int)):
+            raise ValueError("compact_weight_sf needs static hidden and intermediate sizes.")
+        # Whole SF atoms per k tile and whole 128-row atoms per CTA tile: every k tile of one CTA's rows is one
+        # contiguous run of the compact plane ([row block][k atom][256 B], half of to_blocked's 512-byte atoms).
+        for name, k in (("hidden", self.hidden_size), ("intermediate", self.intermediate_gateup_size // 2)):
+            if k % self.mma_tile_k:
+                raise ValueError(f"compact_weight_sf needs {name} {k} divisible by tile K {self.mma_tile_k}.")
+        for name, m in (("2 x intermediate", self.intermediate_gateup_size), ("hidden", self.hidden_size)):
+            if m % self.cta_tile_m:
+                raise ValueError(f"compact_weight_sf needs {name} {m} divisible by the CTA tile M.")
+        if self.cta_tile_m != 128:
+            raise ValueError("compact_weight_sf needs 128 weight rows per CTA (one SF atom row block).")
+        self.compact_sfa_stage_bytes = self.cta_tile_m * self.mma_tile_k // (2 * self.sf_vec_size)
+        # The in-place expansion: each lane reads whole 16-byte words of the compact half.
+        if self.compact_sfa_stage_bytes % (32 * 16):
+            raise ValueError(f"compact_weight_sf: {self.compact_sfa_stage_bytes} compact bytes per stage.")
+
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the selected Rubin mainloop SMEM plan."""
         smem_workspace.register_mbarrier(self.ab_pipeline_mbarriers_region, self.num_ab_pipeline_stages * 2)
+        if self.compact_weight_sf:
+            smem_workspace.register_mbarrier(self.compact_sfa_mbarriers_region, self.num_ab_pipeline_stages)
         # Register the 4 B holding word before the 128 B-aligned stage tensors so it lands in the alignment gap.
         smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
 
@@ -319,6 +364,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             + stage_one_regions[2].nbytes
             + stage_one_regions[3].nbytes
         )
+        if self.compact_weight_sf:
+            # The compact SFA bytes land on the CTA's own barrier (compact_sfa_mbarriers_region), not the AB one.
+            if stage_one_regions[2].nbytes != 2 * self.compact_sfa_stage_bytes:
+                raise ValueError(
+                    f"compact_weight_sf: one SFA stage is {stage_one_regions[2].nbytes} bytes, expected "
+                    f"{2 * self.compact_sfa_stage_bytes}."
+                )
+            self.ab_stage_tma_bytes -= stage_one_regions[2].nbytes
         if self.heterogeneous_shared:
             shared_stage_one_regions = self._fit_shared_stage(stage_one_regions)
             shared_stage_operand_tma_bytes = (
@@ -339,7 +392,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 max(routed.nbytes, shared.nbytes) for routed, shared in zip(stage_one_regions, shared_stage_one_regions)
             )
         mbarrier_bytes = int(cutlass.Int64.width) // 8
-        ab_stage_cost_bytes = self.ab_stage_payload_bytes + 2 * mbarrier_bytes
+        ab_stage_cost_bytes = self.ab_stage_payload_bytes + (3 if self.compact_weight_sf else 2) * mbarrier_bytes
         # Accumulator + TMEM-deallocation mbarriers plus the 8 B-aligned TMEM holding word.
         tmem_holding_buffer_bytes = 8
         plan_tail_bytes = (2 * self.num_accumulator_pipeline_stages + 2) * mbarrier_bytes + tmem_holding_buffer_bytes
@@ -356,6 +409,10 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             (self.a_major_mode, self.b_major_mode),
             self.architecture,
         )
+        if self.compact_weight_sf and self.num_ab_pipeline_stages > 1:
+            # Stage s's SFA bytes are [s * 2C, (s + 1) * 2C) (C compact bytes): [row block][k atom][512 B].
+            if self.sfa_smem_region.stride[-1] != 2 * self.compact_sfa_stage_bytes:
+                raise ValueError(f"compact_weight_sf: SFA stage stride {self.sfa_smem_region.stride[-1]}.")
         self.shared_a_smem_region = None
         self.shared_b_smem_region = None
         self.shared_sfa_smem_region = None
@@ -545,14 +602,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         *,
         fc1_a: cute.Tensor,
         fc1_b: cute.Tensor,
-        fc1_sfa: cute.Tensor,
+        fc1_sfa: Optional[cute.Tensor],
         fc1_sfb: cute.Tensor,
         fc2_a: cute.Tensor,
         fc2_b: cute.Tensor,
-        fc2_sfa: cute.Tensor,
+        fc2_sfa: Optional[cute.Tensor],
         fc2_sfb: cute.Tensor,
     ) -> Tuple:
-        """Return TMA tensor/atom pairs ordered for run_tma_a then run_tma_b."""
+        """Return TMA tensor/atom pairs ordered for run_tma_a then run_tma_b (SFA None: compact weight scales)."""
         a_stage_layout = cute.slice_(self.a_smem_composed_layout_staged, (None, None, None, 0))
         b_stage_layout = cute.slice_(self.b_smem_composed_layout_staged, (None, None, None, 0))
         sfa_stage_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
@@ -618,15 +675,17 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             self.fallback_cluster_layout_vmnk,
             b_internal_type,
         )
-        fc1_sfa_atom, fc1_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_operation,
-            fc1_sfa,
-            sfa_stage_layout,
-            self.mma_tiler_mnk,
-            self.tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint16,
-        )
+        fc1_sfa_atom = fc1_sfa_tensor = None  # compact weight scales: bulk-loaded, no TMA atom
+        if fc1_sfa is not None:
+            fc1_sfa_atom, fc1_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_operation,
+                fc1_sfa,
+                sfa_stage_layout,
+                self.mma_tiler_mnk,
+                self.tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint16,
+            )
         fc1_sfb_tensor, fc1_sfb_atom_or_pair = make_tma_maybe_pair(
             cute.nvgpu.make_tiled_tma_atom_B,
             sfb_operation,
@@ -658,15 +717,17 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             self.fallback_cluster_layout_vmnk,
             b_internal_type,
         )
-        fc2_sfa_atom, fc2_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_operation,
-            fc2_sfa,
-            sfa_stage_layout,
-            self.mma_tiler_mnk,
-            self.tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint16,
-        )
+        fc2_sfa_atom = fc2_sfa_tensor = None  # compact weight scales: bulk-loaded, no TMA atom
+        if fc2_sfa is not None:
+            fc2_sfa_atom, fc2_sfa_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_operation,
+                fc2_sfa,
+                sfa_stage_layout,
+                self.mma_tiler_mnk,
+                self.tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint16,
+            )
         fc2_sfb_tensor, fc2_sfb_atom_or_pair = make_tma_maybe_pair(
             cute.nvgpu.make_tiled_tma_atom_B,
             sfb_operation,
@@ -824,6 +885,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.is_preferred_cluster = is_fallback_cluster == Boolean(False)
         self.mma_cta_index = cta_coord_in_cluster[0] % self.mma_cta_count
         self.is_leader_cta = self.mma_cta_index == 0
+        self.ab_full_mbarriers = smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base)
+        self.compact_sfa_mbarriers = None
+        if cutlass.const_expr(self.compact_weight_sf):
+            self.compact_sfa_mbarriers = smem_workspace.ptr(self.compact_sfa_mbarriers_region, smem_base)
+            # The pair's leader holds the AB barriers the peer's expanded SFA arrives on.
+            self.leader_cta_rank = cta_coord_in_cluster[0] - self.mma_cta_index
         self.main_vmnk_coord = (
             self.mma_cta_index,
             cta_coord_in_cluster[0] // self.mma_cta_count,
@@ -843,8 +910,19 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
     @cute.jit
     def create_ab_pipeline(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> pipeline.PipelineAsync:
-        """Create the shared two-producer TMA-to-UMMA pipeline."""
-        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 2)
+        """Create the shared two-producer TMA-to-UMMA pipeline.
+
+        Compact weight scales: each CTA's compact SFA bytes land on its own barrier (one arrival, the CTA's TMA-A
+        warp); a 2-CTA pair's peer expands its SFA in place and arrives on the leader's AB barrier (a third
+        producer), the leader expands its own before the SMEM -> TMEM copy."""
+        producers = 2
+        if cutlass.const_expr(self.compact_weight_sf):
+            producers += self.mma_cta_count - 1
+            thread_idx, _, _ = cute.arch.thread_idx()
+            if thread_idx == Int32(0):
+                for stage in cutlass.range_constexpr(self.num_ab_pipeline_stages):
+                    cute.arch.mbarrier_init(self.compact_sfa_mbarriers + stage, 1)
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producers)
         return PipelineTmaUmmaMixedCga.create(
             barrier_storage=smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base),
             num_stages=self.num_ab_pipeline_stages,
@@ -922,7 +1000,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         mma_tiler_mnk: tuple,
         a_atom: cute.CopyAtom,
         a_tensor: cute.Tensor,
-        sfa_atom: cute.CopyAtom,
+        sfa_atom: Optional[cute.CopyAtom],
         sfa_tensor: cute.Tensor,
         a_smem_tensor: cute.Tensor,
         sfa_smem_tensor: cute.Tensor,
@@ -935,15 +1013,16 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         ab_pipeline_state: pipeline.PipelineState,
         expected_tx: Optional[Int32] = None,
     ) -> pipeline.PipelineState:
-        """Load one tile's weight and weight-scale k tiles of one kind (routed or shared)."""
+        """Load one tile's weight and weight-scale k tiles of one kind (routed or shared).
+
+        ``sfa_atom`` None: ``sfa_tensor`` is the compact (experts, bytes) weight-scale plane; each CTA bulk-loads
+        its rows' compact bytes of every k tile into the upper half of the stage's SFA slot, on its own barrier."""
+        compact_sfa = sfa_atom is None
         thread_mma = tiled_mma.get_slice(self.mma_cta_index)
         real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor("a", a_tensor, work_tile)
-        real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor("sfa", sfa_tensor, work_tile)
 
         global_a = cute.local_tile(real_a, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None, None))
-        global_sfa = cute.local_tile(real_sfa, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None, None))
         partitioned_global_a = thread_mma.partition_A(global_a)
-        partitioned_global_sfa = thread_mma.partition_A(global_sfa)
 
         partitioned_smem_a, partitioned_global_a = cpasync.tma_partition(
             a_atom,
@@ -952,19 +1031,32 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             cute.group_modes(a_smem_tensor, 0, 3),
             cute.group_modes(partitioned_global_a, 0, 3),
         )
-        partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
-            sfa_atom,
-            self.main_vmnk_coord[2],
-            a_cta_layout,
-            cute.group_modes(sfa_smem_tensor, 0, 3),
-            cute.group_modes(partitioned_global_sfa, 0, 3),
-        )
-        partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
-        partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
-
         mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
         global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
-        global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
+        if cutlass.const_expr(compact_sfa):
+            compact_bytes = self.compact_sfa_stage_bytes
+            # This CTA's 128 weight rows (the rows partition_A gives it), all k tiles: one contiguous run.
+            cta_row_block = mma_tile_m * Int32(self.mma_cta_count) + self.mma_cta_index
+            compact_source = (
+                sfa_tensor.iterator.toint()
+                + cutlass.Int64(work_tile.expert_idx) * cutlass.Int64(sfa_tensor.stride[0])
+                + cutlass.Int64(cta_row_block * k_tile_count) * cutlass.Int64(compact_bytes)
+            )
+            compact_smem = sfa_smem_tensor.iterator + Int32(compact_bytes)
+        else:
+            real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor("sfa", sfa_tensor, work_tile)
+            global_sfa = cute.local_tile(real_sfa, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None, None))
+            partitioned_global_sfa = thread_mma.partition_A(global_sfa)
+            partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
+                sfa_atom,
+                self.main_vmnk_coord[2],
+                a_cta_layout,
+                cute.group_modes(sfa_smem_tensor, 0, 3),
+                cute.group_modes(partitioned_global_sfa, 0, 3),
+            )
+            partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
+            partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
+            global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -982,14 +1074,26 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 tma_desc_ptr=a_descriptor_ptr,
                 mcast_mask=multicast_mask,
             )
-            cute.copy(
-                sfa_atom,
-                global_sfa_slice[(None, k_tile_idx)],
-                partitioned_smem_sfa[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=sfa_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
+            if cutlass.const_expr(compact_sfa):
+                compact_barrier = self.compact_sfa_mbarriers + stage_index
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(compact_barrier, Int32(compact_bytes))
+                    tma_load_1d(
+                        compact_smem + stage_index * Int32(2 * compact_bytes),
+                        compact_source + cutlass.Int64(k_tile_idx * Int32(compact_bytes)),
+                        compact_barrier,
+                        Int32(compact_bytes),
+                        evict_first=False,
+                    )
+            else:
+                cute.copy(
+                    sfa_atom,
+                    global_sfa_slice[(None, k_tile_idx)],
+                    partitioned_smem_sfa[(None, stage_index)],
+                    tma_bar_ptr=tma_barrier,
+                    tma_desc_ptr=sfa_descriptor_ptr,
+                    mcast_mask=multicast_mask,
+                )
         return ab_pipeline_state
 
     @cute.jit
@@ -1054,11 +1158,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         fc1_tma_a_tensor: cute.Tensor,
         fc1_tma_a_atom: cute.CopyAtom,
         fc1_tma_sfa_tensor: cute.Tensor,
-        fc1_tma_sfa_atom: cute.CopyAtom,
+        fc1_tma_sfa_atom: Optional[cute.CopyAtom],
         fc2_tma_a_tensor: cute.Tensor,
         fc2_tma_a_atom: cute.CopyAtom,
         fc2_tma_sfa_tensor: cute.Tensor,
-        fc2_tma_sfa_atom: cute.CopyAtom,
+        fc2_tma_sfa_atom: Optional[cute.CopyAtom],
         ab_pipeline: pipeline.PipelineAsync,
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
@@ -1604,6 +1708,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
+                if cutlass.const_expr(self.compact_weight_sf):
+                    self._expand_compact_sfa_before_mma(ab_pipeline_state)
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
                 for instruction_index in cutlass.range_constexpr(instructions_per_stage):
@@ -1653,6 +1759,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
+                if cutlass.const_expr(self.compact_weight_sf):
+                    self._expand_compact_sfa_before_mma(ab_pipeline_state)
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
                 cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
@@ -1677,6 +1785,54 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
+        return ab_pipeline_state
+
+    @cute.jit
+    def _expand_compact_sfa_stage(self, stage_index: Int32) -> None:
+        """The whole warp: double every byte of the stage's compact SFA half (its upper half) into the full
+        stage, in place, then make the bytes visible to the async proxy (tcgen05.cp)."""
+        compact_bytes = self.compact_sfa_stage_bytes
+        lane_bytes = compact_bytes // 32
+        stage = self.sfa_smem_tensor.iterator + stage_index * Int32(2 * compact_bytes)
+        lane = cute.arch.lane_idx()
+        source = stage + Int32(compact_bytes) + lane * Int32(lane_bytes)
+        words = []
+        for chunk in cutlass.range_constexpr(lane_bytes // 16):
+            words.append(lds128_v4_b32(source + Int32(16 * chunk)))
+        # Every lane's compact bytes are in registers before any lane overwrites them.
+        cute.arch.sync_warp()
+        destination = stage + lane * Int32(2 * lane_bytes)
+        for chunk in cutlass.range_constexpr(lane_bytes // 16):
+            word = words[chunk]
+            sts128_byte_doubled(destination + Int32(32 * chunk), word[0], word[1])
+            sts128_byte_doubled(destination + Int32(32 * chunk + 16), word[2], word[3])
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _expand_compact_sfa_before_mma(self, ab_pipeline_state: pipeline.PipelineState) -> None:
+        """Leader MMA warp, after the stage's AB barrier: the peer's expanded SFA (2-CTA) is visible at cluster
+        scope, this CTA's compact bytes have landed; expand them before the SMEM -> TMEM copy."""
+        stage_index = ab_pipeline_state.index
+        if cutlass.const_expr(self.use_2cta_instrs):
+            mbarrier_wait_acquire_cluster(self.ab_full_mbarriers + stage_index, ab_pipeline_state.phase)
+        cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
+        self._expand_compact_sfa_stage(stage_index)
+        tcgen05_fence_after_thread_sync()
+
+    @cute.jit
+    def _expand_compact_sfa_peer_tile(
+        self, k_tile_count: Int32, ab_pipeline_state: pipeline.PipelineState
+    ) -> pipeline.PipelineState:
+        """Peer MMA warp of a 2-CTA pair (it issues no MMA): expand this CTA's SFA of every k tile of the tile
+        and arrive on the leader's AB barrier of that stage (release at cluster scope)."""
+        for _ in cutlass.range(k_tile_count, unroll=1):
+            stage_index = ab_pipeline_state.index
+            cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
+            self._expand_compact_sfa_stage(stage_index)
+            with cute.arch.elect_one():
+                mbarrier_arrive_release_cluster_on_cta(self.ab_full_mbarriers + stage_index, self.leader_cta_rank)
+            ab_pipeline_state.advance()
         return ab_pipeline_state
 
     @cute.jit
@@ -1788,6 +1944,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                         self.num_mma_instructions_per_ab_stage,
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
+            if cutlass.const_expr(self.compact_weight_sf and self.use_2cta_instrs):
+                if self.mma_cta_index != Int32(0):
+                    ab_pipeline_state = self._expand_compact_sfa_peer_tile(k_tile_count, ab_pipeline_state)
 
             acc_producer_state.advance()
             work_tile = sched_consumer.consume_work()

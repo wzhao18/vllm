@@ -745,9 +745,7 @@ class RouteStage:
             fused = getattr(rt, "_warm_shared", None)
             if fused is None:
                 raise RuntimeError(f"{experts.prefix}: this bucket fuses the shared expert: pass shared.")
-        experts.wait_scales()
         session.launch(weights, out, experts.ep_tokens(n), rmsnorm, fused)
-        experts.prefetch_next_scales()
         owner = experts.prefix
         if rt._poll_owner in (None, owner):
             rt._poll_owner = owner
