@@ -329,6 +329,13 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             + stage_one_regions[2].nbytes
             + stage_one_regions[3].nbytes
         )
+        # PR2 EXPERIMENT ONLY: per-operand TMA bytes of a stage (both CTAs), for the byte-emulation probes.
+        self._pr2_a_tx = (packed_bytes(stage_one_regions[0], self.a_dtype) + stage_one_regions[2].nbytes) * (
+            2 if self.use_2cta_instrs else 1
+        )
+        self._pr2_b_tx = (packed_bytes(stage_one_regions[1], self.b_dtype) + stage_one_regions[3].nbytes) * (
+            2 if self.use_2cta_instrs else 1
+        )
         if self.heterogeneous_shared:
             shared_stage_one_regions = self._fit_shared_stage(stage_one_regions)
             shared_stage_operand_tma_bytes = (
@@ -978,12 +985,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_a = True
         a_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("ws", "bws") and expected_tx is None):
-            # PR2 EXPERIMENT ONLY: weight-stationary byte emulation, an expert's 2nd+ token tile loads no weights.
-            load_a = work_tile.tile_n_idx == Int32(0)
-            a_tx = Int32(0)
-            if load_a:
-                a_tx = Int32(self.num_tma_load_bytes // 2)
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws") and expected_tx is None):
+            # PR2 EXPERIMENT ONLY: each producer expects its own operand bytes (the stock even split assumes equal
+            # A and B stage bytes); ws: an expert's 2nd+ token tile loads no weights (weight-stationary bytes).
+            a_tx = Int32(self._pr2_a_tx)
+            if cutlass.const_expr(PR2_PROBE in ("ws", "bws")):
+                load_a = work_tile.tile_n_idx == Int32(0)
+                if not load_a:
+                    a_tx = Int32(0)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=a_tx)
@@ -1256,12 +1265,13 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_b = True
         b_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("breuse", "bws") and expected_tx is None):
-            # PR2 EXPERIMENT ONLY: M512 B-reuse byte emulation, the odd pair M tile reuses the tokens (loads none).
-            load_b = (work_tile.tile_m_idx // Int32(self.mma_cta_count)) % Int32(2) == Int32(0)
-            b_tx = Int32(0)
-            if load_b:
-                b_tx = Int32(self.num_tma_load_bytes // 2)
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws") and expected_tx is None):
+            # PR2 EXPERIMENT ONLY: own operand bytes (see TMA-A); breuse: the odd pair M tile reuses the tokens.
+            b_tx = Int32(self._pr2_b_tx)
+            if cutlass.const_expr(PR2_PROBE in ("breuse", "bws")):
+                load_b = (work_tile.tile_m_idx // Int32(self.mma_cta_count)) % Int32(2) == Int32(0)
+                if not load_b:
+                    b_tx = Int32(0)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=b_tx)
