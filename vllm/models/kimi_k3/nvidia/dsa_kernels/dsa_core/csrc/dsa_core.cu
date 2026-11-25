@@ -473,8 +473,52 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       if (dbg && tid == 0 && c == 0) dbg[10] = clock64();
       // ---- S = Q K^T of the tile's chunks (FP8, FP32 accumulation, 3 chains; fragments
       // loaded 2 steps ahead) into S columns [64 h, +64); HG = 32: warp (m-tile w >> 3,
-      // n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3)
-      for (int h = 0; h < nh; ++h) {
+      // n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3). A warp whose n-tile
+      // holds keys in both chunks runs their chains interleaved on the same query
+      // fragments (each chunk's sums in the same order as alone: bitwise the same)
+      int h_first = 0;
+      if (nh == 2) {
+        const int nt = warp & 7;
+        const int mt = HG == 32 ? (warp >> 3) : 0;
+        const int kh = HG == 32 ? 0 : (warp >> 3);
+        constexpr int KS = HG == 32 ? kRowB / 32 : kRowB / 64;
+        if (8 * nt < valid_of(c + 1)) {  // (chunk c is full when c + 1 exists)
+          h_first = 2;
+          float s0[3][4] = {}, s1[3][4] = {};
+          const uint8_t* qa = sQ + (mt * 16 + (lane & 15)) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
+          const int koff = (8 * nt + (lane & 7)) * kRowS + ((lane >> 3) & 1) * 16 + kh * KS * 32;
+          const uint8_t* k0 = sKV + koff;
+          const uint8_t* k1 = sKV + kChunk * kRowS + koff;
+          uint32_t fa[3][4], f0[3][2], f1[3][2];
+          ldsm_x4(fa[0][0], fa[0][1], fa[0][2], fa[0][3], qa);
+          ldsm_x2(f0[0][0], f0[0][1], k0);
+          ldsm_x2(f1[0][0], f1[0][1], k1);
+          ldsm_x4(fa[1][0], fa[1][1], fa[1][2], fa[1][3], qa + 32);
+          ldsm_x2(f0[1][0], f0[1][1], k0 + 32);
+          ldsm_x2(f1[1][0], f1[1][1], k1 + 32);
+#pragma unroll
+          for (int ks = 0; ks < KS; ++ks) {
+            if (ks + 2 < KS) {
+              const int nx = (ks + 2) % 3;
+              ldsm_x4(fa[nx][0], fa[nx][1], fa[nx][2], fa[nx][3], qa + 32 * (ks + 2));
+              ldsm_x2(f0[nx][0], f0[nx][1], k0 + 32 * (ks + 2));
+              ldsm_x2(f1[nx][0], f1[nx][1], k1 + 32 * (ks + 2));
+            }
+            const int cu = ks % 3;
+            mma_fp8(s0[cu], fa[cu][0], fa[cu][1], fa[cu][2], fa[cu][3], f0[cu][0], f0[cu][1]);
+            mma_fp8(s1[cu], fa[cu][0], fa[cu][1], fa[cu][2], fa[cu][3], f1[cu][0], f1[cu][1]);
+          }
+          float* sS0 = sSall + (mt + kh) * 16 * kSStr;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int r = 8 * nt + 2 * q4 + (i & 1);
+            const int row = (g8 + 8 * (i >> 1)) * kSStr + r;
+            sS0[row] = (s0[0][i] + s0[1][i]) + s0[2][i];
+            sS0[row + kChunk] = (s1[0][i] + s1[1][i]) + s1[2][i];
+          }
+        }
+      }
+      for (int h = h_first; h < nh; ++h) {
         const uint8_t* buf = sKV + h * kChunk * kRowS;
         const int valid = valid_of(c + h);
         const int nt = warp & 7;
