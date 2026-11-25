@@ -132,6 +132,9 @@ class RubinMegaMoE:
         self.route_error = torch.zeros(2, dtype=torch.int64, device=device)
         self._route_error_host = torch.zeros(2, dtype=torch.int64, pin_memory=True)
         self._route_error_event: torch.cuda.Event | None = None
+        # Side stream of the host mirror copy (poll_route_errors): the D2H copy never
+        # sits between two kernels of the forward stream.
+        self._route_error_stream: torch.cuda.Stream | None = None
         # The layer whose forwards poll the flag (the first caller that names
         # itself): one mirror copy per model step instead of one per layer.
         self._poll_owner: str | None = None
@@ -260,18 +263,30 @@ class RubinMegaMoE:
 
     def poll_route_errors(self) -> None:
         """Non-blocking check: raise if the last landed host mirror of the flag shows
-        an error, then queue a fresh mirror copy on the current stream. No-op during
-        capture (graph replays are surfaced by the next poll / check). The mirror copy
-        is 16 bytes D2H, one per eager forward."""
+        an error, then queue a fresh mirror copy. No-op during capture (graph replays
+        are surfaced by the next poll / check). The mirror copy (16 bytes D2H, at
+        most one per eager forward) runs on a side stream ordered after the work
+        queued so far on the current stream, so the forward stream never waits for
+        it (a copy node between two kernels costs 7-40 us of copy-engine latency).
+        While the previous mirror is still in flight, nothing new is queued."""
         if torch.cuda.is_current_stream_capturing():
             return
         event = self._route_error_event
-        if event is not None and event.query():
+        if event is not None:
+            if not event.query():
+                return
             self._raise_route_error(self._route_error_host)
-        self._route_error_host.copy_(self.route_error, non_blocking=True)
-        if event is None:
+        else:
             event = self._route_error_event = torch.cuda.Event()
-        event.record()
+        stream = self._route_error_stream
+        if stream is None:
+            stream = self._route_error_stream = torch.cuda.Stream(
+                device=self.route_error.device
+            )
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self._route_error_host.copy_(self.route_error, non_blocking=True)
+            event.record(stream)
 
     def reset_route_errors(self) -> None:
         ensure_not_capturing("RubinMegaMoE.reset_route_errors")
