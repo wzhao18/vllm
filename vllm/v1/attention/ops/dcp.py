@@ -1017,19 +1017,57 @@ def dcp_a2a_lse_reduce(
     )
 
 
+def dcp_shardq_few_token_rows(vllm_config: Any, decode_query_len: int) -> int:
+    """Most tokens of a DCP ShardQ few-token step (``DcpShardQPlanner.plan``):
+    its leading decode rows (max_num_seqs requests of at most
+    ``decode_query_len`` tokens) plus fewer than
+    ``sparse_mla_shard_q_min_tokens`` prefill tokens. Such steps keep the DCP
+    path."""
+    return (
+        vllm_config.scheduler_config.max_num_seqs * decode_query_len
+        + vllm_config.attention_config.sparse_mla_shard_q_min_tokens
+        - 1
+    )
+
+
 def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
+    """Rows of the direct DCP workspaces (query gather, A2A combine, top-k
+    merge rescue): the most rows one DCP-path pass takes on this instance.
+
+    Decode and spec-verify steps take at most max_num_seqs x the decode query
+    length. Without DCP ShardQ a CUDA graph replay pushes its padded rows
+    through the DCP path, so the bound also covers the largest capture size.
+
+    Under DCP ShardQ (``dcp_shardq_configured``) PIECEWISE graphs run attention
+    eagerly on the step's real rows, and FULL graphs are decode-only (FULL
+    mixed graphs exclude ShardQ) of at most max_num_seqs x the decode query
+    length rows. The DCP path then keeps only decode rows, few-token steps
+    (``dcp_shardq_few_token_rows``) and padded steps of at most those decode
+    rows; MLAAttention runs larger DCP-path passes (dense-MHA steps) in row
+    chunks of this many rows. The largest capture size does not enter: a
+    16384-token capture would otherwise size these workspaces (and the
+    softmax-stats slab and the profile's DCP-path claim, through
+    ``dcp_fallback_max_tokens``) for 16384 rows, ~11 GiB per GPU at Kimi K3.1
+    TP8+DCP8 that no step uses.
+
+    Every bound of the DCP path's rows derives from this function, so they
+    cannot drift apart."""
     scheduler_config = vllm_config.scheduler_config
     # num_speculative_tokens also counts a diffusion canvas.
     tokens_per_seq = max(
         1 + vllm_config.num_speculative_tokens, max_decode_query_len(vllm_config)
     )
-    return min(
-        scheduler_config.max_num_batched_tokens,
-        max(
-            scheduler_config.max_num_seqs * tokens_per_seq,
+    decode_rows = scheduler_config.max_num_seqs * tokens_per_seq
+    if dcp_shardq_configured(vllm_config):
+        # tokens_per_seq is at least the indexer's decode threshold (1 + the
+        # speculative tokens), so this covers dcp_fallback_max_tokens.
+        rows = max(decode_rows, dcp_shardq_few_token_rows(vllm_config, tokens_per_seq))
+    else:
+        rows = max(
+            decode_rows,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        ),
-    )
+        )
+    return min(scheduler_config.max_num_batched_tokens, rows)
 
 
 def dcp_path_rows_bound(vllm_config: VllmConfig) -> int | None:
@@ -1590,6 +1628,8 @@ class MLADCPManager:
     """Select and own layer-level collective implementations for MLA DCP."""
 
     _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
+    # See __init__.
+    strict_direct_rows: bool = False
 
     def __init__(
         self,
@@ -1619,6 +1659,12 @@ class MLADCPManager:
         self.output_dtype = output_dtype
         self.is_lse_base_on_e = is_lse_base_on_e
         self.direct_a2a: DirectDCPA2AWorkspace | None = None
+        # Set by a DCP ShardQ layer (MLAAttention.process_weights_after_loading):
+        # its DCP-path passes stay within the direct workspaces (larger ones run
+        # in row chunks), so a pass past them is a bug and raises instead of
+        # taking the NCCL fallback (whose communicator buffers would take GiBs
+        # the memory profile never saw).
+        self.strict_direct_rows = False
 
         self.combine = self._init_combine(
             num_heads,
@@ -1701,7 +1747,7 @@ class MLADCPManager:
     ) -> torch.Tensor:
         # Forced MQA path pass all batch tokens (including prefill) into combine,
         # which may exceed the direct symmetric-memory workspace. Fall back to
-        # the nccl a2a combine for those cases.
+        # the nccl a2a combine for those cases (except under DCP ShardQ).
         if partial_output.shape[0] <= direct_workspace.max_num_tokens:
             return direct_workspace.lse_reduce(
                 partial_output,
@@ -1710,6 +1756,7 @@ class MLADCPManager:
                 seq_lens,
                 query_start_loc,
             )
+        self._check_direct_rows("combine", partial_output.shape[0], direct_workspace)
         return dcp_a2a_lse_reduce(
             partial_output,
             partial_lse,
@@ -1759,7 +1806,23 @@ class MLADCPManager:
         # for those cases.
         if query.shape[0] <= direct_workspace.max_num_tokens:
             return direct_workspace.gather(query)
+        self._check_direct_rows("query gather", query.shape[0], direct_workspace)
         return self._gather_query(query)
+
+    def _check_direct_rows(
+        self,
+        what: str,
+        num_rows: int,
+        direct_workspace: DirectDCPA2AWorkspace | DirectDCPQGatherWorkspace,
+    ) -> None:
+        """Raise when a DCP ShardQ layer's pass exceeds a direct workspace."""
+        if self.strict_direct_rows:
+            raise RuntimeError(
+                f"DCP ShardQ: a {num_rows}-row DCP {what} exceeds the "
+                f"{direct_workspace.max_num_tokens}-row direct workspace "
+                "(get_dcp_workspace_max_num_tokens); the layer must run it in "
+                "row chunks (MLAAttention._dcp_mqa_row_cap)."
+            )
 
     def init_kv_gather(
         self,

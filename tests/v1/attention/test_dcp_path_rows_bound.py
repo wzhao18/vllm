@@ -60,8 +60,13 @@ def test_rows_bound_only_on_decode_only_instances(role, bound):
 
 
 def test_rows_bound_is_the_dcp_workspace_tokens():
-    """Unpatched: min(MNBT, max(mns x (1 + spec), max capture)) = 1024 at C256."""
-    with patch.object(dcp, "max_decode_query_len", return_value=1):
+    """Unpatched: min(MNBT, max(mns x (1 + spec), max capture)) = 1024 at C256.
+    A kv_consumer is never a DCP ShardQ instance (dcp_shardq_configured; see
+    test_dcp_workspace_rows.py for the predicate on full configs)."""
+    with (
+        patch.object(dcp, "max_decode_query_len", return_value=1),
+        patch.object(dcp, "dcp_shardq_configured", return_value=False),
+    ):
         assert dcp.dcp_path_rows_bound(_cfg("kv_consumer")) == 1024
 
 
