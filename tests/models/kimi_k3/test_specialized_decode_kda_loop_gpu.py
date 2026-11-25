@@ -39,6 +39,10 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7
 
 os.environ.setdefault("VLLM_SSM_CONV_STATE_LAYOUT", "DS")  # the decode's conv layout
 
+from tests.models.kimi_k3.kda_protocol import (  # noqa: E402
+    accepted_states,
+    record_input,
+)
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.models.kimi_k3.nvidia import kda as kda_module  # noqa: E402
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention  # noqa: E402
@@ -225,6 +229,8 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     stock_kinds = (
         prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
         prepared.KdaVerifyHalfPair,
+        # their deferred-verify record forms (the FP32 default)
+        prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer, prepared.KdaVerifyHalfDefer,
     )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
@@ -234,7 +240,13 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     projected = projected_rows(requests * q, pitch=pitch_of(heads))
     core = prepared.PreparedKda(attention, {(requests, q): (pitch_of(heads), 0)}, True)
     core.prepare_caches(base)  # the production kernel at this shape
-    out, state = run(core, projected, base, table, accepted)
+    start = base
+    if type(kernel) in prepared.RECORD_FORMS.values() or type(kernel) is (
+        prepared.SPLIT_RECORD
+    ):  # a record form starts from the same accepted states in its format
+        start = record_input(tuple(t.clone() for t in base)[1], table, accepted)
+        start = (base[0], start)
+    out, state = run(core, projected, start, table, accepted)
     want, want_state = stock_verify(
         attention, projected, base, table, accepted, q, monkeypatch
     )
@@ -243,7 +255,10 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     untouched = torch.ones(slots, dtype=torch.bool, device=DEVICE)
     untouched[used] = False
     assert_bitwise("untouched slots", state[1][untouched], base[1][untouched])
-    state_error = relative_error(state[1][used], want_state[1][used])
+    # the accepted states a = 1 .. q (either state protocol: kda_protocol)
+    state_error = relative_error(
+        accepted_states(state[1], table), accepted_states(want_state[1], table)
+    )
     assert state_error < 2e-7, state_error  # FP32 order; KdaSplit's math: ~2.1e-3
     torch.testing.assert_close(out.float(), want.float(), rtol=1e-2, atol=1e-2)
     off = (bits(out) != bits(want)).sum().item()
@@ -257,6 +272,9 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
 )
 @pytest.mark.parametrize("kind", ["packed", "loop"])
 def test_packed_and_loop_equal_wide(monkeypatch, q, requests, kind):
+    # stock-format kernels compared with each other (no record forms: the stock
+    # protocol)
+    monkeypatch.setattr(prepared, "RECORDS", False)
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)
@@ -315,6 +333,9 @@ HALF_SHAPES = [(8, 16), (8, 17), (8, 11), (8, 15), (8, 4), (4, 16), (5, 8)]
 @pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
 @pytest.mark.parametrize("kind", ["halfstock", "halfscratch"])  # DSMEM pair / scratch
 def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
+    # the stock-format kernels (HalfPair's DSMEM / HalfStock's scratch exchange) vs
+    # LoopStock; their record form (HalfDefer) is checked by the record-protocol runs
+    monkeypatch.setattr(prepared, "RECORDS", False)
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)

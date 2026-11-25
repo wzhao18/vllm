@@ -28,6 +28,9 @@ from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
 from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
+from .cols_defer import KdaVerifyColsDefer
+from .split_defer import KdaSplitDefer
+from .verify_defer import KdaVerifyHalfDefer, KdaVerifyLoopDefer
 from .window import check_conv_cache
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
@@ -227,6 +230,37 @@ WIDE_KINDS = (
     KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfPair,
     KdaVerifyHalfStock,
 )
+# Under the deferred-verify record protocol (``record_protocol``) an FP32 state's
+# stock-math kinds run their record forms (``verify_defer``); KdaVerifyFeed has none,
+# so its rows run LoopDefer.
+RECORD_FORMS = {
+    KdaVerifyLoopStock: KdaVerifyLoopDefer,
+    KdaVerifyFeed: KdaVerifyLoopDefer,
+    KdaVerifyHalfStock: KdaVerifyHalfDefer,
+    # HalfPair (the halves' DSMEM output exchange) has none: its rows (q8 B11-17) run
+    # HalfStock's record form (two CTAs per item, scratch + counter exchange)
+    KdaVerifyHalfPair: KdaVerifyHalfDefer,
+}
+# The verify kernels' state protocol is a deployment's (every verify kernel, the stock
+# verify and the align copies agree): the record protocol (no per-token checkpoint
+# stores, user 2026-11-24) where every kernel at the verify length has a record form
+# and it is validated (multi-step exactness vs the stock protocol: lanes/KDA round 8):
+# Rubin, an FP32 state, q8, 6 heads per rank (TP16). Elsewhere the stock protocol.
+# ``RECORDS`` False: the stock protocol everywhere (benches build the dev arm with it).
+RECORDS = True
+RECORD_SHAPES = {((10, 7), 8, 6)}  # (capability, verify length, heads per rank)
+
+
+def record_protocol(tokens, bf16_state, heads, capability=None) -> bool:
+    """Whether a deployment's verify kernels (and its stock verify / align copies,
+    ``KimiK3DeltaAttention.state_records``) run the deferred-verify record protocol."""
+    if not RECORDS or bf16_state:
+        return False
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    return (tuple(capability), tokens, heads) in RECORD_SHAPES
+
+
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
               "loop", "loopstock", "feed", "halfstock", "halfscratch")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
@@ -364,6 +398,11 @@ class KdaSplitStock(RecoverKdaSplit):
         self.narrow_fb = True
 
 
+# The FP32 KdaSplit verify kernel and its record form (``record_protocol``).
+SPLIT_STOCK, SPLIT_RECORD = KdaSplitStock, KdaSplitDefer
+# The prepared transposed verify kernel and its record form (FP32).
+COLS_KIND, COLS_RECORD = KdaVerifyCols, KdaVerifyColsDefer
+
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -480,16 +519,23 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     wide = wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
     # (the prepared kernels compute the stock verify's math for an FP32 state, on
     # ``KdaInProj64(stock=True)``'s operands)
+    records = tokens > 1 and record_protocol(tokens, bf16_state, heads, capability)
     if prepared and cols is not None:  # the transposed recurrence
-        return KdaVerifyCols(*options, cols)
+        return (COLS_RECORD if records else COLS_KIND)(*options, cols)
+    if records and (prepared or (wide and WIDE_KINDS[wide - 1] not in RECORD_FORMS)):
+        raise NotImplementedError(
+            f"KDA verify {requests} x q{tokens}: no record form (record_protocol)"
+        )
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
         return KdaVerifyRows(*options, *rows)
     if prepared:  # the gates and betas arrive activated (the in-projection epilogue)
         return KdaVerifyPrepared(*options)
     if wide:  # one or two CTAs per (request, head), or the chunked verify
-        return WIDE_KINDS[wide - 1](*options)
+        kind = WIDE_KINDS[wide - 1]
+        return (RECORD_FORMS[kind] if records else kind)(*options)
     if not bf16_state:  # stock math (FP32 state): verify, q = 1, TP8
-        return KdaSplitStock(*options[:6])
+        split = (SPLIT_RECORD if records else SPLIT_STOCK) if tokens > 1 else KdaSplitStock
+        return split(*options[:6])
     lean = tokens > 1 and capability in LEAN_VERIFY
     norm = verify_table("load_norm", capability, tokens).get(requests)
     return KdaSplit(*options, lean, bool(norm))

@@ -30,6 +30,7 @@ pytest.importorskip("cutlass")
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("needs a Rubin GPU (compute capability 10.7)", allow_module_level=True)
 
+from tests.models.kimi_k3.kda_protocol import accepted_states  # noqa: E402
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (  # noqa: E402
     PreparedProjection,
 )
@@ -204,7 +205,18 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
     torch.cuda.synchronize()
 
     assert_bitwise("output", got, want)
-    assert_bitwise("recurrent state", got_caches[1], want_caches[1])
+    if q > 1 and state_dtype == torch.float32:
+        # both record forms (the FP32 deferred-verify protocol): the raw slots bit for
+        # bit (records + format tag) and the accepted states a = 1 .. q
+        raw = bits(got_caches[1]) != bits(want_caches[1])
+        assert not raw.any(), f"recurrent state: {int(raw.sum())} words differ"
+        assert_bitwise(
+            "accepted states",
+            accepted_states(got_caches[1], slot_index),
+            accepted_states(want_caches[1], slot_index),
+        )
+    else:
+        assert_bitwise("recurrent state", got_caches[1], want_caches[1])
     assert_bitwise("conv state", got_caches[0], want_caches[0])
     if polled:
         assert (bits(rearm[:rows]) == -1).all(), "previous output re-armed"

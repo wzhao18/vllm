@@ -173,7 +173,13 @@ def fused_recurrent_kda_fwd_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
     launch_pdl: tl.constexpr,
+    RECORDS: tl.constexpr = False,
 ):
+    # RECORDS (the deferred-verify record format, vllm/v1/worker/mamba_utils.py
+    # RECORD_TAG_ROW): the initial state is slot 0's (the caller materialized the
+    # accepted state there); stores slot 0 after token 0 and, at slot 1's page, the
+    # records of tokens 1 .. (k, decay, correction rows + the tag) instead of the
+    # states of tokens 1 ..
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
@@ -193,7 +199,7 @@ def fused_recurrent_kda_fwd_kernel(
     m_v = o_v < V
     m_state = m_v[:, None] & m_k[None, :]
 
-    if IS_SPEC_DECODING:
+    if IS_SPEC_DECODING and not RECORDS:
         initial_token = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
     else:
         initial_token = 0
@@ -259,7 +265,8 @@ def fused_recurrent_kda_fwd_kernel(
                 )
                 b_gate = -b_a * b_softplus
 
-        b_state *= exp(b_gate[None, :])
+        b_decay = exp(b_gate)
+        b_state *= b_decay[None, :]
         b_v -= tl.sum(b_state * b_k[None, :], axis=1)
         b_beta = tl.load(p_beta, eviction_policy="evict_last").to(tl.float32)
         if APPLY_BETA_SIGMOID:
@@ -274,9 +281,26 @@ def fused_recurrent_kda_fwd_kernel(
             eviction_policy="evict_first",
         )
 
-        final_state_index = tl.load(state_indices + i_n * stride_indices_seq + i_t).to(
-            tl.int64
-        )
+        if RECORDS:
+            record_index = tl.load(state_indices + i_n * stride_indices_seq + 1).to(
+                tl.int64
+            )
+            if (i_t > 0) & (record_index > 0):
+                p_record = state + record_index * stride_state_token + i_h * V * K
+                tl.store(p_record + (i_t - 1) * K + o_k, b_k, mask=m_k)
+                tl.store(p_record + (8 + i_t - 1) * K + o_k, b_decay, mask=m_k)
+                tl.store(p_record + (16 + i_t - 1) * K + o_v, b_v, mask=m_v)
+                if (i_t == 1) & (i_v == 0):
+                    p_tag = (p_record + 23 * K).to(tl.pointer_type(tl.uint32))
+                    tl.store(p_tag, 0x7FCDEF01)
+            final_state_index = tl.load(state_indices + i_n * stride_indices_seq).to(
+                tl.int64
+            )
+            final_state_index = tl.where(i_t == 0, final_state_index, 0)
+        else:
+            final_state_index = tl.load(
+                state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
         if final_state_index > 0:
             p_final_state = (
                 state
@@ -334,8 +358,10 @@ def fused_recurrent_kda_fwd(
     use_gate_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     out: torch.Tensor | None = None,
+    records: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch recurrent KDA with dense inner dimensions and row strides."""
+    """Launch recurrent KDA with dense inner dimensions and row strides.
+    ``records``: the deferred-verify record format (the kernel's RECORDS)."""
     B, T, H, K = q.shape
     V = v.shape[-1]
     assert B == 1 and k.shape == q.shape
@@ -345,6 +371,11 @@ def fused_recurrent_kda_fwd(
     assert cu_seqlens is not None
     assert ssm_state_indices is not None
     assert inplace_final_state
+    assert not records or (
+        num_accepted_tokens is not None
+        and K == V == 128
+        and initial_state.dtype == torch.float32
+    )
     if out is None:
         out = torch.empty_like(v)
     assert out.shape == v.shape
@@ -422,6 +453,7 @@ def fused_recurrent_kda_fwd(
         num_warps=num_warps,
         num_stages=num_stages,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        RECORDS=records,
     )
     return out, initial_state
 
@@ -441,6 +473,7 @@ def fused_recurrent_kda(
     num_accepted_tokens: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     fuse_gate: bool | None = None,
+    records: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run recurrent KDA from raw gate and beta inputs.
 
@@ -480,6 +513,7 @@ def fused_recurrent_kda(
         use_gate_in_kernel=fuse_gate,
         use_beta_sigmoid_in_kernel=fuse_gate,
         out=out,
+        records=records,
     )
 
 
