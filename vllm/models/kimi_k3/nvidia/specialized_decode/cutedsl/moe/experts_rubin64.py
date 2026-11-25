@@ -914,10 +914,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def ticket(self, workspace):
-        """Warp 2 lane 0 right after the dependency wait (``dies``): this CTA's census
-        add, 1 + (die << 32) on the word of arrivals (low half) and die-1 arrivals (high
-        half); the value before it is consumed in ``group`` (``arrive``), so the
-        atomic's latency overlaps the grouping."""
+        """Warp 2 lane 0 after the prologue, before the dependency wait (``dies``):
+        this CTA's census add, 1 + (die << 32) on the word of arrivals (low half) and
+        die-1 arrivals (high half); the value before it is consumed in ``group``
+        (``arrive``), so the atomic's latency overlaps the wait, not the grouping."""
         before = Uint64(0)
         if (thread()[1] == 2) & (thread()[2] == 0):
             increment = Uint64(1) + (Uint64(self.die()) << Uint64(32))
@@ -931,9 +931,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         word counts from all-ones (the armed workspace), so before + 1 is (earlier
         die-1 arrivals) << 32 | (earlier arrivals) modulo 2^64. The call's last arrival
         re-arms the word: every CTA of the call has added by then, and the next call's
-        CTAs add only after their dependency wait, which follows this call's outputs
-        through the step's kernel chain (its routes, attention and front); a word that
-        was not re-armed traps (an arrival count of grid or more)."""
+        CTAs add only once launched, i.e. after every CTA of this call triggered its
+        dependents (after this arrival) or, in the step, after the next layer's front
+        completed (routing releases the experts after the front's completion, which
+        follows this call's); a word that was not re-armed traps (an arrival count of
+        grid or more)."""
         info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
         if (thread()[1] == 2) & (thread()[2] == 0):
             counts = before + Uint64(1)
@@ -1202,15 +1204,18 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             self.stamp(0)
         tmem_base = self.initialize(sm, maps, batch)
+        # The die census ticket before the dependency wait: its atomic's round trip
+        # overlaps the wait instead of the grouping, and a grid released early no
+        # longer has every CTA add to the one word at once when the wait returns.
+        arrival = None
+        if cutlass.const_expr(len(self.dies) > 0):
+            arrival = self.ticket(workspace)
         cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
         # Images and rearm alternate over grouped calls; ``x`` is the plan.
         routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
-        arrival = None
-        if cutlass.const_expr(len(self.dies) > 0):
-            arrival = self.ticket(workspace)
         self.group(sm, ids, workspace, batch, arrival=arrival)
         if tid == 0:
             self.stamp(2)
