@@ -487,10 +487,17 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         cute.arch.mbarrier_arrive(bars.iterator)
 
     @cute.jit
-    def stream(self, sm, maps, w13_scales, w2_scales, ranges, experts, steal=None):
+    def stream(
+        self, sm, maps, w13_scales, w2_scales, ranges, experts, steal=None, lane=None
+    ):
         """``ExpertsKernel.stream`` (grouped, TP16) on the packed maps: FC1(A), FC1(B),
         then the FC2 jobs (``fc2_pool``); stage metadata only for the pool's jobs."""
         w13, w2 = maps
+        if cutlass.const_expr(lane is None):  # the wide engines: one issuing lane
+            lane = Int32(0)
+            two = False
+        else:
+            two = True
         barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.stages)
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
         ring = (sm, barriers, metadata, w2_scales)
@@ -505,18 +512,26 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 row = expert * self.w13_rows + r * 128
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
                 tma = (w13, w13_scales, row, ks, offset, Int32(1024))
+                mine = (lane == 0) | ((issued & 1) == lane)  # DIAG I2
+                if cutlass.const_expr(two):  # lanes 0 / 1 issue alternate stages
+                    mine = (issued & 1) == lane
                 if cutlass.const_expr(self.trace != 0):
-                    if issued >= self.stages:  # DIAG: producer time waiting on empty
+                    if (issued >= self.stages) & mine:  # DIAG: producer empty wait
                         c0 = clock64()
                         self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
                         waited += clock64() - c0
                     if issued == 0:
                         c_first = clock64()
                     fc1_stages += 1
-                slot, phase, issued = self.issue(
-                    ring, slot, phase, issued, None, tma, False
-                )
-                if issued == 1:
+                if mine:
+                    slot, phase, issued = self.issue(
+                        ring, slot, phase, issued, None, tma, False
+                    )
+                else:
+                    slot, issued = (slot + 1, issued + 1)
+                    if slot == self.stages:
+                        slot, phase = (Int32(0), phase ^ 1)
+                if (issued == 1) & (lane == 0):
                     self.stamp(3)
                 ks += 1
                 if ks == 14:
@@ -524,20 +539,21 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     if r == 3:
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
-        self.stamp(4)
-        if cutlass.const_expr(self.trace != 0):
-            base = Int64(self.trace) + Int64(thread()[3]) * 512
-            stamp_values(base, 21, Int64(fc1_stages), waited)
-            stamp_values(base, 22, clock64() - c_first, Int64(0))
-        state = (slot, phase, issued, Int32(0), Int32(-1))
-        work = (ring, state, maps, experts, ranges, *steal)
-        slot, phase, issued = self.fc2_pool(*work)
-        if issued >= self.stages:
-            self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
-        for i in cutlass.range_constexpr(4):
-            metadata[4 * slot + i] = Int32(2 if i == 0 else 0)
-        cute.arch.mbarrier_arrive(barriers.iterator + slot, arrive_count=33)
-        self.stamp(5)
+        if lane == 0:
+            self.stamp(4)
+            if cutlass.const_expr(self.trace != 0):
+                base = Int64(self.trace) + Int64(thread()[3]) * 512
+                stamp_values(base, 21, Int64(fc1_stages), waited)
+                stamp_values(base, 22, clock64() - c_first, Int64(0))
+            state = (slot, phase, issued, Int32(0), Int32(-1))
+            work = (ring, state, maps, experts, ranges, *steal)
+            slot, phase, issued = self.fc2_pool(*work)
+            if issued >= self.stages:
+                self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            for i in cutlass.range_constexpr(4):
+                metadata[4 * slot + i] = Int32(2 if i == 0 else 0)
+            cute.arch.mbarrier_arrive(barriers.iterator + slot, arrive_count=33)
+            self.stamp(5)
 
     @cute.jit
     def consume(self, sm, tmem, ranges):
@@ -1252,9 +1268,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             self.stamp(11)
         if warp == 0:
-            if lane == 0:
+            if lane < 2:  # DIAG I2: two issuing lanes in FC1
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
-                self.stream(*weights, (workspace, generation & 1))
+                self.stream(*weights, (workspace, generation & 1), lane)
         else:
             if warp == 1:
                 self.consume(sm, tmem, ranges)
