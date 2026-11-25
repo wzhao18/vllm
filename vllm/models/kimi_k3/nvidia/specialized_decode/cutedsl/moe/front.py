@@ -97,6 +97,7 @@ class RouteSitu:
         # CTAs release the experts right after their publish (the copy CTAs at exit),
         # so the experts' launch and prologue overlap the last route CTA's grouping.
         self.ready = ready
+        self.table = ReadyTable(ready) if ready is not None else None
         assert ready is None or (self.lean and not early and "route" in self.roles)
 
     @cute.jit
@@ -319,7 +320,6 @@ class RouteSitu:
         warp, lane = tid // 32, tid % 32
         smem = c.utils.SmemAllocator()
         if c.const_expr(self.ready is not None):
-            table = ReadyTable(self.ready)
             sbuf = alloc(smem, c.Uint8, ReadyTable.SMEM, 128)
         km = alloc(smem, Uint32, (8, 32))
         cand, dense = (alloc(smem, Uint64, shape) for shape in ((8, 128), 64))
@@ -394,8 +394,8 @@ class RouteSitu:
             self.publish(chosen, picked, ids, weights, scale, token, signal)
             if c.const_expr(self.ready is not None):
                 cute.arch.griddepcontrol_launch_dependents()
-                if table.count(ready, self.batch, sbuf):
-                    table.build(ids, ready, self.batch, sbuf)
+                if self.table.count(ready, self.batch, sbuf):
+                    self.table.build(ids, ready, self.batch, sbuf)
             return
         threshold, offset = cutoff[0], Int32(0)
         for i in c.range_constexpr(4):
