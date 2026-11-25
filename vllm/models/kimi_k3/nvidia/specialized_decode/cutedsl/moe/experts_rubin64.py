@@ -17,6 +17,7 @@ late would otherwise set the end. Published modes stage
 each lane's own BF16 half of the FC2 rows (no shuffles or branches), so the epilogue
 keeps up with the MMAs."""
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64, Uint8, Uint32, Uint64
@@ -51,7 +52,7 @@ from ..common.primitives import (
     thread,
     view,
 )
-from ..common.tensormap import GridMap, map_address, prefetch_map
+from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
 from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
@@ -271,13 +272,26 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     def __call__(self, *args):
         options = dict(grid=(self.grid, 1, 1), block=(384, 1, 1), cluster=(1, 1, 1))
         maps = self.encode_maps(args[-3], args[-2])
-        kernel = self.kernel_maps(args[:-3], *maps)
+        if cutlass.const_expr(self.pair == 2):
+            kernel = self.kernel_maps3(args[:-3], *maps)
+        else:
+            kernel = self.kernel_maps(args[:-3], *maps)
         kernel.launch(stream=args[-1], use_pdl=True, **options)
 
     def encode_maps(self, w13, w2):
         # RubinExpertsKernel's packed descriptors: they read only experts, w13_rows,
         # parts and packed, which this kernel sets the same way.
-        return RubinExpertsKernel.encode_maps(self, w13, w2)  # type: ignore[arg-type]
+        maps = RubinExpertsKernel.encode_maps(self, w13, w2)  # type: ignore[arg-type]
+        if self.pair == 2:  # DIAG box2: FC1 boxes of two K128 chunks (32 KiB per op)
+            u8 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
+            swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+            l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+            rows = self.experts * self.w13_rows
+            wide = encode_map(
+                w13, u8, (128, rows, 14), (1792, 128), (128, 128, 2), swizzle, l2
+            )
+            maps = (*maps, wide)
+        return maps
 
     @cute.jit
     def initialize(self, sm, maps, batch):
@@ -325,8 +339,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def issue(
-        self, ring, slot, phase, issued, meta, tma, fc2: cutlass.Constexpr, more=None
-    ):
+        self, ring, slot, phase, issued, meta, tma, fc2: cutlass.Constexpr, more=None,
+        wide: cutlass.Constexpr = False,
+    ):  # fmt: skip
         """``ExpertsKernel.issue`` for packed boxes: 16 KiB (FC1) or 12 KiB (FC2: the
         96 data bytes of 128 w2 rows) plus 1 KiB of scales. ``meta`` None: no stage
         metadata (the MMA warp walks FC1 and the static FC2 jobs itself)."""
@@ -340,7 +355,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             for i in cutlass.range_constexpr(4):
                 metadata[4 * slot + i] = meta[i]
         full = barriers.iterator + index
-        box = 12288 if fc2 else 16384
+        box = 12288 if fc2 else (32768 if wide else 16384)
         cute.arch.mbarrier_arrive_and_expect_tx(full, box + size)
         self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size)
         if cutlass.const_expr(fc2):
@@ -525,10 +540,12 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ks, tile = (lo % 14, 3 * ranges[group, 0] + lo // 14)
             r, index = (tile % 3, self.first_unit(ranges, 0, group))
             expert = experts[index]
-            for _ in cutlass.range(lo, hi, unroll=1):
+            covered = Int32(0)
+            for s in cutlass.range(lo, hi, unroll=1):
                 row = expert * self.w13_rows + r * 128
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
                 tma = (w13, w13_scales, row, ks, offset, Int32(1024))
+                pairable = ((slot & 1) == 0) & (ks < 13) & (s + 1 < hi)
                 if cutlass.const_expr(self.trace != 0):
                     if issued >= self.stages:  # DIAG: producer time waiting on empty
                         c0 = clock64()
@@ -537,9 +554,22 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     if issued == 0:
                         c_first = clock64()
                     fc1_stages += 1
-                slot, phase, issued = self.issue(
-                    ring, slot, phase, issued, None, tma, False
-                )
+                if covered != 0:  # DIAG box2: this slot's chunk came with the pair's op
+                    cute.arch.mbarrier_arrive(barriers.iterator + self.ring(slot))
+                    slot, issued = (slot + 1, issued + 1)
+                    if slot == self.stages:
+                        slot, phase = (Int32(0), phase ^ 1)
+                    covered = Int32(0)
+                elif pairable:
+                    wtma = (maps[2], w13_scales, row, ks, offset, Int32(2048))
+                    slot, phase, issued = self.issue(
+                        ring, slot, phase, issued, None, wtma, False, wide=True
+                    )
+                    covered = Int32(1)
+                else:
+                    slot, phase, issued = self.issue(
+                        ring, slot, phase, issued, None, tma, False
+                    )
                 if issued == 1:
                     self.stamp(3)
                 ks += 1
@@ -1250,6 +1280,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     @cute.kernel
     def kernel_maps(self, args, w13_map: GridMap, w2_map: GridMap):
         self.body(args, (map_address(w13_map), map_address(w2_map)))
+
+    @cute.kernel
+    def kernel_maps3(self, args, w13_map: GridMap, w2_map: GridMap, wide: GridMap):
+        maps = (map_address(w13_map), map_address(w2_map), map_address(wide))
+        self.body(args, maps)
 
     @cute.jit
     def body(self, args, maps):
