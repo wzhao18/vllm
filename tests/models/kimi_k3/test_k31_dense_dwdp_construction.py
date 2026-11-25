@@ -1003,7 +1003,7 @@ def _sched(issue_at_moe, layers=6):
     d.start, d.streams, d.handles = 0, None, None
     d.copies = [_Sched(i) for i in range(layers)]
     d.copies[0].fetch = lambda *a: None  # resident first layer: no copies
-    d.issue_at_moe, d._ordinal = issue_at_moe, None
+    d.issue_at_moe, d._ordinal, d._eager_issue = issue_at_moe, None, False
     return d
 
 
@@ -1051,3 +1051,35 @@ def test_whole_layer_dwdp_issue_point_unchanged():
         _Sched.log.append(("layer", i))
     assert _Sched.log[:3] == [("fetch", 1), ("fetch", 2), ("layer", 0)]
     assert _Sched.log[3:6] == [("wait", 1), ("fetch", 3), ("layer", 1)]
+
+
+def test_shared_selector_breakable_capture_issue_point(monkeypatch):
+    """Under a breakable CUDA graph capture (a segment ends at each attention op) the
+    wait and the copies of the layer two ahead run in an eager break at each layer
+    start (no copy spans a segment), the MegaMoE launch hook does nothing, and
+    replaying the recorded breaks repeats the same schedule."""
+    recorded = []
+
+    class _Capture:
+        def add_eager(self, fn):
+            recorded.append(fn)
+            return fn()
+
+    capture = _Capture()
+    monkeypatch.setattr(dense_dwdp, "_breakable_capture", lambda: capture)
+    _Sched.log = []
+    d = _sched(issue_at_moe=True)
+    for i in range(6):
+        d.layer_start(i)
+        d.moe_start()
+        _Sched.log.append(("layer", i))
+    first = list(_Sched.log)
+    assert len(recorded) == 6
+    want = [("fetch", 1), ("fetch", 2), ("layer", 0)]
+    for i in range(1, 6):
+        want += [("wait", i)] + ([("fetch", i + 2)] if i + 2 < 6 else []) + [("layer", i)]
+    assert first == want
+    _Sched.log = []
+    for fn in recorded:  # replay: only the eager breaks run host code
+        fn()
+    assert _Sched.log == [e for e in want if e[0] != "layer"]

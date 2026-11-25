@@ -160,7 +160,7 @@ class _Forward:
         ]
         for c in d.copies:
             c.pre = torch.cuda.Event()
-        d.issue_at_moe, d._ordinal = True, None
+        d.issue_at_moe, d._ordinal, d._eager_issue = True, None, False
         self.d = d
         self.side = torch.cuda.Stream()
         self.events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(LAYERS)]
@@ -168,7 +168,9 @@ class _Forward:
     def weights(self, i):
         return self.home[0] if i == 0 else self.slots[i % self.depth]
 
-    def __call__(self, skew):
+    def __call__(self, skew, capture=None):
+        """``capture``: a breakable CUDA graph capture; the attention then runs in
+        an eager break, as the real attention ops do."""
         main = torch.cuda.current_stream()
         d = self.d
         for i in range(LAYERS):
@@ -176,7 +178,10 @@ class _Forward:
         for i in range(LAYERS):
             attn, moe, read, _ = skew[i]  # [3]: the copy engines' delay
             d.layer_start(i)
-            _sleep(main, attn)  # attention (its SP all-gather)
+            if capture is not None:  # an eager op: ends the graph segment
+                capture.add_eager(lambda a=attn: torch.cuda._sleep(a) if a else None)
+            else:
+                _sleep(main, attn)  # attention (its SP all-gather)
             fork, join = self.events[i]
             fork.record(main)
             with torch.cuda.stream(self.side):  # the shared expert
@@ -239,6 +244,34 @@ def test_forced_skew_slot_reuse_graph():
         f.out.zero_()
         graphs[replay % 4].replay()
         assert f.check() == [], replay
+
+
+@needs_cuda
+def test_forced_skew_slot_reuse_breakable_graph():
+    """Under the production breakable capture (a graph segment ends at every
+    attention op): no copy spans a segment (capture would fail on unjoined work),
+    and 4 skew patterns x 250 replays read the right weights."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    f = _Forward()
+    rng = random.Random(7)
+    s = torch.cuda.Stream()
+    captures = []
+    with torch.cuda.stream(s):
+        for _ in range(4):
+            skew = _skew(rng)
+            f(skew)
+            torch.cuda.synchronize()
+            with BreakableCUDAGraphCapture() as capture:
+                f(skew, capture)
+            assert capture.num_eager_breaks >= 2 * LAYERS - 1
+            captures.append(capture)
+        torch.cuda.synchronize()
+        for replay in range(1000):
+            f.slots.fill_(0xEE)
+            f.out.zero_()
+            captures[replay % 4].replay()
+            assert f.check() == [], replay
 
 
 @needs_cuda

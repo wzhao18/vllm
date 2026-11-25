@@ -175,6 +175,7 @@ class DenseDwdp:
         roots = [_root(layer, start + i) for i, layer in enumerate(layers)]
         self.issue_at_moe = _SELECT is not None
         self._ordinal: int | None = None
+        self._eager_issue = False
         shared = _shared_storages(
             [r for r in roots if r is not None],
             [s for r, s in zip(roots, stops) if r is not None],
@@ -317,14 +318,27 @@ class DenseDwdp:
         ``depth - 1`` ahead (and, at the first layer, the ones in between). With
         ``issue_at_moe`` those copies start at this layer's MegaMoE launch
         (``moe_start``) instead; here only the next layer's, if the previous layer
-        launched no MegaMoE (a no-op otherwise: they are in flight)."""
+        launched no MegaMoE (a no-op otherwise: they are in flight).
+
+        Under a breakable CUDA graph capture (graph segments end at every attention
+        op, which runs eagerly) a copy may not span two segments: the wait and the
+        copies of the layer ``depth - 1`` ahead then run in an eager break of their
+        own at the layer start, replayed every step."""
+        capture = _breakable_capture()
+        self._eager_issue = capture is not None
+        if capture is not None:
+            capture.add_eager(lambda: self._start(layer_idx, at_moe=False))
+        else:
+            self._start(layer_idx, self.issue_at_moe)
+
+    def _start(self, layer_idx: int, at_moe: bool) -> None:
         i = layer_idx - self.start
         self._ordinal = i
         if i == 0:
             for j in range(1, DEPTH - 1):
                 self._fetch(j)
         self.copies[i].wait()
-        self._fetch(i + DEPTH - (2 if self.issue_at_moe and i else 1))
+        self._fetch(i + DEPTH - (2 if at_moe and i else 1))
 
     def moe_start(self) -> None:
         """At the current layer's MegaMoE launch (main stream, before its stager):
@@ -332,9 +346,29 @@ class DenseDwdp:
         the previous layer, whose shared-expert side stream has joined the main
         stream before this point; the copies run under the MegaMoE kernel, away from
         the next layer's SP all-gather. A no-op without ``issue_at_moe``, outside a
-        forward, and when already in flight (sub-call launches)."""
-        if self.issue_at_moe and self._ordinal is not None:
+        forward, under a breakable capture (``layer_start`` issued them) and when
+        already in flight (sub-call launches)."""
+        if self.issue_at_moe and self._ordinal is not None and not self._eager_issue:
             self._fetch(self._ordinal + DEPTH - 1)
+
+
+def _breakable_capture():
+    """The active breakable CUDA graph capture that ends a segment at each eager
+    op (not a FULL-mode capture, whose graph spans the whole forward), or None."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    capture = BreakableCUDAGraphCapture.current()
+    if capture is None or not capture._capturing:
+        return None
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+    ):
+        return None
+    return capture
 
 
 def _peer_pairs(blob, shard: int, n: int, me: int, handles, key: str, device: int):
