@@ -100,6 +100,17 @@ class Shared(types.SimpleNamespace):
         return self.forward(x)
 
 
+class _Experts:
+    """Experts stand-in: a deterministic latent-space map of the routed rows, on an
+    SM-capped bucket (decode: KimiMoE._overlapped_forward's side-stream form)."""
+
+    def __call__(self, routed, weights, ids):
+        return routed * 2 - routed.flip(0)
+
+    def shared_overlap(self, num_tokens):
+        return True
+
+
 def layer(overlap, seed=0):
     """A stand-in KimiMoE with the stock forward and helpers bound to it."""
     g = torch.Generator(device=DEVICE).manual_seed(seed)
@@ -125,17 +136,19 @@ def layer(overlap, seed=0):
         routed_output_transform=kimi.KimiRoutedOutputTransform(
             Norm(g), Linear(HIDDEN, LATENT, g)
         ),
-        # Experts stand-in: a deterministic latent-space map of the routed rows.
-        experts=lambda routed, weights, ids: routed * 2 - routed.flip(0),
+        # Experts stand-in: a deterministic latent-space map of the routed rows
+        # on an SM-capped bucket (decode: the side-stream shared-expert overlap).
+        experts=_Experts(),
         _down_proj_stream=torch.cuda.Stream(),
         _down_proj_events=(torch.cuda.Event(), torch.cuda.Event()),
         _shared_stream=torch.cuda.Stream(),
         _shared_events=(torch.cuda.Event(), torch.cuda.Event()),
+        _routed_stream=torch.cuda.Stream(priority=-1),
         _prefill_subcalls=None,
     )  # fmt: skip
     for name in ("forward", "_maybe_overlap_router_and_down_proj",
                  "_shared_mxfp8_input", "_routed_experts",
-                 "_prefill_shared_stream"):  # fmt: skip
+                 "_prefill_shared_stream", "_overlapped_forward"):  # fmt: skip
         setattr(mlp, name, types.MethodType(getattr(kimi.KimiMoE, name), mlp))
     return mlp
 
