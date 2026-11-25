@@ -121,12 +121,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
         # vLLM-local: the weight scale planes hold only the even bytes of the swizzled NVFP4 planes (every per-16
-        # pair equal, an exact MXFP4 cast). Both CTAs of a 2-CTA pair bulk-load their compact SFA bytes of a k tile
-        # into the PEER CTA's SFA slot of the stage (the leader's: its lower half, the peer's: its upper half), on
-        # the peer's barrier. The peer's MMA warp (it issues no MMA) doubles every byte: its own in place, the leader's into
-        # the leader's SFA slot by st.async on the leader's AB barrier (transaction bytes, like a TMA load). The
-        # leader's MMA path is unchanged; the expanded stages are the TMA-loaded stages of the full planes, bit for
-        # bit (_validate_compact_weight_sf, _expand_compact_sfa_peer_tile).
+        # pair equal, an exact MXFP4 cast). Both CTAs of a 2-CTA pair bulk-load their compact SFA bytes of a k
+        # tile into the PEER CTA's SFA slot of the stage (the leader's: its lower half, the peer's: its upper
+        # half), on the peer's barrier. The peer's MMA warp (it issues no MMA) doubles every byte: its own in
+        # place, the leader's into the leader's SFA slot by st.async on the leader's AB barrier (transaction
+        # bytes, like a TMA load). The leader's MMA path is unchanged; the expanded stages are the TMA-loaded
+        # stages of the full planes, bit for bit (_validate_compact_weight_sf, _expand_compact_sfa_peer_tile).
         self.compact_weight_sf = bool(impl_desc.get("compact_weight_sf", False))
 
         self.architecture = "sm_107"
