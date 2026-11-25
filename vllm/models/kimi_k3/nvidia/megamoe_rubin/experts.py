@@ -38,6 +38,8 @@ import functools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -1213,6 +1215,10 @@ class KimiK3MegaMoEExperts(nn.Module):
 
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+        if os.environ.get("M1_STAMPS_DIR") and not torch.cuda.is_current_stream_capturing():  # M1 EXPERIMENT ONLY
+            from . import m1_dump
+
+            m1_dump.capture_routes(self.layer_id, topk_ids, topk_weights)
 
         eplb_state = self.eplb_state
         eplb = None

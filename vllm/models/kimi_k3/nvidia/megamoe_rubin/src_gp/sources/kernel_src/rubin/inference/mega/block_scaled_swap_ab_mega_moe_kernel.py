@@ -14,7 +14,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
@@ -31,6 +31,7 @@ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
 from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import barrier_sync_unaligned
+from ......common import m1_stamps
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce, check_reduce_operand_alignment
@@ -138,6 +139,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
+        self._m1 = m1_stamps.ENABLED
         self._validate_desc_inputs(problem_desc, impl_desc)
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
@@ -782,6 +784,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         self._register_shared_workspace(device_workspace)
+        if self._m1:
+            m1_stamps.register(device_workspace)
         device_workspace.finalize()
         return device_workspace
 
@@ -877,6 +881,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             + self._shared_name_suffix()
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")
+            + ("_m1st" if self._m1 else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -1533,6 +1538,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         token_src_metadata = self.token_comm.token_src_metadata_tensor(self._device_workspace)
         fc2_done_counter = self.token_comm.fc2_done_counter_tensor(self._device_workspace)
         pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
+        if cutlass.const_expr(self._m1):
+            m1_call, m1_slot, m1_rec = m1_stamps.record_base(self._device_workspace, linear_cta_idx)
+            m1_lane0 = Int32((thread_idx % Int32(32)) == Int32(0))
 
         self._mainloop.assign_device_members(
             self._smem_workspace, smem_base, cta_coord_in_cluster, is_fallback_cluster, hidden, intermediate_gateup
@@ -1628,6 +1636,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
 
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.scheduler_register_count)
+            if cutlass.const_expr(self._m1):
+                m1s = m1_stamps.M1Writer(m1_rec, m1_lane0)
+                m1s.init("sched")
+                m1s.st(m1_stamps.W_ENTRY, m1_stamps.gtime())
+                m1s.st(m1_stamps.CLK_ENTRY, m1_stamps.clk())
+                m1s.st(m1_stamps.SMID, Int64(m1_stamps.smid()))
             iket.range_push("mega.scheduler")
             if cutlass.const_expr(hasattr(scheduler, "initialize_fallback_group")):
                 iket.range_push("scheduler.register_group")
@@ -1638,6 +1652,15 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 iket.range_push("scheduler.wait_sizes_ready")
                 self.token_comm.wait_for_sizes_ready(self._device_workspace)
                 iket.range_pop()
+            if cutlass.const_expr(self._m1):
+                m1s.st(m1_stamps.W_SIZES_READY, m1_stamps.gtime())
+                m1h = m1_stamps.header_base(self._device_workspace, m1_slot)
+                m1hp = Int32(m1_lane0 * Int32(linear_cta_idx == Int32(0)))
+                m1_stamps.st_s32(m1h, m1_call, m1hp)
+                m1_ne = min(self.local_expert_count, m1_stamps.MAX_HDR_EXPERTS)
+                m1_stamps.st_s32(m1h + Int64(4), Int32(m1_ne), m1hp)
+                for m1e in cutlass.range(m1_ne, unroll=1):
+                    m1_stamps.st_s32(m1h + Int64(8) + Int64(m1e) * Int64(4), expert_token_sizes[m1e], m1hp)
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
@@ -1659,10 +1682,16 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             scheduler.produce_tail()
             iket.range_pop()
             iket.range_pop()
+            if cutlass.const_expr(self._m1):
+                m1s.st(m1_stamps.W_SCHED_END, m1_stamps.gtime())
 
         if warp_idx == self.tma_a_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("mega.tma_a")
+            if cutlass.const_expr(self._m1):
+                m1a = m1_stamps.M1Writer(m1_rec, m1_lane0)
+                m1a.init("tmaa")
+                object.__setattr__(self._mainloop, "_m1a", m1a)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_a(
                 fc1_tma_a_tensor=fc1_tma_a_tensor,
@@ -1692,6 +1721,10 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.tma_b_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("mega.tma_b")
+            if cutlass.const_expr(self._m1):
+                m1b = m1_stamps.M1Writer(m1_rec, m1_lane0)
+                m1b.init("tmab")
+                object.__setattr__(self._mainloop, "_m1b", m1b)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_b(
                 fc1_tma_b_tensor=fc1_tma_b_tensor,
@@ -1725,6 +1758,10 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("mega.mma")
+            if cutlass.const_expr(self._m1):
+                m1m = m1_stamps.M1Writer(m1_rec, m1_lane0)
+                m1m.init("mma")
+                object.__setattr__(self._mainloop, "_m1m", m1m)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_mma(
                 tmem_allocator=tmem_allocator,
@@ -1738,6 +1775,10 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx < len(self.epilogue_warp_ids):
             cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
             iket.range_push("mega.epilogue")
+            if cutlass.const_expr(self._m1):
+                m1e = m1_stamps.M1Writer(m1_rec, Int32(thread_idx == Int32(0)))
+                m1e.init("epi")
+                object.__setattr__(self.epilogue, "_m1e", m1e)
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
@@ -1773,6 +1814,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             cute.arch.warpgroup_reg_dealloc(self.token_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")
+                if cutlass.const_expr(self._m1):
+                    m1i = m1_stamps.M1Writer(
+                        m1_rec, Int32(m1_lane0 * Int32(warp_idx == Int32(self.transfer_warp_idx_start)))
+                    )
+                    m1i.init("tokin")
+                    object.__setattr__(self.token_comm, "_m1i", m1i)
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 # epi_warps pushes the data from the epilogue, but a quantized wire still needs its scale rows pushed
@@ -1794,6 +1841,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 iket.range_pop()
             elif cutlass.const_expr(self.token_back_mode in ("standalone_warps", "hybrid_warps")):
                 iket.range_push("mega.token_back_standalone")
+                if cutlass.const_expr(self._m1):
+                    m1t = m1_stamps.M1Writer(
+                        m1_rec, Int32(m1_lane0 * Int32(warp_idx == Int32(self.token_in_end_warp_idx)))
+                    )
+                    m1t.init("tb")
+                    object.__setattr__(self.token_comm, "_m1t", m1t)
                 if cutlass.const_expr(not self._diag_skip_token_back):
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()

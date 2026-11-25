@@ -442,6 +442,10 @@ class RubinMegaMoeSession:
             max_ranks=cfg.world_size,
         )
         self._carved = True
+        if getattr(self.kernel, "_m1", False):  # M1 EXPERIMENT ONLY
+            from . import m1_dump
+
+            m1_dump.register(self)
 
     # -- bind / compile / launch ------------------------------------------------------
 
