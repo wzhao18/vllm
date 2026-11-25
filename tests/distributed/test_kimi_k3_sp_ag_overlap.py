@@ -113,6 +113,40 @@ def _worker(local_rank: int, world_size: int, port: int, q: mp.Queue):
                 st = (torch.randn(NSEQ, 3 * P, 3, generator=gen) * 0.1).bfloat16().to(device)
                 return qsl, lines, init, st
 
+            def say(msg):
+                print(f"[r{local_rank}] {msg}", flush=True)
+
+            # Stage checks (localize a failure): complete() alone, then the
+            # "ag" GEMM with every tile local (no waits, no pushers).
+            rows = ROWS[0]
+            m = rows * world_size
+            x = _shard(0, local_rank, rows, device)
+            qa = qa_of(x)
+            ref_qa = sp_ag.kimi_sp_all_gather_mxfp8(qa, m)
+            ref_bytes = ref_qa.data.view(torch.uint8).clone()
+            torch.accelerator.synchronize()
+            say("stock gather ok")
+            oqa = sp_ag.kimi_sp_all_gather_mxfp8_overlapped(qa, m, cl)
+            sp_ag.complete_pending()
+            torch.accelerator.synchronize()
+            assert torch.equal(oqa.data.view(torch.uint8), ref_bytes)
+            say("overlapped gather + complete ok")
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+                _LocalAg,
+            )
+
+            qsl, lines, init, st = conv_inputs(m)
+            st1, st2 = st.clone(), st.clone()
+            o1, _ = gemm(oqa.data, oqa.scale.view(torch.uint8).reshape(-1), st1, qsl, lines,
+                         init, null_block_id=NULL_BLOCK_ID)  # fmt: skip
+            zero = torch.zeros(64, dtype=torch.int32, device=device)
+            o2, _ = gemm(oqa.data, oqa.scale.view(torch.uint8).reshape(-1), st2, qsl, lines,
+                         init, null_block_id=NULL_BLOCK_ID,
+                         ag=_LocalAg(zero.data_ptr(), m // cl))  # fmt: skip
+            torch.accelerator.synchronize()
+            assert torch.equal(o1, o2) and torch.equal(st1, st2), "rotated GEMM differs"
+            say("ag GEMM (all local, rotated) bitwise ok")
+
             step = 0
             for it in range(3):
                 for rows in ROWS:
@@ -145,6 +179,7 @@ def _worker(local_rank: int, world_size: int, port: int, q: mp.Queue):
                         qsl, lines, init, null_block_id=NULL_BLOCK_ID, ag=pending,
                     )  # fmt: skip
                     torch.accelerator.synchronize()
+                    say(f"it {it} rows {rows}: overlapped GEMM done")
                     assert torch.equal(oqa.data.view(torch.uint8), ref_bytes), (it, rows)
                     sf = oqa.scale.view(torch.uint8).reshape(-1)[: m * HIDDEN // 32]
                     assert torch.equal(sf, ref_sf), (it, rows)
