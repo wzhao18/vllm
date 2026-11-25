@@ -100,9 +100,12 @@ ROWS = 16
 # 600 18.6-18.9 / 11.9-15.4. With the core's pushed DcpValue against the "proj" one the
 # chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to
 # -6 us per DSA layer on balanced rows, even with one row at 384 entries.
+# 2x16s3 (L1 round 6): rows of up to 3 chunks solo, the pair splitting the latent dims
+# (csrc/dsa_core.cu dsplit): 1-node DSA chain (W4, 24 heads, q8, us per layer) 2x16s2
+# / 2x16s3 + dim split, rows 8 37.27 / 36.26, rows 16 39.23 / 38.15 (Rhea 136829).
 VARIANT = {
-    **{q: "1-16:2x16s2" for q in range(2, 8)},  # q2-q7
-    8: "1-16:2x16s2",  # q8: the original entry (928a80c56b), unchanged
+    **{q: "1-16:2x16s3" for q in range(2, 8)},  # q2-q7
+    8: "1-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
 }
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
@@ -144,11 +147,15 @@ class MergeRows:
         source, _ = self.stage.merge_source(batch)
         return source in ("merge", "exchange")
 
-    def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def rows(
+        self, *args, q: int = 1, after_logits=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
         accepted. The core reads them after its PDL wait, so the merge's rescue
-        releases it early (``release``)."""
-        merged = self.stage.merge_rows(*args, q, release=True)
+        releases it early (``release``). ``after_logits``: as merge_rows'."""
+        merged = self.stage.merge_rows(
+            *args, q, release=True, after_logits=after_logits
+        )
         assert merged is not None, "merge_rows declined a step fits accepted"
         return merged
 

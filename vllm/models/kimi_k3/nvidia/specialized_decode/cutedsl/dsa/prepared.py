@@ -73,6 +73,7 @@ from .overlap import (
     NORM,
     QUERY_OVERLAP_UNFUSED,
     index_stream,
+    late_fork,
     overlap_for,
     side_stream,
 )
@@ -382,6 +383,7 @@ class PreparedDsa:
                 (rows,), self.indexer.max_model_len, dtype=torch.int32, device=device
             )
         self.kernels, self.overlap_kernels = {}, {}
+        self.late_query = None  # the pending late query fork (run_query)
         local_topk = self.indexer_stage.local_topk
         # NQ-NOFALLBACK: a target deployment (Rubin TP16 = DCP16, verify) never runs
         # the stock indexer op + filter or FlashInfer's chain on a shape the sparse
@@ -509,8 +511,9 @@ class PreparedDsa:
         stage = self.indexer_stage
         if scorer:
             if not fp4_unsupported:
-                # Logits only: DeepSelect + pack take the local top-N (the fused
-                # local select is slower than them on Rubin).
+                # Logits only: DeepSelect + pack take the local top-N
+                # (IndexerLocalTopk, even publishing into the mailbox itself, is
+                # no faster: 1-node chain, L1 round 5 E1).
                 stage.fused = FusedIndexer(
                     self.indexer,
                     self.shapes,
@@ -665,7 +668,8 @@ class PreparedDsa:
         kv, stride_rows = self.fi.rows(cache, md.block_size)
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
-        sel, counts = self.dsac_rows.rows(*args, q=q)
+        late, self.late_query = self.late_query, None
+        sel, counts = self.dsac_rows.rows(*args, q=q, after_logits=late)
         if join is not None:
             join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
@@ -791,9 +795,33 @@ class PreparedDsa:
             return lambda: wait(*mailbox, stream(self.device))
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
-        side.wait_stream(main)
         if mode == "fork":
             stage.run_norm(norm, projected)
+
+        def fork():
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                stage.run_query(query, projected, cache, slots, publish)
+                if wait is not None:
+                    wait(*mailbox, stream(self.device))
+
+        if mode in ("fork", "front") and late_fork(batch, self.rubin, self.dcp > 1):
+            # forked after the merge's logits (overlap.QUERY_FORK_AT); the join
+            # forks it first if the step took no merge
+            pending = [fork]
+
+            def launch():
+                if pending:
+                    pending.pop()()
+
+            def join():
+                launch()
+                self.late_query = None
+                torch.cuda.current_stream(self.device).wait_stream(side)
+
+            self.late_query = launch
+            return join
+        side.wait_stream(main)
         with torch.cuda.stream(side):
             stage.run_query(query, projected, cache, slots, publish)
             if wait is not None:
@@ -836,7 +864,8 @@ class PreparedDsa:
             if topk is None and self.indexer_stage.local_topk:
                 stage = self.query_stage
                 args = stage.q_fp8, stage.head_w, md, stride_rows, batch
-                merged = self.indexer_stage.merge_rows(*args, q)
+                late, self.late_query = self.late_query, None
+                merged = self.indexer_stage.merge_rows(*args, q, after_logits=late)
             if merged is None and self.strict and full_capture():
                 # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
                 # would capture the stock indexer op and the slot filter.

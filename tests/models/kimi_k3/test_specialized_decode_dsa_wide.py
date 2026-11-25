@@ -933,3 +933,62 @@ def test_dsa_wide_kernels_resident_past_512(q):
                 args = value, heads, 16, rows, q, sms, device
                 grid = wide.check_value_residency(*args)
             assert grid[0] * grid[1] * grid[2] <= sms, (rows, partials, grid)
+
+
+def _merge_rows_worker(rank, size, port, cases):
+    """One rank of the DSA chain bench's WideDsa (MXFP4 indexer cache, 6 heads per
+    rank, an index top-k of 512, ~2K local keys per row) at ``cases`` rows (q8): the
+    #63 merge's rows of each step against the stock op's global top-k filtered to
+    this rank's rows (bench ``check``), per row as sets."""
+    import importlib.util
+    import os
+
+    from vllm.config import set_current_vllm_config
+
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(size),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+    )
+    root = os.path.join(os.path.dirname(__file__), "../../..")
+    path = os.path.join(root, "benchmarks/kernels/bench_k31_dsa_chain.py")
+    spec = importlib.util.spec_from_file_location("bench_k31_dsa_chain", path)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    local, topk = 2000, 512
+    mp = pytest.MonkeyPatch()
+    bench.patch(mp, local * size + 4096, 6, topk)
+    bench.init(size, rank, rank, topk)
+    for rows in cases:
+        case = bench.build(rows, 8, size, local, topk)
+        with set_current_vllm_config(case.config), case.context:
+            info = case.info()
+            assert info["merge"] == f"('merge', {rows})", info
+            assert info["core"].startswith("WideDsa: #63 merge rows"), info
+            result = case.check()
+        assert result is not None and result["rows_mismatch"] == 0, (rows, result)
+        del case
+    mp.undo()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
+def test_wide_dsa_merge_rows_match_op():
+    """WideDsa's merge rows (WIDE_MERGE: 65-256 rows) on DCP4 over one node: every
+    row's selected KV rows equal the stock sparse_attn_indexer op's global top-k
+    filtered to this rank's rows (the path they replace), at 128 and 256 rows (q8)."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    args = (4, get_open_port(), (128, 256))
+    context = mp.start_processes(
+        _merge_rows_worker, args=args, nprocs=4, join=False, start_method="spawn"
+    )
+    deadline = time.monotonic() + 1200
+    while not context.join(timeout=10):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                process.kill()
+            pytest.fail("WideDsa merge rows: no progress in 20 min (a hang?)")

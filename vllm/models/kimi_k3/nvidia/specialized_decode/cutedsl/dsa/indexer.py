@@ -1414,13 +1414,18 @@ class IndexerLocalTopk:
       4  each thread's count of candidates above it and ties at it, block-
          scanned -> their slots."""
 
-    def __init__(self, rows: int, n: int, pitch: int):
+    def __init__(self, rows: int, n: int, pitch: int, world: int = 0):
         assert n % 32 == 0 and n < 1 << LOCAL_ABOVE_BITS and pitch % 512 == 0
         self.rows, self.n, self.pitch = rows, n, pitch
+        # world > 0: also multicast each B' row into the #63 merge's round-1
+        # mailbox (dcp_topk_round1_mailbox; the pack kernel's layout), so the
+        # merge runs no pack kernel.
+        self.world = world
 
     @cute.jit
-    def __call__(self, logits, row_ends, out, valid, s):
-        self.kernel(logits, row_ends, out, valid).launch(
+    def __call__(self, logits, row_ends, out, valid, ordinals, box_mc, rank, rows, s):
+        args = logits, row_ends, out, valid, ordinals, box_mc, rank, rows
+        self.kernel(*args).launch(
             grid=(self.rows, 1, 1),
             block=(SELECT_THREADS, 1, 1),
             stream=s,
@@ -1498,8 +1503,42 @@ class IndexerLocalTopk:
                             count += c
         return count, state
 
+    @cute.jit
+    def publish(self, out, row, ordinals, box_mc, rank, max_rows, tid):
+        """Multicast B' row ``row`` (``out``, written by this CTA before the
+        barrier) into this rank's slot of every rank's round-1 mailbox: the N
+        words, the bit plane as marked half-words, marks to the 16-byte end."""
+        from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+            box_words,
+            multimem_st_v4,
+        )
+
+        N, mark = self.n, Uint32(0x10000)
+        words = box_words(N)
+        parity = ordinals[row] & Int32(1)
+        slot = (
+            (Int64(parity) * Int64(max_rows) + Int64(row)) * Int64(self.world)
+            + Int64(rank)
+        ) * Int64(words * 4)
+        for c in cutlass.range(tid, words // 4, SELECT_THREADS, unroll=1):
+            v = [Int32(0), Int32(0), Int32(0), Int32(0)]
+            for e in cutlass.range_constexpr(4):
+                i = c * 4 + e
+                w = mark
+                if i < N:
+                    w = Uint32(out[row, i])
+                elif i < N + 2 * (N // 32):
+                    plane = Uint32(out[row, N + (i - N) // 2])
+                    if (i - N) % 2 == 1:
+                        plane = plane >> Uint32(16)
+                    w = mark | (plane & Uint32(0xFFFF))
+                v[e] = Int32(w)
+            multimem_st_v4(box_mc + slot + Int64(c) * Int64(16), *v)
+
     @cute.kernel
-    def kernel(self, logits, row_ends, out, valid):
+    def kernel(
+        self, logits, row_ends, out, valid, ordinals, box_mc, box_rank, max_rows
+    ):
         N = self.n
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -1661,6 +1700,9 @@ class IndexerLocalTopk:
                 out[row, N + tid] = Int32(plane[tid])
             if tid == 0:
                 valid[row] = Int32(N)
+        if cutlass.const_expr(self.world > 0):
+            cute.arch.sync_threads()  # the row's words and plane, block-visible
+            self.publish(out, row, ordinals, box_mc, box_rank, max_rows, tid)
 
     @cute.jit
     def list_pass(
@@ -1794,6 +1836,7 @@ def compile_indexer(
     release=True,
     page=PAGE,
     fp4=False,
+    world=0,
 ):
     """The score and select kernels of one (rows, q) for an indexer cache layout
     (every DSA layer's is the same). DCP (``pitch``): DeepGEMM-layout logits and,
@@ -1831,8 +1874,11 @@ def compile_indexer(
             width = topk + topk // 32
             out = fake((rows, width), (width, 1), torch.int32, 4)
             valid = fake((rows,), (1,), torch.int32, 4)
-            local = IndexerLocalTopk(rows, topk, pitch)
-            return score_kernel, cute.compile(local, scratch, ends, out, valid, s)
+            local = IndexerLocalTopk(rows, topk, pitch, world)
+            ordinals = fake((rows,), (1,), torch.int32, 4)
+            box = Int64(0), Int32(0), Int32(0)
+            args = scratch, ends, out, valid, ordinals, *box, s
+            return score_kernel, cute.compile(local, *args)
         select = IndexerSelect(rows, q, topk, logical=ids, release=release, page=page)
         out = fake((rows, topk), (topk, 1), torch.int32, 4)
         valid = fake((rows,), (1,), torch.int32, 4)
@@ -1887,6 +1933,14 @@ class FusedIndexer:
         self.logits, self.tops, self.out, self.valid, self.ends, self.pitch = buffers
         self.ctas = torch.cuda.get_device_properties(device).multi_processor_count
         self.ids: torch.Tensor | None = None
+        # The packed select publishes the #63 merge's round-1 rows itself.
+        self.box = None
+        if self.packed:
+            from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+                dcp_topk_round1_mailbox,
+            )
+
+            self.box = dcp_topk_round1_mailbox(indexer.topk_tokens, local_topk)
         self.kernels = {shape: self.compile(*shape) for shape in shapes}
 
     def compile(self, rows, q):
@@ -1898,7 +1952,14 @@ class FusedIndexer:
         packed = self.packs(rows)
         args += (self.device.index, self.ids is not None, self.pitch, packed)
         release = (rows, q) not in self.hold
-        return compile_indexer(*args, release=release, page=self.page, fp4=self.fp4)
+        world = self.box.world_size if self.box is not None and packed else 0
+        return compile_indexer(
+            *args, release=release, page=self.page, fp4=self.fp4, world=world
+        )
+
+    def publishes(self, rows):
+        """Whether ``run_dcp`` multicasts its B' rows into the merge's mailbox."""
+        return self.box is not None and self.packs(rows)
 
     def packs(self, rows):
         """DCP: whether ``run_dcp`` selects the B' rows itself: one CTA per row
@@ -2002,12 +2063,21 @@ class FusedIndexer:
             return None, logits, ends
         _, select = self.kernels[rows, q]
         out, valid = self.out[:rows], self.valid[:rows]
-        s = stream(self.device)
+        box = self.box
+        if box is not None:
+            assert rows <= box.max_rows, (rows, box.max_rows)
+            ordinals = to_cute(box.ordinals[:rows], 4)
+            mailbox = Int64(box.box_mc), Int32(box.rank), Int32(box.max_rows)
+        else:
+            ordinals = to_cute(valid, 4)  # placeholders (world 0)
+            mailbox = Int64(0), Int32(0), Int32(0)
         select(
             to_cute(self.logits),
             to_cute(ends, 4),
             to_cute(out, 4),
             to_cute(valid, 4),
-            s,
+            ordinals,
+            *mailbox,
+            stream(self.device),
         )
         return out, logits, ends

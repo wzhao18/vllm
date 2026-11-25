@@ -236,21 +236,48 @@ def build(batch, q, world, local_len, topk):
         )
         box = dcp_box(runtime, dsa.HEADS, dsa=True, flashinfer=True)
         policy = dict(queries=(q,), core="auto", dcp=box, partials=DSA_PARTIALS)
+        wide = batch > 64  # providers.Attention: WideDsa past PreparedDsa's rows
+        if wide:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+                WideDsa,
+            )
+
+            # (the served policy: no partials override, r1.AUTO_PARTIALS)
+            policy = dict(queries=(q,), core="auto", dcp=box)
         layers = []
         for parity in (0, 1):
-            p = PreparedDsa(
-                attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=parity
-            )
+            cls = WideDsa if wide else PreparedDsa
+            p = cls(attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=parity)
             layers.append(p.prepare_cache(mla))
         out = torch.empty(batch, dsa.HEADS * 128, device=dev, dtype=bf)
         p0 = layers[0]
-        info = lambda: dict(  # noqa: E731  (inside the forward context)
-            overlap=p0.overlaps[batch, q],
-            core=p0.coverage_note(batch, q),
-            local_topk=p0.indexer_stage.local_topk,
-            merge=str(p0.indexer_stage.merge_source(batch)),
-            local_kv=local[0],
-        )
+
+        def info():  # (inside the forward context)
+            stage = getattr(p0, "indexer_stage", None)
+            if wide:
+                fused = stage is not None and stage.fused is not None
+                core = "WideDsa: " + (
+                    "#63 merge rows" + (" + IndexerScoreFp4" if fused else "")
+                    if stage is not None
+                    and stage.local_topk
+                    and batch in getattr(p0, "merged", ())
+                    else p0.stock_pieces(batch)
+                )
+                return dict(
+                    overlap=p0.overlaps[batch],
+                    core=core,
+                    local_topk=stage.local_topk if stage is not None else 0,
+                    merge=str(stage.merge_source(batch)) if stage is not None else "op",
+                    partials=p0.dsa_box.mailbox(batch).format,
+                    local_kv=local[0],
+                )
+            return dict(
+                overlap=p0.overlaps[batch, q],
+                core=p0.coverage_note(batch, q),
+                local_topk=stage.local_topk,
+                merge=str(stage.merge_source(batch)),
+                local_kv=local[0],
+            )
 
         def run(prepared):
             prepared.run(
@@ -263,9 +290,55 @@ def build(batch, q, world, local_len, topk):
                 q=q,
             )
 
+    def check():
+        """Wide rows: the merge's rows of this step (merge_rows, after an eager
+        layer filled the indexer query) against the stock op's global top-k
+        filtered to this rank's rows (the path it replaces), as per-row sets."""
+        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+        stage = getattr(p0, "indexer_stage", None)
+        if not wide or stage is None or not stage.local_topk:
+            return None
+        run(p0)
+        torch.accelerator.synchronize()
+        stride_rows = flat_kv_row_view(mla, md.block_size)[1]
+        args = p0.q_fp8, p0.head_w, md, stride_rows, batch
+        slots, valid = (t.clone() for t in stage.merge_rows(*args, q))
+        topk = p0.indexer_core(projected, batch)
+        impl, counts = p0.impl, p0.impl.dcp_local_topk_counts
+        p0.impl.dcp_local_topk_counts = None
+        try:
+            # dcp_core's filter branch on the op's ids (no decode: wait unused)
+            from vllm.v1.attention.backends.mla.sparse_utils import (
+                triton_filter_and_convert_dcp_index,
+            )
+
+            ref, ref_valid = triton_filter_and_convert_dcp_index(
+                md.req_id_per_token[:batch],
+                md.block_table,
+                topk[:batch],
+                dcp_size=world,
+                dcp_rank=rank,
+                cp_kv_cache_interleave_size=p0.indexer.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=md.block_size,
+                BLOCK_STRIDE_ROWS=stride_rows,
+                NUM_TOPK_TOKENS=topk.shape[1],
+                return_valid_counts=True,
+            )
+        finally:
+            impl.dcp_local_topk_counts = counts
+        bad = 0
+        for r in range(batch):
+            n, m = int(valid[r]), int(ref_valid[r])
+            a = torch.sort(slots[r, :n]).values
+            b = torch.sort(ref[r, :m]).values
+            bad += int(n != m or not torch.equal(a, b))
+        return dict(rows_mismatch=bad, mean_count=float(valid.float().mean()))
+
     return SimpleNamespace(
-        config=config, context=context, layers=layers, run=run, info=info
-    )
+        config=config, context=context, layers=layers, run=run, info=info,
+        check=check, outputs=lambda: {"out": out.clone()},
+    )  # fmt: skip
 
 
 DBG = {}
@@ -306,6 +379,14 @@ def dsac_phases(rows):
         if ok.any():
             rel = (col[ok] - d[ok, 0]) / 1e3
             out[n] = [round(float(rel.mean()), 3), round(float(rel.max()), 3)]
+    # the loop's first tile in SM clocks from its start (dbg[18]): gather landed,
+    # QK + V cast, softmax, PV (dsa_core.cu dbg 10-13)
+    base = d[:, 18]
+    for i, n in {10: "clk_gather", 11: "clk_qk", 12: "clk_softmax", 13: "clk_pv"}.items():
+        ok = (d[:, i] > 0) & (base > 0)
+        if ok.any():
+            rel = d[ok, i] - base[ok]
+            out[n] = [round(float(rel.mean())), round(float(rel.max()))]
     return out
 
 
@@ -318,6 +399,8 @@ def bench(case, args, rank):
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     with set_current_vllm_config(case.config), case.context:
         case.info = case.info()
+        if args.check:
+            case.info["check"] = case.check()
         for i in range(4):  # eager warm-up (compiles), both parities
             case.run(case.layers[i % 2])
         torch.accelerator.synchronize()
@@ -330,16 +413,26 @@ def bench(case, args, rank):
             g.replay()
         torch.accelerator.synchronize()
         times = []
+        # The replays start together on every rank: a device-side all-reduce
+        # right before the start event (a host barrier leaves the ranks' launches
+        # tens of us apart, which the early ranks' first mailbox polls absorb
+        # into their timed span).
+        align = torch.zeros(1, device=dev)
         for _ in range(args.reps):
             group.barrier()
             torch.accelerator.synchronize()
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
+            torch.distributed.all_reduce(align, group=group.device_group)
             e0.record()
             g.replay()
             e1.record()
             e1.synchronize()
             times.append(e0.elapsed_time(e1) * 1000 / args.layers)
+        if args.dump:  # the last layer's output after the replays (out_digest.py)
+            path = os.path.join(args.dump, args.tag)
+            os.makedirs(path, exist_ok=True)
+            torch.save(case.outputs(), f"{path}/M{args.cur_rows}.rank{rank}.pt")
         trace = None
         if args.prof:
             from torch.profiler import ProfilerActivity, profile
@@ -373,6 +466,8 @@ def main():
     ap.add_argument("--tag", default="chain")
     ap.add_argument("--out", default="")
     ap.add_argument("--dsac-dbg", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--dump", default="", help="dir: per-tag/rows/rank outputs")
     args = ap.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
