@@ -42,6 +42,8 @@ class KdaSplitDefer(RecoverKdaSplit):
     # The fold after the PDL wait, under the input loads (its state loads then
     # overlap them as the stock verify's do) instead of before the wait.
     fold_late = False
+    # The fold unrolled over the record slots with selects (``fold_selected``).
+    fold_unrolled = False
 
     def __init__(self, heads, batch, gate_mode, has_bias, schedule, tokens):
         assert tokens >= 2, "KdaSplitDefer: verify only"
@@ -344,6 +346,35 @@ class KdaSplitDefer(RecoverKdaSplit):
     def fold(self, history, rec, pending, value_base, group, group_lane):
         """The ``pending`` accepted tokens 1 .. pending of the previous verify into
         the thread's rows from the staged records, ``update``'s instructions."""
+        if cutlass.const_expr(self.fold_unrolled):
+            self.fold_selected(history, rec, pending, value_base, group, group_lane)
+        else:
+            self.fold_loop(history, rec, pending, value_base, group, group_lane)
+
+    @cute.jit
+    def fold_selected(self, history, rec, pending, value_base, group, group_lane):
+        """``fold_loop`` unrolled over the 7 record slots: every slot's operands load
+        unconditionally (staged rows; past ``pending`` they are stale) and a token
+        past ``pending`` keeps the state (a select of the unchanged value), so the
+        loads of later tokens issue ahead of the earlier tokens' arithmetic."""
+        for i in cutlass.range_constexpr(self.tokens - 1):
+            live = i < pending
+            for p in cutlass.range_constexpr(self.passes):
+                safe_row = (p * self.groups + group) % self.rows
+                v_new = rec[(V_ROW + i) * 128 + value_base + safe_row]
+                for j in cutlass.range_constexpr(self.chunks):
+                    column = 4 * (group_lane + self.lanes_per_row * j)
+                    k4 = load_f32x4(rec.iterator + i * 128 + column, shared=True)
+                    d4 = load_f32x4(
+                        rec.iterator + (DECAY_ROW + i) * 128 + column, shared=True
+                    )
+                    for e in cutlass.range_constexpr(4):
+                        h = history[p, j, e]
+                        folded = fma(k4[e], v_new, h * d4[e])
+                        history[p, j, e] = cutlass.select_(live, folded, h)
+
+    @cute.jit
+    def fold_loop(self, history, rec, pending, value_base, group, group_lane):
         for i in cutlass.range(pending, unroll=1):
             kr = cute.make_rmem_tensor((self.chunks, 4), Float32)
             decays = []
