@@ -314,26 +314,15 @@ def pd_prefill_capture_sizes(max_num_batched_tokens: int) -> list[int]:
     return sorted({s for s in sizes if s <= cap} | {cap})
 
 
-def _capped_shared_overlap_tokens(
-    vllm_config: VllmConfig, max_tokens_per_rank: int
-) -> int | None:
-    """Largest per-rank step of a sequence-parallel MegaMoE layer that runs on an
-    SM-capped grid beside the side-stream shared expert (``KimiMoE._overlapped_forward``);
-    None = every step (decode, unified serving: the decode SP measurement behind
-    RUBIN_SHARED_OVERLAP_MAX_SMS).
-
-    P/D prefill workers: RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS. Their larger steps are
-    SM-throughput-bound in MegaMoE (TP8+DCP8 NVFP4, 4096 rows per rank: 884 -> 1182 us
-    per layer on the 148-SM cap), so they keep the full grid and overlap the shared
-    expert by stream priority instead. Decided by role, no switch."""
-    from .megamoe_rubin.experts import RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
-
-    if (
-        not pd_prefill_worker(vllm_config)
-        or max_tokens_per_rank <= RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
-    ):
-        return None
-    return RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
+def prefill_full_grid_shared_overlap(vllm_config: VllmConfig) -> bool:
+    """Whether the sequence-parallel MegaMoE layers keep the full persistent grid and
+    overlap the replicated shared expert by stream priority (``KimiMoE._overlapped_forward``)
+    instead of capping MegaMoE at RUBIN_SHARED_OVERLAP_MAX_SMS beside a side-stream shared
+    expert. P/D prefill workers: their steps are SM-throughput-bound in MegaMoE, so the
+    cap costs more than it hides (TP8+DCP8 NVFP4: 2K / 4K tokens per GPU -11.4 / -23.6 ms
+    per step eager, 128-1024 rows per rank no slower). Decode and unified serving keep
+    the decode SP measurement's cap. Decided by role, no switch."""
+    return pd_prefill_worker(vllm_config)
 
 
 _routed_priority_streams: dict[int, torch.cuda.Stream] = {}
@@ -1156,11 +1145,10 @@ class KimiMoE(nn.Module):
             and not self.shared_experts.shard_sequence_parallel
         )
         if self._shared_overlap:
-            self.experts.reserve_sms_for_shared_expert(
-                up_to_tokens=_capped_shared_overlap_tokens(
-                    vllm_config, self.experts.buckets[-1].max_tokens
-                )
-            )
+            if prefill_full_grid_shared_overlap(vllm_config):
+                self.experts.full_grid_beside_shared_expert()
+            else:
+                self.experts.reserve_sms_for_shared_expert()
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
             # Full-grid buckets: the routing chain runs on a high-priority stream
@@ -1337,11 +1325,11 @@ class KimiMoE(nn.Module):
         shared expert concurrent with the routed experts; same kernels, operands
         and up-projection epilogue as the serial order, only concurrent.
 
-        * SM-capped bucket (``experts.shared_overlap``: decode, and P/D prefill
-          steps of at most RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS rows): the
-          MegaMoE grid leaves the shared expert its SMs; the shared expert runs on
-          the side stream from the dispatch on.
-        * Full-grid bucket (larger P/D prefill steps): MegaMoE needs every SM, so
+        * SM-capped bucket (``experts.shared_overlap``: decode, unified serving):
+          the MegaMoE grid leaves the shared expert its SMs; the shared expert runs
+          on the side stream from the dispatch on.
+        * Full-grid bucket (P/D prefill workers,
+          ``prefill_full_grid_shared_overlap``): MegaMoE needs every SM, so
           the whole routing chain (router, top-k, latent down, dispatch, MegaMoE,
           reduce) runs on a high-priority stream and the shared expert on the
           current stream from the layer input on: the block scheduler hands each

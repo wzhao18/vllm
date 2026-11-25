@@ -378,45 +378,38 @@ def test_shared_overlap_sm_cap_admits_every_server_bucket(monkeypatch, world, to
 
 
 @pytest.mark.parametrize("world,tokens", [(8, 8192), (8, 2048), (16, 8192)])
-def test_prefill_shared_overlap_caps_only_the_small_bucket(monkeypatch, world, tokens):
-    """P/D prefill workers (reserve_sms_for_shared_expert(up_to_tokens=...)): a small
-    capped bucket (same variant / knob record, fallback clusters dropped) is added below
-    the main bucket, which keeps the full grid; the small one passes the kernel
-    admission rules; shared_overlap() follows the selected bucket."""
+def test_prefill_full_grid_beside_shared_expert(monkeypatch, world, tokens):
+    """P/D prefill workers (full_grid_beside_shared_expert): every bucket keeps the
+    full grid and its knobs (no extra capped bucket, no extra arena share), the layer
+    is marked sequence-parallel, shared_overlap() is False at every size (the caller
+    overlaps by stream priority); refused after the runtime is built or on a capped
+    bucket."""
     from vllm.models.kimi_k3.nvidia.megamoe_rubin import die_local
 
     monkeypatch.setattr(die_local, "current_die_sm_mask32", lambda: None)
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
     buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)
-    assert len(buckets) == 1
-    main = buckets[0]
     module = SimpleNamespace(
-        bucket=main, buckets=buckets, kernel_weights=None, prefix="layer",
+        bucket=buckets[-1], buckets=buckets, kernel_weights=None, prefix="layer",
         prefill_worker=True, max_num_tokens=tokens, dp_size=1,
-    )
-    cap = X.RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
-    X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module, up_to_tokens=cap)
-    small, big = module.buckets
-    assert module.bucket == big == main  # full grid, untouched
-    assert big.max_sm_count is None
-    assert small.max_tokens == cap and small.variant == main.variant
-    assert small.max_sm_count == X.RUBIN_SHARED_OVERLAP_MAX_SMS
-    assert small.knobs.fallback_cluster_shape_mn is None
-    assert dataclasses.replace(small.knobs, fallback_cluster_shape_mn=None) == dataclasses.replace(
-        main.knobs, fallback_cluster_shape_mn=None
-    )
-    C.RubinMoeConfig.make(problem, small, rank=0, world_size=world)
-    sel = lambda n: X.KimiK3MegaMoEExperts.select_bucket(module, n)  # noqa: E731
-    module.select_bucket = sel
-    for n, capped in ((1, True), (cap, True), (cap + 1, False), (tokens, False)):
-        assert X.KimiK3MegaMoEExperts.shared_overlap(module, n) is capped
-    with pytest.raises(ValueError):
-        X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(
-            SimpleNamespace(bucket=main, buckets=buckets, kernel_weights=None,
-                            prefix="layer", prefill_worker=True),
-            up_to_tokens=tokens,
-        )
+        sequence_parallel=False,
+    )  # fmt: skip
+    X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(module)
+    assert module.buckets == buckets and module.sequence_parallel
+    assert all(b.max_sm_count is None for b in module.buckets)
+    module.select_bucket = lambda n: X.KimiK3MegaMoEExperts.select_bucket(module, n)
+    for n in (1, 1024, tokens):
+        assert X.KimiK3MegaMoEExperts.shared_overlap(module, n) is False
+    module.kernel_weights = object()
+    with pytest.raises(RuntimeError):
+        X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(module)
+    capped = SimpleNamespace(
+        buckets=(dataclasses.replace(buckets[-1], max_sm_count=148),),
+        kernel_weights=None, prefix="layer",
+    )  # fmt: skip
+    with pytest.raises(RuntimeError):
+        X.KimiK3MegaMoEExperts.full_grid_beside_shared_expert(capped)
 
 
 def test_server_bucket_without_knob_record_borrows_nearest():
