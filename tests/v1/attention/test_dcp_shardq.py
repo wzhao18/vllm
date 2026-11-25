@@ -1342,6 +1342,25 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 gate=True,
                 count=1,
             ):
+                import os as _os
+                import time as _t
+
+                mt = None
+                if backend == "DeepGEMM":
+                    base = _os.environ.get("DG_JIT_CACHE_DIR") or _os.path.expanduser(
+                        "~/.deep_gemm"
+                    )
+                    try:
+                        mt = _os.stat(
+                            _os.path.join(base, "cache", fn_name, ".committed")
+                        ).st_mtime
+                    except OSError:
+                        pass
+                print(
+                    f"JITEV rank={rank} t={_t.time():.3f} mtime={mt} "
+                    f"mon={monitoring[0]} count={count} {backend} {event}: {fn_name}",
+                    flush=True,
+                )
                 if monitoring[0] and count:
                     compiled.append(f"{backend} {event}: {fn_name}")
 
@@ -1408,6 +1427,9 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 # The DCP path's kernels, which the runner's dummy runs warm.
                 forward(dcp_metadata)
 
+                import time as _t
+
+                print(f"JITWIN rank={rank} {name} start {_t.time():.3f}", flush=True)
                 monitoring[0] = True
                 metadata = builder.build(0, step)
                 index_metadata = index_builder.build(0, index_step)
@@ -1433,6 +1455,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 out = forward(metadata).clone()
                 torch.accelerator.synchronize()
                 monitoring[0] = False
+                print(f"JITWIN rank={rank} {name} stop {_t.time():.3f} {compiled}", flush=True)
                 assert not compiled, (name, compiled)
                 # The keys of the DCP path's cross-rank top-k merge, up to the
                 # order of near-tied (bf16) scores at the top-k boundary.
