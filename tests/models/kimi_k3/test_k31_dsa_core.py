@@ -457,7 +457,7 @@ def _ulps(a, b):
 
 
 @pytest.mark.parametrize("pattern", ["balanced", "skewed", "long"])
-@pytest.mark.parametrize("rows", [8, 14, 16])
+@pytest.mark.parametrize("rows", [8, 14, 16, 24, 32, 48])
 def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     """Stock precision, rank by rank (DCP16 q8 rows 8 / 14 / 16: trtllm-gen KV CTAs 8 /
     7 / 6 on one GPU, the served 2x16s3): every rank's pushed partial rows and base-2
@@ -465,15 +465,16 @@ def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     (attn_fi.trtllm's call), and both against the FP32 emulation of trtllm-gen's
     precision (``_emulate``), with local counts of up to 2048 (every piece size of
     trtllm-gen's KV CTA split at these rows). The old FP16-P core matched trtllm-gen
-    on 53-68% of the elements."""
+    on 53-68% of the elements. Rows 24 / 32 / 48 run the served 1x16 / 1x32."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import (
         VARIANT,
         parse_variant,
+        rows_table,
     )
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore, trtllm_kv_ctas
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    variant = parse_variant(VARIANT[8].split(":")[1])
+    variant = parse_variant(rows_table(VARIANT[8])[rows])  # the served variant
     box, sel, cnt, kv8, q8, q_scale, k_scale = _dcp_case(rows, pattern)
     sm_scale = 1.0 / math.sqrt(192)
     scales = sm_scale * q_scale * k_scale, k_scale
@@ -552,11 +553,13 @@ def test_dsa_core_policy():
         with pytest.raises(ValueError):
             decode.parse_variant(bad)
     dsac = decode.DsacDecode(torch.device("cuda"), H)
-    assert dsac.rows == decode.ROWS == 16
+    assert dsac.rows == decode.ROWS == 48
     assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 3)
     assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 3)  # every q2-q8
+    assert dsac.variant(24, 8) == dsac.variant(32, 4) == (1, 16, 4)
+    assert dsac.variant(40, 8) == dsac.variant(48, 2) == (1, 32, 4)
     assert dsac.variant(8, 1) is None  # (no verify: no table)
-    assert dsac.variant(24, 8) is None  # past ROWS
+    assert dsac.variant(56, 8) is None  # past ROWS
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:4x32")
     assert every.variant(8, 4) == (1, 16, 4) and every.variant(64, 8) == (4, 32, 4)
 

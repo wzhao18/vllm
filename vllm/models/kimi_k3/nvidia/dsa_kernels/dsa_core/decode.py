@@ -55,9 +55,10 @@ logger = init_logger(__name__)
 # B8 q8 11664 -> 11447, B1 q4 5852 -> 5601, B8 q4 9449 -> 8825.
 # Caveat: a row whose selection sits on one rank (a ~100K-way tie at the cut, e.g. all
 # index keys zero) walks its tiles serially: DCP4 skew bench B8 q8 97 -> 122 us/layer.
-# Here 16 (DL7 M8 / M16, see VARIANT): from 24 rows no variant holds up where one rank
-# holds 600 or more of a request's entries.
-ROWS = 16
+# Here 48: with one CTA per row and head group above 16 rows (1x16 to 32 rows, 1x32 to
+# 48) the core is faster than FlashInfer's chain at TP16 = DCP16 q8 on filled index
+# keys and in the all-zero-key tie case alike; above 48 rows the chain stays ahead.
+ROWS = 48
 # Core variant by rows, per verify length q: "<S>x<HG>[s<M>]" = S KV splits (one
 # cluster; rows of at most M 64-key chunks, default 4, on one CTA) per (row, HG = 16 /
 # 32 gathered heads). A q without a table keeps FlashInfer's chain.
@@ -104,8 +105,8 @@ ROWS = 16
 # (csrc/dsa_core.cu dsplit): 1-node DSA chain (W4, 24 heads, q8, us per layer) 2x16s2
 # / 2x16s3 + dim split, rows 8 37.27 / 36.26, rows 16 39.23 / 38.15 (Rhea 136829).
 VARIANT = {
-    **{q: "1-16:2x16s3" for q in range(2, 8)},  # q2-q7
-    8: "1-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
+    **{q: "1-16:2x16s3,17-32:1x16,33-48:1x32" for q in range(2, 8)},  # q2-q7
+    8: "1-16:2x16s3,17-32:1x16,33-48:1x32",  # q8: 1-16 the original entry (928a80c56b)
 }
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
