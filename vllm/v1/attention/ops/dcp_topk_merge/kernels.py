@@ -662,7 +662,7 @@ def _make_radix_select(
         tab: cute.Tensor = None,
         dbg: Int64 = None,
     ) -> Int32:
-        # scalars: [committed, owned, threshold, take_all]
+        # scalars: [committed, owned, final pass, done]
         sel_min = Int32(0x10000)
         # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
         # written after the passes, in (thread, key) order at block-scan
@@ -675,68 +675,82 @@ def _make_radix_select(
         if tid == Int32(0):
             scalars[0] = Int32(0)
             scalars[1] = Int32(0)
+            scalars[2] = Int32(0)
             scalars[3] = Int32(0)
             prefix_ptr.store(Uint64(0))
+        hist[tid] = Int32(0)
         cute.arch.sync_threads()
 
+        # The passes only find the K-th key's digits: pass p histograms the
+        # keys under the current prefix into hist buffer p % 2 (the other
+        # buffer is zeroed meanwhile: its last reader, pass p - 1's scan, is
+        # behind a barrier), and the thread whose bin holds the K-th key
+        # appends its digit to the prefix. The selected keys are then the
+        # non-empty keys >= the final prefix at the final pass's shift (a key
+        # is either above the cut at the first digit where it leaves the
+        # prefix, or below it, or equal on every digit up to the take-all /
+        # exact cut): the same set as selecting bins above the threshold pass
+        # by pass, with one selection loop instead of one per pass.
         for p in cutlass.range_constexpr(num_passes):
             shift, pbits = passes[p]
+            cur = (p % 2) * num_bins
+            nxt = ((p + 1) % 2) * num_bins
             if scalars[3] == Int32(0):
                 prefix = prefix_ptr.load()
-                hist[tid] = Int32(0)
-                cute.arch.sync_threads()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
                     if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
                         b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
                         cute.arch.atomic_add(
-                            hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
+                            hist.iterator + (b + Int32(cur)),
+                            Int32(1),
+                            sem="relaxed",
+                            scope="cta",
                         )
+                if cutlass.const_expr(p + 1 < num_passes):
+                    hist[Int32(nxt) + tid] = Int32(0)
                 cute.arch.sync_threads()
 
                 # Bins high to low: tid t scans bin num_bins - 1 - t.
                 need = Int32(topk) - scalars[0]
-                count = hist[Int32(num_bins - 1) - tid]
+                count = hist[Int32(cur + num_bins - 1) - tid]
                 incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
-                # The committed count grows by the keys selected below: the
-                # bins above the threshold (and the threshold bin when done).
                 # Every thread read scalars[0] before the scan's barriers.
                 if count > Int32(0) and incl >= need and incl - count < need:
-                    scalars[2] = Int32(num_bins - 1) - tid
+                    prefix_ptr.store(
+                        (prefix << Uint64(pbits)) | Uint64(Int32(num_bins - 1) - tid)
+                    )
                     if incl == need:
+                        scalars[2] = Int32(p)
                         scalars[3] = Int32(1)
                         scalars[0] = scalars[0] + incl
                     else:
                         scalars[0] = scalars[0] + incl - count
                 if tid == Int32(tb_size - 1) and incl < need:
                     # Fewer matching candidates than needed: keep them all.
-                    scalars[2] = Int32(0)
+                    prefix_ptr.store(prefix << Uint64(pbits))
+                    scalars[2] = Int32(p)
                     scalars[3] = Int32(1)
                     scalars[0] = scalars[0] + incl
-                cute.arch.sync_threads()
-
-                thr = scalars[2]
-                done = scalars[3] != Int32(0)
-                for i in cutlass.range_constexpr(keys_per_thread):
-                    key = keys[i]
-                    selected = False
-                    if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
-                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
-                        selected = b > thr or (done and b == thr)
-                    if selected:
-                        score = Int32(key >> Uint64(gid_bits))
-                        if score < sel_min:
-                            sel_min = score
-                        sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
-                cute.arch.sync_threads()
-                if tid == Int32(0) and not done:
-                    prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
                 cute.arch.sync_threads()
                 if cutlass.const_expr(stamps):
                     if tid == Int32(0):
                         _st_i64(
                             dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1)
                         )
+
+        cut = prefix_ptr.load()
+        last = scalars[2]
+        for p in cutlass.range_constexpr(num_passes):
+            shift, pbits = passes[p]
+            if last == Int32(p):
+                for i in cutlass.range_constexpr(keys_per_thread):
+                    key = keys[i]
+                    if key != Uint64(0) and (key >> Uint64(shift)) >= cut:
+                        score = Int32(key >> Uint64(gid_bits))
+                        if score < sel_min:
+                            sel_min = score
+                        sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
 
         if cutlass.const_expr(stamps):
             if tid == Int32(0):
@@ -1066,7 +1080,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
 
         @cute.struct
         class SharedStorage:
-            hist: cute.struct.MemRange[Int32, num_bins]
+            hist: cute.struct.MemRange[Int32, 2 * num_bins]
             warp_totals: cute.struct.MemRange[Int32, num_warps]
             scalars: cute.struct.MemRange[Int32, 8]
             notsat: cute.struct.MemRange[Int32, 16]
@@ -1317,7 +1331,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                     _st_i64(dbg_row, _globaltimer())
             smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage, 16)
-            hist = storage.hist.get_tensor(cute.make_layout((num_bins,)))
+            hist = storage.hist.get_tensor(cute.make_layout((2 * num_bins,)))
             warp_totals = storage.warp_totals.get_tensor(cute.make_layout((num_warps,)))
             scalars = storage.scalars.get_tensor(cute.make_layout((8,)))
             notsat = storage.notsat.get_tensor(cute.make_layout((16,)))
@@ -1888,7 +1902,7 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
 
         @cute.struct
         class SharedStorage:
-            hist: cute.struct.MemRange[Int32, num_bins]
+            hist: cute.struct.MemRange[Int32, 2 * num_bins]
             warp_totals: cute.struct.MemRange[Int32, num_warps]
             scalars: cute.struct.MemRange[Int32, 8]
             owner: cute.struct.MemRange[Int32, 16]
@@ -1917,7 +1931,7 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage, 16)
-            hist = storage.hist.get_tensor(cute.make_layout((num_bins,)))
+            hist = storage.hist.get_tensor(cute.make_layout((2 * num_bins,)))
             warp_totals = storage.warp_totals.get_tensor(cute.make_layout((num_warps,)))
             scalars = storage.scalars.get_tensor(cute.make_layout((8,)))
             owner = storage.owner.get_tensor(cute.make_layout((16,)))
