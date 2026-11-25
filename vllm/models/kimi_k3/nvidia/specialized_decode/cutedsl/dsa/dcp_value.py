@@ -135,6 +135,13 @@ def _tma3d(dst, tmap, bar, c0, c1, c2):
 
 
 @asm()
+def _tma3d_l2(tmap, c0, c1, c2):
+    """The tile ``_tma3d`` would load, prefetched into L2 only (no barrier)."""
+    code = "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];"
+    return code, "l,r,r,r,~{memory}", (Int64(tmap), Int32(c0), Int32(c1), Int32(c2))
+
+
+@asm()
 def _mma_f16(d, a, b, idesc, acc):
     code = (
         "{ .reg .pred p; setp.ne.b32 p, $4, 0; "
@@ -602,6 +609,14 @@ class DcpValue:
                         mbar_arrive_tx(full, Uint32(TC_STAGE))
                         dst = ring + Uint32(TC_STAGE * k + TC_STAGE // 2)
                         _tma3d(dst, tm_b, full, 64 * k, 0, c % DH)
+                    # The rest of this CTA's W_UV (the first unit's later stages,
+                    # every later unit) into L2 while the predecessor finishes: the
+                    # ring then reads it from L2, not HBM, after the wait.
+                    for k in cutlass.range_constexpr(TC_STAGES, 8):
+                        _tma3d_l2(tm_b, 64 * k, 0, c % DH)
+                    for u in range(c + G, self.units, G):
+                        for k in cutlass.range_constexpr(8):
+                            _tma3d_l2(tm_b, 64 * k, 0, u % DH)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
         cute.arch.griddepcontrol_wait()
