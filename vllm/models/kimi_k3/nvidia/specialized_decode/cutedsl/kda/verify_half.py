@@ -16,12 +16,13 @@ checkpoint bytes, and the two warp groups split the prologue's pairs: group 0 (w
 0-3) the convolution / SiLU / norms of tokens 0-3, group 1 (warps 4-7) the F_B gate
 tiles (two per warp) and then tokens 4-7.
 
-The gated RMS norm needs all 128 outputs of a token: each half writes its rows'
-(BF16-rounded) recurrence outputs to the layer's scratch row of the item and
-arrives on the item's counter (fence + acq_rel atomic, no waiting); the second
-arriver reads the whole row back and runs LoopStock's gated norm for every token,
-then re-arms the counter. No CTA waits for another, so any number of CTAs per SM /
-waves is safe.
+The gated RMS norm needs all 128 outputs of a token: a ninth warp that issues no
+checkpoint stores (so its fence waits for its own 4 KiB, not for the SM's checkpoint
+drain) writes this half's outputs to the item's scratch row, arrives on the item's
+counter (release) and waits for the other half (acquire), then merges the other
+half's rows; each half then runs LoopStock's gated norm for half of the tokens. The
+halves wait for each other, so the grid must be resident at once: at most one CTA
+per SM (``HALF_SMEM``) and 2 x items <= SMs (asserted; the policy rows fit).
 
 Math: per state row exactly LoopStock's (same thread layout: lanes j of row group g,
 two rows per thread, the same packed token loop, prologue, gates, betas and gated
@@ -46,11 +47,13 @@ from ..common.primitives import (
     zeros,
 )
 from .recover import mul_rn, reciprocal, sqrt_approx, triton_sigmoid
-from .verify_loop import K, KdaVerifyLoopStock
+from .verify_loop import K, KdaVerifyLoopStock, persistent_ctas
 from .verify_packed import CHUNKS
 from .window import conv_put, conv_tap
 
 HALF_THREADS = 256  # 8 warps: rows 64 h + 8 w + g (+ 4), as LoopStock's warps w
+MESSENGER = 8  # warp 8: the output exchange (it issues no checkpoint stores)
+ALL_THREADS = HALF_THREADS + 32
 HALF_ROWS = 64
 HALF_PAGE = HALF_ROWS * K * 4  # 32 KiB of the item's FP32 page
 COPY_BYTES = 16384
@@ -63,26 +66,25 @@ HALF_SMEM = 120 * 1024
 
 
 @asm(Uint32)
-def _arrive(address):
-    """acq_rel atomic add 1 on the item's counter; the old value."""
-    code = "atom.acq_rel.gpu.global.add.u32 $0,[$1],1;"
+def _arrive_release(address):
+    """release atomic add 1 on the item's arrival counter; the old value."""
+    code = "atom.release.gpu.global.add.u32 $0,[$1],1;"
     return code, "=r,l,~{memory}", (Int64(address),)
 
 
-@asm()
-def _rearm(address):
-    return "st.relaxed.gpu.global.u32 [$0],0;", "l,~{memory}", (Int64(address),)
+@asm(Uint32)
+def _acquire_u32(address):
+    return "ld.acquire.gpu.global.u32 $0,[$1];", "=r,l,~{memory}", (Int64(address),)
+
+
+@asm(Float32)
+def _load_f32_gpu(address):
+    return "ld.relaxed.gpu.global.f32 $0,[$1];", "=f,l,~{memory}", (Int64(address),)
 
 
 @asm()
 def _fence():
     return "fence.acq_rel.gpu;", "~{memory}", ()
-
-
-@asm((Float32, Float32, Float32, Float32))
-def _load_f32x4_gpu(address):
-    code = "ld.relaxed.gpu.global.v4.f32 {$0,$1,$2,$3},[$4];"
-    return code, "=f,=f,=f,=f,l,~{memory}", (Int64(address),)
 
 
 class KdaVerifyHalfStock(KdaVerifyLoopStock):
@@ -94,11 +96,13 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
     def __call__(self, *args):
         assert args[0].shape[0] // self.tokens * self.heads == self.items
         ctas = 2 * self.items
+        # the halves wait for each other: every CTA must be resident (one per SM)
+        assert persistent_ctas(ctas) == ctas, f"KdaVerifyHalfStock: {ctas} CTAs"
         # <= 128 registers a thread (another kernel's CTA can share the SM), and
         # HALF_SMEM: at most one of these CTAs per SM
         launch(
-            self.kernel, args, ctas, HALF_THREADS, smem=HALF_SMEM,
-            max_number_threads=[HALF_THREADS, 1, 1], min_blocks_per_mp=2,
+            self.kernel, args, ctas, ALL_THREADS, smem=HALF_SMEM,
+            max_number_threads=[ALL_THREADS, 1, 1], min_blocks_per_mp=2,
         )  # fmt: skip
 
     @cute.kernel
@@ -123,7 +127,6 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         reductions = alloc(smem, Float32, 8 * T)
         shared_beta = alloc(smem, Float32, T)
         meta = alloc(smem, Int32, (1, 4 + T))  # LoopStock's per-item metadata
-        last = alloc(smem, Int32, 1)
         pairs: cutlass.Constexpr = (T + 1) // 2
         bars = alloc(smem, cutlass.Int64, pairs + 1, 8).iterator
         ready, state_full = bars, bars + pairs
@@ -160,90 +163,122 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
                 for t in cutlass.range_constexpr(T):
                     output[token + t, head * 128 + thread] = BFloat16(0)
         else:
-            local0 = 8 * warp + group  # this thread's rows in the staged half page
-            row0 = HALF_ROWS * half + local0
-            wait(state_full, 0, scope="cta")
-            history = zeros((2, CHUNKS, 4), Float32)
-            for r in cutlass.range_constexpr(2):
-                for c in cutlass.range_constexpr(CHUNKS):
-                    pointer = page.iterator + (local0 + 4 * r) * K + 4 * (j + 8 * c)
-                    values = load_f32x4(pointer, shared=True)
-                    for e in cutlass.range_constexpr(4):
-                        history[r, c, e] = values[e]
-            own_gates = zeros(2, gate.element_type)
-            shared = (shared_q, shared_k, shared_v, reductions, shared_beta)
-            if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
-                self.half_prologue(
-                    args, thread, token, head, offset, conv_slot, shared, ready,
-                    (0, pairs // 2), 1, half == 0,
+            if thread < HALF_THREADS:
+                self.half_math(
+                    args, (thread, lane, warp, group, j), (item, half, head, token),
+                    (offset, conv_slot, slot), (page, state_full, ready, meta),
+                    (shared_q, shared_k, shared_decay, shared_v, shared_o, reductions,
+                     shared_beta),
                 )  # fmt: skip
-            else:  # group 1: the F_B gate tiles (two a warp), then the other pairs
-                for i in cutlass.range_constexpr(2):
-                    self.loop_gate(args, 2 * (warp - 4) + i, lane, head, token,
-                                   shared_decay, own_gates)  # fmt: skip
-                for p in cutlass.range_constexpr(pairs):
-                    cute.arch.mbarrier_arrive(ready + p)
-                self.half_prologue(
-                    args, thread - GROUP, token, head, offset, conv_slot, shared,
-                    ready, (pairs // 2, pairs), 2, half < 0,
-                )  # fmt: skip
-            cute.arch.griddepcontrol_launch_dependents()
-
-            for t in cutlass.range_constexpr(T):
-                if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
-                    cute.arch.mbarrier_wait(ready + t // 2, 0)
-                self.loop_token(history, t, group, j, row0, shared_q, shared_k,
-                                shared_decay, shared_v, shared_beta, shared_o,
-                                state, meta, 0, head)  # fmt: skip
-            q_last = self.column_chunks(shared_q, T - 1, j)
-            sums = self.row_dots(history, q_last)
-            upper = (j & 4) != 0
-            send = sums[0] if upper else sums[1]
-            keep = sums[1] if upper else sums[0]
-            owned = keep + cute.arch.shuffle_sync_bfly(send, 4)
-            owned += cute.arch.shuffle_sync_bfly(owned, 2)
-            owned += cute.arch.shuffle_sync_bfly(owned, 1)
-            if (j & 3) == 0:
-                row = row0 + 4 * (j // 4)
-                position = (T - 1) * 128 + self.output_position(row)
-                shared_o[position] = self.round_out(owned)
-            cute.arch.sync_threads()
-            # this half's rows of every token -> the item's scratch row
-            row_base = scratch.iterator + Int64(item) * (T * 128)
-            for i in cutlass.range_constexpr(-(-T * HALF_ROWS // HALF_THREADS)):
-                index = thread + HALF_THREADS * i
-                t, row = index // HALF_ROWS, HALF_ROWS * half + index % HALF_ROWS
-                position = t * 128 + self.output_position(row)
-                if index < T * HALF_ROWS:
-                    scratch[item, position] = shared_o[position]
-            _fence()
-            cute.arch.sync_threads()
-            counter = counters.iterator + item
-            if thread == 0:
-                last[0] = Int32(_arrive(counter.toint()))
-            cute.arch.sync_threads()
-            if last[0] == 1:  # the second half: the gated norm of every token
-                _fence()
-                for i in cutlass.range_constexpr(-(-T * 128 // (4 * HALF_THREADS))):
-                    index = 4 * (thread + HALF_THREADS * i)
-                    if index < T * 128:
-                        values = _load_f32x4_gpu((row_base + index).toint())
-                        for e in cutlass.range_constexpr(4):
-                            shared_o[index + e] = values[e]
-                cute.arch.sync_threads()
+            cute.arch.sync_threads()  # this half's outputs of every token in shared_o
+            if warp == MESSENGER:
+                self.exchange(scratch, counters, item, half, lane, shared_o)
+            cute.arch.sync_threads()  # the other half's rows merged
+            if thread < HALF_THREADS:  # this half's tokens: the gated RMS norm
+                first: cutlass.Constexpr = (T + 1) // 2
                 nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
                 c, glane = thread % 64, thread % 32
-                for tt in cutlass.range_constexpr(-(-T * 64 // HALF_THREADS)):
-                    t = thread // 64 + (HALF_THREADS // 64) * tt
-                    if t < T:
-                        gates = zeros(2, gate.element_type)
-                        for h in cutlass.range_constexpr(2):
-                            gates[h] = gate[token + t, head * 128 + c + 64 * h]
-                        self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
-                                        token, head)  # fmt: skip
-                if thread == 0:
-                    _rearm(counter.toint())
+                t = first * half + thread // 64
+                if (thread // 64 < first) & (t < T):
+                    gates = zeros(2, gate.element_type)
+                    for h in cutlass.range_constexpr(2):
+                        gates[h] = gate[token + t, head * 128 + c + 64 * h]
+                    self.gated_norm(t, c, glane, shared_o, gates, nw, eps, output,
+                                    token, head)  # fmt: skip
         cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def half_math(self, args, ids, where, rows, staging, shared):
+        """Warps 0-7: the half's state rows, the prologue roles, the token loop and the
+        last token's query dots (this half's rows of ``shared_o``)."""
+        thread, lane, warp, group, j = ids
+        item, half, head, token = where
+        offset, conv_slot, slot = rows
+        page, state_full, ready, meta = staging
+        shared_q, shared_k, shared_decay, shared_v, shared_o, reductions = shared[:6]
+        shared_beta = shared[6]
+        state, gate = args[9], args[11]
+        T: cutlass.Constexpr = self.tokens
+        pairs: cutlass.Constexpr = (T + 1) // 2
+        local0 = 8 * warp + group  # this thread's rows in the staged half page
+        row0 = HALF_ROWS * half + local0
+        wait(state_full, 0, scope="cta")
+        history = zeros((2, CHUNKS, 4), Float32)
+        for r in cutlass.range_constexpr(2):
+            for c in cutlass.range_constexpr(CHUNKS):
+                pointer = page.iterator + (local0 + 4 * r) * K + 4 * (j + 8 * c)
+                values = load_f32x4(pointer, shared=True)
+                for e in cutlass.range_constexpr(4):
+                    history[r, c, e] = values[e]
+        own_gates = zeros(2, gate.element_type)
+        shared = (shared_q, shared_k, shared_v, reductions, shared_beta)
+        if thread < GROUP:  # group 0: tokens 0 .. 2 (pairs // 2) - 1 (+ window)
+            self.half_prologue(
+                args, thread, token, head, offset, conv_slot, shared, ready,
+                (0, pairs // 2), 1, half == 0,
+            )  # fmt: skip
+        else:  # group 1: the F_B gate tiles (two a warp), then the other pairs
+            for i in cutlass.range_constexpr(2):
+                self.loop_gate(args, 2 * (warp - 4) + i, lane, head, token,
+                               shared_decay, own_gates)  # fmt: skip
+            for p in cutlass.range_constexpr(pairs):
+                cute.arch.mbarrier_arrive(ready + p)
+            self.half_prologue(
+                args, thread - GROUP, token, head, offset, conv_slot, shared,
+                ready, (pairs // 2, pairs), 2, half < 0,
+            )  # fmt: skip
+        cute.arch.griddepcontrol_launch_dependents()
+
+        for t in cutlass.range_constexpr(T):
+            if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
+                cute.arch.mbarrier_wait(ready + t // 2, 0)
+            self.loop_token(history, t, group, j, row0, shared_q, shared_k,
+                            shared_decay, shared_v, shared_beta, shared_o,
+                            state, meta, 0, head)  # fmt: skip
+        q_last = self.column_chunks(shared_q, T - 1, j)
+        sums = self.row_dots(history, q_last)
+        upper = (j & 4) != 0
+        send = sums[0] if upper else sums[1]
+        keep = sums[1] if upper else sums[0]
+        owned = keep + cute.arch.shuffle_sync_bfly(send, 4)
+        owned += cute.arch.shuffle_sync_bfly(owned, 2)
+        owned += cute.arch.shuffle_sync_bfly(owned, 1)
+        if (j & 3) == 0:
+            row = row0 + 4 * (j // 4)
+            position = (T - 1) * 128 + self.output_position(row)
+            shared_o[position] = self.round_out(owned)
+
+    @cute.jit
+    def exchange(self, scratch, counters, item, half, lane, shared_o):
+        """Warp MESSENGER: this half's ``shared_o`` to its scratch region, arrive on
+        the item's counter (release), wait for the other half's arrival (acquire),
+        and merge the other half's rows into ``shared_o``. The counter only grows (two
+        arrivals per launch): this launch's pair completes at the next even value.
+        The warp stored nothing before, so its fence waits for its 4 KiB only, not
+        for the math warps' checkpoint stores."""
+        T: cutlass.Constexpr = self.tokens
+        size: cutlass.Constexpr = T * 128
+        for i in cutlass.range_constexpr(size // 32):
+            index = lane + 32 * i
+            scratch[item, half * size + index] = shared_o[index]
+        _fence()
+        cute.arch.sync_warp()
+        counter = (counters.iterator + item).toint()
+        if lane == 0:
+            old = _arrive_release(counter)
+            target = (old & Uint32(0xFFFFFFFE)) + Uint32(2)
+            seen = _acquire_u32(counter)
+            while Int32(seen - target) < 0:
+                seen = _acquire_u32(counter)
+        cute.arch.sync_warp()
+        _fence()
+        other = scratch.iterator + Int64(item) * (2 * size) + (1 - half) * size
+        for i in cutlass.range_constexpr(-(-T * HALF_ROWS // 32)):
+            index = lane + 32 * i
+            if index < T * HALF_ROWS:
+                t, row = index // HALF_ROWS, HALF_ROWS * (1 - half) + index % HALF_ROWS
+                position = t * 128 + self.output_position(row)
+                shared_o[position] = _load_f32_gpu((other + position).toint())
 
     @cute.jit
     def half_prologue(self, args, thread, token, head, offset, conv_slot, shared,

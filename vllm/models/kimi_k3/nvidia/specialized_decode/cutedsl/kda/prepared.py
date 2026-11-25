@@ -546,7 +546,7 @@ class PreparedKda:
             if kind == FP32_HALF_KIND and tokens > 1 and key not in self.prepared:
                 items, device = requests * self.heads, self.device
                 self.halves[key] = (
-                    torch.zeros(items, tokens * 128, dtype=torch.float32, device=device),
+                    torch.zeros(items, 2 * tokens * 128, dtype=torch.float32, device=device),
                     torch.zeros(items, dtype=torch.int32, device=device),
                 )
                 operands += self.halves[key]

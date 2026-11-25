@@ -332,7 +332,9 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad):
         assert_bitwise("output", got[0], want[0])
         assert_bitwise("recurrent state", got[1][1], want[1][1])
         assert_bitwise("conv state", got[1][0], want[1][0])
-    assert not half.halves[(requests, q)][1].any(), "counters re-armed"
+    # two arrivals per live item and call, none for a padding request
+    counts = set(half.halves[(requests, q)][1].tolist())
+    assert counts <= {0, 4} and 4 in counts, counts
 
 
 def test_half_policy_rows():
