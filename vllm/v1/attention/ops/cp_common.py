@@ -133,10 +133,48 @@ def _cpu_group_of(device_group: ProcessGroup) -> ProcessGroup | None:
 # blocked in a CPU collective (graph-capture bookkeeping) never makes one, while
 # the peers spin forever in collectives that wait for the dead rank: the engine
 # hangs instead of failing (DCRIT r148). A watcher thread polls the context
-# state with a stream query on a private, empty stream (its thread uses relaxed
-# capture mode, so a concurrent graph capture is unaffected) and aborts the
-# worker on a sticky error, which the executor turns into an engine failure.
+# state with a stream query and aborts the worker on a sticky error, which the
+# executor turns into an engine failure.
+#
+# The query must never touch a stream that is being captured: a stream query on
+# a capturing stream fails with CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED and
+# invalidates the capture. The watcher therefore owns a stream created with the
+# driver API (a torch.cuda.Stream() comes from torch's 32-stream round-robin
+# pool and is shared with whoever draws the same slot, e.g. torch.cuda.graph's
+# default capture stream or vLLM's current_stream(); 'vllm bench forward' drew
+# the same slot and every rank aborted at its first capture). Its thread runs
+# in relaxed capture mode, so its calls are never "unsafe" against a concurrent
+# global-mode capture on another thread, and it checks the stream's capture
+# status before querying it.
 DEVICE_FAULT_EXIT_CODE = 87
+
+# Results that do not mean the context faulted. The capture family is per-call
+# (an operation met a stream capture) and never sticky: a real fault keeps being
+# returned by every later call, so it is still caught at the next poll.
+_HEALTHY_RESULTS = frozenset({"CUDA_SUCCESS", "CUDA_ERROR_NOT_READY"})
+_CAPTURE_RESULTS = frozenset(
+    {
+        "CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED",
+        "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED",
+        "CUDA_ERROR_STREAM_CAPTURE_MERGE",
+        "CUDA_ERROR_STREAM_CAPTURE_UNMATCHED",
+        "CUDA_ERROR_STREAM_CAPTURE_UNJOINED",
+        "CUDA_ERROR_STREAM_CAPTURE_ISOLATION",
+        "CUDA_ERROR_STREAM_CAPTURE_IMPLICIT",
+        "CUDA_ERROR_CAPTURED_EVENT",
+        "CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD",
+    }
+)
+
+
+def _classify_cuda_result(error: Any) -> str:
+    """'healthy', 'capture' (a capture was in the way; not a fault) or 'fault'."""
+    name = error.name
+    if name in _HEALTHY_RESULTS:
+        return "healthy"
+    if name in _CAPTURE_RESULTS:
+        return "capture"
+    return "fault"
 
 
 class _DeviceFaultWatch:
@@ -151,16 +189,24 @@ class _DeviceFaultWatch:
 
         self.driver = driver
         self.device_index = device_index
-        self.stream = torch.cuda.Stream(device=device_index)
-        self.stream_handle = self.stream.cuda_stream
-        with torch.cuda.device(device_index):
-            torch.cuda.current_stream().query()  # the primary context is current
-            _, self.context = driver.cuCtxGetCurrent()
+        self.stream: Any = None
+        self.polls = 0
         self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._setup_error: str | None = None
         self._thread = threading.Thread(
             target=self._watch, name="direct-cp-fault-watch", daemon=True
         )
         self._thread.start()
+        # All driver calls run on the watcher thread (after it switched to
+        # relaxed capture mode), so creating the watch is safe even while this
+        # thread is capturing.
+        self._ready.wait()
+        if self._setup_error is not None:
+            raise RuntimeError(
+                f"Device fault watch for device {device_index} could not start: "
+                f"{self._setup_error}"
+            )
         atexit.register(self.close)
 
     def close(self) -> None:
@@ -168,17 +214,56 @@ class _DeviceFaultWatch:
         if self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=5.0)
 
+    def _setup(self) -> None:
+        driver = self.driver
+
+        def call(name: str, *args: Any) -> Any:
+            error, *values = getattr(driver, name)(*args)
+            if error != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"{name}: {error.name}")
+            return values[0] if values else None
+
+        # Relaxed first: no call of this thread is then prohibited by (or can
+        # invalidate) a global-mode capture running on another thread.
+        call(
+            "cuThreadExchangeStreamCaptureMode",
+            driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+        call("cuInit", 0)
+        device = call("cuDeviceGet", self.device_index)
+        context = call("cuDevicePrimaryCtxRetain", device)
+        self._device = device
+        call("cuCtxSetCurrent", context)
+        self.stream = call(
+            "cuStreamCreate", driver.CUstream_flags.CU_STREAM_NON_BLOCKING
+        )
+
     def query(self) -> Any:
         """CUDA_SUCCESS while the context is healthy, else its sticky error."""
-        (error,) = self.driver.cuStreamQuery(self.driver.CUstream(self.stream_handle))
+        driver = self.driver
+        error, status = driver.cuStreamIsCapturing(self.stream)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            return error
+        if status != driver.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+            # Unreachable for a private stream; never query a capturing stream
+            # (the query would invalidate the capture).
+            return driver.CUresult.CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED
+        (error,) = driver.cuStreamQuery(self.stream)
         return error
 
     def check(self) -> bool:
+        self.polls += 1
         error = self.query()
-        if error in (
-            self.driver.CUresult.CUDA_SUCCESS,
-            self.driver.CUresult.CUDA_ERROR_NOT_READY,
-        ):
+        kind = _classify_cuda_result(error)
+        if kind == "healthy":
+            return False
+        if kind == "capture":
+            logger.warning_once(
+                "Device fault watch (device %d): stream query met a stream "
+                "capture (%s); not a fault, polling continues.",
+                self.device_index,
+                error.name,
+            )
             return False
         self._abort(
             f"CUDA context of this worker (device {self.device_index}) faulted: "
@@ -195,14 +280,18 @@ class _DeviceFaultWatch:
         os._exit(DEVICE_FAULT_EXIT_CODE)
 
     def _watch(self) -> None:
-        driver = self.driver
-        driver.cuCtxSetCurrent(self.context)
-        driver.cuThreadExchangeStreamCaptureMode(
-            driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
-        )
+        try:
+            self._setup()
+        except Exception as e:  # reported by __init__ on the creating thread
+            self._setup_error = repr(e)
+            return
+        finally:
+            self._ready.set()
         while not self._stop.wait(self.POLL_S):
             if self.check():
                 return
+        self.driver.cuStreamDestroy(self.stream)
+        self.driver.cuDevicePrimaryCtxRelease(self._device)
 
 
 _device_fault_watches: dict[int, _DeviceFaultWatch] = {}
