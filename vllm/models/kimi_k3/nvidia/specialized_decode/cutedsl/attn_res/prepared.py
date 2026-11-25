@@ -62,7 +62,7 @@ def rows_tokens(rows):
 def compile_consumer(
     nb, delta, write, final, slots, cap, arch, aux=False, sanitize=False, carveout=None,
     stores_first=False, spread_push=False, poll_warp=False, min_blocks=0, out_mc=False,
-    tokens=1, x_ready=False,
+    tokens=1,
 ):  # fmt: skip
     """``carveout`` only keys the cache: consumers with a preferred carve-out get their
     own function (the attribute is per function). ``tokens`` > 1: the token-batched
@@ -74,8 +74,6 @@ def compile_consumer(
         stores_first=stores_first, spread_push=spread_push, poll_warp=poll_warp,
         min_blocks=min_blocks, out_mc=out_mc,
     )  # fmt: skip
-    if x_ready:
-        options["x_ready"] = True
     kernel: ClusterAttnRes
     if tokens > 1:
         from .rows import ClusterAttnResRows
@@ -87,7 +85,6 @@ def compile_consumer(
     # The updated prefix row, also stored to an aux stream (row-sharded: multicast).
     args += (cutlass.Int64(0) if out_mc else row,) * aux
     args += (cutlass.Int64(0), cutlass.Int32(0)) if out_mc else ()
-    args += (cutlass.Int64(0),) if x_ready else ()
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
 
 

@@ -15,7 +15,6 @@ from ..common import mx_rows
 from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
-    asm,
     alloc,
     at,
     bf16,
@@ -34,15 +33,6 @@ from ..common.primitives import (
     wait,
     zeros,
 )
-
-
-@asm()
-def release_add_gpu(address):
-    """A gpu-scope release add of one: the CTA's stores, ordered before it by the
-    barrier (causality order is transitive through bar.sync), become visible to an
-    acquire of the counter."""
-    code = "red.release.gpu.global.add.u32 [$0],1;"
-    return code, "l,~{memory}", (Int64(address),)
 
 
 @cute.jit
@@ -102,14 +92,8 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False, out_mx=None, delta_parts=0, x_ready=False,
+        out_mc=False, out_mx=None, delta_parts=0,
     ):  # fmt: skip
-        # ``x_ready`` (plain BF16 output): the trailing argument is the address of a
-        # u32 counter; every CTA adds one (gpu-scope release) after its output stores,
-        # so a consumer that polls it for 7 x rows (``KdaHeadVerify.x_poll``) reads the
-        # output without waiting for this grid's completion (PDL).
-        assert not (x_ready and (out_mc or out_mx)), "x_ready: plain output only"
-        self.x_ready = x_ready
         # ``delta_parts`` (slots 0): the delta is the beta-add GEMM's output left as
         # FP32 split-K partials: ``post`` takes (partials [parts * n, 7168] FP32,
         # residual [n, 7168] BF16) and forms the delta as stock's cuBLAS beta-add does
@@ -199,15 +183,9 @@ class ClusterAttnRes:
         rows, ids = (prefix, blocks, norm, query, out_norm), (rank, token, tid)
         self.pre(state, bufs, rows, eps, ids)
         extra = args[9:]
-        if cutlass.const_expr(self.x_ready):
-            ready, extra = extra[-1], extra[:-1]
         if cutlass.const_expr(self.out_mc):
             output, extra = extra[-2:], extra[:-2]  # (multicast address, row0)
         self.post(state, bufs, delta, rows, output, eps, out_eps, ids, extra)
-        if cutlass.const_expr(self.x_ready):
-            group_barrier(0)  # every thread's output stores before the release
-            if tid == 0:
-                release_add_gpu(ready)
         cute.arch.griddepcontrol_wait()
 
     def state(self):

@@ -32,13 +32,8 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.arch import store_async_dsmem
 
-from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
-
 from ..attn_res.kernel import BESIDE_SMEM
 from ..common.primitives import (
-    asm,
-    sleep_ns,
-    try_wait,
     at,
     float_bits,
     fma,
@@ -51,13 +46,9 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
-from ..gemm.splitk import ATOM_K, _acquire_tensor_map, _smem, _tma_load_evict_first
+from ..gemm.splitk import _smem
 from .head import (
-    B_ISSUERS,
     CLUSTER,
-    _acquire_load,
-    _fetch_add,
-    _store_zero,
     INPUT_BYTES,
     SECTIONS,
     KdaHeadWide,
@@ -67,13 +58,6 @@ from .head import (
 from .kernel import KdaSplit, sigmoids
 from .window import conv_put, conv_tap
 
-@asm()
-def fence_proxy_async_global():
-    return "fence.proxy.async.global;", "~{memory}", ()
-
-
-# ``x_poll``: warps 0, 1 and 4-7 meet on this named barrier once x is complete
-X_BARRIER, X_THREADS = 6, 192
 KDA_CTAS = 8  # CTAs that run the recurrence (KdaSplit's B1 verify: cluster 8)
 ROWS = 128 // KDA_CTAS  # state rows per KDA CTA
 
@@ -93,9 +77,6 @@ class KdaHeadVerify(KdaHeadWide):
         )  # fmt: skip
         assert tokens == 8, "B1 x q 8: every CTA pair of the cluster holds one token"
         self.tokens = tokens
-        # ``x_poll``: x's tiles (and the weight tiles past ``early_loads``) wait for the
-        # AttnRes's x counter (``ClusterAttnRes.x_ready``) instead of the PDL wait.
-        self.x_poll = False
         # KdaSplit's B1 verify geometry (schedule 1.8.x.8): 16 rows, 8 lanes per row.
         self.vkda = KdaSplit(heads, 1, 0, has_bias, (1, 8, 0, KDA_CTAS), 1, bf16_state)
         assert self.vkda.rows == ROWS and self.vkda.passes == 1
@@ -103,7 +84,7 @@ class KdaHeadVerify(KdaHeadWide):
         extra = 2 * T * 128 * 2 + T * ROWS * 2 + 128 * 2  # hop 2: raw Q / K, V, gate
         extra += 448 * 2  # this CTA's rounded token inputs (Q | K | V 64 | gate)
         extra += 3 * T * 128 * 4 + T * ROWS * 4 + 128 * 4  # q, k, decays, v, out
-        extra += 8 * 4 + 8 * 4 + 6 * 8  # norms (one token), betas, barriers
+        extra += 8 * 4 + 8 * 4 + 5 * 8  # norms (one token), betas, barriers
         extra += T * ROWS * 4 + T * 4  # outputs (pushed after the loop), slots
         # KdaHeadWide's bytes without its q = 1 buffers (q, k, decay, v, out, norms,
         # betas, barriers), which this kernel allocates token-major instead (``extra``),
@@ -121,13 +102,12 @@ class KdaHeadVerify(KdaHeadWide):
         slots: cute.Tensor, state: cute.Tensor, output: cute.Tensor,
         norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
         lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
-        target: Int32, out_rearm: cutlass.Int64, x_ready: cutlass.Int64,
-        x_target: Int32, x_readers: Int32, stream,
+        target: Int32, out_rearm: cutlass.Int64, stream,
     ):  # fmt: skip
         self.kernel(
             mA, mB, a_map, conv_w, bias, conv_state, fa_beta, a_log, dt_bias, slots,
             state, output, norm_w, f_b, accepted, lower_bound, scale, eps, counter,
-            target, out_rearm, x_ready, x_target, x_readers,
+            target, out_rearm,
         ).launch(
             grid=(CLUSTER, self.heads, 1),
             block=(self.threads_per_cta, 1, 1),
@@ -145,11 +125,9 @@ class KdaHeadVerify(KdaHeadWide):
         slots: cute.Tensor, state: cute.Tensor, output: cute.Tensor,
         norm_w: cute.Tensor, f_b: cute.Tensor, accepted: cute.Tensor,
         lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
-        target: Int32, out_rearm: cutlass.Int64, x_ready: cutlass.Int64,
-        x_target: Int32, x_readers: Int32,
+        target: Int32, out_rearm: cutlass.Int64,
     ):  # fmt: skip
         T: cutlass.Constexpr = self.tokens
-        x_poll: cutlass.Constexpr = self.x_poll
         stages, staged = self.num_ab_stage, self.tmem_tiles > 0
         ab_dtype = mA.element_type
         majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
@@ -201,7 +179,6 @@ class KdaHeadVerify(KdaHeadWide):
         bar_gate = _smem(cutlass.Int64, 1, 8).iterator
         bar_out = _smem(cutlass.Int64, 1, 8).iterator
         bar_qk = _smem(cutlass.Int64, 1, 8).iterator
-        bar_x = _smem(cutlass.Int64, 1, 8).iterator  # x_poll: x is complete
         kda_cta = rank < KDA_CTAS
 
         if warp_idx == 0:
@@ -215,7 +192,6 @@ class KdaHeadVerify(KdaHeadWide):
                 cute.arch.mbarrier_init(bar_mma_epilog, 1)
                 cute.arch.mbarrier_init(bar_tmem_alloc, 160)
         if tid == 128:
-            cute.arch.mbarrier_init(bar_x, 1)
             cute.arch.mbarrier_init(bar_in, 1)
             cute.arch.mbarrier_arrive_and_expect_tx(bar_in, SECTIONS * INPUT_BYTES * 2)
             if kda_cta:
@@ -242,22 +218,11 @@ class KdaHeadVerify(KdaHeadWide):
         if warp_idx < 3:
             cute.arch.cluster_wait()
             if warp_idx == 0:
-                if cutlass.const_expr(x_poll):
-                    self.x_weight_warp(
-                        bar_full, bar_empty, sA, a_map, row0, *tiles, bar_x
-                    )
-                else:
-                    self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
-                if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, x_readers, rank, True)
-                    self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
-                    # completion order (successors' PDL waits are transitive through
-                    # this grid; the polled output's re-arm below) off x's path
-                    cute.arch.griddepcontrol_wait()
-                elif cutlass.const_expr(staged):
+                if cutlass.const_expr(staged):
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                 else:
                     self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
@@ -290,11 +255,7 @@ class KdaHeadVerify(KdaHeadWide):
             if cutlass.const_expr(staged):  # the other B_ISSUERS - 1 warps of x's tiles
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
-                if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, x_readers, rank, False)
-                    self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
-                else:
-                    self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+                self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
             self.push_partials(
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
@@ -327,94 +288,6 @@ class KdaHeadVerify(KdaHeadWide):
                     kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
                 )
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
-
-    @cute.jit
-    def x_wait(self, bar_x, x_ready, x_target, x_readers, rank, poller: cutlass.Constexpr):
-        """``x_poll``: one thread per cluster (rank 0, warp 1) spins on the AttnRes's x
-        counter (acquire) until all ``x_target`` CTA adds landed, re-arms it as its last
-        reader (one per cluster, of ``x_readers`` with an x-polled F_A GEMM) and arrives
-        (release, cluster) on every cluster CTA's ``bar_x``; the x / weight issuers wait
-        on ``bar_x``. Then a proxy fence: x is read by TMA. (96 polling CTAs slowed the
-        AttnRes they waited for: +0.8 us per layer.)"""
-        if cutlass.const_expr(poller):
-            if (rank == 0) & (cute.arch.lane_idx() == 0):
-                seen = Int32(_acquire_load(x_ready))
-                sgn, sgt = spin_start()
-                while seen < x_target:
-                    sleep_ns(64)  # (backoff: the AttnRes's own loads share the L2)
-                    seen = Int32(_acquire_load(x_ready))
-                    sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
-                for peer in cutlass.range_constexpr(CLUSTER):
-                    cute.arch.mbarrier_arrive(bar_x, Int32(peer))
-                if Int32(_fetch_add(x_ready + 4)) == x_readers - 1:
-                    _store_zero(x_ready)
-                    _store_zero(x_ready + 4)
-            cute.arch.sync_warp()
-            ready = try_wait(bar_x)
-            while ready == 0:
-                sleep_ns(64)  # (a parked warp beside the AttnRes's CTA)
-                ready = try_wait(bar_x)
-            fence_proxy_async_global()
-            named_barrier(X_BARRIER, X_THREADS, arrive=True)
-        else:  # blocked in bar.sync: no issue slots taken from the AttnRes beside it
-            named_barrier(X_BARRIER, X_THREADS)
-            fence_proxy_async_global()
-
-    @cute.experimental.jit
-    def x_resident_b(
-        self, b_full, g_tile: cute.Tensor, s_tile: cute.Tensor, cta_v_map: cute.Layout,
-        k_tile_start: cutlass.Int32, first: cutlass.Int32,
-    ):  # fmt: skip
-        """``resident_b`` after ``x_wait`` instead of the PDL wait."""
-        tile_bytes = cute.size_in_bytes(
-            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
-        )
-        for k_tile in cutlass.range(first, self.k_tiles, B_ISSUERS, unroll=1):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(b_full + k_tile, tile_bytes)
-            cute_ext.tma_load(
-                g_tile[None, None, k_tile_start + k_tile],
-                s_tile[None, None, None, k_tile],
-                (b_full + k_tile).value,
-                cta_v_map=cta_v_map,
-                tma_operation_type=cute_ext.OperationTypeEnum.SM90_TMA_LOAD,
-                update_expect_tx=False,
-            )
-
-    @cute.experimental.jit
-    def x_weight_warp(
-        self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
-        row0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
-        bar_x,
-    ):  # fmt: skip
-        """``weight_warp`` whose tiles from ``early_loads`` on wait for x (``bar_x``)
-        instead of the PDL wait."""
-        stages = self.num_ab_stage
-        stage_bytes = cute.size_in_bytes(
-            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
-        )
-        early = self.k_tiles if self.early_loads is None else self.early_loads
-        _acquire_tensor_map(a_map)
-        empty_phase = cutlass.Int32(1)
-        for k_tile in cutlass.range(k_tile_count, unroll=1):
-            stage = k_tile % stages
-            if k_tile == early:
-                named_barrier(X_BARRIER, X_THREADS)
-            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
-            with cute.arch.elect_one():
-                k0 = (k_tile_start + k_tile) * self.cta_k
-                tile = s_tile[None, None, None, stage].iterator
-                for atom in cutlass.range_constexpr(self.cta_k // ATOM_K):
-                    box, mbar = tile + atom * self.cta_m * ATOM_K, bar_full + stage
-                    k = k0 + atom * ATOM_K
-                    _tma_load_evict_first(box, mbar, a_map, k, row0)
-            if stage == stages - 1:
-                empty_phase = empty_phase ^ 1
-        if early >= k_tile_count:  # (the barrier counts this warp once)
-            named_barrier(X_BARRIER, X_THREADS)
-        self.drain(bar_empty, empty_phase, k_tile_count)
 
     @cute.jit
     def hop(self, kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop):
@@ -766,9 +639,7 @@ class KdaHeadVerify(KdaHeadWide):
 
 
 @cache
-def compile_head_verify(
-    heads, bf16_state, has_bias, specs, arch, tile, hidden, polled, x_poll=False
-):
+def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, polled):
     """``KdaHeadVerify`` for ``specs`` (the tensors of ``PreparedKdaHead._tensors`` plus
     accepted); ``tile``: ``KdaHeadWide``'s (stages, K per stage, ...): its K per stage,
     with VERIFY_STAGES ring stages, VERIFY_TMEM_TILES tensor-memory tiles and
@@ -791,11 +662,8 @@ def compile_head_verify(
         has_bias=has_bias,
     )  # fmt: skip
     kernel.polled_out = polled
-    kernel.x_poll = x_poll
     args = (matrix(1), matrix(1), cutlass.Int64(0), *tensors, *scalars)
-    args += (cutlass.Int64(0), Int32(0), cutlass.Int64(0), cutlass.Int64(0), Int32(0))
-    args += (Int32(0),)
-    args += (make_fake_stream(),)
+    args += (cutlass.Int64(0), Int32(0), cutlass.Int64(0), make_fake_stream())
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
 
