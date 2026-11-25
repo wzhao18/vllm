@@ -270,7 +270,9 @@ def published(tp, batch, device=None):
 # of a push kernel ending the side stream that the experts join before they launch.
 # MoE front proxy (o-proj -> front / shared chain -> experts), us per layer: that push
 # kernel adds +2.5 (B8) / +2.6 (B5) to the experts' end.
-RUBIN_EXPERTS_PUSH = {16: "5-8:1"}
+# TP16 8 rows (B1 verify): the side stream pushes them right behind the down GEMM, inside
+# the routing window, and only the tail joins it (``moe.prepared.SHARED_TO_TAIL_WIDE``).
+RUBIN_EXPERTS_PUSH = {16: "5-7:1"}
 
 
 def experts_push(tp, batch, device=None):
