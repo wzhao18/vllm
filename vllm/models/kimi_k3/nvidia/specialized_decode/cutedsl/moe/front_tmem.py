@@ -26,7 +26,7 @@ from ..gemm.splitk_tmem64 import SplitKTmemGemm64, _ld_shared_v4, _tma_box
 from ..gemm.ws_gemm import positive_zero, positive_zero32
 from .shared import situ
 
-__all__ = ["MoeFrontRows", "MoeFrontTmem64"]
+__all__ = ["MoeFrontRows", "MoeFrontTmem64", "MoeFrontTmem64Ready"]
 
 FRONT_TILES = 3  # 288 packed front rows in 128-row tiles
 
@@ -46,9 +46,19 @@ def _tma_half(dst, barrier, tensor_map, k0, row0):
     return code, "r,l,r,r,r,~{memory}", operands
 
 
+@asm()
+def _count_ready(address):
+    """One h writer done: its CTA's h stores (ordered by the CTA barrier before)
+    released at GPU scope, then one count."""
+    code = "fence.acq_rel.gpu; red.release.gpu.global.add.u32 [$0],1;"
+    return code, "l,~{memory}", (address,)
+
+
 class MoeFrontTmem64(SplitKTmemGemm64):
     """Front rows (``valid`` router rows padded to ``split_rows``, then ``shard``
     latent rows) and ``hidden`` gate/up pairs at 64 tokens; split K 8."""
+
+    ready = False  # ``MoeFrontTmem64Ready``: gate/up CTAs count their h stores
 
     def __init__(self, *, valid, split_rows, shard, hidden, stamps=False):
         super().__init__(
@@ -139,6 +149,11 @@ class MoeFrontTmem64(SplitKTmemGemm64):
                     gate, up = Float32(BFloat16(gates[c])), Float32(BFloat16(ups[c]))
                     value = BFloat16(situ(gate, up, beta, linear_beta))
                     h[col0 + token, column + c] = value
+        if cutlass.const_expr(self.ready):
+            if m >= FRONT_TILES:
+                named_barrier(3, 128)  # this CTA's h stores
+                if epi_tid == 0:
+                    _count_ready(self.ready_count)
 
     @cute.experimental.jit
     def publish(
@@ -165,6 +180,50 @@ class MoeFrontTmem64(SplitKTmemGemm64):
             )
             offset = token * pitch + base + row - self.split_rows
             multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
+
+
+class MoeFrontTmem64Ready(MoeFrontTmem64):
+    """``MoeFrontTmem64`` whose gate/up CTAs (``writers``) each count once into the
+    Int32 at ``ready`` (last argument before the stream) after their h stores, for a
+    ``SharedDown`` launched before it on another stream (``shared.SharedDown``
+    writers). Same outputs."""
+
+    ready = True
+
+    @property
+    def writers(self):
+        return self.gate_tiles * self.split_k
+
+    @cute.experimental.jit
+    def __call__(
+        self, packed: cute.Tensor, x: cute.Tensor, h: cute.Tensor, box: cute.Tensor,
+        mc: cutlass.Int64, slot: cutlass.Int32, base: cutlass.Int32,
+        beta: cutlass.Float32, linear_beta: cutlass.Float32, front_map: cutlass.Int64,
+        gate_map: cutlass.Int64, ready: cutlass.Int64, stream: _cuda.CUstream,
+    ):  # fmt: skip
+        self.kernel(
+            packed, x, h, box, mc, slot, base, beta, linear_beta, front_map, gate_map,
+            ready,
+        ).launch(
+            grid=(self.tiles, cute.ceil_div(x.layout.shape[0], 64) * self.split_k, 1),
+            block=(self.threads_per_cta, 1, 1),
+            cluster=self.cluster_shape,
+            smem=cute.Int64(self.smem_bytes),
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, h: cute.Tensor, box: cute.Tensor,
+        mc: cutlass.Int64, slot: cutlass.Int32, base: cutlass.Int32,
+        beta: cutlass.Float32, linear_beta: cutlass.Float32, front_map: cutlass.Int64,
+        gate_map: cutlass.Int64, ready: cutlass.Int64,
+    ):  # fmt: skip
+        tokens = mB.layout.shape[0]
+        self.gate_map, self.ready_count = gate_map, ready
+        out = (box, mc, slot, base, tokens, h, beta, linear_beta)
+        self.body(mA, mB, box, front_map, out)
 
 
 class MoeFrontRows(MoeFrontTmem64):

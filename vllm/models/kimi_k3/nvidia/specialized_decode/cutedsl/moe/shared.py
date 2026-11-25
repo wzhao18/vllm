@@ -616,11 +616,11 @@ class SharedDown(SharedBase):
             if c.const_expr(self.staged):
                 cute.arch.griddepcontrol_wait()  # h written
             if c.const_expr(self.writers > 0):
-                ready = args[6]
+                count = args[6]
                 if tid == 0:
-                    wait_count(ready.iterator, self.writers)
-                    if fetch_count(ready.iterator + 1) == self.sms - 1:
-                        ready[0], ready[1] = Int32(0), Int32(0)
+                    wait_count(count.iterator, self.writers)
+                    if fetch_count(count.iterator + 1) == self.sms - 1:
+                        count[0], count[1] = Int32(0), Int32(0)
                 named_barrier(1, 128)  # h written (acquired by thread 0)
             for j in c.range_constexpr(self.down):
                 self.load_rows(image + j * self.n * 128, h, 64 * j)

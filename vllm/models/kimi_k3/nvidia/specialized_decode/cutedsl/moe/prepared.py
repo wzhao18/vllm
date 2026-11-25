@@ -134,7 +134,7 @@ class PreparedMoE:
         self.join = batch_table(JOIN[state.tp])
         self.sms = torch.cuda.get_device_properties(state.device).multi_processor_count
         for b, sms in front.split.items():  # the split's down CTAs take the SMs left
-            if b not in front.situ_down:  # staged: done before the experts need them
+            if not front.down_first(b):  # done before the experts need them
                 experts.grids[b] = min(experts.grid_for(b), self.sms - sms)
         if self.sms > 152 and state.tp == 16:
             # Rubin-class TP16 B3-8: routing releases the experts at entry (their
@@ -168,7 +168,20 @@ class PreparedMoE:
         # The shared expert runs on the side stream beside the routed experts, or, when
         # the persistent expert grid spans every SM, beside the front only. Split: its
         # gate/up half beside the front, its down rows beside the experts.
-        before = self.experts.grid_for(b) >= self.sms and b not in self.front.situ_down
+        before = self.experts.grid_for(b) >= self.sms and not self.front.down_first(b)
+        if self.front.merged_batch(b) and self.front.down_first(b):
+            # SharedDown forks first: its weights stream while the merged front runs,
+            # its h load polls the front's count, and it exits before the experts need
+            # its SMs.
+            state.begin.record(main)
+            with torch.cuda.stream(state.stream):
+                state.stream.wait_event(state.begin)
+                shared, beside = self.front.shared_expert(x, self.tail)
+                beside()
+                state.shared_done.record(state.stream)
+            ids, weights, latent = self.front.route(x)
+            self.experts.group(ids)
+            return self.finish(b, out, latent, ids, weights, shared, consume)
         if self.front.merged_batch(b):
             # One kernel publishes the routing logits and leaves h; the down rows then
             # run beside the experts.
