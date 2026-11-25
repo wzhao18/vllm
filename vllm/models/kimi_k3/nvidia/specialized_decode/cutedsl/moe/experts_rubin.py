@@ -332,6 +332,45 @@ def match_rank(bits, grid: cutlass.Constexpr[int], die, k):
     return rank
 
 
+@cute.jit
+def match_rank_popc(bits, grid: cutlass.Constexpr[int], die, k):
+    """``match_rank`` without ``fns`` (~0.7 us on the critical path here): the words
+    loaded once, the hit word found by running popcounts and its n-th set bit by
+    halving popcounts (``experts_rubin64``'s ``matched``). The same rank."""
+    words: cutlass.Constexpr = (grid + 31) // 32
+    masks = [(1 << min(32, grid - 32 * w)) - 1 for w in range(words)]
+    word = [bits[w] & Uint32(masks[w]) for w in range(words)]
+    h1 = Int32(0)
+    for w in cutlass.range_constexpr(words):
+        h1 += Int32(cute.arch.popc(word[w]))
+    own, other = (grid - h1, h1)
+    if die == 1:
+        own, other = (h1, grid - h1)
+    target, index = (die, k)
+    if k >= own:
+        target, index = (1 - die, other - 1 - (k - own))
+    before, hit, base = (Int32(0), Uint32(0), Int32(-1))
+    for w in cutlass.range_constexpr(words):
+        homed = word[w]
+        if target == 0:
+            homed = ~word[w] & Uint32(masks[w])
+        count = Int32(cute.arch.popc(homed))
+        if (index >= before) & (index < before + count):
+            hit, base = (homed, 32 * w + index - before)
+        before += count
+    rank = Int32(-1)
+    if base >= 0:
+        n, position = (base % 32, Int32(0))
+        for width in cutlass.range_constexpr(5):
+            half: cutlass.Constexpr = 16 >> width
+            low = Int32(cute.arch.popc(hit & Uint32((1 << half) - 1)))
+            if n >= low:
+                n, position = (n - low, position + half)
+                hit = hit >> Uint32(half)
+        rank = base - base % 32 + position
+    return rank
+
+
 @asm()
 def stamp_at(pointer, slot):
     """Benchmark trace: (%globaltimer, %smid) into 16 B ``slot`` of ``pointer``."""
@@ -1312,7 +1351,7 @@ class RubinExpertsKernel(ExpertsKernel):
         if warp == 0:
             if lane < 2:
                 rows = view(sm.iterator, self.off_match + 16 + 32 * lane, Uint32, 8)
-                ranks[lane] = match_rank(rows, self.grid, info[0], info[1])
+                ranks[lane] = match_rank_popc(rows, self.grid, info[0], info[1])
             named_barrier(MATCHED, 384, arrive=True)
         else:
             named_barrier(MATCHED, 384)
