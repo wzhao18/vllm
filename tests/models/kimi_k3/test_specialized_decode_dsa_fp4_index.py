@@ -875,3 +875,144 @@ def test_wide_dsa_dcp16_mxfp4_exchange(
     mla_cache_ready(core)
     args = dict(dcp8_group=dcp8_group, monkeypatch=monkeypatch, batch=batch, q=q)
     run_fp8_test(dsa.test_wide_dsa_dcp_exchange, **args, core=core)
+
+
+def fused_fp4_inputs(contexts, q, seed, gap=GAP):
+    """A packed MXFP4 indexer cache of random E2M1 keys and UE8M0 scales (each of a
+    key's four 32-value blocks its own) under a random block table, the per-row
+    ends (row j of a request sees ``context + 1 + j`` keys), DsaIndex's FP8 query
+    buffer holding a random MXFP4 query (fp4_query_views) and BF16 head weights."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    pages = [-(-(c + q) // UNIT) for c in contexts]
+    blocks = sum(pages) + 3
+    index = dsa.packed_cache(blocks, UNIT, FP4_ROW, gap)
+    page = fp4_pages(index)
+    codes = torch.randint(0, 256, (blocks, UNIT * 64), device="cuda", generator=gen)
+    exps = torch.randint(118, 134, (blocks, UNIT * 4), device="cuda", generator=gen)
+    page[:, : UNIT * 64] = codes.to(torch.uint8)
+    page[:, UNIT * 64 :] = exps.to(torch.uint8)
+    perm = torch.randperm(blocks, device="cuda", generator=gen).int()
+    table = torch.zeros(len(contexts), max(pages), dtype=torch.int32, device="cuda")
+    used = 0
+    for r, n in enumerate(pages):
+        table[r, :n] = perm[used : used + n]
+        used += n
+    ends = [c + 1 + j for c in contexts for j in range(q)]
+    ends = torch.tensor(ends, dtype=torch.int32, device="cuda")
+    rows = len(contexts) * q
+    e2m1 = torch.randint(0, 256, (rows, 32, 64), device="cuda", generator=gen)
+    q_exp = torch.randint(118, 134, (rows, 32, 4), device="cuda", generator=gen)
+    q_rows = torch.zeros(rows, 32, 128, dtype=torch.uint8, device="cuda")
+    flat = q_rows.view(-1)
+    flat[: rows * 32 * 64] = e2m1.to(torch.uint8).view(-1)
+    flat[rows * 32 * 64 : rows * 32 * 68] = q_exp.to(torch.uint8).view(-1)
+    weights = (torch.randn(rows, 32, device="cuda", generator=gen) * 0.1).bfloat16()
+    return SimpleNamespace(
+        index=index, table=table, ends=ends, q_rows=q_rows, weights=weights
+    )
+
+
+def deepgemm_fp4_logits(x, q, max_model_len):
+    """Stock's MXFP4 paged logits (DeepGEMM SM100, the decode varlen form) of
+    ``fused_fp4_inputs``' rows."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        kv_cache_as_quant_view,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.index import (
+        fp4_query_views,
+    )
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_mqa_logits,
+        get_num_sms,
+        get_paged_mqa_logits_metadata,
+    )
+
+    rows = x.ends.shape[0]
+    packed, q_sf = fp4_query_views(x.q_rows, rows, rows)
+    context_lens = x.ends.view(rows, 1).contiguous()
+    indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    table = x.table.repeat_interleave(q, 0).contiguous()
+    return fp8_fp4_paged_mqa_logits(
+        (packed.view(torch.int8).unsqueeze(1), q_sf.unsqueeze(1)),
+        kv_cache_as_quant_view(x.index, 128, True),
+        x.weights,
+        context_lens,
+        table,
+        get_paged_mqa_logits_metadata(context_lens, UNIT, get_num_sms(), indices),
+        max_model_len=max_model_len,
+        indices=indices,
+    )
+
+
+# One DCP16 rank's local contexts (interleave 1), q8 (test_fused_indexer_dcp16_q8's).
+FP4_DCP16_CASES = {
+    "c1": [8250],  # C1 at 132K
+    "c8": [10000 + 997 * r for r in range(8)],
+    "short": [100, 150],  # every row within N
+    "boundary": [182, 183, 184, 185, 186, 190, 191, 192],  # rows around N
+    "far": [65000, 30000],
+    "padded": [5000, 400, 0],  # a CUDA-graph padding request
+}
+
+
+@DEEPGEMM
+@pytest.mark.parametrize("q", [8, 5])
+@pytest.mark.parametrize("case", list(FP4_DCP16_CASES))
+def test_fused_indexer_dcp16_mxfp4(case, q):
+    """The fused DCP indexer on an MXFP4 cache (IndexerScoreFp4 + IndexerLocalTopk):
+    its logits bit for bit DeepGEMM's MXFP4 paged logits (every scored key of every
+    row), and its B' rows exactly the local top-N of them (ties to the lowest
+    key), in the #63 pack's word format, with the counts."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
+        FusedIndexer,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_pack_indices
+
+    contexts = FP4_DCP16_CASES[case]
+    x = fused_fp4_inputs(contexts, q, len(contexts) * 7 + q)
+    rows, n = len(contexts) * q, 192
+    ends = x.ends
+    if case == "padded":
+        ends[-q:] = 0
+    real = rows - q if case == "padded" else rows
+    decode = SimpleNamespace(
+        seq_lens=ends[:real].view(real, 1),
+        block_table=x.table.repeat_interleave(q, 0)[:real],
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=x.index),
+        topk_tokens=2048,
+        max_model_len=1 << 20,
+        dcp_world_size=16,
+    )
+    fused = FusedIndexer(
+        indexer, [(rows, q)], torch.device("cuda"), max(64, rows), local_topk=n,
+        packed=True,
+    )  # fmt: skip
+    packed, out_logits, aux = fused.run_dcp(x.q_rows, x.weights, decode, rows, q)
+    assert torch.equal(aux, ends[:rows])
+    ref = deepgemm_fp4_logits(x, q, fused.pitch)
+    torch.accelerator.synchronize()
+    logits = fused.logits[: rows * fused.pitch].view(rows, fused.pitch)
+    for t in range(rows):
+        length = int(ends[t])
+        got, want = logits[t, :length], ref[t, :length].view(torch.int16)
+        assert torch.equal(got, want), (case, t, int((got != want).sum()))
+    out, counts = packed, fused.valid[:rows]
+    local = torch.full((rows, n), -1, dtype=torch.int32, device="cuda")
+    for t in range(rows):
+        length = int(ends[t])
+        c = min(length, n)
+        assert int(counts[t]) == c, (case, t)
+        words = out[t, :n].long() & 0xFFFFFFFF
+        plane = out[t, n:].long() & 0xFFFFFFFF
+        assert bool((words[c:] == 0).all()) and bool((words[:c] != 0).all())
+        j = torch.arange(c, device="cuda")
+        high = (plane[j // 32] >> (j % 32)) & 1
+        ids = (0xFFFF - (words[:c] & 0xFFFF)) | (high << 16)
+        assert torch.equal(ids.sort().values, dsa.exact_topk(logits[t, :length], n))
+        local[t, :c] = ids.int()
+    want = torch.full_like(out, 7)
+    dcp_topk_pack_indices(logits.view(torch.bfloat16), local, want)
+    torch.accelerator.synchronize()
+    assert torch.equal(out, want), case

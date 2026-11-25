@@ -50,6 +50,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import fake, stream, to_cute
+from .index import fp4_query_views, is_fp4_cache
 from ..common.primitives import (
     asm,
     bits_float,
@@ -1787,25 +1788,38 @@ def compile_indexer(
     packed=False,
     release=True,
     page=PAGE,
+    fp4=False,
 ):
     """The score and select kernels of one (rows, q) for an indexer cache layout
     (every DSA layer's is the same). DCP (``pitch``): DeepGEMM-layout logits and,
     ``packed``, the local top-``topk`` select into B' rows (else none).
-    ``page``: the MLA cache's tokens per block (TP select)."""
-    score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
+    ``page``: the MLA cache's tokens per block (TP select). ``fp4``: an MXFP4
+    indexer cache (DCP only: IndexerScoreFp4)."""
     fp8 = cutlass.Float8E4M3FN
     with torch.accelerator.device_index(device):
-        query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
         weights = fake((rows * HEADS,), (1,), torch.bfloat16)
-        key_view = fake(*keys, fp8)
         scale_view = fake(*scales, torch.int32)
         table = Int64(0), Int32(0), Int32(0)
         ends = fake((rows,), (1,), torch.int32, 4)
         scratch = fake(logits, (1,), cutlass.Int16)
-        tops = fake(tops, (1,), cutlass.Int16)
         s = make_fake_stream()
-        args = query, weights, key_view, scale_view, *table, ends, scratch, tops, s
-        score_kernel = cute.compile(score, *args)
+        if fp4:
+            from .indexer_fp4 import IndexerScoreFp4
+
+            assert pitch, "the MXFP4 scorer writes DeepGEMM's layout (DCP) only"
+            score = IndexerScoreFp4(rows, q, ctas, pitch)
+            query = fake((rows * HEADS, DIM // 2), (DIM // 2, 1), torch.uint8)
+            q_sf = fake((rows * HEADS,), (1,), torch.int32)
+            key_view = fake(*keys, torch.uint8)
+            args = query, q_sf, weights, key_view, scale_view, *table, ends, scratch
+            score_kernel = cute.compile(score, *args, s)
+        else:
+            score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
+            query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
+            key_view = fake(*keys, fp8)
+            tops = fake(tops, (1,), cutlass.Int16)
+            args = query, weights, key_view, scale_view, *table, ends, scratch, tops, s
+            score_kernel = cute.compile(score, *args)
         if pitch:
             if not packed:
                 return score_kernel, None
@@ -1848,16 +1862,19 @@ class FusedIndexer:
         self.indexer, self.device, self.page = indexer, device, page
         self.topk = local_topk or indexer.topk_tokens
         self.packed = packed and local_topk > 0
+        # MXFP4 keys: [64 x 64 B E2M1 | 64 x UE8M0 x4] per page (DCP only).
+        self.fp4 = is_fp4_cache(cache)
+        assert not self.fp4 or local_topk, "MXFP4 fused indexer: DCP only"
+        key_bytes = DIM // 2 if self.fp4 else DIM
         blocks, unit = cache.shape[0], cache.stride(0)
-        self.keys = torch.as_strided(cache, (PAGE, DIM, blocks), (DIM, 1, unit)).view(
-            torch.float8_e4m3fn
-        )
+        keys = torch.as_strided(cache, (PAGE, key_bytes, blocks), (key_bytes, 1, unit))
+        self.keys = keys if self.fp4 else keys.view(torch.float8_e4m3fn)
         words = cache.view(torch.int32)
         self.scales = torch.as_strided(
             words,
             (blocks, PAGE),
             (unit // 4, 1),
-            storage_offset=words.storage_offset() + PAGE * DIM // 4,
+            storage_offset=words.storage_offset() + PAGE * key_bytes // 4,
         )
         if local_topk:  # a rank's keys of a context (interleave 1)
             self.max_local_len = -(-indexer.max_model_len // indexer.dcp_world_size)
@@ -1876,7 +1893,7 @@ class FusedIndexer:
         packed = self.packs(rows)
         args += (self.device.index, self.ids is not None, self.pitch, packed)
         release = (rows, q) not in self.hold
-        return compile_indexer(*args, release=release, page=self.page)
+        return compile_indexer(*args, release=release, page=self.page, fp4=self.fp4)
 
     def packs(self, rows):
         """DCP: whether ``run_dcp`` selects the B' rows itself: one CTA per row
@@ -1913,6 +1930,21 @@ class FusedIndexer:
             self.ends[: ends.shape[0]].copy_(ends)
             ends = self.ends
         ends = ends[:rows]
+        if self.fp4:
+            # DsaIndex's MXFP4 query of this ``rows``-row step (fp4_query_views).
+            packed, q_sf = fp4_query_views(q_fp8, rows, rows)
+            score(
+                to_cute(packed.reshape(rows * HEADS, DIM // 2)),
+                to_cute(q_sf.reshape(-1), 4),
+                to_cute(head_w[:rows].reshape(-1)),
+                to_cute(self.keys),
+                to_cute(self.scales),
+                *self._table(index_table),
+                to_cute(ends, 4),
+                to_cute(self.logits),
+                stream(self.device),
+            )
+            return ends
         query = torch.as_strided(
             q_fp8[:rows].view(torch.float8_e4m3fn),
             (rows * HEADS, DIM, 1),
