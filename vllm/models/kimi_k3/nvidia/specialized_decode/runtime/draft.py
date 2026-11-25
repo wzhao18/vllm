@@ -158,6 +158,9 @@ FAST_CONTEXT = {8: "1-:1", 16: "1-:1"}
 # from the deployment's rows. Beyond one wave of 1024-thread CTAs a row's CTA waits
 # only on the same row's CTAs of the other ranks, which push before they wait.)
 # NQ-TUNE: ArNormRows above 576 rows (DL7 B83+) vs the stock site.
+# TP16 65-128 rows: two-shot sites over the wide box, fed by the pushed producers
+# (TWO_SHOT_PRODUCERS; the sites alone measured no gain over ArNormRows, so TP8, which
+# has no producers, keeps ArNormRows there).
 FAST_AR = {8: "1-7:1,8-64:2,65-:3", 16: "1-7:1,8-128:2,129-:3"}
 # FAST_AR one-shot batches whose sites gate their 16-source poll on one fragment per
 # source (cutedsl.draft.allreduce ``gate``), per TP, on Rubin. 16 ranks, the B1

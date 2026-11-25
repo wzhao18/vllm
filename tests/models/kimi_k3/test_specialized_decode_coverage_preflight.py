@@ -446,15 +446,19 @@ def test_drafter_build_covers_every_captured_graph(monkeypatch, deployment):
     )  # fmt: skip
     wide_ar = {r for r in ar_rows if draft.covered(ar, r, steps) == 3}
     cap_ar = allreduce.WIDE_CAP or max(ar_rows, default=0)
+    two_ar = {r for r in ar_rows if draft.covered(ar, r, steps) == 2}
     served = {
         r
         for r in ar_rows
-        if r <= min(allreduce.CAP, allreduce.TWO_CAP) or (r in wide_ar and r <= cap_ar)
+        if r <= min(allreduce.CAP, allreduce.TWO_CAP)
+        or (r in wide_ar and r <= cap_ar)
+        or (r in two_ar and r <= allreduce.WIDE_TWO_CAP)
     }  # (PreparedDraftAr.rows)
     gaps.add(
         "allreduce.py PreparedDraftAr.rows (draft.py:652)",
         sorted(set(query_rows) - served),
-        "query rows above the 64-row boxes that are not ArNormRows rows",
+        "query rows above the 64-row boxes that are neither ArNormRows rows nor"
+        " two-shot rows over the wide box (WIDE_TWO_CAP)",
     )
     # ArNormRows push sites: each CTA pushes its partial row's chunks, reduces the
     # chunks this rank owns from every rank's same-row CTA, then polls the gathered
