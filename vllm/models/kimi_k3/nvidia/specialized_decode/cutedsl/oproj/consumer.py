@@ -36,12 +36,11 @@ from ..common.primitives import (
     store_shared_words,
     store_words,
     unpack_bf16,
-    view,
     zeros,
 )
 from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
 from ..common.twoshot import reduce
-from .producer import OprojProducer, OprojUmma, pack8, tree_reduce
+from .producer import OprojProducer, pack8, tree_reduce
 
 
 @asm((Float32,) * 2, pure=True)
@@ -200,10 +199,7 @@ class OprojConsumer:
         return result
 
     @cute.jit
-    def pre(
-        self, state, rank, eps, mix, wait_groups: cutlass.Constexpr[int] = 0,
-        synced: cutlass.Constexpr[bool] = False,
-    ):  # fmt: skip
+    def pre(self, state, rank, eps, mix, wait_groups: cutlass.Constexpr[int] = 0):
         wpre, pre, blk, _, _, bars, _, pf = state
         tid, _, _ = cute.arch.thread_idx()
         warp, lane = tid // 32, tid % 32
@@ -220,8 +216,7 @@ class OprojConsumer:
             if ((lane & (32 // self.kpre - 1)) == 0) & (idx < 2 * self.nb):
                 wpre[warp, idx] = partial[0]
             named_barrier()
-            if cutlass.const_expr(not synced):  # synced: the cluster waited already
-                cute.arch.cluster_wait()
+            cute.arch.cluster_wait()
             if tid < 2 * self.nb:
                 pre_sum = Float32(0)
                 for w in cutlass.range_constexpr(4):
@@ -248,7 +243,7 @@ class OprojConsumer:
                         (exp[block], exp[block]), two(value, j), two(mix, j), op="fma"
                     )
             qpart = dot8(mix, mix)
-        elif cutlass.const_expr(not synced):
+        else:
             cute.arch.cluster_wait()
         return maximum, exponent_sum, qpart
 
@@ -512,85 +507,3 @@ class OprojFused:
                     cute.arch.fence_acq_rel_gpu()
         if cutlass.const_expr(self.polled_x):
             cute.arch.griddepcontrol_wait()
-
-
-class OprojUmmaFold(OprojUmma):
-    """Two-shot tcgen05 producer (resident ring, owner reduce) that also runs the
-    reduced-gather consumer's AttnRes (``OprojConsumer(twoshot, reduced)``) instead of
-    a separate consumer grid. The 112 CTAs form 16 clusters of 7; cluster g's CTA r
-    takes columns [1024 r, 1024 (r + 1)) of tokens g, g + 16, g + 32, g + 48 (one
-    consumer unit each: the same 7-CTA slice partition, partial sums, DSMEM
-    exchanges and summation order as the consumer's per-token clusters, so the
-    outputs are bitwise identical). Each unit's prefix, blocks and weights are
-    prefetched into the ring past the D tile once the MMAs are done; the units' block
-    logits run after the owner reduce, while the gather is in flight, then each unit
-    polls its gather row. Args: the reduced producer's (x, w, recv, peers, rank,
-    gather, gather multicast) + the consumer's rows (prefix .. out_eps)."""
-
-    PF_OFFSET = 32768  # ring bytes kept for the D tile ([N, 68] FP32 <= 17 KB)
-
-    def __init__(self, k, nb, *, has_delta=True):
-        super().__init__(k, twoshot=True, reduce=True, resident=True)
-        self.folded = True
-        self.consumer = OprojConsumer(
-            nb, groups=1, has_delta=has_delta, twoshot=True, reduced=True
-        )
-
-    def units(self, batches):
-        return (batches + 15) // 16
-
-    def fold_alloc(self, smem, ring, ring_bytes, batches):
-        """Per unit: the consumer's exchange buffers and barriers (own shared
-        memory: peers push into them) and its prefetch rows (in the ring)."""
-        rows = 4 + self.consumer.nb
-        states = []
-        # post()'s poll-helper branch (thread >= 128) is traced, never taken here
-        parts = alloc(smem, Float32, (1, 2, 128, 4))
-        for u in range(self.units(batches)):
-            offset = self.PF_OFFSET + u * rows * 2048
-            if offset + rows * 2048 > ring_bytes:
-                raise ValueError(f"o-proj fold: {batches} rows overflow the ring")
-            wpre = alloc(smem, Float32, (4, 16))
-            pre = alloc(smem, Float32, (7, 16))
-            blk = alloc(smem, Float32, 16)
-            post = alloc(smem, Float32, (7, 4, 4))
-            total = alloc(smem, Float32, 4)
-            bars = alloc(smem, cutlass.Uint64, 2, 8)
-            pf = view(ring.iterator, offset, Uint32, (rows, 128, 4), (512, 4, 1))
-            states.append((wpre, pre, blk, post, total, bars, parts, pf))
-        return states
-
-    def fold_arm(self, states):
-        c = self.consumer
-        for state in states:
-            arm_exchanges(state[5], (2 * c.nb, 4 * c.npost))
-
-    def fold_rows(self, args):
-        return (args[5], *args[7:17])
-
-    @cute.jit
-    def fold_prefetch(self, args, states, cta):
-        x, rows = args[0], self.fold_rows(args)
-        r, g = cta % 7, cta // 7
-        for u in cutlass.range_constexpr(self.units(x.shape[0])):
-            if g + 16 * u < x.shape[0]:
-                self.consumer.prefetch(rows, states[u][7], r, g + 16 * u)
-
-    @cute.jit
-    def fold_consume(self, args, states, cta):
-        x, rows = args[0], self.fold_rows(args)
-        r, g = cta % 7, cta // 7
-        units: cutlass.Constexpr = self.units(x.shape[0])
-        mixes = [zeros(8, Float32) for _ in range(units)]
-        stats = []
-        for u in cutlass.range_constexpr(units):
-            maximum, exponent_sum, qpart = Float32(0), Float32(0), Float32(0)
-            if g + 16 * u < x.shape[0]:
-                maximum, exponent_sum, qpart = self.consumer.pre(
-                    states[u], r, rows[9], mixes[u], 0, True
-                )
-            stats.append((maximum, exponent_sum, qpart))
-        for u in cutlass.range_constexpr(units):
-            if g + 16 * u < x.shape[0]:
-                block_mix = (mixes[u], *stats[u])
-                self.consumer.post(rows, states[u], block_mix, r, g + 16 * u)

@@ -1704,9 +1704,6 @@ OSMALL_VARIANTS = {
     "noxmc-pcarve100": ((32, 64), dict(
         X_MULTICAST={16: "17-64:1"},
         PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
-    # the producer also runs the consumer's AttnRes (one kernel per layer, clusters
-    # of 7, no x multicast); bitwise-checked against prod before timing
-    "fold": (tuple(range(17, 65)), dict(FOLD={16: "17-64:1"})),
     "prod2": (None, {}),  # production again (order / drift check)
 }
 
@@ -1797,25 +1794,6 @@ def _osmall_impl(args, d, res, dog):
                         fill(i % 2)
                         preps[i % 2].run(x, prefix, blocks[:b], out[:b])
 
-                if tables.get("FOLD"):  # bitwise vs the production pair
-                    ref = [op.PreparedOproj(dec, mailbox, [b], False, None, box,
-                                            x_buffer=x_buffer) for dec in decoders]
-                    outs = []
-                    for p in (ref, preps):
-                        pre = prefix.clone()
-                        o = torch.full_like(out[:b], float("nan"))
-                        for i in range(2):
-                            fill(i % 2)
-                            p[i % 2].run(x, pre, blocks[:b], o)
-                        torch.cuda.synchronize()
-                        outs.append((o, pre))
-                    same = all(torch.equal(a, c) for a, c in zip(*outs))
-                    bad = int((outs[0][0] != outs[1][0]).sum())
-                    if rank == 0:
-                        log(f"OSMALL rows {rows} {name}: bitwise vs prod "
-                            f"{'OK' if same else 'MISMATCH'} (out diffs {bad})")
-                    if not same:
-                        raise RuntimeError(f"fold rows {rows}: not bitwise vs prod")
                 us_f, _ = time_region(fills, dist=d, samples=args.samples)
                 us_c, how = time_region(chain, prefill=None, dist=d,
                                         samples=args.samples)  # fmt: skip

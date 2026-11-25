@@ -457,9 +457,6 @@ class OprojUmma(OprojProducer):
         # argument (box {64, N / xmc}).
         self.xmc = xmc
         assert xmc == 1 or resident
-        # folded (``consumer.OprojUmmaFold``): clusters of 7 CTAs that also run the
-        # consumer's AttnRes for their tokens after the owner reduce (fold_* hooks).
-        self.folded = False
 
     def geometry(self, batches):
         """(N, ring stage bytes, stages, TMEM columns)."""
@@ -538,7 +535,7 @@ class OprojUmma(OprojProducer):
 
     @cute.jit
     def __call__(self, *args):
-        cluster = 7 if self.folded else self.xmc if self.xmc > 1 else None
+        cluster = self.xmc if self.xmc > 1 else None
         launch(self.kernel, args, 112, 160, cluster, min_blocks_per_mp=1)
 
     @cute.kernel
@@ -550,9 +547,6 @@ class OprojUmma(OprojProducer):
         ring = alloc(smem, Uint8, stages * stage, 1024)
         bars = alloc(smem, Uint64, 2 * stages + 1, 8)
         tmem_slot = alloc(smem, Uint32, 1)
-        states = ()
-        if cutlass.const_expr(self.folded):
-            states = self.fold_alloc(smem, ring, stages * stage, x.shape[0])
         # Each stage: the 128 loader threads' W (and, without xmc, x) cp.async arrivals;
         # with xmc thread 0's expect-tx arrival for the multicast x tile instead.
         arrivals: Constexpr = 129 if self.xmc > 1 else 256
@@ -562,14 +556,12 @@ class OprojUmma(OprojProducer):
                 cute.arch.mbarrier_init(bars.iterator + stages + s, 1)
             cute.arch.mbarrier_init(bars.iterator + 2 * stages, 1)
             cute.arch.mbarrier_init_fence()
-        if cutlass.const_expr(self.folded):
-            self.fold_arm(states)
         if warp == 4:
             cute.arch.alloc_tmem(columns, tmem_slot.iterator)
             cute.arch.relinquish_tmem_alloc_permit()
         fence_tmem(before=True)
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.xmc > 1 or self.folded):  # peers' barriers armed
+        if cutlass.const_expr(self.xmc > 1):  # every peer's barriers armed first
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
         fence_tmem()
@@ -602,17 +594,12 @@ class OprojUmma(OprojProducer):
             fence_tmem()
             # The MMAs (async proxy) read the ring the epilogue now overwrites.
             cute.arch.fence_proxy("async.shared", space="cta")
-            if cutlass.const_expr(self.folded):  # into the ring past the D tile
-                self.fold_prefetch(args, states, cta)
             self.epilogue(args, ring, tmem, cta, n)
             if cutlass.const_expr(self.reduce):
                 self.reduce_owned(args, cta, tid)
         else:
             self.multiply(ring, bars, tmem, n, stage)
         release_tmem(tmem, columns, warp, 4)
-        if cutlass.const_expr(self.folded):  # noqa: SIM102
-            if warp < 4:
-                self.fold_consume(args, states, cta)
         if cutlass.const_expr(self.xmc > 1):  # no CTA leaves while peers' tiles land
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
