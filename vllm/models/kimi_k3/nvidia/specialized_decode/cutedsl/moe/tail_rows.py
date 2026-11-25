@@ -115,7 +115,15 @@ UP_GEMM = "cublas"
 # 128 rows (B16 verify): cuBLAS picks a split-K nvjet + splitKreduce pair there (~4.3
 # us per layer on the critical path, 16 ranks, prod cfg); the fused up replaces it and
 # OutRows with one PDL-chained kernel.
-UP_ROWS = {16: "65-80:1,128-256:1"}
+# Above 256 rows (B64 verify = 512 rows): the same pair, cuBLAS split-K nvjet +
+# splitKreduce + OutRows. 4 ranks + 12 emulated, whole tail per call (max over ranks,
+# CUDA graph, ABAB): M384 -3.9, M512 -1.6 / -3.1 us with the fused up; the isolated
+# stage is level there (copy + up chained, M512 9.3 vs 9.3 us), so the gain is the
+# weights pre-staged before the PDL wait. M768 loses (stage 10.1 -> 13.3 us, tail
+# +3.7): 12 token tiles re-read the weights. Output vs an FP64 reference: same
+# rel-norm error (1.66e-3), >= 99.8 % of outputs bitwise vs cuBLAS, the rest an FP32
+# K-reorder.
+UP_ROWS = {16: "65-80:1,128-512:1"}
 
 # Rows whose NormRows skips the PDL dependency wait (``NormRows(polled=True)``): its
 # inputs are Lamport-polled (the gather rows, the RS slots) or static (gamma), and
