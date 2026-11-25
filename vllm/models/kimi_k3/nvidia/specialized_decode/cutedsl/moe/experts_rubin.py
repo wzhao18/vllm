@@ -1284,6 +1284,8 @@ class RubinExpertsKernel(ExpertsKernel):
             k = Int32(arrivals) - Int32(ones)
             if die == 1:
                 k = Int32(ones)
+            if cutlass.const_expr(self.stamp > 0):
+                stamp_at(workspace.iterator + self.stamp + thread()[3] * 256, 8)
             if arrivals == Uint32(self.grid - 1):
                 base = workspace.iterator + self.ws_census
                 mailbox_store(base, (Uint32(4294967295), Uint32(4294967295)))
@@ -1304,6 +1306,9 @@ class RubinExpertsKernel(ExpertsKernel):
                 if lane == 0:
                     bits[group * 8 + warp] = Uint32(ballot)
         named_barrier(MATCHED, 384)
+        if cutlass.const_expr(self.stamp > 0):
+            if tid == 0:
+                stamp_at(workspace.iterator + self.stamp + thread()[3] * 256, 9)
         if warp == 0:
             if lane < 2:
                 rows = view(sm.iterator, self.off_match + 16 + 32 * lane, Uint32, 8)
@@ -1578,7 +1583,7 @@ class RubinExpertsKernel(ExpertsKernel):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
         else:
             cute.arch.griddepcontrol_wait()
-        trace = workspace.iterator + self.stamp + cta * 128
+        trace = workspace.iterator + self.stamp + cta * 256
         if cutlass.const_expr(self.stamp > 0):
             if tid == 0:
                 stamp_at(trace, 4)
