@@ -106,6 +106,10 @@ def smem_desc_rows(pointer, sbo: cutlass.Constexpr[int]):
 class RubinVWExpertsKernel(RubinWideExpertsKernel):
     """``RubinWideExpertsKernel`` with streams of up to ``width`` (16 or 32) tokens."""
 
+    # DIAG (never merge): skip the FC2 staged stores and the finalize (wrong output):
+    # an upper bound of what a faster FC2 epilogue buys (benchmarks set it).
+    diag_skip_fc2 = False
+
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,
         trace=0, pool=(12, 6), dies=(), static_groups=False, fc2_base=1,
@@ -651,7 +655,8 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                             self.store_hidden(*store, scalars[:3])
                     else:
                         unit, tile = (first + s, item % self.jobs)
-                        self.fc2(sm, workspace, output, values, unit, tile, ranges)
+                        if cutlass.const_expr(not self.diag_skip_fc2):
+                            self.fc2(sm, workspace, output, values, unit, tile, ranges)
             offset += count
         # The pool: this group's uses offset + m (m of its parity); pmeta[b]'s phase
         # counts the earlier pool uses of the slot (m // big).
@@ -671,9 +676,10 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 self.sync(full.iterator + slot, pool_use // self.big & 1, True)
                 for s in cutlass.range(k, unroll=1):
                     values = self.take(tmem, empty, slot, s, s == k - 1)
-                    self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
+                    if cutlass.const_expr(not self.diag_skip_fc2):
+                        self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
                 m += 2
-        if cutlass.const_expr(self.publish):
+        if cutlass.const_expr(self.publish and not self.diag_skip_fc2):
             self.finalize(workspace, output, batch, scalars[3:], sm=sm)
 
     @cute.jit

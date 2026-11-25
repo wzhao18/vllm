@@ -264,7 +264,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 self.load_hidden(sm, workspace, ranges, wgen & 1)
                 if lane == 0:
                     self.stamp(12)
-                if cutlass.const_expr(self.publish):
+                if cutlass.const_expr(self.publish and not getattr(self, "diag_skip_fc2", False)):
                     self.finalize(workspace, output, batch, scalars[3:], sm=sm)
             elif warp == 3:
                 self.gather_x(sm, x, ranges, batch)
@@ -274,7 +274,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 if lane == 0:
                     self.claims(sm, workspace, ranges, generation & 1)
                 cute.arch.sync_warp()
-                if cutlass.const_expr(self.publish):
+                if cutlass.const_expr(self.publish and not getattr(self, "diag_skip_fc2", False)):
                     self.finalize(workspace, output, batch, scalars[3:], sm=sm)
             else:
                 self.epilogue(
