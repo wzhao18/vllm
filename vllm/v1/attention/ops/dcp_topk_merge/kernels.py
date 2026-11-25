@@ -842,6 +842,9 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         # The rescue's second round of this CTA's row in this kernel (no rescue
         # kernel); see ``dcp_topk_select``.
         fold: bool = False
+        # (fold) dependents launch at this grid's completion: a consumer that
+        # reads the rows before its PDL wait (FlashInfer's trtllm-gen counts).
+        hold: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
@@ -850,6 +853,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         exact = compile_key.exact
         mailbox = compile_key.mailbox
         fold = compile_key.fold
+        hold = compile_key.hold
+        assert fold or not hold
         assert emit_ids or block_size > 0
         assert exact or not mailbox
         assert mailbox or not fold
@@ -1273,8 +1278,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
                 cute.arch.griddepcontrol_wait()
-                # The rescue (PDL) becomes resident now and waits for this grid.
-                cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(not hold):
+                    # The rescue (PDL) becomes resident now and waits for this
+                    # grid; folded, the consumer (it reads after its wait).
+                    cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1531,6 +1538,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         exact: bool = False,
         mailbox: bool = False,
         fold: bool = False,
+        hold: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1541,6 +1549,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             exact=exact,
             mailbox=mailbox,
             fold=fold,
+            hold=hold,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1570,6 +1579,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         exact: "_ExactArgs | None" = None,
         mailbox: "_Mailbox | None" = None,
         fold: bool = False,
+        hold: bool = False,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1580,6 +1590,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             exact=exact is not None,
             mailbox=mailbox is not None,
             fold=fold,
+            hold=hold,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
@@ -2281,16 +2292,18 @@ def register_dcp_topk_merge_warmup(
         mailbox=mailbox and exact,
     )
     if mailbox and exact and block_size:  # the select with the rescue folded in
-        _DCP_TOPK_SELECT_KERNEL.register_warmup(
-            topk=topk,
-            local_topk=local_topk,
-            world_size=world_size,
-            emit_ids=emit_ids,
-            block_size=block_size,
-            exact=exact,
-            mailbox=True,
-            fold=True,
-        )
+        for hold in (False, True):
+            _DCP_TOPK_SELECT_KERNEL.register_warmup(
+                topk=topk,
+                local_topk=local_topk,
+                world_size=world_size,
+                emit_ids=emit_ids,
+                block_size=block_size,
+                exact=exact,
+                mailbox=True,
+                fold=True,
+                hold=hold,
+            )
     if exact:
         # Physical rows (``dcp_topk_merge_rows``): also the variant that releases
         # the DSA sparse core early (``release``).
@@ -2438,14 +2451,13 @@ def dcp_topk_select(
         raise ValueError(
             "the round-1 mailbox needs the exact merge and its own gathered rows"
         )
-    # The rescue folded into the select: through the mailbox, for a consumer
-    # that reads the rows after its PDL wait (the select releases its
-    # dependents after its own wait), with every row's CTA resident at once
-    # (no more rows than SMs: a saturated row's CTA pushes before it waits for
-    # the others', so no rank's wait can block another rank's push).
+    # The rescue folded into the select: through the mailbox, with every
+    # row's CTA resident at once (no more rows than SMs: a saturated row's CTA
+    # pushes before it waits for the others', so no rank's wait can block
+    # another rank's push). ``release``: the consumer launches after the
+    # select's own wait; else at its completion (``hold``).
     fold = (
         mailbox is not None
-        and release
         and rows is not None
         and gathered.shape[1] <= _num_sms(gathered.device)
     )
@@ -2458,6 +2470,7 @@ def dcp_topk_select(
         exact=exact,
         mailbox=mailbox,
         fold=fold,
+        hold=fold and not release,
     )
     if exact is not None and not fold:
         _DCP_TOPK_RESCUE_KERNEL(

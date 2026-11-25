@@ -283,7 +283,7 @@ def _check_published(group, ws, n: int) -> None:
         req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
         block_table = _block_table(num_rows, int(local_end.max()))
         results = []
-        # "folded": the rescue inside the select (release=, rows <= SMs).
+        # Rows <= SMs: the rescue inside the select ("folded": release=).
         for mode in ("logits", "published", "folded"):
             rows_out = torch.full(
                 (num_rows, TOPK), -7, dtype=torch.int32, device="cuda"
