@@ -134,6 +134,8 @@ def query_tokens(heads, batch, sms):
     if sms <= GB300_SMS:
         return 0
     return batch_table(WIDE_QUERY_TOKENS.get(heads, "")).get(batch, 0)
+
+
 OVERLAP_MODES = ("serial", "fork")
 # Rows whose forked indexer chain (wq_b through the sparse decode) runs on the
 # high-priority index stream ("chain"; other rows: the layer's stream). MlaQuery
