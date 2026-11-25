@@ -1543,7 +1543,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             acc_pipeline_epi = _M1AccWaitTimer(acc_pipeline, m1w)
         while work_tile_info.is_valid_tile:
             if cutlass.const_expr(m1w is not None):
-                m1tile0 = m1_stamps.clk()
+                m1w.begin(m1_stamps.C_EPI_TILE)
                 m1w.vmin(m1_stamps.W_EPI_FIRST, m1_stamps.clk())
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
@@ -1596,10 +1596,10 @@ class SwapABGatedActEpilogue(KernelComponent):
                     flag_tracker = flag_tracker.drained()
 
             if cutlass.const_expr(m1w is not None):
-                m1sched0 = m1_stamps.clk()
+                m1w.begin(m1_stamps.C_EPI_SCHED)
             work_tile_info = sched_consumer.consume_work()
             if cutlass.const_expr(m1w is not None):
-                m1w.add(m1_stamps.C_EPI_SCHED, m1_stamps.clk() - m1sched0)
+                m1w.end(m1_stamps.C_EPI_SCHED)
 
             if not publish_before_fetch:
                 # Every asynchronous store commits at issue; drain before completion or scratch reuse.
@@ -1628,7 +1628,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
             if cutlass.const_expr(m1w is not None):
-                m1w.add(m1_stamps.C_EPI_TILE, m1_stamps.clk() - m1tile0)
+                m1w.end(m1_stamps.C_EPI_TILE)
                 m1w.vmax(m1_stamps.W_EPI_LAST, m1_stamps.clk())
         # Tail flush
         flag_tracker.fire()
@@ -3748,7 +3748,7 @@ class _M1AccWaitTimer:
                                new_from_mlir_values(self._m1_writer, values[n:]))
 
     def consumer_wait(self, *args, **kwargs):
-        t0 = m1_stamps.clk()
+        self._m1_writer.begin(m1_stamps.C_EPI_ACCWAIT)
         result = self._m1_inner.consumer_wait(*args, **kwargs)
-        self._m1_writer.add(m1_stamps.C_EPI_ACCWAIT, m1_stamps.clk() - t0)
+        self._m1_writer.end(m1_stamps.C_EPI_ACCWAIT)
         return result

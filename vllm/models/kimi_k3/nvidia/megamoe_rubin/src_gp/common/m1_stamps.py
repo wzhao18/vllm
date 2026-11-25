@@ -214,6 +214,13 @@ class M1Writer:
     def add(self, word: int, value) -> None:
         red_add_u64(self.addr(word), Int64(value), self.pred)
 
+    def begin(self, word: int) -> None:
+        """span start: subtract the clock (no register lives across the span)."""
+        red_add_u64(self.addr(word), Int64(0) - clk(), self.pred)
+
+    def end(self, word: int) -> None:
+        red_add_u64(self.addr(word), clk(), self.pred)
+
     def vmin(self, word: int, value) -> None:
         red_min_u64(self.addr(word), Int64(value), self.pred)
 
