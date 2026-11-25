@@ -121,7 +121,7 @@ def stock_forward(model, input_ids, rank, shard):
     return out
 
 
-def time_graph(fn, device, iters=40):
+def time_graph(fn, device, iters=40, flush=None):
     fn()  # eager warmup (the FlashInfer all-reduce workspace is created lazily)
     torch.accelerator.synchronize(device)
     torch.distributed.barrier()
@@ -131,6 +131,9 @@ def time_graph(fn, device, iters=40):
     times = []
     for _ in range(iters):
         torch.accelerator.synchronize(device)
+        if flush is not None:  # --flush-mb: every weight cold (the target forward's place)
+            flush.zero_()
+            torch.accelerator.synchronize(device)
         torch.distributed.barrier()
         a = torch.cuda.Event(enable_timing=True)
         b = torch.cuda.Event(enable_timing=True)
@@ -150,6 +153,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows", default=",".join(map(str, ROWS)))
+    # weight-exposure probe: --flush-mb N memsets N MB before every replay (cold
+    # weights); --shared-weights gives the 5 layers layer 0's weights (51 MB/rank,
+    # L2-resident across replays: hot)
+    ap.add_argument("--flush-mb", type=int, default=0)
+    ap.add_argument("--shared-weights", action="store_true")
+    ap.add_argument("--spec-only", action="store_true")
     args = ap.parse_args()
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -181,6 +190,18 @@ def main():
         act = SiluAndMul()
         gen = torch.Generator(device=device).manual_seed(100 + rank)
         layers = [Layer(i, gen, device, act, RMSNorm) for i in range(5)]
+        if args.shared_weights:
+            for layer in layers[1:]:
+                for mod, src in (
+                    (layer.self_attn.qkv_proj, layers[0].self_attn.qkv_proj),
+                    (layer.self_attn.o_proj, layers[0].self_attn.o_proj),
+                    (layer.mlp.gate_up_proj, layers[0].mlp.gate_up_proj),
+                    (layer.mlp.down_proj, layers[0].mlp.down_proj),
+                ):
+                    mod.weight = src.weight
+        flush = None
+        if args.flush_mb:
+            flush = torch.empty(args.flush_mb << 20, dtype=torch.uint8, device=device)
         shared = torch.Generator(device=device).manual_seed(7)
         vocab = 1024 * world
         table = torch.randn((vocab, HIDDEN), generator=shared, device=device).bfloat16()
@@ -217,10 +238,15 @@ def main():
         for r in rows:
             ids = torch.randint(0, vocab, (r,), generator=shared, device=device,
                                 dtype=torch.int32)  # fmt: skip
-            stock = time_graph(
-                lambda ids=ids: stock_forward(model, ids, rank, shard), device
+            stock = float("nan")
+            if not args.spec_only:
+                stock = time_graph(
+                    lambda ids=ids: stock_forward(model, ids, rank, shard), device,
+                    flush=flush,
+                )
+            spec = time_graph(
+                lambda ids=ids: sites.run(model, ids, None), device, flush=flush
             )
-            spec = time_graph(lambda ids=ids: sites.run(model, ids, None), device)
             kind = (
                 ("polled" if r in ar.polled else "stored")
                 + (" two-shot" if r in ar.two_rows else "")
