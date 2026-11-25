@@ -179,7 +179,7 @@ _WORD_BLOCK = _BLOCK // 2  # 32-bit words per tile (16 KiB, as the BF16 tiles)
 
 _AG_CHUNK = 64 << 10  # pusher TMA chunk (64 KiB, 3-slot ring = 192 KiB smem)
 _AG_NS = 3
-_AG_SPIN_NS = 2_000_000_000  # 2 s: trap instead of hanging
+_AG_SPIN_NS = 60_000_000_000  # 60 s: a hang traps (a peer late by host work is not one)
 _AG_FLAG_WORDS = 1024  # [0] arrival word, [64:] per-cluster-tile counters
 
 _AG_CUDA = r"""

@@ -25,8 +25,8 @@ from cutlass.utils.static_persistent_tile_scheduler import (
     WorkTileInfo,
 )
 
-# ~2^24 polls x >= 64 ns: >= 1 s before the trap.
-SPIN_LIMIT = 1 << 24
+# ~2^30 polls x >= 64 ns: >= 60 s before the trap (a hang, not a late peer).
+SPIN_LIMIT = 1 << 30
 
 
 @dsl_user_op
