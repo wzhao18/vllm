@@ -171,7 +171,7 @@ def test_c512_on_kimi_k3_mega_moe_is_the_sp_topology():
 )
 def test_other_topologies_are_not_sp(tp, dcp, ep, backend):
     """Only TP4 = DCP4 over expert-parallel MegaMoE is SP; everything else keeps the
-    TP8 / TP16 gate, which refuses TP4, EP and ReplaySSM as before."""
+    TP8 / TP16 gate, which refuses TP4 and EP as before."""
     backend = {"kernel_config.moe_backend": backend}
     config = deployment(tp=tp, dcp=dcp, ep=ep, **backend)
     assert not sp_topology(config)
@@ -294,7 +294,8 @@ def test_tp16_gate_unchanged():
         capture_sizes=decode.capture_sizes,
         captured=decode.captured,
     )
-    assert "ReplaySSM" in unsupported(tp16(**{"cache_config.use_replayssm": True}))
+    # ReplaySSM records on TP16: the record cores serve its verify rows
+    assert unsupported(tp16(**{"cache_config.use_replayssm": True})) is None
     config = tp16()
     config.parallel_config.enable_expert_parallel = True
     assert unsupported(config).startswith("expert parallelism")
