@@ -156,6 +156,7 @@ class PreparedMoE:
                 publish = (*publish, flat(shared), tail.peers, Int32(CAP))
             twoshot = b in tail.twoshots
             experts.prepare(b, buffers, expanded, publish, planned, twoshot, True)
+        front.ready_tables(experts.ready)
 
     def run(self, x, out, *, consume=None):
         state, b = self.state, x.shape[0]

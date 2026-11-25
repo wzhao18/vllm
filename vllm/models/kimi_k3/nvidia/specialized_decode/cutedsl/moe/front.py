@@ -33,6 +33,7 @@ from ..gemm.splitk_situ import PreparedSitu
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .experts_rubin import ROUTE_WORDS, count_image, image_chunk
+from .experts_rubin64 import READY_BYTES, ReadyTable, RubinGroupedExpertsKernel
 from .experts_runtime import polled, rubin
 from .shared import compile_down, compile_shared, situ, weight_maps
 from .tail_runtime import CAP
@@ -56,6 +57,7 @@ class RouteSitu:
     def __init__(
         self, batch, shared, renorm, early, roles, polled, plan=False, lean=None,
         rcp=False, halves=False, signal=False, sync_copy=False, early_ids=False,
+        ready=None,
     ):  # fmt: skip
         # Lean (B>8 by default): few registers, so routing CTAs co-reside with the front
         # and the fused shared expert, polled logits skip the front's completion wait,
@@ -91,6 +93,11 @@ class RouteSitu:
         # its id into the experts' route mailbox (each word is valid on its own), so
         # the experts read the ids before select's last barrier and warp 0's publish.
         self.early_ids = early_ids and signal and self.lean
+        # ready (lean, late release): the grouped experts' ``ReadyTable``; the route
+        # CTAs release the experts right after their publish (the copy CTAs at exit),
+        # so the experts' launch and prologue overlap the last route CTA's grouping.
+        self.ready = ready
+        assert ready is None or (self.lean and not early and "route" in self.roles)
 
     @cute.jit
     def __call__(self, *args):
@@ -103,6 +110,7 @@ class RouteSitu:
         scale, beta, linear_beta = args[8:11]
         plan = args[11] if self.plan else None
         signal = args[11 + bool(self.plan)] if self.signal else None
+        ready = args[11 + bool(self.plan) + self.signal] if self.ready else None
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         token, role = cta % self.batch, cta // self.batch
@@ -119,7 +127,7 @@ class RouteSitu:
             if role == r:
                 if c.const_expr(self.roles[r] == "route"):
                     work = (logits, bias, ids, weights, scale, token, tid, mailbox)
-                    self.route(*work, signal)
+                    self.route(*work, signal, ready)
                 elif c.const_expr(self.roles[r] == "copy"):
                     # Lamport: no dependency wait; the sentinel poll is the barrier.
                     if c.const_expr(self.halves):
@@ -302,12 +310,17 @@ class RouteSitu:
 
     @cute.jit
     def route(
-        self, logits, bias, ids, weights, scale, token, tid, mailbox, signal=None
-    ):
+        self, logits, bias, ids, weights, scale, token, tid, mailbox, signal=None,
+        ready=None,
+    ):  # fmt: skip
         """Exact top16 by threads [0, 256): candidates at or above the 16th largest
-        lane-group maximum are compacted and ranked by an unrolled 64-way compare."""
+        lane-group maximum are compacted and ranked by an unrolled 64-way compare;
+        ``ready``: then the ready table's count and, in the last CTA, the table."""
         warp, lane = tid // 32, tid % 32
         smem = c.utils.SmemAllocator()
+        if c.const_expr(self.ready is not None):
+            table = ReadyTable(self.ready)
+            sbuf = alloc(smem, c.Uint8, ReadyTable.SMEM, 128)
         km = alloc(smem, Uint32, (8, 32))
         cand, dense = (alloc(smem, Uint64, shape) for shape in ((8, 128), 64))
         sig = alloc(smem, c.Float32, 1024)
@@ -379,6 +392,10 @@ class RouteSitu:
             buffers = (dense, sig, chosen, picked, found)
             self.select(key, cutoff[0], buffers, signal, token)
             self.publish(chosen, picked, ids, weights, scale, token, signal)
+            if c.const_expr(self.ready is not None):
+                cute.arch.griddepcontrol_launch_dependents()
+                if table.count(ready, self.batch, sbuf):
+                    table.build(ids, ready, self.batch, sbuf)
             return
         threshold, offset = cutoff[0], Int32(0)
         for i in c.range_constexpr(4):
@@ -636,14 +653,20 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None, wide=False)
 def compile_route(
     batch, shared, renorm, roles, device, polled=False, plan=False, lean=None,
     early=None, rcp=False, halves=False, signal=False, sync_copy=False,
-    early_ids=False, box_rows=64,
+    early_ids=False, box_rows=64, ready=None,
 ):  # fmt: skip
     """``box_rows``: the front mailbox's rows (``FrontRows``: its capacity); above 64
-    tokens the plan is 64-row blocks of PLAN_BYTES."""
+    tokens the plan is 64-row blocks of PLAN_BYTES; ``ready``: (experts, grid, slots,
+    dies) of the grouped experts whose ready table the route CTAs build (the ready
+    region is the last argument)."""
     early = batch <= 2 if early is None else early
+    moe = None
+    if ready is not None:
+        experts, grid, slots, dies = ready
+        moe = RubinGroupedExpertsKernel(experts, grid, slots, dies=dies, ready=True)
     kernel = RouteSitu(
         batch, shared, renorm, early, roles, polled, plan, lean, rcp, halves, signal,
-        sync_copy, early_ids,
+        sync_copy, early_ids, moe,
     )  # fmt: skip
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
@@ -653,7 +676,9 @@ def compile_route(
     args += (fake((batch, shared)), *(f32(v) for v in (1, 4, 25)))
     blocks = -(-batch // 64)
     args += (fake((blocks * PLAN_BYTES,), None, c.Uint8),) * bool(plan)
-    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal + (make_fake_stream(),)
+    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal
+    args += (fake((READY_BYTES,), None, c.Uint8),) * (ready is not None)
+    args += (make_fake_stream(),)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
@@ -863,6 +888,19 @@ class SharedFront:
                 b, compile_route(*self.route_keys[b], early=early, **opts)
             )
             self.plans[b] = (*plan[:2], route, *plan[3:])
+
+    def ready_tables(self, ready):
+        """``ready``: {batch: ((experts, grid, slots, dies), ready region)} of the
+        grouped experts that copy routing's ready table (``experts_runtime.READY``):
+        those batches' routing kernels build it."""
+        for b, (key, region) in ready.items():
+            if b not in self.plans:  # the experts would read a stale table
+                raise RuntimeError(f"MoE batch {b}: ready experts without routing")
+            plan = self.plans[b]
+            opts = self.route_opts[b]
+            code = compile_route(*self.route_keys[b], ready=key, **opts)
+            extra = (*plan[5], to_cute(region))
+            self.plans[b] = (*plan[:2], self.carved(b, code), *plan[3:5], extra, plan[6])
 
     def carved(self, batch, route):
         """``ROUTE_CARVEOUT_WIDE`` batches: the routing kernel with carve-out 100."""

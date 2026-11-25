@@ -133,8 +133,16 @@ def match_arrival(bits, grid: cutlass.Constexpr[int], die, k):
 
 
 # The die census (``dies``): one 64-bit word (in 16 B) past ``ExpertsGeometry``'s
-# workspace (``experts_runtime.scratch``), armed all-ones like the workspace.
-CENSUS_BYTES = 16
+# workspace (``experts_runtime.scratch``), armed all-ones like the workspace; then
+# routing's ready unit table (``ReadyTable``, ``RubinGroupedExpertsKernel`` ready):
+# header (units, the route CTAs' count), experts [1024] Int32, rows [1024, 8] Int16,
+# matched ranks [2 dies, 256 arrivals, 4 lists] Int16, home bits [4 lists, 8] words.
+R_EXPERTS = 16
+R_ROWS = R_EXPERTS + 4096
+R_RANKS = R_ROWS + 16384
+R_BITS = R_RANKS + 4096
+READY_BYTES = (R_BITS + 128 + 255) // 256 * 256
+CENSUS_BYTES = 16 + READY_BYTES
 # FC2 tail pool: the producer lets the claim warp claim its first grain this many static
 # jobs before its last (a claim and its hand-over take ~0.45 us, a job ~0.23 us).
 POOL_LEAD = 3
@@ -151,10 +159,15 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False,
+        dies=(), static_groups=False, ready=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
+        # ready: routing's last route CTA leaves the unit table, the home bits and the
+        # matched ranks of every (die, arrival) in the ready region (``ReadyTable``);
+        # the CTAs copy them after the dependency wait instead of grouping.
+        self.ready = ready
+        self.ws_ready = (self.workspace_bytes + 15) // 16 * 16 + 16
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -183,6 +196,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.ws_census = (self.workspace_bytes + 15) // 16 * 16
             self.workspace_bytes = self.ws_census + CENSUS_BYTES
             assert grid <= 256
+        elif ready:
+            self.workspace_bytes = self.ws_ready + READY_BYTES
         # trace (benchmarks only): a global address; (%globaltimer, %smid) stamps in
         # 16 slots of 16 B per CTA at trace + 512 cta.
         self.trace = trace
@@ -961,24 +976,69 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         bits = view(sm.iterator, self.off_misc + 2704, Uint32, 48)
         if warp < (self.grid + 31) // 32:
             ranges = self.rank_ranges(sm, units, tid)
-            dies = []
-            for kind in cutlass.range_constexpr(2):
-                for group in cutlass.range_constexpr(2):
-                    lo, hi = (ranges[group, 2 + 2 * kind], ranges[group, 3 + 2 * kind])
-                    mid = (lo + hi) // 2
-                    if cutlass.const_expr(kind == 0):
-                        tile = 3 * ranges[group, 0] + mid // 14
-                        row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
-                        address = Int64(row) * 1792 + mid % 14 * 128
-                    else:
-                        row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                        address = Int64(row) * 128
-                    live = (tid < self.grid) & (lo < hi)
-                    dies.append(live & ((address >> 21 & 1) != 0))
+            dies = self.range_dies(ranges, experts, tid)
             for p in cutlass.range_constexpr(4):
                 ballot = cute.arch.vote_ballot_sync(dies[p])
                 if lane == 0:
                     bits[p * 12 + warp] = Uint32(ballot)
+
+    @cute.jit
+    def range_dies(self, ranges, experts, rank):
+        """``home_bits``' four dies of ``rank`` (its ``partition`` ``ranges``)."""
+        dies = []
+        for kind in cutlass.range_constexpr(2):
+            for group in cutlass.range_constexpr(2):
+                lo, hi = (ranges[group, 2 + 2 * kind], ranges[group, 3 + 2 * kind])
+                mid = (lo + hi) // 2
+                if cutlass.const_expr(kind == 0):
+                    tile = 3 * ranges[group, 0] + mid // 14
+                    row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
+                    address = Int64(row) * 1792 + mid % 14 * 128
+                else:
+                    row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
+                    address = Int64(row) * 128
+                live = (rank < self.grid) & (lo < hi)
+                dies.append(live & ((address >> 21 & 1) != 0))
+        return dies
+
+    @cute.jit
+    def load_ready(self, sm, workspace, batch: Int32, arrival=None):
+        """``ready``: ``group``'s tables, ``home_bits``' FC2(B) list and this CTA's
+        ``matched`` ranks out of the ready region, one round trip (routing wrote them:
+        complete at the dependency wait). Misc scalars as ``group``."""
+        tid, warp, lane, cta = thread()
+        ws = workspace.iterator + self.ws_ready
+        scalars = view(sm.iterator, self.off_misc + 1140, Int32, 3)
+        slots = self.slots
+        calls = view(workspace.iterator, self.ws_counter, Int32, slots)[cta]
+        grouped = view(workspace.iterator, self.ws_calls, Int32, slots)[cta]
+        pairs = batch * 16  # units <= pairs
+        tables = sm.iterator + self.off_tables
+        for i in cutlass.range(tid, (pairs + 3) // 4, self.threads, unroll=1):
+            copy_g2s(tables + 16 * i, ws + R_EXPERTS + 16 * i)
+        for i in cutlass.range(tid, pairs, self.threads, unroll=1):
+            copy_g2s(tables + 4 * self.units + 16 * i, ws + R_ROWS + 16 * i)
+        cute.arch.cp_async_commit_group()
+        if tid == 0:
+            header = load_words(ws, count=1, mutable=True)
+            scalars[0], scalars[1], scalars[2] = (Int32(header[0]), calls, grouped)
+        if cutlass.const_expr(len(self.dies) > 0):
+            words: cutlass.Constexpr = (self.grid + 31) // 32
+            if tid < words:  # FC2(B)'s home bits (``pool_homed``)
+                word = load_words(ws + R_BITS + 4 * (24 + tid), count=1, mutable=True)
+                view(sm.iterator, self.off_misc + 2704 + 144, Uint32, 12)[tid] = word[0]
+            self.arrive(sm, workspace, arrival)
+            if (warp == 2) & (lane == 0):
+                info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
+                entry = R_RANKS + 8 * (info[0] * self.grid + info[3])
+                pair = load_words(ws + entry, count=2, mutable=True)
+                ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
+                ranks[0] = Int32(pair[0] & Uint32(65535))
+                ranks[1] = Int32(pair[0] >> Uint32(16))
+                ranks[2] = Int32(pair[1] & Uint32(65535))
+                ranks[3] = Int32(pair[1] >> Uint32(16))
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
 
     @cute.jit
     def matched(self, sm):
@@ -1216,7 +1276,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
         # Images and rearm alternate over grouped calls; ``x`` is the plan.
         routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
-        self.group(sm, ids, workspace, batch, arrival=arrival)
+        if cutlass.const_expr(self.ready):
+            self.load_ready(sm, workspace, batch, arrival)
+        else:
+            self.group(sm, ids, workspace, batch, arrival=arrival)
         if tid == 0:
             self.stamp(2)
         distinct, call_count, generation = (routed[0], routed[1], routed[2])
@@ -1275,3 +1338,199 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 grouped[self.grid + cta] = generation + 1
             if cta == 0:
                 grouped[self.slots + (generation & 1)] = distinct
+
+
+@asm(Uint32)
+def count_route(pointer):
+    """GPU-scope acq_rel ``atom.add.u32`` of 1: the value before."""
+    return (
+        "atom.acq_rel.gpu.global.add.u32 $0,[$1],1;",
+        "=r,l,~{memory}",
+        (pointer,),
+    )
+
+
+class ReadyTable:
+    """Routing's side of ``RubinGroupedExpertsKernel`` ready: every route CTA counts
+    itself after its publish; the last one (256 threads) groups all routes into the
+    ready region exactly as ``group`` (per-expert token masks, units in expert order,
+    rows in token order), then ``home_bits`` of every rank and, for every (die,
+    arrival k), the four ``matched`` ranks (the k-th rank homed on the die, then the
+    other die's from the end: ``match_arrival``) from per-die rank lists. ``moe``:
+    the experts kernel (grid, partition, dies)."""
+
+    O_MASKS, O_BASE, O_TOTALS = 0, 7168, 10752
+    O_EXPERTS, O_ROWS = 10816, 14912
+    O_BITS, O_LISTS, O_SCALARS = 31296, 31424, 35520
+    SMEM = 35584
+    THREADS = 256
+
+    def __init__(self, moe):
+        assert moe.experts == 896 and moe.units == 1024 and moe.grid <= 256
+        self.moe = moe
+
+    @cute.jit
+    def count(self, ready, batch: cutlass.Constexpr[int], sbuf):
+        """Every route CTA after its ids (all threads): True in the last one. The
+        count word starts all-ones (armed); the last arrival re-arms it (the next
+        writer is the next layer's routing, after this call's experts completed)."""
+        tid = cute.arch.thread_idx()[0]
+        flag = view(sbuf.iterator, self.O_SCALARS + 4, Int32, 1)
+        cute.arch.sync_threads()  # the publish's id stores before the release
+        if tid == 0:
+            before = count_route(ready.iterator + 4)
+            last = (before + Uint32(1)) == Uint32(batch - 1)
+            flag[0] = Int32(last)
+            if last:
+                mailbox_store(ready.iterator + 4, (Uint32(4294967295),))
+        cute.arch.sync_threads()
+        return flag[0] != 0
+
+    @cute.jit
+    def build(self, ids, ready, batch: cutlass.Constexpr[int], sbuf):
+        """The last route CTA: the ready region (see the class)."""
+        moe = self.moe
+        tid = cute.arch.thread_idx()[0]
+        warp, lane = (tid // 32, tid % 32)
+        threads: cutlass.Constexpr = self.THREADS
+        experts_n: cutlass.Constexpr = 896
+        grid: cutlass.Constexpr = moe.grid
+        base_ptr = sbuf.iterator
+        masks = view(base_ptr, self.O_MASKS, Uint32, 2 * experts_n)
+        base = view(base_ptr, self.O_BASE, Int32, experts_n)
+        totals = view(base_ptr, self.O_TOTALS, Int32, threads // 32)
+        experts = view(base_ptr, self.O_EXPERTS, Int32, 1024)
+        rows = view(base_ptr, self.O_ROWS, Int16, 8 * 1024)
+        row_words = view(base_ptr, self.O_ROWS, Uint32, 4 * 1024)
+        scalars = view(base_ptr, self.O_SCALARS, Int32, 8)
+        pairs: cutlass.Constexpr = batch * 16
+        assert pairs <= 4 * threads
+        # every id in one round trip (4 per thread); the masks and rows clear meanwhile
+        mine = cute.make_rmem_tensor(4, Int32)
+        for i in cutlass.range_constexpr(4):
+            mine[i] = Int32(0)
+        if 4 * tid < pairs:
+            got = load_words(ids.iterator + 4 * tid, count=4, scope="gpu")
+            for i in cutlass.range_constexpr(4):
+                mine[i] = Int32(got[i])
+        for i in cutlass.range(tid, 2 * experts_n, threads, unroll=1):
+            masks[i] = Uint32(0)
+        for i in cutlass.range(tid, 4 * 1024, threads, unroll=1):
+            row_words[i] = Uint32(4294967295)
+        cute.arch.sync_threads()
+        for i in cutlass.range_constexpr(4):
+            pair = 4 * tid + i
+            if pair < pairs:
+                token = pair >> 4
+                bit = Uint32(1) << (token & 31)
+                word = masks.iterator + 2 * mine[i] + (token >> 5)
+                cute.arch.atomic_or(word, bit, sem="relaxed", scope="cta")
+        cute.arch.sync_threads()
+        span: cutlass.Constexpr = (experts_n + threads - 1) // threads
+        units = cute.make_rmem_tensor(span, Int32)
+        count = Int32(0)
+        for j in cutlass.range_constexpr(span):
+            units[j], e = (Int32(0), span * tid + j)
+            if e < experts_n:
+                n = cute.arch.popc(masks[2 * e]) + cute.arch.popc(masks[2 * e + 1])
+                units[j] = Int32(n + 7) >> 3
+            count += units[j]
+        total = count
+        for shift in cutlass.range_constexpr(5):
+            other = cute.arch.shuffle_sync_up(total, 1 << shift)
+            if lane >= 1 << shift:
+                total += other
+        if lane == 31:
+            totals[warp] = total
+        cute.arch.sync_threads()
+        start = total - count
+        for w in cutlass.range_constexpr(threads // 32 - 1):
+            if warp > w:
+                start += totals[w]
+        if tid == threads - 1:
+            scalars[0] = start + count
+        most: cutlass.Constexpr = (moe.capacity + 7) // 8
+        for j in cutlass.range_constexpr(span):
+            e = span * tid + j
+            if e < experts_n:
+                base[e] = start
+                for v in cutlass.range_constexpr(most):
+                    if v < units[j]:
+                        experts[start + v] = e
+            start += units[j]
+        cute.arch.sync_threads()
+        distinct = scalars[0]
+        for i in cutlass.range_constexpr(4):
+            pair = 4 * tid + i
+            if pair < pairs:
+                e, token = (mine[i], pair >> 4)
+                low, word = (masks[2 * e], masks[2 * e + 1])
+                rank = Int32(0)
+                if token < 32:
+                    word = low
+                else:
+                    rank = Int32(cute.arch.popc(low))
+                below = (Uint32(1) << (token & 31)) - 1
+                rank += Int32(cute.arch.popc(word & below))
+                rows[(base[e] + (rank >> 3)) * 8 + (rank & 7)] = Int16(pair)
+        out = ready.iterator
+        if cutlass.const_expr(len(moe.dies) > 0):
+            words: cutlass.Constexpr = (grid + 31) // 32
+            bits = view(base_ptr, self.O_BITS, Uint32, 32)
+            lists = view(base_ptr, self.O_LISTS, Int16, 2048)
+            if warp < words:
+                ranges = moe.partition(distinct, tid)
+                dies = moe.range_dies(ranges, experts, tid)
+                for p in cutlass.range_constexpr(4):
+                    ballot = cute.arch.vote_ballot_sync(dies[p])
+                    if lane == 0:
+                        bits[8 * p + warp] = Uint32(ballot)
+            cute.arch.sync_threads()
+            # per list and die, the ranks in ascending order (``match_arrival``'s)
+            masks_w = [(1 << min(32, grid - 32 * w)) - 1 for w in range(words)]
+            if tid < grid:
+                for p in cutlass.range_constexpr(4):
+                    own = (bits[8 * p + (tid >> 5)] >> Uint32(tid & 31)) & Uint32(1)
+                    flip = Uint32(0) - (Uint32(1) - own)  # all-ones on die 0
+                    position = Int32(0)
+                    for w in cutlass.range_constexpr(words):
+                        same = (bits[8 * p + w] ^ flip) & Uint32(masks_w[w])
+                        if w < (tid >> 5):
+                            position += Int32(cute.arch.popc(same))
+                        elif w == (tid >> 5):
+                            below = (Uint32(1) << Uint32(tid & 31)) - Uint32(1)
+                            position += Int32(cute.arch.popc(same & below))
+                    lists[(2 * p + Int32(own)) * 256 + position] = Int16(tid)
+            if tid < 4:
+                h1 = Int32(0)
+                for w in cutlass.range_constexpr(words):
+                    word = bits[8 * tid + w] & Uint32(masks_w[w])
+                    h1 += Int32(cute.arch.popc(word))
+                scalars[4 + tid] = h1
+            cute.arch.sync_threads()
+            for q in cutlass.range(tid, 2 * grid, threads, unroll=1):
+                die, k = (q // grid, q % grid)
+                packed = [Uint32(0), Uint32(0)]
+                for p in cutlass.range_constexpr(4):
+                    h1 = scalars[4 + p]
+                    own, other = (grid - h1, h1)
+                    if die == 1:
+                        own, other = (h1, grid - h1)
+                    target, index = (die, k)
+                    if k >= own:
+                        target, index = (1 - die, other - 1 - (k - own))
+                    rank = Uint32(Int32(lists[(2 * p + target) * 256 + index]))
+                    packed[p // 2] = packed[p // 2] | (rank << Uint32(16 * (p % 2)))
+                store_words(out + R_RANKS + 8 * q, (packed[0], packed[1]))
+            if tid < 32:
+                store_words(out + R_BITS + 4 * tid, (bits[tid],))
+        else:
+            cute.arch.sync_threads()
+        for i in cutlass.range(tid, (distinct + 3) // 4, threads, unroll=1):
+            words4 = load_words(base_ptr + self.O_EXPERTS + 16 * i, count=4, shared=True)
+            store_words(out + R_EXPERTS + 16 * i, words4)
+        for i in cutlass.range(tid, distinct, threads, unroll=1):
+            words4 = load_words(base_ptr + self.O_ROWS + 16 * i, count=4, shared=True)
+            store_words(out + R_ROWS + 16 * i, words4)
+        if tid == 0:
+            store_words(out, (Uint32(distinct),))

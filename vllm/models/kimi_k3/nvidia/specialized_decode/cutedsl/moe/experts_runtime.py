@@ -35,7 +35,7 @@ from .experts_rubin import (
     peers_bytes,
     peers_offset,
 )
-from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
+from .experts_rubin64 import CENSUS_BYTES, READY_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
 from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
@@ -146,6 +146,14 @@ FAST_EXCHANGE = {16: "8:1"}
 # zone 12: M16 zone 0 -1.42, M24 zone 6 -0.53, M32 zone 6 -0.20 us per call (M40-64:
 # zone 6 within 0.15, zone 0 +0.7 to +1.0).
 POOL_ZONE = {16: "9-16:0,17-32:6"}
+# Verify steps (q > 1), by TP: rows on ``RubinGroupedExpertsKernel`` whose routing
+# kernel builds the ready unit table (``ReadyTable``: the last route CTA groups the
+# routes, home bits and matched ranks of every arrival; the route CTAs release the
+# experts at their publish, so the experts' launch and prologue overlap that grouping)
+# and whose experts copy it after their dependency wait instead of grouping (2.3 us
+# per layer after the wait at M16-32, 16 ranks). Not M64: its experts are released
+# after the front GEMM, so the grouping would add to routing's end unhidden.
+READY = {16: "9-63:1"}
 
 
 def polled(tp, batch, device):
@@ -384,16 +392,17 @@ def place(routed):
 
 @functools.cache
 def compile_rubin64(
-    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
+    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12,
+    ready=False,
 ):  # fmt: skip
     """``compile_experts``' arguments (plan, publish modes incl. two-shot) for
     ``RubinGroupedExpertsKernel``, then the w13 / w2 addresses; ``dies``: the SMs'
     dies when the weights were ``place``d; ``static``: constant epilogue-group
     barrier ids (``ExpertsKernel.static_groups``); ``zone``: the FC2 tail pool's
-    (``POOL_ZONE``)."""
+    (``POOL_ZONE``); ``ready``: the CTAs copy routing's ready table (``READY``)."""
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static,
+        static_groups=static, ready=ready,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
@@ -537,6 +546,9 @@ class PersistentExperts:
         self.fast = batch_table(FAST_EXCHANGE.get(self.tp, "") if q > 1 else "")
         self.rows64 = batch_table(RUBIN64_VERIFY.get(self.tp, "") if q > 1 else "")
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
+        self.readies = batch_table(READY.get(self.tp, "") if q > 1 else "")
+        # prepared ``READY`` batches: (experts, grid, slots, dies), the ready region
+        self.ready: dict[int, tuple] = {}
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
         self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
         self.slots = workspace_slots(self.device)
@@ -623,10 +635,20 @@ class PersistentExperts:
             return
         if planned and batch > 8 and self.grouped64(batch):
             grid = self.grid_for(batch)
+            ready = bool(self.readies.get(batch)) and batch < 64
             code = compile_rubin64(
                 self.experts, batch, grid, self.device.index, mode, self.slots,
                 self.dies, bool(self.static.get(batch)), self.zones.get(batch, 12),
+                ready,
             )  # fmt: skip
+            if ready:
+                start = RubinGroupedExpertsKernel(
+                    self.experts, grid, self.slots, dies=self.dies, ready=True
+                ).ws_ready
+                region = buffers["workspace"][start : start + READY_BYTES]
+                assert region.numel() == READY_BYTES, "no ready region (scratch)"
+                key = (self.experts, grid, self.slots, self.dies)
+                self.ready[batch] = key, region
             check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
             ws = tensor(buffers["workspace"])
             plan = (tensor(buffers["plan"]),)
