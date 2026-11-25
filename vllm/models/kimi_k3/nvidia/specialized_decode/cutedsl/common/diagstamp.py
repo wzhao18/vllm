@@ -21,6 +21,10 @@ from cutlass import Int64, Uint32
 from .primitives import asm
 
 RING, CTAS, SLOTS = 256, 128, 8
+# Stamp buffer addresses are baked into the compiled code, so a shared (Lustre) cute
+# cache entry compiled by one rank is an illegal address on every other rank: this
+# process compiles into its own node-local cache (read per compile by cute_cache).
+os.environ["VLLM_KIMI_K3_CUTE_CACHE_DIR"] = f"/tmp/oadiag-cutecache-{os.getpid()}"
 _BUFS: dict = {}
 
 
