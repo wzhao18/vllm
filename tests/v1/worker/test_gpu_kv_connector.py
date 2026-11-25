@@ -135,3 +135,59 @@ def test_deferred_finalize_keeps_sync_loads_before_forward(
     connector.post_forward(set(), defer_finalize=True)
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]
+
+
+def test_execute_model_launches_the_state_precopy_after_sync_loads():
+    """The Mamba "align" pre-copy reads blocks a same-step load writes outside the
+    CUDA streams; pre_forward returns once those loads landed, so execute_model
+    launches the staged pre-copy right after every pre_forward, before the
+    forward, and nowhere before."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    source = textwrap.dedent(inspect.getsource(GPUModelRunner.execute_model))
+    calls = sorted(
+        (node.lineno, node.func.value.attr, node.func.attr)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and (node.func.value.attr, node.func.attr)
+        in (
+            ("kv_connector", "pre_forward"),
+            ("model_state", "launch_state_precopy"),
+            ("model_state", "preprocess_state"),
+        )
+    )
+    order = [(owner, name) for _, owner, name in calls]
+    assert order == [
+        ("model_state", "preprocess_state"),
+        ("kv_connector", "pre_forward"),
+        ("model_state", "launch_state_precopy"),
+        ("kv_connector", "pre_forward"),
+        ("model_state", "launch_state_precopy"),
+    ]
+    forward_lines = [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("run_fullgraph", "run_pw_graph", "run")
+    ]
+    launches = [line for line, _, name in calls if name == "launch_state_precopy"]
+    assert all(any(f > launches[0] for f in forward_lines) for _ in launches)
+
+
+def test_k3_step_prep_stages_the_state_precopy():
+    """The K3 fused step prep stages the pre-copy like preprocess_state; it does
+    not enqueue it ahead of the connector's same-step loads."""
+    import inspect
+
+    from vllm.models.kimi_k3.nvidia.model_state import KimiK3ModelState
+
+    source = inspect.getsource(KimiK3ModelState._run_step_prep)
+    assert "run_fused_precopy" not in source
+    assert "_stage_precopy" in source

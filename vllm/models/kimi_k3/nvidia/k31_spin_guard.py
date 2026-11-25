@@ -201,7 +201,14 @@ def spin_tick(n, t0, observed=0, target=0, rank=-1, size=-1, kernel=None, site=N
               polls=1):
     """Count ``polls`` (a divisor or multiple of SPIN_POLLS) failed polls of a wait;
     returns (n, t0). ``site`` defaults to the poll loop's source location
-    (``caller_site``), ``kernel`` to its file."""
+    (``caller_site``), ``kernel`` to its file.
+
+    ``K31_SPIN_GUARD=0`` traces the poll loops unguarded (no poll count, clock
+    read or timeout path; the polls and every value are unchanged), for decode
+    steps where the guards' registers and instructions in the hot poll loops cost
+    more than the budget above. The env var is part of the cute_cache key."""
+    if os.environ.get("K31_SPIN_GUARD", "1") == "0":
+        return n, t0
     if site is None:
         site = caller_site()
     if kernel is None:
