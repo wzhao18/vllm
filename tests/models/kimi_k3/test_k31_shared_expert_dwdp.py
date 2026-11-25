@@ -132,8 +132,9 @@ class _Forward:
         self.home = torch.randint(
             0, 256, (LAYERS, SLOT_BYTES), generator=g, device="cuda", dtype=torch.uint8
         )
+        self.depth = dense_dwdp.DEPTH  # staging slots (fixed at load)
         self.slots = torch.empty(
-            dense_dwdp.DEPTH, SLOT_BYTES, device="cuda", dtype=torch.uint8
+            self.depth, SLOT_BYTES, device="cuda", dtype=torch.uint8
         )
         self.out = torch.empty_like(self.home)
         class SkewCopies(edwdp.Copies):
@@ -165,7 +166,7 @@ class _Forward:
         self.events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(LAYERS)]
 
     def weights(self, i):
-        return self.home[0] if i == 0 else self.slots[i % dense_dwdp.DEPTH]
+        return self.home[0] if i == 0 else self.slots[i % self.depth]
 
     def __call__(self, skew):
         main = torch.cuda.current_stream()
