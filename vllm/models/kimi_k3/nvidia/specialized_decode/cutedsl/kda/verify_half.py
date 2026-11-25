@@ -56,6 +56,11 @@ HALF_ROWS = 64
 HALF_PAGE = HALF_ROWS * K * 4  # 32 KiB of the item's FP32 page
 COPY_BYTES = 16384
 GROUP = 128  # threads of a prologue warp group (thread = channel)
+# Dynamic shared memory requested per CTA (the kernel uses ~53 KB at q8): more than
+# half of an SM's, so no SM holds two of its CTAs. Launched early (PDL) while the
+# in-projection drains, two halves per freed SM would share it (1-GPU chain at q8
+# B16: 192 CTAs on 97 SMs, +1.2-1.5 us per layer vs LoopStock).
+HALF_SMEM = 120 * 1024
 
 
 @asm(Uint32)
@@ -90,9 +95,10 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
     def __call__(self, *args):
         assert args[0].shape[0] // self.tokens * self.heads == self.items
         ctas = 2 * self.items
-        # two CTAs per SM can share its register file (<= 128 registers a thread)
+        # <= 128 registers a thread (another kernel's CTA can share the SM), and
+        # HALF_SMEM: at most one of these CTAs per SM
         launch(
-            self.kernel, args, ctas, HALF_THREADS,
+            self.kernel, args, ctas, HALF_THREADS, smem=HALF_SMEM,
             max_number_threads=[HALF_THREADS, 1, 1], min_blocks_per_mp=2,
         )  # fmt: skip
 
@@ -216,11 +222,12 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             cute.arch.sync_threads()
             # this half's rows of every token -> the item's scratch row
             row_base = scratch.iterator + Int64(item) * (T * 128)
-            for i in cutlass.range_constexpr(T * HALF_ROWS // HALF_THREADS):
+            for i in cutlass.range_constexpr(-(-T * HALF_ROWS // HALF_THREADS)):
                 index = thread + HALF_THREADS * i
                 t, row = index // HALF_ROWS, HALF_ROWS * half + index % HALF_ROWS
                 position = t * 128 + self.output_position(row)
-                scratch[item, position] = shared_o[position]
+                if index < T * HALF_ROWS:
+                    scratch[item, position] = shared_o[position]
             _fence()
             cute.arch.sync_threads()
             counter = counters.iterator + item
@@ -230,15 +237,16 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
             l5diag.stamp(drow, 6, thread == 0)
             if last[0] == 1:  # the second half: the gated norm of every token
                 _fence()
-                for i in cutlass.range_constexpr(T * 128 // (4 * HALF_THREADS)):
+                for i in cutlass.range_constexpr(-(-T * 128 // (4 * HALF_THREADS))):
                     index = 4 * (thread + HALF_THREADS * i)
-                    values = _load_f32x4_gpu((row_base + index).toint())
-                    for e in cutlass.range_constexpr(4):
-                        shared_o[index + e] = values[e]
+                    if index < T * 128:
+                        values = _load_f32x4_gpu((row_base + index).toint())
+                        for e in cutlass.range_constexpr(4):
+                            shared_o[index + e] = values[e]
                 cute.arch.sync_threads()
                 nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
                 c, glane = thread % 64, thread % 32
-                for tt in cutlass.range_constexpr(T * 64 // HALF_THREADS):
+                for tt in cutlass.range_constexpr(-(-T * 64 // HALF_THREADS)):
                     t = thread // 64 + (HALF_THREADS // 64) * tt
                     if t < T:
                         gates = zeros(2, gate.element_type)
