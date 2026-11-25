@@ -119,7 +119,13 @@ def _worker(local_rank: int, world_size: int, port: int) -> None:
 
 def _check(rank: int, world_size: int, device) -> None:
     from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar as g
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
+    )
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
     from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
 
     op = g.GemmRsAr(max_M=max(_ROWS), N=_N, all_reduce=True)
@@ -182,6 +188,45 @@ def _check(rank: int, world_size: int, device) -> None:
         assert e_fused < 4e-3 and e_stock < 4e-3 and d < 4e-3
         # A BF16-input o_proj differs by the activation quantization error.
         assert e_bf16 > 5 * max(e_fused, e_stock, d)
+
+        # Pre-quantized input (the KDA gated o_norm's MXFP8 output): the fused
+        # op skips its quantize and gives the BF16-input result bitwise.
+        x_q, x_sf_sw = orig_q(x, is_sf_swizzled_layout=True)
+        qa = QuantizedActivation(
+            data=x_q,
+            scale=x_sf_sw.view(torch.uint8),
+            orig_dtype=torch.bfloat16,
+            orig_shape=x.shape,
+            quant_key=kMxfp8Dynamic,
+        )
+        assert op.should_run(qa) == op.should_run(x)
+        seen.clear()
+        mxfp8_utils.mxfp8_e4m3_quantize = spy
+        try:
+            fused_q = op.apply(qa, kda).clone()
+        finally:
+            mxfp8_utils.mxfp8_e4m3_quantize = orig_q
+        assert not seen, "a pre-quantized activation must not be re-quantized"
+        assert torch.equal(fused_q, fused)
+
+    # The KDA producer: gated o_norm written as MXFP8 (kda_norm) into the fused
+    # op == the BF16 gated o_norm (in place) into the fused op, bitwise.
+    from vllm.models.kimi_k3.nvidia.ops import kda_norm
+
+    heads = _K_KDA // 128
+    for M in _ROWS:
+        core = (torch.randn(1, M, heads, 128, generator=gen, device=device) * 3).to(
+            torch.bfloat16
+        )
+        gate = (torch.randn(M, heads, 128, generator=gen, device=device) * 2).to(
+            torch.bfloat16
+        )
+        nw = torch.rand(128, generator=gen, device=device) + 0.5
+        qa = kda_norm.rmsnorm_gated_mxfp8(core, gate, nw, 1e-6)
+        via_mx = op.apply(qa, kda).clone()
+        kda_norm.rmsnorm_gated_(core, gate, nw, 1e-6)
+        via_bf16 = op.apply(core.view(M, _K_KDA), kda).clone()
+        assert torch.equal(via_mx, via_bf16), f"KDA o_norm MXFP8 route M={M}"
 
     # --- DSA o_proj: BF16 checkpoint linear --------------------------------
     wb = (torch.randn(_N, _K_DSA, generator=gen, device=device) * _K_DSA**-0.5).to(
