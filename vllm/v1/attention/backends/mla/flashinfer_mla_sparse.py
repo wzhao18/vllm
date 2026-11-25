@@ -709,10 +709,12 @@ def trtllm_gen_lse_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
       K3.1's 12 or 24 heads per rank), so up to max_num_batched_tokens rows.
       No step keeps it for a full gathered-context workspace: that holds at
       least max_model_len tokens, so one request always fits, and larger steps
-      run in request groups.
+      run in request groups. PIECEWISE CUDA graphs run attention eagerly on
+      the real rows, so the largest capture size does not bound these steps
+      (``get_dcp_workspace_max_num_tokens``).
 
-    The slab covers ``dcp_fallback_max_tokens`` rows (2048 rows for Kimi K3.1
-    C512 prefill against 32768 tokens per step: 0.9 instead of 8.4 GiB per
+    The slab covers ``dcp_fallback_max_tokens`` rows (1279 rows for Kimi K3.1
+    C512 prefill against 32768 tokens per step: 0.7 instead of 8.4 GiB per
     rank at 128 padded heads); the layer runs a dense-MHA step's DCP-path MQA
     in row chunks of that many rows, end to end (query gather, kernel,
     combine), so the profile claims its working set at this bound too
