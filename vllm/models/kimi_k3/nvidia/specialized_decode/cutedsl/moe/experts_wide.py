@@ -448,19 +448,83 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             if rank >= half:
                 target, job = (1 - die, 2 * half - 1 - rank)
             address = stage.toint()
-            for i in range(job, batch * 14, half):
-                page = address + Int64(i) * 8192
-                bits = Uint32(Int32(page >> 12) & Int32(0x1DB))
-                c = Int32((page >> 21) - (address >> 21))
-                if cutlass.const_expr(self.capacity <= 512):  # 32 chunks at most
-                    word = homes[0] >> Uint32(c)
-                else:  # the staged rows span up to 44 chunks: two words
-                    word = homes[c >> 5] >> Uint32(c & 31)
-                h = (Int32(cute.arch.popc(bits)) ^ Int32(word)) & 1
-                self.unit(stage, weights, box, 2 * i + Int32(h != target), lane)
+            # Two of the warp's units a round (``units``: both units' polls in flight
+            # at once), the same units in the same order.
+            for i in range(job, batch * 14, 2 * half):
+                first = self.home_unit(address, homes, i, target)
+                second = first
+                more = i + half < batch * 14
+                if more:
+                    second = self.home_unit(address, homes, i + half, target)
+                self.units(stage, weights, box, first, second, more, lane)
         else:
-            for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):
-                self.unit(stage, weights, box, unit, lane)
+            stride = self.grid * 10
+            for unit in range(cta * 10 + warp - 2, batch * 28, 2 * stride):
+                more = unit + stride < batch * 28
+                second = unit
+                if more:
+                    second = unit + stride
+                self.units(stage, weights, box, unit, second, more, lane)
+
+    @cute.jit
+    def home_unit(self, address, homes, i, target):
+        """Unit 2i or 2i + 1 of pair i: the one on die ``target``."""
+        page = address + Int64(i) * 8192
+        bits = Uint32(Int32(page >> 12) & Int32(0x1DB))
+        c = Int32((page >> 21) - (address >> 21))
+        if cutlass.const_expr(self.capacity <= 512):  # 32 chunks at most
+            word = homes[0] >> Uint32(c)
+        else:  # the staged rows span up to 44 chunks: two words
+            word = homes[c >> 5] >> Uint32(c & 31)
+        h = (Int32(cute.arch.popc(bits)) ^ Int32(word)) & 1
+        return 2 * i + Int32(h != target)
+
+    @cute.jit
+    def units(self, stage, weights, box, first, second, more, lane):
+        """``unit`` on ``first`` and (``more``) ``second`` with one poll loop over
+        both units' 32 slots: the second unit's loads in flight with the first's
+        (finalize is a chain of L2 round trips, one a unit, after the last FC2 job).
+        Per unit the same loads, re-arm, FMA chains in slot order and stores."""
+        source = (stage + Int64(first) * 4096 + lane * 8, stage + Int64(second) * 4096 + lane * 8)
+        token = (first // 28, second // 28)
+        words = cute.make_rmem_tensor(64, Uint32)
+        scale = cute.make_rmem_tensor(32, Float32)
+        ones = Uint32(4294967295)
+        for u in cutlass.range_constexpr(2):
+            for slot in cutlass.range_constexpr(16):
+                scale[16 * u + slot] = Float32(weights[token[u] * 16 + slot])
+        ready = False
+        sgn, sgt = spin_start()
+        while not ready:
+            bad = False
+            for u in cutlass.range_constexpr(2):
+                for slot in cutlass.range_constexpr(16):
+                    pair = load_volatile(source[u] + slot * 256, count=2)
+                    words[32 * u + 2 * slot], words[32 * u + 2 * slot + 1] = pair
+                    bad |= (pair[0] == ones) | (pair[1] == ones)
+            ready = cute.arch.vote_all_sync(not bad)
+            if not ready:
+                sleep_ns(64)
+            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
+        self.unit_sum(box, source[0], words, scale, 0, token[0], first % 28 * 128, lane)
+        if more:
+            column = second % 28 * 128
+            self.unit_sum(box, source[1], words, scale, 1, token[1], column, lane)
+
+    @cute.jit
+    def unit_sum(self, box, source, words, scale, u: cutlass.Constexpr[int], token, column, lane):
+        """``units``' unit ``u``: re-arm, the FMA chains in slot order, the stores."""
+        ones = Uint32(4294967295)
+        low = [Float32(0), Float32(0)]
+        high = [Float32(0), Float32(0)]
+        for slot in cutlass.range_constexpr(16):
+            store_words(source + slot * 256, (ones, ones))
+            for v in cutlass.range_constexpr(2):
+                w = words[32 * u + 2 * slot + v]
+                low[v] = fma(bf16(w), scale[16 * u + slot], low[v])
+                high[v] = fma(bf16(w, True), scale[16 * u + slot], high[v])
+        packed = [pack_pair(low[v], high[v], policy="latent") for v in range(2)]
+        self.unit_store(box, token, column, packed, lane)
 
     @cute.jit
     def unit(self, stage, weights, box, unit, lane):
@@ -494,6 +558,11 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 low[v] = fma(bf16(words[2 * slot + v]), scale[slot], low[v])
                 high[v] = fma(bf16(words[2 * slot + v], True), scale[slot], high[v])
         packed = [pack_pair(low[v], high[v], policy="latent") for v in range(2)]
+        self.unit_store(box, token, column, packed, lane)
+
+    @cute.jit
+    def unit_store(self, box, token, column, packed, lane):
+        """A unit's packed latent words (``unit``'s stores)."""
         if cutlass.const_expr(self.publish == "twoshot"):
             # box: the receive slots [parities x TP, capacity, 3584 / TP], the owners'
             # bases, this rank's slot (parity x TP + rank): the words LatentRows would
