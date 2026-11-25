@@ -39,6 +39,9 @@ class KdaSplitDefer(RecoverKdaSplit):
     """``prepared.KdaSplitStock`` (verify, q >= 2) under the deferred protocol."""
 
     bf16_state = False
+    # The fold after the PDL wait, under the input loads (its state loads then
+    # overlap them as the stock verify's do) instead of before the wait.
+    fold_late = False
 
     def __init__(self, heads, batch, gate_mode, has_bias, schedule, tokens):
         assert tokens >= 2, "KdaSplitDefer: verify only"
@@ -149,11 +152,12 @@ class KdaSplitDefer(RecoverKdaSplit):
                             for t in cutlass.range_constexpr(1, T):
                                 accum[3 * t + s] = accum[s]
                 nw = norm_weight[thread]
-                # the fold (before the PDL wait: records and counts are host-ordered)
-                cute.arch.barrier(barrier_id=2, number_of_threads=128)  # rec_barrier armed
-                if pending > 0:
-                    wait(rec_barrier, 0, scope="cta")
-                    self.fold(history, rec, pending, value_base, group, group_lane)
+                # rec_barrier armed before any thread waits on it
+                cute.arch.barrier(barrier_id=2, number_of_threads=128)
+                if cutlass.const_expr(not self.fold_late):  # the fold before the wait
+                    if pending > 0:
+                        wait(rec_barrier, 0, scope="cta")
+                        self.fold(history, rec, pending, value_base, group, group_lane)
 
                 cute.arch.griddepcontrol_wait()
                 inputs = cute.make_rmem_tensor(3 * T, BFloat16)
@@ -177,6 +181,10 @@ class KdaSplitDefer(RecoverKdaSplit):
                         betas.append(Float32(beta[row, head]))
                         gates.append(Float32(gate[row, qk_channel]))
                 cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(self.fold_late):  # the fold under the input loads
+                    if pending > 0:
+                        wait(rec_barrier, 0, scope="cta")
+                        self.fold(history, rec, pending, value_base, group, group_lane)
 
                 vs, squares, qks = [], [], []
                 for t in cutlass.range_constexpr(T):  # window: 3 taps, then the inputs
