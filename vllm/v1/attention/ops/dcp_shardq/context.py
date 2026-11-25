@@ -359,6 +359,11 @@ class DcpShardQContext:
     # Under ``rank_major``: the next DSA layer's copies, issued a layer ahead
     # (``prefetch``), by the address of that layer's MLA cache.
     mla_prefetch: "tuple[int, InFlight] | None" = None
+    # Under ``rank_major``: the MLA cache address of the DSA layer whose
+    # attention consumed its copies (``after_attend``) since its last gather. A
+    # repeated attention over that same gathered context (no new gather, e.g. a
+    # replicated-query recompute) has nothing in flight and issues nothing.
+    mla_attended: int | None = None
     # Under ``rank_major``: the forward context and the MLA caches and block
     # tables of its DSA layers that attend this context, in layer order
     # (``_dsa_layers``).
@@ -486,6 +491,7 @@ class DcpShardQContext:
         assert plan is not None
         prefetched = self.mla_prefetch
         self.mla_prefetch = None
+        self.mla_attended = None
         if prefetched is not None:
             # This layer's MLA rows were packed and copied a layer ahead.
             if prefetched[0] != mla_cache.data_ptr():
@@ -604,8 +610,13 @@ class DcpShardQContext:
         from vllm.v1.attention.ops.dcp_shardq import rank_major
 
         in_flight = self.mla_in_flight
+        if in_flight is None and self.mla_attended == mla_cache.data_ptr():
+            # The same layer's attention again over its already gathered
+            # context: its copies were waited for and the next layer's issued.
+            return
         assert in_flight is not None and in_flight.waited
         self.mla_in_flight = None
+        self.mla_attended = mla_cache.data_ptr()
         layers = self._dsa_layers()
         ptrs = [cache.data_ptr() for cache, _ in layers]
         if layers and mla_cache.data_ptr() not in ptrs:
