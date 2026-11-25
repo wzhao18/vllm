@@ -517,13 +517,19 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             cute.arch.sync_warp()
             if lane == 0:
                 count_image(folded)
-        target = Uint32(8 * self.grid - 1)
-        seen = load_acquire(folded)
-        sgn, sgt = spin_start()
-        while seen != target:
-            sleep_ns(64)
+        # One poller a warp (lane 0, acquire), backed off: the 10 grid warps on one
+        # line all through FC2 (warps 2 / 3 arrive early) slowed the folds' L2 slice
+        # (+6..+8 us exit with every lane polling at 64 ns). The other lanes' reads
+        # follow the warp barrier after lane 0's acquire.
+        if lane == 0:
+            target = Uint32(8 * self.grid - 1)
             seen = load_acquire(folded)
-            sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
+            sgn, sgt = spin_start()
+            while seen != target:
+                sleep_ns(256)
+                seen = load_acquire(folded)
+                sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
+        cute.arch.sync_warp()
         acc = base + ACC_OFFSET
         for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):
             self.unit(acc, box, unit, lane)
