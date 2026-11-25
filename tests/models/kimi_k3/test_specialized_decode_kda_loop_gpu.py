@@ -308,7 +308,7 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
 # HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4), and
 # q4 / odd q (the conv window is written after both halves read its taps: at q4 / q5
 # an early writer raced the other half's tap loads before that fix).
-HALF_SHAPES = [(8, 16), (8, 17), (8, 4), (4, 16), (5, 8)]
+HALF_SHAPES = [(8, 16), (8, 17), (8, 11), (8, 15), (8, 4), (4, 16), (5, 8)]
 
 
 @pytest.mark.parametrize("q,requests", HALF_SHAPES, ids=lambda v: str(v))
@@ -344,11 +344,12 @@ def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
 
 
 def test_half_policy_rows():
-    """q8 B16-17 run HalfStock for an FP32 state; a BF16 state never does."""
-    for requests in (16, 17):
+    """q8 B11-17 run HalfStock (the DSMEM pair) for an FP32 state; a BF16 state never
+    does."""
+    for requests in range(11, 18):
         assert prepared.verify_kernel(requests, 8, RUBIN, False) == "halfstock"
         assert prepared.verify_kernel(requests, 8, RUBIN, True) != "halfstock"
-    for requests in (15, 18, 32, 64):
+    for requests in (9, 10, 18, 32, 64):
         assert prepared.verify_kernel(requests, 8, RUBIN, False) != "halfstock"
 
 

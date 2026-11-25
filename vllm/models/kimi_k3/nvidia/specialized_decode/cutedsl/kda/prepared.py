@@ -266,9 +266,14 @@ FP32_FEED_KIND = 8
 # head counts, e.g. the SP decode's 24, keep their rows).
 # The halves run as a cluster of two and exchange their outputs over DSMEM
 # (``KdaVerifyHalfPair``, bitwise): 1-GPU KDA chain (carve-out-100 AttnRes stand-in ->
-# in-projection 64.64.2.6 -> verify -> o-proj stand-in, 69 layers, us per layer) q8 B16
-# 25.82 -> 24.18 vs the global scratch + arrival counter exchange (10, "halfscratch").
-FP32_HALF: dict = {(10, 7): {8: {6: "16-17:1"}}}
+# the production in-projection -> verify -> o-proj stand-in, 69 layers, FP32 state +
+# conv, us per layer) q8 B16 25.82 -> 24.18 vs the global scratch + arrival counter
+# exchange (10, "halfscratch"), B17 32.93 -> 31.35. With the DSMEM exchange the rows
+# take precedence over FP32_SPLIT_Q (checked first): q8 B11-15 vs that table's / the
+# default KdaSplitStock, B11 23.73 -> 22.67, B12 23.37 -> 22.60, B13 23.65 -> 23.56,
+# B14 23.88 -> 23.74, B15 (1.8.4.4) 30.22 -> 23.84; B9 / B10 keep KdaSplitStock
+# (HalfPair +0.42 / +0.81).
+FP32_HALF: dict = {(10, 7): {8: {6: "11-17:1"}}}
 FP32_HALF_KIND = 9
 HALF_KINDS = (9, 10)  # kinds that take the scratch + counter operands
 # FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
@@ -300,7 +305,7 @@ HALF_KINDS = (9, 10)  # kinds that take the scratch + counter operands
 FP32_SPLIT_Q: dict = {
     (10, 7): {
         4: {6: "41-42:1.8.3.4"},
-        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
+        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},  # q8 B11-17: FP32_HALF first
     },
 }
 
@@ -399,6 +404,10 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     KdaSplit (an FP32 state: ``KdaSplitStock``)."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
+    if not bf16_state:  # LoopStock on two CTAs per item (bitwise), FP32_HALF's rows
+        halves = FP32_HALF.get(capability, {}).get(tokens, {}).get(heads, "")
+        if batch_table(halves).get(requests):
+            return FP32_HALF_KIND
     if not bf16_state and requests in fp32_split_table(capability, tokens, heads):
         return 0  # KdaSplitStock at FP32_SPLIT_Q's geometry (``schedule_of``)
     table = wide_table(capability, tokens, bf16_state)
@@ -410,10 +419,6 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
         feed = batch_table(FP32_FEED.get(capability, {}).get(tokens, ""))
         if feed.get(requests):  # LoopStock with feed warps (bitwise)
             kind = FP32_FEED_KIND
-        halves = FP32_HALF.get(capability, {}).get(tokens, {}).get(heads, "")
-        halves = batch_table(halves)
-        if halves.get(requests):  # LoopStock, two CTAs per item (bitwise)
-            kind = FP32_HALF_KIND
     if kind in BF16_ONLY and tokens > 4:
         kind = KIND_WIDE
     return kind or 0
