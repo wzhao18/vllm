@@ -489,7 +489,8 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         low = [Float32(0), Float32(0)]
         high = [Float32(0), Float32(0)]
         for slot in cutlass.range_constexpr(16):
-            store_words(source + slot * 256, (ones, ones))
+            if cutlass.const_expr(getattr(self, "diag_fc2_mode", 0) != 4):
+                store_words(source + slot * 256, (ones, ones))
             for v in cutlass.range_constexpr(2):
                 low[v] = fma(bf16(words[2 * slot + v]), scale[slot], low[v])
                 high[v] = fma(bf16(words[2 * slot + v], True), scale[slot], high[v])
@@ -513,7 +514,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         return (
             bool(self.publish)
             and not getattr(self, "diag_skip_fc2", False)
-            and getattr(self, "diag_fc2_mode", 0) == 0
+            and getattr(self, "diag_fc2_mode", 0) in (0, 4)
         )
 
     def staged_word(self, pair, tile, warp):

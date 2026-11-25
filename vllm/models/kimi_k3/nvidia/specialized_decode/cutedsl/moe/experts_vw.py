@@ -116,7 +116,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
 
     def diag_finalize(self):
         """DIAG (never merge): whether the finalize runs (plain Python, compile time)."""
-        return bool(self.publish) and not self.diag_skip_fc2 and self.diag_fc2_mode == 0
+        return bool(self.publish) and not self.diag_skip_fc2 and self.diag_fc2_mode in (0, 4)
 
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,
