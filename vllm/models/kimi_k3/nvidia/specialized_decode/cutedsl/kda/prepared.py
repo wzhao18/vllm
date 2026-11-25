@@ -273,28 +273,28 @@ FP32_FEED_KIND = 8
 #   q8 B15    1.8.4.4: 11.08 (1.8.3.4 11.81; LoopStock 11.24); cliff at B16 (15.87).
 #   q8 B18-22 1.8.3.4: B18 11.55 / B20 11.87 / B22 12.36 (LoopStock 12.81 / 13.22 /
 #             13.35). B23 up stays LoopStock (B24 LoopStock 13.14 vs 1.8.3.4
-#             20.10); B16-17: see the 2026-11-24 rows below.
+#             20.10), and so do B16-17 (see the 2026-11-24 note below).
 #   q4 B41-42 1.8.3.4: B42 13.81 (Feed 14.28), B40 13.62 vs Feed 14.24; B43 up stay
 #             Feed (B44 14.12 vs 14.31: within 2 %).
 # Measured, not adopted: 8-CTA clusters at four per SM at q8 B12-15 (9.75-12.14; its
 # one-wave capacity ends between 672 and 720 CTAs, not the 848 slots) and 2-CTA
 # clusters at q4 B36-44 (14.52-15.04 vs 1.8.3.4's 13.25-14.12: four passes per CTA
 # cost more than 1.8.3.4's second wave).
-# 2026-11-24 (DCP16 SOL, FP32 conv state as served): q8 B16-17 1.8.0.2. LoopStock
-# runs one CTA per (request, head) item, so 16 requests (96 items) leave 116 of 212
-# SMs idle while each busy SM runs its item's whole token loop and drains its 512 KB
-# of checkpoints; two-CTA clusters without an occupancy bound halve each item over
-# 192 SMs. Same sweep as above but an FP32 conv state, us per layer, LoopStock /
-# 1.8.0.2 (two runs, two nodes): B16 13.14 / 11.50 and 12.52 / 11.53, B17 12.58 /
-# 11.70. From B18 the 2-CTA clusters need a second wave (B18 19.20 vs LoopStock
-# 13.58), and B32 / B64 stay LoopStock (best KdaSplitStock 1.8.2.2: 17.66 / 33.86 vs
-# 15.37 / 30.15). The table is not keyed on the conv dtype, so a BF16 conv state takes
-# 1.8.0.2 at B16-17 too; the older BF16-conv sweep above had LoopStock 11.33 vs
-# 11.44 there, a ~1 % sub-op slowdown that this accepts.
+# 2026-11-24 (DCP16 SOL, FP32 conv state as served): q8 B4 1.8.3.8.1 (8 lanes, three
+# CTAs per SM, four CTAs per head, checkpoint stores evict-first) in place of
+# DEVICE_SPEC_SCHEDULE's 1.16.2.8.1, whose B4 crossover was tuned with a BF16 state.
+# Same sweep (1 GPU, verify alone, own cold FP32 state + FP32 conv slots, us per
+# layer, two passes): 1.16.2.8.1 6.74 / 6.74, 1.8.3.8.1 6.10 / 6.10 (1.8.3.8 6.09,
+# 1.16.3.8 6.15, 1.8.0.8 6.33, 1.8.2.8 6.36, 1.8.x.4 6.61-6.70); outputs bitwise
+# (8 or 16 lanes per row reduce in the same tree). Measured in the TP16 step, not
+# adopted: q8 B16-17 on 2-CTA clusters (1.8.0.2) won the 1-GPU sweep (11.50 vs
+# LoopStock 13.14) but lost 4.5 us per layer in the step (the core starts PDL-early
+# beside the in-projection and the o-projection producer, so its 192 one-per-SM
+# CTAs do not find free SM pairs; LoopStock's 96 CTAs do).
 FP32_SPLIT_Q: dict = {
     (10, 7): {
         4: {6: "41-42:1.8.3.4"},
-        8: {6: "12-14:1.8.2.4,15:1.8.4.4,16-17:1.8.0.2,18-22:1.8.3.4"},
+        8: {6: "4:1.8.3.8.1,12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
     },
 }
 

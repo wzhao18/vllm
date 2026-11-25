@@ -307,9 +307,9 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
     assert_bitwise("conv state", got[1][0], want[1][0])
 
 
-# FP32_SPLIT_Q rows (q, requests): the 2-CTA clusters of q8 B16-17, the 4-CTA ones
-# around them and q4's.
-SPLIT_SHAPES = [(8, 12), (8, 15), (8, 16), (8, 17), (8, 18), (4, 41)]
+# FP32_SPLIT_Q rows (q, requests): q8 B4's 3-per-SM geometry, the 4-CTA clusters of
+# q8 B12-22 and q4's.
+SPLIT_SHAPES = [(8, 4), (8, 12), (8, 15), (8, 18), (4, 41)]
 
 
 @pytest.mark.parametrize("q,requests", SPLIT_SHAPES, ids=lambda v: str(v))
