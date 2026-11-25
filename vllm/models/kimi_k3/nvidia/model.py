@@ -2048,7 +2048,18 @@ class KimiDecoderLayer(nn.Module):
             return hidden_states, prefix_sum, residual
         if sp_mxfp8:
             M = positions.shape[0]
-            hidden_states = sp_ag.kimi_sp_all_gather_mxfp8(hidden_states, M)
+            # Overlapped with the KDA Q|K|V GEMM when it can (ops/sp_all_gather.py;
+            # the GEMM or the first other consumer completes it).
+            gathered = None
+            if cl_rows := sp_ag.overlap_cl_rows():
+                gathered = sp_ag.kimi_sp_all_gather_mxfp8_overlapped(
+                    hidden_states, M, cl_rows
+                )
+            hidden_states = (
+                gathered
+                if gathered is not None
+                else sp_ag.kimi_sp_all_gather_mxfp8(hidden_states, M)
+            )
         elif self.use_sequence_parallel:
             hidden_states = sp_ag.kimi_sp_all_gather(hidden_states)
             # Remove SP padding before attention.

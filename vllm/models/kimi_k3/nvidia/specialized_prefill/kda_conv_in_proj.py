@@ -135,6 +135,22 @@ class PrefillKdaConvInProj:
         init = torch.zeros(1, dtype=torch.bool, device=dev)
         st = torch.zeros((1, nq, 3), dtype=torch.bfloat16, device=dev)
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
+        # Overlapped SP all-gather (ops/sp_all_gather.py): the grid of the "ag"
+        # form leaves SMs idle for the pushers; compile it now (every tile local:
+        # no waits, no pushers) and tell the gather.
+        idle = overlap_idle_sms(dev, self._gemm.tactic)
+        if idle > 0:
+            from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
+
+            from .sm107_gemm.kda_conv_gemm import ag_tactic, cluster_rows
+
+            ctr = torch.zeros(64, dtype=torch.int32, device=dev)
+            self._gemm(
+                x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID,
+                ag=_LocalAg(ctr.data_ptr(), rows // cluster_rows(ag_tactic(self._gemm.tactic))),
+            )  # fmt: skip
+            torch.cuda.synchronize(dev)
+            sp_ag.enable_overlap(idle, cluster_rows(ag_tactic(self._gemm.tactic)))
         from .sm107_gemm import conv_fixup
 
         conv_fixup.warm(
@@ -145,7 +161,7 @@ class PrefillKdaConvInProj:
             NULL_BLOCK_ID,
         )
 
-    def fused(self, qa):
+    def fused(self, qa, ag=None):
         """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta,
         checkpoint rows)`` for an eager prefill-only batch of at least
         ``MIN_ROWS`` rows, else None (stock in_proj + conv).
@@ -212,6 +228,7 @@ class PrefillKdaConvInProj:
             null_block_id=NULL_BLOCK_ID,
             checkpoint_offsets=ckpt.checkpoint_offsets if ckpt is not None else None,
             halo=halo,
+            ag=ag,
         )  # fmt: skip
         rest = torch._scaled_mm(
             qa.data,
@@ -223,6 +240,34 @@ class PrefillKdaConvInProj:
         if rest.shape[-1] != self.rest_cols:
             rest = rest[:, : self.rest_cols]  # drop the in_proj padding rows
         return planes, rest, ckpt_rows
+
+
+class _LocalAg(NamedTuple):
+    """An "ag" GEMM launch whose rows are all local (compile / warm-up)."""
+
+    ctr_ptr: int
+    hi: int
+    target: int = 0
+    rot: int = 0
+    lo: int = 0
+
+    def launch_pushers(self) -> None:
+        pass
+
+
+def overlap_idle_sms(device, tactic) -> int:
+    """SMs the "ag" form of the Q|K|V GEMM leaves idle: whole clusters of its
+    shape fill only part of the GPU (TP8 tactic, 4x1 clusters: 184 of 212);
+    the pusher grid of the overlapped SP all-gather runs there. 0 when the
+    grid covers every SM (then the gather stays stock)."""
+    import cutlass.utils as cutlass_utils
+
+    from .sm107_gemm.kda_conv_gemm import ag_tactic
+
+    cl = ag_tactic(tactic)[1]
+    nsm = torch.cuda.get_device_properties(device).multi_processor_count
+    mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+    return max(0, nsm - mac * cl[0] * cl[1])
 
 
 class CheckpointRows(NamedTuple):

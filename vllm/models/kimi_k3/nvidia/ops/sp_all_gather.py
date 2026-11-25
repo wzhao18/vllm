@@ -60,6 +60,26 @@ consumed inside its layer. Across forwards: with an even number of gathers per
 forward the last uses slot 1 and the next forward's first slot 0; with an odd
 number both use slot 0, so the first push of such a forward waits on one more
 barrier first (one per forward, a few us).
+
+Overlapped MXFP8 gather (PR-3, ``gather_mxfp8_overlapped``): on an eager
+prefill step whose KDA in_proj runs the fused sm_107 Q|K|V GEMM
+(``specialized_prefill.kda_conv_in_proj``), the gather does not run before the
+GEMM. The rank copies its own shard into its slot, raises its arrival word (the
+gather index) and hands the GEMM an ``AgPending``. The GEMM starts on the own
+shard and walks the M clusters from there (rank, rank + 1, ...); a pusher grid
+launched as its PDL secondary lands on the SMs the GEMM grid leaves idle (28 of
+212 at the TP8 tactic) and TMA-pushes this rank's shard into every peer's slot,
+peer rank - 1 first (the order each peer's GEMM needs it), one 1024-row cluster
+tile at a time, each tile closed by a counted, release-ordered add on the
+peer's tile counter. The GEMM's TMA producer waits for that count before
+loading a peer tile. A pusher writes a peer's slot only after the peer's
+arrival word reached this gather (the peer's stream finished every read of the
+slot's previous gather), so no barrier is needed; a stock gather that follows
+an overlapped one waits for every peer's arrival first. The bytes are the same
+as the stock gather's (pure copy), and the GEMM computes every output tile
+exactly as before (only the tile order changes). Every spin is bounded and
+traps. Capture, non-fused consumers and other shapes keep the stock gather (a
+consumer that is not the fused GEMM completes a pending gather first).
 """
 
 from typing import Any
@@ -157,6 +177,256 @@ MXFP8_ROW_TILE = 128
 _WORD_BLOCK = _BLOCK // 2  # 32-bit words per tile (16 KiB, as the BF16 tiles)
 
 
+_AG_CHUNK = 64 << 10  # pusher TMA chunk (64 KiB, 3-slot ring = 192 KiB smem)
+_AG_NS = 3
+_AG_SPIN_NS = 2_000_000_000  # 2 s: trap instead of hanging
+_AG_FLAG_WORDS = 1024  # [0] arrival word, [64:] per-cluster-tile counters
+
+_AG_CUDA = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+__device__ __forceinline__ uint64_t ag_now() { uint64_t t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
+__device__ __forceinline__ uint32_t ag_sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ uint32_t ag_ld_acq(uint64_t a) { uint32_t v; asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(a) : "memory"); return v; }
+
+__device__ __forceinline__ void ag_spin_ge(uint64_t addr, uint32_t target, uint64_t limit) {
+  const uint64_t t0 = ag_now();
+  while ((int32_t)(ag_ld_acq(addr) - target) < 0) {
+    __nanosleep(128);
+    if (ag_now() - t0 > limit) { printf("K31_SPIN_TIMEOUT kernel=sp_ag_push site=arrival\n"); __trap(); }
+  }
+}
+
+// One issuing thread per CTA. Units u = (j, b): peer d = rank - j (j = 1..W-1),
+// cluster tile b of this rank's shard; unit chunks = the tile's F8_128x4 scale
+// bytes, then its rows, in 64 KiB pieces; chunk c of the gather goes to CTA
+// c % G. A unit's chunks of this CTA are closed with one counted add on the
+// peer's counter of that cluster tile once their stores completed.
+template <int NS>
+__global__ void __launch_bounds__(32, 1) sp_ag_push_kernel(
+    uint64_t own_slot, const int64_t* __restrict__ peer_slot, const int64_t* __restrict__ peer_flags,
+    int rank, int W, int64_t rows, int64_t hidden, int64_t sf_base, int64_t cl_rows, int chunk,
+    uint32_t arrive_target, uint64_t limit) {
+  extern __shared__ __align__(1024) uint8_t smem[];
+  __shared__ __align__(8) uint64_t bar[NS];
+  if (threadIdx.x != 0) return;
+  for (int i = 0; i < NS; ++i) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(ag_sa(&bar[i])));
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  const int G = gridDim.x, g = blockIdx.x;
+  const int64_t nblk = rows / cl_rows;
+  const int64_t sfb = cl_rows * hidden / 32, db = cl_rows * hidden;
+  const int64_t nsf = (sfb + chunk - 1) / chunk, nd = (db + chunk - 1) / chunk, cpu = nsf + nd;
+  const int64_t nunits = (int64_t)(W - 1) * nblk, total = nunits * cpu;
+  const int64_t cl_base = (int64_t)rank * rows / cl_rows;  // global cluster index of own tile 0
+  // this CTA's chunks: c = g, g + G, ...
+  const int64_t n = g < total ? (total - g + G - 1) / G : 0;
+  struct Pend { int64_t unit; uint32_t cnt; int64_t last; };
+  Pend q[16]; int qh = 0, qt = 0;
+  int64_t cur_unit = -1; uint32_t cur_cnt = 0; uint32_t seen = 0;
+  uint32_t ph = 0;
+  auto unit_of = [&](int64_t k) { return (g + k * (int64_t)G) / cpu; };
+  auto signal = [&](int64_t unit, uint32_t cnt) {
+    const int j = 1 + (int)(unit / nblk); const int64_t b = unit % nblk;
+    const int d = (rank - j + W) % W;
+    const uint64_t ctr = (uint64_t)peer_flags[d] + 4ull * (64 + cl_base + b);
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    asm volatile("red.release.sys.global.add.u32 [%0], %1;" :: "l"(ctr), "r"(cnt) : "memory");
+  };
+  auto addr_of = [&](int64_t k, uint64_t& src, uint64_t& dst, uint32_t& nb) {
+    const int64_t c = g + k * (int64_t)G, unit = c / cpu, i = c % cpu;
+    const int j = 1 + (int)(unit / nblk); const int64_t b = unit % nblk;
+    const int d = (rank - j + W) % W;
+    int64_t off, bytes;
+    if (i < nsf) {
+      const int64_t o = i * chunk; bytes = min((int64_t)chunk, sfb - o);
+      off = sf_base + ((int64_t)rank * rows / cl_rows + b) * sfb + o;
+    } else {
+      const int64_t o = (i - nsf) * chunk; bytes = min((int64_t)chunk, db - o);
+      off = ((int64_t)rank * rows + b * cl_rows) * hidden + o;
+    }
+    if (!((seen >> d) & 1u)) {  // the peer finished reading this slot's previous gather
+      ag_spin_ge((uint64_t)peer_flags[d], arrive_target, limit);
+      seen |= 1u << d;
+    }
+    src = own_slot + off; dst = (uint64_t)peer_slot[d] + off; nb = (uint32_t)bytes;
+  };
+  uint64_t dsts[NS]; uint32_t nbs[NS];
+  auto issue = [&](int64_t k) {
+    uint64_t src, dst; uint32_t nb; addr_of(k, src, dst, nb);
+    const int s = (int)(k % NS); dsts[s] = dst; nbs[s] = nb;
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1;\n}" :: "r"(ag_sa(&bar[s])), "r"(nb) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(ag_sa(smem + (size_t)s * chunk)), "l"(src), "r"(nb), "r"(ag_sa(&bar[s])) : "memory");
+  };
+  for (int64_t k = 0; k < NS - 1 && k < n; ++k) issue(k);
+  for (int64_t k = 0; k < n; ++k) {
+    const int s = (int)(k % NS);
+    const uint32_t a = ag_sa(&bar[s]), p = (ph >> s) & 1u;
+    asm volatile("{\n.reg .pred q;\nW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 q, [%0], %1;\n@!q bra W_%=;\n}" :: "r"(a), "r"(p) : "memory");
+    ph ^= 1u << s;
+    asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" :: "l"(dsts[s]), "r"(ag_sa(smem + (size_t)s * chunk)), "r"(nbs[s]) : "memory");
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    const int64_t u = unit_of(k);
+    if (u != cur_unit) {
+      if (cur_unit >= 0) { q[qt & 15] = {cur_unit, cur_cnt, k - 1}; ++qt; }
+      cur_unit = u; cur_cnt = 0;
+    }
+    ++cur_cnt;
+    // stores up to k - 4 have completed (writes performed): close their units
+    asm volatile("cp.async.bulk.wait_group 4;" ::: "memory");
+    while (qh != qt && q[qh & 15].last <= k - 4) { signal(q[qh & 15].unit, q[qh & 15].cnt); ++qh; }
+    asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");  // slot of store k - 1 reusable
+    if (k + NS - 1 < n) issue(k + NS - 1);
+  }
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  while (qh != qt) { signal(q[qh & 15].unit, q[qh & 15].cnt); ++qh; }
+  if (cur_unit >= 0) signal(cur_unit, cur_cnt);
+  // PDL secondary of the GEMM: complete only after it (later kernels see both).
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+// Wait (one thread) until every peer cluster tile's counter reaches target.
+__global__ void sp_ag_wait_kernel(uint64_t own_flags, int64_t ncl, int64_t lo, int64_t hi, uint32_t target, uint64_t limit) {
+  for (int64_t c = 0; c < ncl; ++c)
+    if (c < lo || c >= hi) {
+      const uint64_t a = own_flags + 4ull * (64 + c);
+      const uint64_t t0 = ag_now();
+      while ((int32_t)(ag_ld_acq(a) - target) < 0) {
+        __nanosleep(128);
+        if (ag_now() - t0 > limit) { printf("K31_SPIN_TIMEOUT kernel=sp_ag_wait site=tile\n"); __trap(); }
+      }
+    }
+  __threadfence_system();
+}
+// Wait until every peer's arrival word reached target.
+__global__ void sp_ag_arrivals_kernel(const int64_t* peer_flags, int W, uint32_t target, uint64_t limit) {
+  for (int d = 0; d < W; ++d) ag_spin_ge((uint64_t)peer_flags[d], target, limit);
+}
+// Raise the arrival word. An overlapped gather also tops up its own tile
+// counters and those past its tiles by `add` (the pushers add it to every peer
+// tile), so every counter gains the same count per overlapped gather whatever
+// the step's row count: one target (gather ordinal x add) for all tiles.
+__global__ void sp_ag_arrive_kernel(uint64_t own_flags, uint32_t v, int64_t lo, int64_t hi, int64_t ncl,
+                                    int64_t maxcl, uint32_t add) {
+  if (add)
+    for (int64_t c = 0; c < maxcl; ++c)
+      if ((c >= lo && c < hi) || c >= ncl) atomicAdd((unsigned*)(own_flags + 4ull * (64 + c)), add);
+  __threadfence_system();
+  asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(own_flags), "r"(v) : "memory");
+}
+
+static cudaStream_t ag_cur() { return c10::cuda::getCurrentCUDAStream().stream(); }
+
+void sp_ag_push(int64_t own_slot, torch::Tensor peer_slot, torch::Tensor peer_flags, int64_t rank, int64_t W,
+                int64_t rows, int64_t hidden, int64_t sf_base, int64_t cl_rows, int64_t chunk,
+                int64_t arrive_target, int64_t grid, bool pdl, int64_t limit) {
+  const size_t smem = (size_t)3 * chunk;
+  auto k = sp_ag_push_kernel<3>;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)grid); cfg.blockDim = dim3(32); cfg.dynamicSmemBytes = smem; cfg.stream = ag_cur();
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  at[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+  cfg.attrs = at; cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, (uint64_t)own_slot, (const int64_t*)peer_slot.data_ptr<int64_t>(),
+      (const int64_t*)peer_flags.data_ptr<int64_t>(), (int)rank, (int)W, rows, hidden, sf_base, cl_rows, (int)chunk,
+      (uint32_t)arrive_target, (uint64_t)limit));
+}
+void sp_ag_wait(int64_t own_flags, int64_t ncl, int64_t lo, int64_t hi, int64_t target, int64_t limit) {
+  sp_ag_wait_kernel<<<1, 1, 0, ag_cur()>>>((uint64_t)own_flags, ncl, lo, hi, (uint32_t)target, (uint64_t)limit);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void sp_ag_arrivals(torch::Tensor peer_flags, int64_t W, int64_t target, int64_t limit) {
+  sp_ag_arrivals_kernel<<<1, 1, 0, ag_cur()>>>((const int64_t*)peer_flags.data_ptr<int64_t>(), (int)W, (uint32_t)target, (uint64_t)limit);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void sp_ag_arrive(int64_t own_flags, int64_t v, int64_t lo, int64_t hi, int64_t ncl, int64_t maxcl, int64_t add) {
+  sp_ag_arrive_kernel<<<1, 1, 0, ag_cur()>>>((uint64_t)own_flags, (uint32_t)v, lo, hi, ncl, maxcl, (uint32_t)add);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+_AG_CPP = r"""
+#include <torch/extension.h>
+void sp_ag_push(int64_t, torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                int64_t, int64_t, int64_t, bool, int64_t);
+void sp_ag_wait(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+void sp_ag_arrivals(torch::Tensor, int64_t, int64_t, int64_t);
+void sp_ag_arrive(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+"""
+
+_ag_ext = None
+
+
+def _ag_module():
+    global _ag_ext
+    if _ag_ext is None:
+        import hashlib
+
+        from torch.utils.cpp_extension import load_inline
+
+        tag = hashlib.sha256((_AG_CUDA + _AG_CPP).encode()).hexdigest()[:12]
+        _ag_ext = load_inline(
+            name=f"k31_sp_ag_push_{tag}",
+            cpp_sources=_AG_CPP,
+            cuda_sources=_AG_CUDA,
+            functions=["sp_ag_push", "sp_ag_wait", "sp_ag_arrivals", "sp_ag_arrive"],
+            extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
+            verbose=False,
+        )
+    return _ag_ext
+
+
+class AgPending:
+    """An overlapped MXFP8 gather whose peer shards have not been pushed yet
+    (module docstring). The fused Q|K|V GEMM takes it (``ctr_ptr``, ``target``,
+    ``rot``, ``lo``, ``hi``) and calls ``launch_pushers`` right after its own
+    launch; any other consumer calls ``complete`` first."""
+
+    def __init__(self, gather: "SymmSpAllGather", slot: int, rows: int, hidden: int,
+                 cl_rows: int, target: int, arrive: int) -> None:  # fmt: skip
+        self.gather, self.slot, self.rows, self.hidden = gather, slot, rows, hidden
+        self.cl_rows = cl_rows
+        self.target = target
+        self.arrive = arrive
+        self.ncl = gather.world * rows // cl_rows
+        self.lo = gather.rank * rows // cl_rows
+        self.hi = self.lo + rows // cl_rows
+        self.rot = self.lo
+        self.ctr_ptr = gather.flags.data_ptr() + 4 * 64
+        self.done = False
+
+    def _push(self, pdl: bool) -> None:
+        if self.done:
+            raise RuntimeError("SP all-gather: pending gather pushed twice")
+        self.done = True
+        g = self.gather
+        _ag_module().sp_ag_push(
+            g.storage.data_ptr() + self.slot * g.slot_numel * g.storage.element_size(),
+            g.peer_ptrs[self.slot], g.peer_flags, g.rank, g.world, self.rows, self.hidden,
+            g.world * g.max_rows * self.hidden, self.cl_rows, _AG_CHUNK, self.arrive,
+            g.idle_sms, pdl, _AG_SPIN_NS,
+        )  # fmt: skip
+        if g.pending is self:
+            g.pending = None
+
+    def launch_pushers(self) -> None:
+        """Launch the pusher grid as the PDL secondary of the kernel just
+        launched on this stream (the fused GEMM)."""
+        self._push(True)
+
+    def complete(self) -> None:
+        """Make the gathered tensor whole on this stream (non-fused consumer)."""
+        self._push(False)
+        _ag_module().sp_ag_wait(
+            self.gather.flags.data_ptr(), self.ncl, self.lo, self.hi, self.target, _AG_SPIN_NS
+        )
+
+
 class SymmSpAllGather:
     """Two-slot symmetric output buffer of the TP group, sized for
     ``max_rows`` rows per rank (the token shard of the largest step)."""
@@ -195,6 +465,26 @@ class SymmSpAllGather:
         # Gathers of the current forward: announced and pushed so far.
         self.num_gathers = 0
         self.count = 0
+        # Overlapped MXFP8 gather (module docstring): 4 KiB of flags per rank
+        # ([0] arrival word = gather index, [64:] cluster-tile counters).
+        self.flags = symm_mem.empty(_AG_FLAG_WORDS, dtype=torch.int32, device=device)
+        self.flags.zero_()
+        self.flags_handle = symm_mem.rendezvous(self.flags, tp.device_group.group_name)
+        self.peer_flags = torch.tensor(
+            [
+                self.flags_handle.get_buffer(p, [_AG_FLAG_WORDS], torch.int32, 0).data_ptr()
+                for p in range(self.world)
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        # Set by the fused Q|K|V GEMM at weight loading (enable_overlap).
+        self.idle_sms = 0
+        self.cl_rows = 0
+        self.gidx = 0  # gathers so far (all forwards): the arrival word
+        self.kidx = 0  # overlapped gathers so far: the tile counters' epoch
+        self.last_overlapped = False
+        self.pending: AgPending | None = None
         torch.accelerator.synchronize()
         self.handle.barrier()
 
@@ -223,12 +513,71 @@ class SymmSpAllGather:
             f"SP all-gather {self.count + 1} of a forward that announced "
             f"{self.num_gathers} (begin_forward)"
         )
+        if self.pending is not None:
+            raise RuntimeError(
+                "SP all-gather: the previous overlapped gather was never consumed"
+            )
         slot = self.count % _NUM_SLOTS
         if self.count == 0 and self.num_gathers % _NUM_SLOTS:
             # The previous forward's last push used slot 0 as well.
             self.handle.barrier()
         self.count += 1
+        self.gidx += 1
         return slot
+
+    def _arrive(self, lo: int = 0, hi: int = 0, ncl: int = 0, add: int = 0) -> None:
+        """Arrival word = this gather's index: this rank's stream finished every
+        read of the slot's previous gather (pushers wait for it)."""
+        if self.idle_sms:
+            _ag_module().sp_ag_arrive(
+                self.flags.data_ptr(), self.gidx, lo, hi, ncl, _AG_FLAG_WORDS - 64, add
+            )
+
+    def _stock_push_prologue(self) -> None:
+        """A stock push after an overlapped gather: no barrier since, so wait
+        for every peer's arrival at this gather before writing its slot."""
+        self._arrive()
+        if self.last_overlapped:
+            _ag_module().sp_ag_arrivals(self.peer_flags, self.world, self.gidx, _AG_SPIN_NS)
+        self.last_overlapped = False
+
+    def gather_mxfp8_overlapped(
+        self, data: torch.Tensor, scale: torch.Tensor, cl_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, AgPending]:
+        """``gather_mxfp8`` with the peers' shards still to be pushed by the
+        consumer (module docstring): copies this rank's shard into its slot,
+        returns the gathered views and the ``AgPending``."""
+        rows, hidden = data.shape
+        sf_bytes = rows * hidden // MXFP8_BLOCK
+        scale = scale.reshape(-1)
+        if (
+            rows % cl_rows
+            or data.element_size() != 1
+            or scale.numel() * scale.element_size() != sf_bytes
+        ):
+            raise ValueError(f"SP overlapped all-gather: {rows} x {hidden} shard")
+        slot = self._check_shard(rows, hidden, self.dtype)
+        sf_base = self.world * self.max_rows * hidden
+        start = slot * self.slot_numel * self.storage.element_size()
+        raw = self.storage.view(torch.uint8)
+        own = raw[start + self.rank * rows * hidden : start + (self.rank + 1) * rows * hidden]
+        own.copy_(data.reshape(-1).view(torch.uint8))
+        own_sf = raw[
+            start + sf_base + self.rank * sf_bytes : start + sf_base + (self.rank + 1) * sf_bytes
+        ]
+        own_sf.copy_(scale.view(torch.uint8))
+        self.kidx += 1
+        cpu = _ag_chunks_per_tile(cl_rows, hidden)
+        pending = AgPending(self, slot, rows, hidden, cl_rows,
+                            target=self.kidx * cpu, arrive=self.gidx)  # fmt: skip
+        if pending.ncl > _AG_FLAG_WORDS - 64:
+            raise ValueError(f"SP overlapped all-gather: {pending.ncl} tiles")
+        self._arrive(pending.lo, pending.hi, pending.ncl, cpu)
+        self.pending = pending
+        self.last_overlapped = True
+        out = raw[start : start + self.world * rows * hidden]
+        sf = raw[start + sf_base : start + sf_base + self.world * sf_bytes]
+        return out.view(data.dtype).view(self.world * rows, hidden), sf, pending
 
     def gather_mxfp8(
         self, data: torch.Tensor, scale: torch.Tensor
@@ -252,6 +601,7 @@ class SymmSpAllGather:
                 f"{rows} x {hidden} shard (expected {sf_bytes} bytes)"
             )
         slot = self._check_shard(rows, hidden, self.dtype)
+        self._stock_push_prologue()
         data_words = data.contiguous().view(torch.int32).reshape(-1)
         sf_words = scale.contiguous().view(torch.int32)
         # Slot layout in bytes: rows from 0, scales from world * max_rows *
@@ -288,6 +638,7 @@ class SymmSpAllGather:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         rows, hidden = x.shape
         slot = self._check_shard(rows, hidden, x.dtype)
+        self._stock_push_prologue()
         x = x.contiguous()
         numel = rows * hidden
         _push_shard_kernel[(min(self.num_sms, cdiv(numel, _BLOCK)),)](
@@ -305,6 +656,12 @@ class SymmSpAllGather:
         return self.storage[start : start + self.world * numel].view(
             self.world * rows, hidden
         )
+
+
+def _ag_chunks_per_tile(cl_rows: int, hidden: int) -> int:
+    """Pusher chunks of one cluster tile (its scale bytes, then its rows):
+    the count each tile's counter gains per overlapped gather."""
+    return cdiv(cl_rows * hidden // MXFP8_BLOCK, _AG_CHUNK) + cdiv(cl_rows * hidden, _AG_CHUNK)
 
 
 _sp_all_gather: SymmSpAllGather | None = None
@@ -442,6 +799,73 @@ def _takes_custom_all_gather(rows: int, hidden: int, dtype: torch.dtype) -> bool
     return ca_comm is not None and ca_comm.should_custom_all_gather(
         torch.empty((rows, hidden), dtype=dtype, device="meta")
     )
+
+
+def kimi_sp_all_gather_mxfp8_overlapped(qa: Any, num_tokens: int, cl_rows: int) -> Any | None:
+    """The overlapped form of ``kimi_sp_all_gather_mxfp8`` (module docstring),
+    or None when this gather cannot take it (no idle SMs, CUDA graph capture,
+    shard not a multiple of the GEMM's cluster tile, SP padding rows): the
+    caller then takes the stock gather."""
+    from dataclasses import replace
+
+    gather = _sp_all_gather
+    assert gather is not None
+    rows, hidden = qa.data.shape
+    if (
+        not gather.idle_sms
+        or torch.cuda.is_current_stream_capturing()
+        or rows % cl_rows
+        or num_tokens != gather.world * rows
+    ):
+        return None
+    data, sf, _ = gather.gather_mxfp8_overlapped(qa.data, qa.scale, cl_rows)
+    return replace(
+        qa,
+        data=data,
+        scale=sf,
+        orig_shape=torch.Size((num_tokens, hidden)),
+    )
+
+
+def enable_overlap(idle_sms: int, cl_rows: int) -> None:
+    """The fused KDA Q|K|V GEMM can take overlapped gathers: its grid leaves
+    ``idle_sms`` SMs for the pushers, its cluster M tile is ``cl_rows`` rows
+    (same value on every rank: same GPU, same tactic)."""
+    gather = _sp_all_gather
+    if gather is None or gather.dtype != torch.bfloat16:
+        return
+    if gather.gidx:
+        raise RuntimeError("SP all-gather: overlap enabled after the first gather")
+    gather.idle_sms, gather.cl_rows = idle_sms, cl_rows
+    logger.info_once(
+        "Kimi K3 SP all-gather: KDA in_proj gathers overlap the Q|K|V GEMM "
+        "(pushers on %d idle SMs, %d-row tiles)", idle_sms, cl_rows,
+    )
+
+
+def overlap_cl_rows() -> int:
+    """Cluster tile rows of the overlapped gather (0: not enabled)."""
+    gather = _sp_all_gather
+    return gather.cl_rows if gather is not None and gather.idle_sms else 0
+
+
+def take_pending(qa: Any) -> "AgPending | None":
+    """The pending overlapped gather whose gathered rows ``qa`` holds, if any
+    (handed to the consumer once)."""
+    gather = _sp_all_gather
+    if gather is None or gather.pending is None or qa is None:
+        return None
+    p = gather.pending
+    start = gather.storage.data_ptr() + p.slot * gather.slot_numel * gather.storage.element_size()
+    return p if qa.data.data_ptr() == start else None
+
+
+def complete_pending() -> None:
+    """Complete a pending overlapped gather on the current stream (a consumer
+    other than the fused GEMM)."""
+    gather = _sp_all_gather
+    if gather is not None and gather.pending is not None:
+        gather.pending.complete()
 
 
 def kimi_sp_all_gather_mxfp8(qa: Any, num_tokens: int) -> Any:

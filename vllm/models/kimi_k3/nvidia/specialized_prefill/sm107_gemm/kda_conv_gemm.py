@@ -45,6 +45,9 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_hot = "hot" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
+        # "ag": the A operand is the SP all-gather landing during this GEMM
+        # (ag_wait: rotated cluster M order + per-cluster-tile counter waits).
+        self.ag_wait = "ag" in flags
         # "red": the TMA store reduce-adds the BF16 tile into C (residual add).
         self.c_store_reduce = "red" in flags
         self.l2_store_evict_first = "sef" in flags
@@ -112,6 +115,20 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         elif split_producer:
             self.tma_b_warp_id = self.tma_warp_id + 1
             self.threads_per_cta += 32
+
+
+def _ag_args(ag):
+    """(ag_ctr, ag_target, ag_rot, ag_lo, ag_hi) kernel arguments (zeros: no
+    overlapped all-gather)."""
+    if ag is None:
+        return (cutlass.Int64(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0))
+    return (
+        cutlass.Int64(ag.ctr_ptr),
+        cutlass.Int32(ag.target),
+        cutlass.Int32(ag.rot),
+        cutlass.Int32(ag.lo),
+        cutlass.Int32(ag.hi),
+    )
 
 
 def _ptr(dtype, t: torch.Tensor, align: int = 16):
@@ -188,6 +205,26 @@ class PlainGemm:
         self._compiled(*args, problem, stream, *tail)
 
 
+def ag_tactic(tactic):
+    """``tactic`` for the overlapped all-gather form: flag "ag", cluster
+    swizzle 1 (the wave front then walks the M clusters in order, so it needs
+    the shards in the order the pushers deliver them)."""
+    flags = [f for f in (tactic[7] if len(tactic) > 7 else "").split("+") if f]
+    t = list(tactic) + [0] * (8 - len(tactic))
+    t[3] = 1
+    t[7] = "+".join(flags + ["ag"])
+    if len(tactic) <= 7:
+        t[5], t[6] = (tactic[5] if len(tactic) > 5 else 0), (tactic[6] if len(tactic) > 6 else 0)
+    return tuple(t)
+
+
+def cluster_rows(tactic) -> int:
+    """Rows of one cluster M tile (the all-gather's counted-put unit)."""
+    (tm, _), (cm, _), inst_m = tactic[0], tactic[1], tactic[2]
+    cta_m = tm // 2 if inst_m == 256 else tm
+    return cta_m * cm
+
+
 def shape_tactic(n: int, tactic):
     """``tactic`` fitted to an ``n``-column problem, or ValueError.
 
@@ -246,14 +283,15 @@ class KdaConvGemm:
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
-    def _kernel(self, norms, args, problem, tail, conv, stream):
-        key = ("conv", self.tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
+    def _kernel(self, norms, args, problem, tail, conv, stream, ag=None):
+        tactic = ag_tactic(self.tactic) if ag is not None else self.tactic
+        key = ("conv", tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
         fn = self._compiled.get(key) or _COMPILED.get(key)
         if fn is None:
-            gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
+            gemm = _Kernel(tactic, conv=True, norms=norms, drain=self.drain)
             gemm.conv_mode = True
             gemm.conv_p_dim = self.p
-            cl = self.tactic[1]
+            cl = tactic[1]
             mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
             layouts = (
                 OperandMajorMode.K,
@@ -263,7 +301,7 @@ class KdaConvGemm:
             fn = cute.compile(
                 gemm, *args, layouts, problem, mac, stream, lambda v: v,
                 tail[0], None, *tail[1:], True,
-                None, None, cutlass.Int64(0), cutlass.Int64(0), None, *conv,
+                None, None, cutlass.Int64(0), cutlass.Int64(0), None, *conv, *_ag_args(ag),
             )  # fmt: skip
             _COMPILED[key] = fn
         self._compiled[key] = fn
@@ -278,6 +316,7 @@ class KdaConvGemm:
     def __call__(
         self, x, x_scale, conv_state, qsl, lines, has_init, with_norms=False,
         null_block_id: int | None = None, checkpoint_offsets=None, halo=None,
+        ag=None,
     ):  # fmt: skip
         """``checkpoint_offsets`` (int32, one per sequence, 0 = none) with
         ``halo`` (BF16 ``(nseq, 3, N)``): the epilogue also writes the three
@@ -336,8 +375,13 @@ class KdaConvGemm:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
         args = (*args, from_dlpack(self.alpha))
-        fn = self._kernel(with_norms, args, problem, tail, conv, stream)
-        fn(*args, problem, stream, *tail, cutlass.Int64(0), cutlass.Int64(0), *conv)
+        fn = self._kernel(with_norms, args, problem, tail, conv, stream, ag)
+        fn(*args, problem, stream, *tail, cutlass.Int64(0), cutlass.Int64(0), *conv, *_ag_args(ag))
+        if ag is not None:
+            # The pushers: PDL secondary of the GEMM, on the SMs its grid leaves
+            # idle; they wait for the GEMM's completion at their end, so every
+            # later kernel sees both.
+            ag.launch_pushers()
         conv_fixup(
             out, side, norms, self.conv_w, conv_state, qsl, lines, has_init,
             self.p, null_block_id,

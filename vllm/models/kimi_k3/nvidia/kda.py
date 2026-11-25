@@ -56,6 +56,7 @@ from vllm.models.kimi_k3.nvidia.ops import (
     kda_norm,
     kda_segscan,
     prefill_glue,
+    sp_all_gather,
 )
 from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
@@ -1090,7 +1091,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         elif (
             qa is not None
             and self._prefill_conv_in_proj is not None
-            and (fused := self._prefill_conv_in_proj.fused(qa)) is not None
+            and (
+                fused := self._prefill_conv_in_proj.fused(
+                    qa, ag=sp_all_gather.take_pending(qa)
+                )
+            )
+            is not None
         ):
             # (3, T, P) q|k|v planes after conv + SiLU; _forward skips the conv.
             mixed_qkv, projected_rest, checkpoint_rows = fused
@@ -1101,6 +1107,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             beta = contiguous_rows(beta)
             g1 = self.f_b_proj(f_a)[0]
         else:
+            # A pending overlapped SP gather (no fused GEMM took it) completes
+            # before the stock in_proj reads the rows.
+            sp_all_gather.complete_pending()
             projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
             split_sizes = [
                 3 * self.local_projection_size,

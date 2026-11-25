@@ -51,7 +51,7 @@ from .conv_epilogue import (
     epilogue_kda_conv_t2,
     setmaxnreg,
 )
-from . import die_sched
+from . import ag_wait, die_sched
 from .situ_epilogue import epilogue_situ_mxfp8, epilogue_situ_mxfp8_drain
 from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
@@ -991,6 +991,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
         conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
         conv_halo: cutlass.Int64 = cutlass.Int64(0),
+        ag_ctr: cutlass.Int64 = cutlass.Int64(0),
+        ag_target: cutlass.Int32 = cutlass.Int32(0),
+        ag_rot: cutlass.Int32 = cutlass.Int32(0),
+        ag_lo: cutlass.Int32 = cutlass.Int32(0),
+        ag_hi: cutlass.Int32 = cutlass.Int32(0),
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -1396,6 +1401,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             drain_c_tensor,
             conv_ckpt,
             conv_halo,
+            ag_ctr,
+            ag_target,
+            ag_rot,
+            ag_lo,
+            ag_hi,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1457,6 +1467,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         mCg_mnl: Optional[cute.Tensor] = None,
         conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
         conv_halo: cutlass.Int64 = cutlass.Int64(0),
+        ag_ctr: cutlass.Int64 = cutlass.Int64(0),
+        ag_target: cutlass.Int32 = cutlass.Int32(0),
+        ag_rot: cutlass.Int32 = cutlass.Int32(0),
+        ag_lo: cutlass.Int32 = cutlass.Int32(0),
+        ag_hi: cutlass.Int32 = cutlass.Int32(0),
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -1757,6 +1772,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         tile_sched = utils.StaticPersistentTileScheduler.create(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
+        ag = cutlass.const_expr(getattr(self, "ag_wait", False))
+        ag_cl_rows = self.cta_tile_shape_mnk[0] * cluster_shape_mn[0]
+        if cutlass.const_expr(ag):
+            # vLLM PR-3: the SP all-gather lands while this GEMM runs. Cluster M
+            # tiles start at this rank's own shard (ag_rot) so peers' shards are
+            # consumed in their arrival order; every role sees the same rotated
+            # coordinates, so each output tile is computed exactly as before.
+            ag_ncl_m = (mC_mnl.shape[0] + ag_cl_rows - 1) // ag_cl_rows
+            tile_sched = ag_wait.RotatedTileScheduler.wrap(tile_sched, ag_rot, ag_ncl_m)
+            # Pusher grid (PDL secondary) may start once every CTA is resident.
+            cute.arch.griddepcontrol_launch_dependents()
         work_tile = tile_sched.initial_work_tile_info()
         dsched_args = None
         if cutlass.const_expr(die):
@@ -1829,6 +1855,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         cur_tile_coord[1],
                         cur_tile_coord[2],
                     )
+                    if cutlass.const_expr(ag):
+                        # A rows of this cluster M tile come from a peer:
+                        # wait for its landed-chunk count (counted puts).
+                        ag_wait.wait_rows(
+                            ag_ctr, cur_tile_coord[0] // cluster_shape_mn[0],
+                            ag_target, ag_lo, ag_hi,
+                        )
 
                     #
                     # Slice to per mma tile index
@@ -2577,6 +2610,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         mCg_mnl: Optional[cute.Tensor] = None,
         conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
         conv_halo: cutlass.Int64 = cutlass.Int64(0),
+        ag_ctr: cutlass.Int64 = cutlass.Int64(0),
+        ag_target: cutlass.Int32 = cutlass.Int32(0),
+        ag_rot: cutlass.Int32 = cutlass.Int32(0),
+        ag_lo: cutlass.Int32 = cutlass.Int32(0),
+        ag_hi: cutlass.Int32 = cutlass.Int32(0),
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2630,6 +2668,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             mCg_mnl,
             conv_ckpt,
             conv_halo,
+            ag_ctr,
+            ag_target,
+            ag_rot,
+            ag_lo,
+            ag_hi,
         )
 
     @staticmethod
