@@ -20,6 +20,7 @@ from ..cutedsl.dsa.index import DIM, HEADS
 from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
 from ..cutedsl.dsa.wide import WideDsa
 from ..cutedsl.dsa.wide import choose as dsa_choose
+from ..cutedsl.gemm.ltpin import LtPin, pinned_rows, shape_name
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.head import (
@@ -28,6 +29,7 @@ from ..cutedsl.kda.head import (
     polled_out_batches,
 )
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
+from ..cutedsl.kda.prepared import record_protocol
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.mla.dcp import PAIR_SENT, DcpBox, polled_output
@@ -236,6 +238,22 @@ INPROJ_LT = {
 }
 
 
+def inproj_pin(weight, kind, split_k, batches, sms, tp):
+    """Rubin TP16 in-projection rows above the split-K tactics that have a pinned
+    cuBLASLt algorithm (``ltpin`` ``kda_in_tp16`` / ``dsa_in_tp16``, measured at
+    exactly these rows): one LtPin over them, else None (cuBLAS / ``INPROJ_LT``)."""
+    if sms <= 152 or tp != 16:
+        return None
+    name = shape_name(*weight.shape, "bf16")
+    if name is None or not name.endswith("_tp16"):
+        return None
+    measured = pinned_rows(name)
+    rows = [b for b in batches if b not in split_k.kernels and b in measured]
+    if not rows:
+        return None
+    return LtPin(f"{kind}_in", *weight.shape, rows, device=weight.device)
+
+
 def inproj_note(attention, b):
     """NQ-NOFALLBACK: the coverage note of an attention's in-projection at a wide
     batch: the specialized GEMM, or the stock cuBLAS GEMM with its measured reason
@@ -245,6 +263,8 @@ def inproj_note(attention, b):
         return f"inproj mxfp8 {attention.projection.engine(b)}"
     if b in attention.projection.fallback.kernels:
         return "inproj splitk"
+    if attention.inproj_pin is not None and b in attention.inproj_pin.plans:
+        return "inproj pinned cuBLASLt (ltpin: the measured best above split-K)"
     library = "cuBLASLt" if attention.lt_rows.get(b) else "cuBLAS"
     pitch = attention.weight.shape[0]
     if pitch in INPROJ_LT:
@@ -556,6 +576,7 @@ class Attention:
                 )  # fmt: skip
             pitch, policies = self.projection.n, {}
             self.lt_rows = {}
+            self.inproj_pin = None
         else:
             if kind == "dsa":
                 weight = pack_dsa_projection(attention)
@@ -571,6 +592,9 @@ class Attention:
             # Wide rows whose cuBLAS in-projection prefers cuBLASLt (``INPROJ_LT``)
             lt = INPROJ_LT.get(pitch, "") if sms > 152 and tp == 16 else ""
             self.lt_rows = batch_table(lt)
+            self.inproj_pin = inproj_pin(
+                weight, kind, split_k, runtime.batches, sms, tp
+            )
         self.weight = weight
         self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
         self.core_long: Any = None  # MLA: the step switch's body 1 core (SWITCH)
@@ -659,6 +683,20 @@ class Attention:
             prepared = ((8, q),) if folded else ()
             dim_first = is_conv_state_dim_first()
             self.core = PreparedKda(attention, policies, dim_first, prepared=prepared)
+            # An FP32 state's verify kernels store the deferred-verify records
+            # (kda.verify_defer): the layer's stock verify and the align copies
+            # follow the record format (ops/kda_records.py).
+            a_log = getattr(attention, "A_log", None)
+            records = a_log is not None and record_protocol(
+                q, runtime.bf16_state, a_log.numel()
+            )
+            if records and not getattr(attention, "use_recoverssm", False):
+                if getattr(attention, "kda_spec_decode_backend", None) == "flashinfer":
+                    raise RuntimeError(
+                        "Kimi K3 decode: the KDA record protocol (FP32 state) needs "
+                        "the native stock verify, not FlashInfer's packed decode"
+                    )
+                attention.state_records = True
             if folded:
                 self.fold64 = PreparedKdaInProj64(
                     weight, self.core, tactics[64][:4], tokens=q
@@ -1024,6 +1062,8 @@ class Attention:
         projected, local = self.storage[b]
         if self.mx_in or b in self.projection.fallback.kernels:
             projected = self.projection.run(x, projected)
+        elif self.inproj_pin is not None and b in self.inproj_pin.plans:
+            self.inproj_pin.run(self.weight, x, projected)
         else:  # no generic tactic at these rows: cuBLAS, as the stock layer
             with blas_library("cublaslt" if self.lt_rows.get(b) else None):
                 torch.mm(x, self.weight.t(), out=projected)

@@ -462,6 +462,11 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
+    _asm_void([Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
     i32 = T.i32()
     value = llvm.inline_asm(
@@ -552,6 +557,8 @@ _NUM_BINS = 1 << _RADIX_BITS
 # A rescue waits on peers' selects, which may run late (host stalls, a JIT
 # compile in eager mode); only a peer that never pushes (a bug) reaches this.
 _SPIN_TIMEOUT_NS = 600 * 10**9
+# Block-table entries the mailbox select keeps in shared memory (4 KiB).
+_TABLE_CACHE = 1024
 
 
 def _gid_bits(world_size: int) -> int:
@@ -598,12 +605,23 @@ def _make_radix_select(
     keys_per_thread: int,
     emit_ids: bool,
     block_size: int,
+    table_cache: int = 0,
+    stamps: bool = False,
+    fast: bool = False,
 ) -> Any:
     """Top-``topk`` of the CTA's register keys ``(ord16 << gid_bits) | ~gid``
     (0 = empty) under (score desc, global id asc): writes the ids and/or this
     rank's owned physical rows for ``row`` and returns the thread's smallest
     selected ord16 (0x10000 when none). The select and the rescue share it, so
-    both emit bit-identical rows for the same candidate set."""
+    both emit bit-identical rows for the same candidate set. ``table_cache``:
+    the row's first block-table entries are in shared ``tab`` (the caller
+    loaded them before its poll), the rest are read from ``block_table``.
+    ``fast``: the passes only find the cut (two histogram buffers and the score
+    range: ``hist`` holds ``2 * num_bins + 2 * num_warps`` words), one selection
+    loop after them; else one selection loop per pass (``num_bins`` words). Same
+    selected set and order. The folded select uses it; the non-folded select
+    (rows > SMs) and the rescue kernel keep the per-pass loop, whose smaller
+    footprint is faster in-step at 256 rows (16-rank A/B L1-r9e23e)."""
     emit_rows = block_size > 0
     # One selected-key bit per register key, in 64-bit words.
     num_sel_words = -(-keys_per_thread // 64)
@@ -613,7 +631,20 @@ def _make_radix_select(
     num_warps = tb_size // _WARP
     gid_bits = _gid_bits(world_size)
     gid_mask = (1 << gid_bits) - 1
-    num_passes = -(-(16 + gid_bits) // radix_bits)
+    # Radix passes (shift, bits), most significant first, aligned to the score /
+    # gid boundary: the 16 score bits in two passes (9 + 7), then the gid bits
+    # only while the K-th key's score is tied (9-bit passes from the top). The
+    # unaligned schedule (5 x 9 bits from bit 0) spent its first pass on one bit
+    # and mixed score and gid bits in its third, so a typical row took 4-5
+    # passes; this one resolves a tie-free cut in 2 and a short tie in 3. Same
+    # total order, so the same selected set and outputs.
+    passes = [(gid_bits + 16 - radix_bits, radix_bits), (gid_bits, 16 - radix_bits)]
+    low = gid_bits
+    while low > 0:
+        width = min(radix_bits, low)
+        low -= width
+        passes.append((low, width))
+    num_passes = len(passes)
 
     @cute.jit
     def radix_select(
@@ -633,84 +664,247 @@ def _make_radix_select(
         valid_out: cute.Tensor,
         dcp_rank: Int32,
         stride_rows: Int32,
+        tab: cute.Tensor = None,
+        dbg: Int64 = None,
     ) -> Int32:
-        # scalars: [committed, owned, threshold, take_all]
-        sel_min = Int32(0x10000)
-        # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
-        # written after the passes, in (thread, key) order at block-scan
-        # offsets, so they come out in the same order on every run (warp-order
-        # atomics would vary it, and with it the downstream sparse attention's
-        # summation order).
-        sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
-        for w in cutlass.range_constexpr(num_sel_words):
-            sel_bits[w] = Uint64(0)
-        if tid == Int32(0):
-            scalars[0] = Int32(0)
-            scalars[1] = Int32(0)
-            scalars[3] = Int32(0)
-            prefix_ptr.store(Uint64(0))
-        cute.arch.sync_threads()
-
-        for p in cutlass.range_constexpr(num_passes):
-            shift = (num_passes - 1 - p) * radix_bits
-            if scalars[3] == Int32(0):
-                prefix = prefix_ptr.load()
-                hist[tid] = Int32(0)
-                cute.arch.sync_threads()
+        if cutlass.const_expr(fast):
+            # scalars: [committed, owned, final pass, done]
+            sel_min = Int32(0x10000)
+            # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
+            # written after the passes, in (thread, key) order at block-scan
+            # offsets, so they come out in the same order on every run (warp-order
+            # atomics would vary it, and with it the downstream sparse attention's
+            # summation order).
+            sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+            for w in cutlass.range_constexpr(num_sel_words):
+                sel_bits[w] = Uint64(0)
+            if tid == Int32(0):
+                scalars[0] = Int32(0)
+                scalars[1] = Int32(0)
+                scalars[2] = Int32(0)
+                scalars[3] = Int32(0)
+                prefix_ptr.store(Uint64(0))
+            hist[tid] = Int32(0)
+            hist[Int32(num_bins) + tid] = Int32(0)
+            # The candidates' score range (empty keys excluded): a row's top
+            # candidates usually span < num_bins ord16 values, and one pass over
+            # ord16 - lo then resolves the score (instead of the 9 + 7 bit pair).
+            lo = Int32(0xFFFF)
+            hi = Int32(0)
+            for i in cutlass.range_constexpr(keys_per_thread):
+                key = keys[i]
+                if key != Uint64(0):
+                    score = Int32(key >> Uint64(gid_bits))
+                    lo = cutlass.min(lo, score)
+                    hi = cutlass.max(hi, score)
+            lo = cute.arch.warp_redux_sync(lo, "min")
+            hi = cute.arch.warp_redux_sync(hi, "max")
+            if lane == Int32(0):
+                hist[Int32(2 * num_bins) + warp] = lo
+                hist[Int32(2 * num_bins + num_warps) + warp] = hi
+            cute.arch.sync_threads()
+            for w in cutlass.range_constexpr(num_warps):
+                lo = cutlass.min(lo, hist[Int32(2 * num_bins + w)])
+                hi = cutlass.max(hi, hist[Int32(2 * num_bins + num_warps + w)])
+            narrow = hi - lo < Int32(num_bins)
+            if narrow:
+                # Score pass on ord16 - lo (buffer 1; buffer 0 stays zero for the
+                # first gid pass); its cut is a 16-bit score = passes[1]'s level.
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
-                    if (
-                        key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
-                    ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
+                    if key != Uint64(0):
+                        b = Int32(key >> Uint64(gid_bits)) - lo
                         cute.arch.atomic_add(
-                            hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
+                            hist.iterator + (b + Int32(num_bins)),
+                            Int32(1),
+                            sem="relaxed",
+                            scope="cta",
                         )
                 cute.arch.sync_threads()
-
-                # Bins high to low: tid t scans bin num_bins - 1 - t.
-                need = Int32(topk) - scalars[0]
-                count = hist[Int32(num_bins - 1) - tid]
+                need = Int32(topk)
+                count = hist[Int32(2 * num_bins - 1) - tid]
                 incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
-                # The committed count grows by the keys selected below: the
-                # bins above the threshold (and the threshold bin when done).
-                # Every thread read scalars[0] before the scan's barriers.
                 if count > Int32(0) and incl >= need and incl - count < need:
-                    scalars[2] = Int32(num_bins - 1) - tid
+                    prefix_ptr.store(Uint64(lo + Int32(num_bins - 1) - tid))
                     if incl == need:
+                        scalars[2] = Int32(1)
+                        scalars[3] = Int32(1)
+                        scalars[0] = incl
+                    else:
+                        scalars[0] = incl - count
+                if tid == Int32(tb_size - 1) and incl < need:
+                    # Fewer candidates than needed: keep them all.
+                    prefix_ptr.store(Uint64(0))
+                    scalars[2] = Int32(1)
+                    scalars[3] = Int32(1)
+                    scalars[0] = incl
+                cute.arch.sync_threads()
+
+            # The passes only find the K-th key's digits: pass p histograms the
+            # keys under the current prefix into hist buffer p % 2 (the other
+            # buffer is zeroed meanwhile: its last reader, pass p - 1's scan, is
+            # behind a barrier), and the thread whose bin holds the K-th key
+            # appends its digit to the prefix. The selected keys are then the
+            # non-empty keys >= the final prefix at the final pass's shift (a key
+            # is either above the cut at the first digit where it leaves the
+            # prefix, or below it, or equal on every digit up to the take-all /
+            # exact cut): the same set as selecting bins above the threshold pass
+            # by pass, with one selection loop instead of one per pass.
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                cur = (p % 2) * num_bins
+                nxt = ((p + 1) % 2) * num_bins
+                if scalars[3] == Int32(0) and (p >= 2 or not narrow):
+                    prefix = prefix_ptr.load()
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            cute.arch.atomic_add(
+                                hist.iterator + (b + Int32(cur)),
+                                Int32(1),
+                                sem="relaxed",
+                                scope="cta",
+                            )
+                    if cutlass.const_expr(p + 1 < num_passes):
+                        hist[Int32(nxt) + tid] = Int32(0)
+                    cute.arch.sync_threads()
+
+                    # Bins high to low: tid t scans bin num_bins - 1 - t.
+                    need = Int32(topk) - scalars[0]
+                    count = hist[Int32(cur + num_bins - 1) - tid]
+                    incl = _block_scan_inclusive(
+                        count, lane, warp, warp_totals, num_warps
+                    )
+                    # Every thread read scalars[0] before the scan's barriers.
+                    if count > Int32(0) and incl >= need and incl - count < need:
+                        prefix_ptr.store(
+                            (prefix << Uint64(pbits))
+                            | Uint64(Int32(num_bins - 1) - tid)
+                        )
+                        if incl == need:
+                            scalars[2] = Int32(p)
+                            scalars[3] = Int32(1)
+                            scalars[0] = scalars[0] + incl
+                        else:
+                            scalars[0] = scalars[0] + incl - count
+                    if tid == Int32(tb_size - 1) and incl < need:
+                        # Fewer matching candidates than needed: keep them all.
+                        prefix_ptr.store(prefix << Uint64(pbits))
+                        scalars[2] = Int32(p)
                         scalars[3] = Int32(1)
                         scalars[0] = scalars[0] + incl
-                    else:
-                        scalars[0] = scalars[0] + incl - count
-                if tid == Int32(tb_size - 1) and incl < need:
-                    # Fewer matching candidates than needed: keep them all.
-                    scalars[2] = Int32(0)
-                    scalars[3] = Int32(1)
-                    scalars[0] = scalars[0] + incl
-                cute.arch.sync_threads()
+                    cute.arch.sync_threads()
+                    if cutlass.const_expr(stamps):  # noqa: SIM102
+                        if tid == Int32(0):
+                            _st_i64(
+                                dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1)
+                            )
 
-                thr = scalars[2]
-                done = scalars[3] != Int32(0)
-                for i in cutlass.range_constexpr(keys_per_thread):
-                    key = keys[i]
-                    selected = False
-                    if (
-                        key != Uint64(0)
-                        and (key >> Uint64(shift + radix_bits)) == prefix
-                    ):
-                        b = Int32((key >> Uint64(shift)) & Uint64(num_bins - 1))
-                        selected = b > thr or (done and b == thr)
-                    if selected:
-                        score = Int32(key >> Uint64(gid_bits))
-                        if score < sel_min:
-                            sel_min = score
-                        sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
-                cute.arch.sync_threads()
-                if tid == Int32(0) and not done:
-                    prefix_ptr.store((prefix << Uint64(radix_bits)) | Uint64(thr))
-                cute.arch.sync_threads()
+            cut = prefix_ptr.load()
+            last = scalars[2]
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                if last == Int32(p):
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if key != Uint64(0) and (key >> Uint64(shift)) >= cut:
+                            score = Int32(key >> Uint64(gid_bits))
+                            if score < sel_min:
+                                sel_min = score
+                            sel_bits[i // 64] = sel_bits[i // 64] | Uint64(
+                                1 << (i % 64)
+                            )
+        else:
+            # The per-pass select (kept where the folded select does not run:
+            # rows > SMs, the rescue kernel; see ``fast``).
+            # scalars: [committed, owned, threshold, take_all]
+            sel_min = Int32(0x10000)
+            # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
+            # written after the passes, in (thread, key) order at block-scan
+            # offsets, so they come out in the same order on every run (warp-order
+            # atomics would vary it, and with it the downstream sparse attention's
+            # summation order).
+            sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+            for w in cutlass.range_constexpr(num_sel_words):
+                sel_bits[w] = Uint64(0)
+            if tid == Int32(0):
+                scalars[0] = Int32(0)
+                scalars[1] = Int32(0)
+                scalars[3] = Int32(0)
+                prefix_ptr.store(Uint64(0))
+            cute.arch.sync_threads()
 
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                if scalars[3] == Int32(0):
+                    prefix = prefix_ptr.load()
+                    hist[tid] = Int32(0)
+                    cute.arch.sync_threads()
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            cute.arch.atomic_add(
+                                hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
+                            )
+                    cute.arch.sync_threads()
+
+                    # Bins high to low: tid t scans bin num_bins - 1 - t.
+                    need = Int32(topk) - scalars[0]
+                    count = hist[Int32(num_bins - 1) - tid]
+                    incl = _block_scan_inclusive(
+                        count, lane, warp, warp_totals, num_warps
+                    )
+                    # The committed count grows by the keys selected below: the
+                    # bins above the threshold (and the threshold bin when done).
+                    # Every thread read scalars[0] before the scan's barriers.
+                    if count > Int32(0) and incl >= need and incl - count < need:
+                        scalars[2] = Int32(num_bins - 1) - tid
+                        if incl == need:
+                            scalars[3] = Int32(1)
+                            scalars[0] = scalars[0] + incl
+                        else:
+                            scalars[0] = scalars[0] + incl - count
+                    if tid == Int32(tb_size - 1) and incl < need:
+                        # Fewer matching candidates than needed: keep them all.
+                        scalars[2] = Int32(0)
+                        scalars[3] = Int32(1)
+                        scalars[0] = scalars[0] + incl
+                    cute.arch.sync_threads()
+
+                    thr = scalars[2]
+                    done = scalars[3] != Int32(0)
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        selected = False
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            selected = b > thr or (done and b == thr)
+                        if selected:
+                            score = Int32(key >> Uint64(gid_bits))
+                            if score < sel_min:
+                                sel_min = score
+                            sel_bits[i // 64] = sel_bits[i // 64] | Uint64(
+                                1 << (i % 64)
+                            )
+                    cute.arch.sync_threads()
+                    if tid == Int32(0) and not done:
+                        prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
+                    cute.arch.sync_threads()
+
+        if cutlass.const_expr(stamps):  # noqa: SIM102
+            if tid == Int32(0):
+                _st_i64(dbg + Int64(row) * Int64(64) + Int64(32), _globaltimer())
         if cutlass.const_expr(emit_ids):
             count = Int32(0)
             for w in cutlass.range_constexpr(num_sel_words):
@@ -754,9 +948,17 @@ def _make_radix_select(
                     gid = Uint32(gid_mask) - Uint32(keys[i] & Uint64(gid_mask))
                     local = recast_val(gid // Uint32(world_size), Int32)
                     block = local // Int32(block_size)
-                    rows_out[row, pos] = block_table[
-                        req_id[row], block
-                    ] * stride_rows + (local - block * Int32(block_size))
+                    if cutlass.const_expr(table_cache > 0):
+                        entry = Int32(0)
+                        if block < Int32(table_cache):
+                            entry = tab[block]
+                        else:
+                            entry = block_table[req_id[row], block]
+                    else:
+                        entry = block_table[req_id[row], block]
+                    rows_out[row, pos] = entry * stride_rows + (
+                        local - block * Int32(block_size)
+                    )
                     pos += Int32(1)
             cute.arch.sync_threads()
             num_owned = scalars[1]
@@ -833,18 +1035,42 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         block_size: int = 0
         exact: bool = False
         mailbox: bool = False
+        # The rescue (exact only) becomes resident while this grid runs.
+        early: bool = False
+        # The rescue's second round of this CTA's row in this kernel (no rescue
+        # kernel); see ``dcp_topk_select``.
+        fold: bool = False
+        # (fold) dependents launch at this grid's completion: a consumer that
+        # reads the rows before its PDL wait (FlashInfer's trtllm-gen counts).
+        hold: bool = False
+        # Debug: per-CTA %globaltimer phase stamps to ``dbg`` (int64 [T, 8]).
+        stamps: bool = False
+        # Cut-only radix passes (``_make_radix_select``); dispatch: = fold.
+        fast: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
+        stamps = compile_key.stamps
+        fast = compile_key.fast
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
         exact = compile_key.exact
         mailbox = compile_key.mailbox
+        early = compile_key.early
+        fold = compile_key.fold
+        hold = compile_key.hold
+        assert fold or not hold
         assert emit_ids or block_size > 0
         assert exact or not mailbox
+        assert exact or not early
+        assert mailbox or not fold
+        # Folded, the consumer's early launch is ``not hold`` (= release).
+        assert not (fold and early)
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
+        # The cut-only radix keeps two histograms + the score range.
+        hist_words = 2 * num_bins + 2 * num_warps if fast else num_bins
         topk = compile_key.topk
         local_topk = compile_key.local_topk
         world_size = compile_key.world_size
@@ -858,17 +1084,160 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         box_words = _box_words(local_topk)
         row_chunks = world_size * box_words // 4
         polls = -(-row_chunks // tb_size)
+        # The mailbox select loads its row's block-table entries while it polls.
+        table_cache = _TABLE_CACHE if mailbox and block_size > 0 else 0
         radix_select = _make_radix_select(
             topk=topk,
             world_size=world_size,
             keys_per_thread=keys_per_thread,
             emit_ids=emit_ids,
             block_size=block_size,
+            table_cache=table_cache,
+            stamps=stamps,
+            fast=fast,
         )
+        num_r1 = world_size * local_topk
+        rescue_keys = num_r1 + num_slots * topk
+        rescue_per_thread = -(-rescue_keys // tb_size)
+        rescue_select = _make_radix_select(
+            topk=topk,
+            world_size=world_size,
+            keys_per_thread=rescue_per_thread,
+            emit_ids=emit_ids,
+            block_size=block_size,
+            table_cache=table_cache,
+            fast=fast,
+        )
+
+        @cute.jit
+        def rescue_row(
+            row: Int32,
+            mask: Int32,
+            tau: Int32,
+            tid: Int32,
+            lane: Int32,
+            warp: Int32,
+            owner: cute.Tensor,
+            hist: cute.Tensor,
+            warp_totals: cute.Tensor,
+            scalars: cute.Tensor,
+            prefix_ptr,
+            gathered: cute.Tensor,
+            out: cute.Tensor,
+            req_id: cute.Tensor,
+            block_table: cute.Tensor,
+            rows_out: cute.Tensor,
+            valid_out: cute.Tensor,
+            dcp_rank: Int32,
+            stride_rows: Int32,
+            seq2: cute.Tensor,
+            peer_recv: Int64,
+            peer_flags: Int64,
+            max_rows: Int32,
+            tab: cute.Tensor,
+        ):
+            """DCPTopkRescueKernel's second round of a saturated ``row`` (its
+            ``mask`` and ``tau16``), by the CTA that selected it: wait for the
+            mask's pushes, re-select over the other ranks' round-1 words at or
+            above tau16 plus the pushed lists, overwrite the row, bump seq2."""
+            # This rank's own receive slots and flags (its entries of the
+            # symmetric pointer tables).
+            recv = _ld_i64(peer_recv + Int64(dcp_rank) * Int64(8))
+            flags = _ld_i64(peer_flags + Int64(dcp_rank) * Int64(8))
+            num_sat = recast_val(cute.arch.popc(recast_val(mask, Uint32)), Int32)
+            expected = seq2[row] + Int32(1)
+            if tid == Int32(0):
+                k = Int32(0)
+                for r in cutlass.range_constexpr(world_size):
+                    if ((mask >> Int32(r)) & Int32(1)) != Int32(0):
+                        owner[k] = Int32(r)
+                        k += Int32(1)
+            if (
+                warp == Int32(0)
+                and lane < Int32(world_size)
+                and ((mask >> lane) & Int32(1)) != Int32(0)
+            ):
+                flag_addr = flags + (
+                    Int64(lane) * Int64(max_rows) + Int64(row)
+                ) * Int64(4)
+                start = _globaltimer()
+                while _ld_acquire_sys(flag_addr) != expected:
+                    _nanosleep()
+                    if _globaltimer() - start > Int64(_SPIN_TIMEOUT_NS):
+                        cute.printf(
+                            "DCP top-k folded rescue timeout row=%d rank=%d seq=%d\n",
+                            row,
+                            lane,
+                            expected,
+                        )
+                        _trap()
+            cute.arch.sync_threads()
+            keys = cute.make_rmem_tensor((rescue_per_thread,), Uint64)
+            row_base = recv + Int64(row) * Int64(num_slots * recv_words * 4)
+            for i in cutlass.range_constexpr(rescue_per_thread):
+                flat = tid + Int32(i * tb_size)
+                key = Uint64(0)
+                if flat < Int32(num_r1):
+                    rank = flat // Int32(local_topk)
+                    if ((mask >> rank) & Int32(1)) == Int32(0):
+                        j = flat - rank * Int32(local_topk)
+                        key = _decode_key(
+                            recast_val(gathered[rank, row, j], Uint32),
+                            recast_val(
+                                gathered[
+                                    rank, row, Int32(local_topk) + (j >> Int32(5))
+                                ],
+                                Uint32,
+                            ),
+                            j,
+                            recast_val(rank, Uint32),
+                            world_size,
+                            gid_bits,
+                        )
+                        if Int32(key >> Uint64(gid_bits)) < tau:
+                            key = Uint64(0)
+                elif flat < Int32(rescue_keys):
+                    s = (flat - Int32(num_r1)) // Int32(topk)
+                    if s < num_sat:
+                        j = flat - Int32(num_r1) - s * Int32(topk)
+                        base = row_base + Int64(s) * Int64(recv_words * 4)
+                        key = _decode_key(
+                            _ld_u32(base + Int64(j) * Int64(4)),
+                            _ld_u32(
+                                base + Int64(Int32(topk) + (j >> Int32(5))) * Int64(4)
+                            ),
+                            j,
+                            recast_val(owner[s], Uint32),
+                            world_size,
+                            gid_bits,
+                        )
+                keys[i] = key
+            rescue_select(
+                keys,
+                row,
+                tid,
+                lane,
+                warp,
+                hist,
+                warp_totals,
+                scalars,
+                prefix_ptr,
+                out,
+                req_id,
+                block_table,
+                rows_out,
+                valid_out,
+                dcp_rank,
+                stride_rows,
+                tab,
+            )
+            cute.arch.sync_threads()
+            if tid == Int32(0):
+                seq2[row] = expected
 
         @cute.struct
         class SharedStorage:
-            hist: cute.struct.MemRange[Int32, num_bins]
+            hist: cute.struct.MemRange[Int32, hist_words]
             warp_totals: cute.struct.MemRange[Int32, num_warps]
             scalars: cute.struct.MemRange[Int32, 8]
             notsat: cute.struct.MemRange[Int32, 16]
@@ -880,6 +1249,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 cute.struct.MemRange[Int32, world_size * box_words if mailbox else 4],
                 16,
             ]
+            tab: cute.struct.Align[cute.struct.MemRange[Int32, max(table_cache, 4)], 16]
 
         @cute.jit
         def poll_row(
@@ -1106,20 +1476,33 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
         ):
             row, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
             lane = cute.arch.lane_idx()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            dbg_row = dbg + Int64(row) * Int64(64)
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row, _globaltimer())
             smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage, 16)
-            hist = storage.hist.get_tensor(cute.make_layout((num_bins,)))
+            hist = storage.hist.get_tensor(cute.make_layout((hist_words,)))
             warp_totals = storage.warp_totals.get_tensor(cute.make_layout((num_warps,)))
             scalars = storage.scalars.get_tensor(cute.make_layout((8,)))
             notsat = storage.notsat.get_tensor(cute.make_layout((16,)))
             prefix_ptr = storage.prefix.data_ptr()
 
             keys = cute.make_rmem_tensor((keys_per_thread,), Uint64)
+            tab = storage.tab.get_tensor(cute.make_layout((max(table_cache, 4),)))
+            if cutlass.const_expr(table_cache > 0):
+                # Step metadata (written before the step's kernels): the row's
+                # block-table entries, loaded while the mailbox fills.
+                req = req_id[row]
+                width = cutlass.min(Int32(block_table.shape[1]), Int32(table_cache))
+                for i in cutlass.range(tid, width, tb_size, unroll=1):
+                    tab[i] = block_table[req, i]
             if cutlass.const_expr(mailbox):
                 stage = storage.stage.get_tensor(
                     cute.make_layout((world_size * box_words,))
@@ -1127,7 +1510,18 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 ordinal = ordinals[row]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
+                if cutlass.const_expr(stamps):  # noqa: SIM102
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(8), _globaltimer())
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(stamps):  # noqa: SIM102
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(16), _globaltimer())
+                if cutlass.const_expr(early or (fold and not hold)):
+                    # The rescue (PDL, ``early``) becomes resident now and waits
+                    # for this grid; folded (no rescue), the consumer when it
+                    # reads after its wait (``release``; else ``hold``).
+                    cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1149,6 +1543,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         )
                     keys[i] = key
             else:
+                if cutlass.const_expr(early):
+                    # Launched in stream order (no PDL): the rescue (PDL with
+                    # ``early``) may become resident at once; it waits for this
+                    # grid before reading it. Otherwise the next kernel launches
+                    # at this grid's end.
+                    cute.arch.griddepcontrol_launch_dependents()
                 for i in cutlass.range_constexpr(keys_per_thread):
                     flat = tid + Int32(i * tb_size)
                     key = Uint64(0)
@@ -1172,6 +1572,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             if cutlass.const_expr(exact):  # noqa: SIM102
                 if tid < Int32(16):
                     notsat[tid] = Int32(0)
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(24), _globaltimer())
 
             sel_min = radix_select(
                 keys,
@@ -1190,7 +1594,13 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 valid_out,
                 dcp_rank,
                 stride_rows,
+                tab,
+                dbg,
             )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(40), _globaltimer())
 
             if cutlass.const_expr(exact):
                 # tau16: the K-th selected key's ord16 (0 below K selected).
@@ -1288,6 +1698,40 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             if cutlass.const_expr(mailbox):  # noqa: SIM102
                 if tid == Int32(0):
                     ordinals[row] = ordinal + Int32(1)
+            if cutlass.const_expr(fold):  # noqa: SIM102
+                if mask != Int32(0):
+                    # The gathered rows and this rank's push, CTA-visible.
+                    cute.arch.sync_threads()
+                    rescue_row(
+                        row,
+                        mask,
+                        tau,
+                        tid,
+                        lane,
+                        warp,
+                        notsat,
+                        hist,
+                        warp_totals,
+                        scalars,
+                        prefix_ptr,
+                        gathered,
+                        out,
+                        req_id,
+                        block_table,
+                        rows_out,
+                        valid_out,
+                        dcp_rank,
+                        stride_rows,
+                        seq2,
+                        peer_recv,
+                        peer_flags,
+                        max_rows,
+                        tab,
+                    )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(56), _globaltimer())
 
         @cute.jit
         def host_entrypoint(
@@ -1308,6 +1752,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
             stream,
         ):
             # Unused outputs / exact-only and mailbox inputs are placeholders.
@@ -1329,6 +1774,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 max_rows,
                 box,
                 ordinals,
+                dbg,
             ).launch(
                 grid=(gathered.shape[1], 1, 1),
                 block=(tb_size, 1, 1),
@@ -1348,6 +1794,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         block_size: int = 0,
         exact: bool = False,
         mailbox: bool = False,
+        early: bool = False,
+        fold: bool = False,
+        hold: bool = False,
+        stamps: bool = False,
+        fast: bool | None = None,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1357,6 +1808,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             block_size=block_size,
             exact=exact,
             mailbox=mailbox,
+            early=early and exact,
+            fold=fold,
+            hold=hold,
+            stamps=stamps,
+            fast=fold if fast is None else fast,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1372,6 +1828,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             ),
             Int64(0),
             make_fake_tensor(Int32, (cute.sym_int(),)),
+            Int64(0),
         )
 
     @kernel_launcher
@@ -1385,6 +1842,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         rows: "_RowsOutput | None" = None,
         exact: "_ExactArgs | None" = None,
         mailbox: "_Mailbox | None" = None,
+        early: bool = False,
+        fold: bool = False,
+        hold: bool = False,
+        stamps: torch.Tensor | None = None,
+        fast: bool | None = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1394,6 +1856,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             block_size=0 if rows is None else rows.block_size,
             exact=exact is not None,
             mailbox=mailbox is not None,
+            early=early,
+            fold=fold,
+            hold=hold,
+            stamps=stamps is not None,
+            fast=fast,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
@@ -1403,6 +1870,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             *_select_args(gathered, out, rows, 0 if exact is None else exact.rank),
             *_exact_args(exact, gathered.device),
             *mailbox_args,
+            0 if stamps is None else stamps.data_ptr(),
         )
 
 
@@ -1562,11 +2030,17 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         world_size: int
         emit_ids: bool = True
         block_size: int = 0
+        release: bool = False
+        # PDL launch (resident while the select runs; its ``early`` variant).
+        early: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
+        release = compile_key.release
+        early = compile_key.early
+        assert early or not release
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
@@ -1624,6 +2098,19 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             owner = storage.owner.get_tensor(cute.make_layout((16,)))
             prefix_ptr = storage.prefix.data_ptr()
             num_rows = gathered.shape[1]
+            # PDL (``early``): resident during the select, which it waits for here
+            # (a no-op in stream order).
+            cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(release):
+                # Only for a consumer that reads this grid's outputs after its own
+                # PDL wait (the DSA sparse core): it becomes resident while this
+                # grid runs. Triggering only after this wait keeps the guarantee
+                # that the consumer's launch implies every kernel before this one
+                # has completed (the core polls its q mailbox before its wait).
+                # Without ``release`` (FlashInfer's trtllm-gen / prims_ts read
+                # their counts / rows before their wait; the stock hook's
+                # consumers) dependents launch at this grid's completion.
+                cute.arch.griddepcontrol_launch_dependents()
 
             for row in cutlass.range(cta, num_rows, num_ctas, unroll=1):
                 word = recast_val(sat_word[row], Uint32)
@@ -1766,6 +2253,7 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
                 grid=(num_ctas, 1, 1),
                 block=(tb_size, 1, 1),
                 stream=stream,
+                use_pdl=early,
             )
 
         return host_entrypoint
@@ -1778,6 +2266,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         world_size: int,
         emit_ids: bool = True,
         block_size: int = 0,
+        release: bool = False,
+        early: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1785,6 +2275,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             world_size=world_size,
             emit_ids=emit_ids,
             block_size=block_size,
+            release=release,
+            early=early or release,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1809,6 +2301,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
         topk: int,
         exact: _ExactArgs,
         rows: "_RowsOutput | None" = None,
+        release: bool = False,
+        early: bool = False,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1816,6 +2310,8 @@ class DCPTopkRescueKernel(VllmCuTeDSLJitKernel["DCPTopkRescueKernel.CompileKey"]
             world_size=gathered.shape[0],
             emit_ids=out is not None,
             block_size=0 if rows is None else rows.block_size,
+            release=release,
+            early=early,
         )
         num_rows = gathered.shape[1]
         num_ctas = max(1, min(num_rows, _num_sms(gathered.device)))
@@ -2023,6 +2519,23 @@ def _mailbox_for(topk: int, local_topk: int) -> _Mailbox | None:
     return ws.mailbox
 
 
+def dcp_topk_round1_mailbox(topk: int, local_topk: int) -> _Mailbox | None:
+    """The round-1 mailbox of the (K, N) merge (None: the all-gather) for a
+    producer that publishes its packed rows itself (``published=`` of
+    ``dcp_topk_merge_rows``): row ``r`` of a call goes to slot ``[ordinals[r] &
+    1, r, rank]`` of every rank's ``box`` (``box_mc``, ``box_words(N)`` u32
+    words in the pack kernel's layout), after the producer's PDL wait."""
+    return _mailbox_for(topk, local_topk)
+
+
+def box_words(local_topk: int) -> int:
+    """u32 words of one round-1 mailbox slot (``_box_words``)."""
+    return _box_words(local_topk)
+
+
+multimem_st_v4 = _multimem_st_v4
+
+
 def register_dcp_topk_merge_warmup(
     topk: int,
     local_topk: int,
@@ -2034,7 +2547,8 @@ def register_dcp_topk_merge_warmup(
     mailbox: bool | None = None,
 ) -> None:
     """Compile the pack kernel and one select (+ rescue) variant at JIT
-    warmup.
+    warmup (with ``block_size``, also the ``early`` select + rescue and the
+    rescue's ``release`` variants).
 
     The stock indexer uses the defaults (global ids); a caller of
     ``dcp_topk_merge_rows`` passes its ``block_size`` and whether it also
@@ -2051,23 +2565,46 @@ def register_dcp_topk_merge_warmup(
                 from_packed=from_packed,
             )
     _DCP_TOPK_PACK_KERNEL.register_warmup(local_topk=local_topk, has_row_ends=True)
-    _DCP_TOPK_SELECT_KERNEL.register_warmup(
-        topk=topk,
-        local_topk=local_topk,
-        world_size=world_size,
-        emit_ids=emit_ids,
-        block_size=block_size,
-        exact=exact,
-        mailbox=mailbox and exact,
-    )
-    if exact:
-        _DCP_TOPK_RESCUE_KERNEL.register_warmup(
+    # Physical rows (``dcp_topk_merge_rows``): also the early-resident rescue
+    # (``early``, per shape: ``merge_early``) and the variant that releases the
+    # DSA sparse core early (``release``).
+    phys = exact and block_size > 0
+    for early in (False, True) if phys else (False,):
+        _DCP_TOPK_SELECT_KERNEL.register_warmup(
             topk=topk,
             local_topk=local_topk,
             world_size=world_size,
             emit_ids=emit_ids,
             block_size=block_size,
+            exact=exact,
+            mailbox=mailbox and exact,
+            early=early,
         )
+    if mailbox and exact and block_size:  # the select with the rescue folded in
+        for hold in (False, True):
+            _DCP_TOPK_SELECT_KERNEL.register_warmup(
+                topk=topk,
+                local_topk=local_topk,
+                world_size=world_size,
+                emit_ids=emit_ids,
+                block_size=block_size,
+                exact=exact,
+                mailbox=True,
+                fold=True,
+                hold=hold,
+            )
+    if exact:
+        variants = ((False, False), (True, False), (True, True))
+        for early, release in variants if phys else ((False, False),):
+            _DCP_TOPK_RESCUE_KERNEL.register_warmup(
+                topk=topk,
+                local_topk=local_topk,
+                world_size=world_size,
+                emit_ids=emit_ids,
+                block_size=block_size,
+                release=release,
+                early=early,
+            )
 
 
 def dcp_topk_pack_indices(
@@ -2179,11 +2716,20 @@ def dcp_topk_select(
     rows: _RowsOutput | None = None,
     exact: _ExactArgs | None = None,
     mailbox: _Mailbox | None = None,
+    release: bool = False,
+    early: bool | None = None,
 ) -> None:
     """Exact global top-K of the gathered ``[W, T, N + N/32]`` rows: the
     select, then the rescue (second round) of saturated rows. With
     ``mailbox`` the select reads round 1 from it (``gathered`` is then the
-    mailbox's own, which the select fills for the rescue)."""
+    mailbox's own, which the select fills for the rescue). ``release``: the
+    rescue releases its PDL dependents after its own wait, while it runs; only
+    for a consumer that reads the outputs after its PDL wait (else they launch
+    at the rescue's completion). ``early`` (default ``release``; implied by
+    it): the select launches the rescue (PDL) while it runs, so the rescue is
+    resident during the select (a per-shape choice: its idle CTAs hold SM
+    slots that overlapped kernels would use)."""
+    early = release if early is None else early or release
     if topk is None:
         assert topk_indices is not None
         topk = topk_indices.shape[1]
@@ -2199,6 +2745,16 @@ def dcp_topk_select(
         raise ValueError(
             "the round-1 mailbox needs the exact merge and its own gathered rows"
         )
+    # The rescue folded into the select: through the mailbox, with every
+    # row's CTA resident at once (no more rows than SMs: a saturated row's CTA
+    # pushes before it waits for the others', so no rank's wait can block
+    # another rank's push). ``release``: the consumer launches after the
+    # select's own wait; else at its completion (``hold``).
+    fold = (
+        mailbox is not None
+        and rows is not None
+        and gathered.shape[1] <= _num_sms(gathered.device)
+    )
     _DCP_TOPK_SELECT_KERNEL(
         gathered,
         topk_indices,
@@ -2207,8 +2763,11 @@ def dcp_topk_select(
         rows=rows,
         exact=exact,
         mailbox=mailbox,
+        early=early and not fold,
+        fold=fold,
+        hold=fold and not release,
     )
-    if exact is not None:
+    if exact is not None and not fold:
         _DCP_TOPK_RESCUE_KERNEL(
             gathered,
             topk_indices,
@@ -2216,6 +2775,8 @@ def dcp_topk_select(
             topk=topk,
             exact=exact,
             rows=rows,
+            release=release,
+            early=early,
         )
 
 
@@ -2300,6 +2861,7 @@ def _publish_round1(
     *,
     exact: _ExactArgs,
     rows: _RowsOutput | None = None,
+    published: bool = False,
 ) -> torch.Tensor:
     """Round 1 through the mailbox: this rank's local top-N (DeepSelect, or
     ``packed``) published to every rank; returns the select's ``gathered``.
@@ -2312,7 +2874,9 @@ def _publish_round1(
             f"({mailbox.max_rows} rows)"
         )
     _check_exact(mailbox.gathered[:, :num_rows], exact.topk, local_topk, rows, exact)
-    if packed is None:
+    if published:  # the producer multicast ``packed`` into the mailbox itself
+        assert packed is not None
+    elif packed is None:
         from vllm.model_executor.layers.indexer_topk import deep_select_topk
 
         local_idx = deep_select_topk(logits, local_topk, end=row_ends)
@@ -2408,6 +2972,9 @@ def dcp_topk_merge_rows(
     ids_out: torch.Tensor | None = None,
     group: Any = None,
     max_local_len: int | None = None,
+    release: bool = False,
+    early: bool | None = None,
+    published: bool = False,
 ) -> None:
     """Exact DCP top-K merge straight to this rank's physical KV rows.
 
@@ -2430,6 +2997,14 @@ def dcp_topk_merge_rows(
     may own up to ``topk`` of a row), ``valid_out`` ``[T]`` their count,
     ``ids_out`` ``[T, topk]`` the global ids (optional).
 
+    ``release``: the next kernel reads ``rows_out`` / ``valid_out`` only after
+    its PDL wait (the DSA sparse core), so the rescue may launch it while it
+    runs. Leave False for any consumer that reads them before its wait
+    (FlashInfer's trtllm-gen counts, prims_ts) or that is not audited.
+    ``early``: the rescue is resident while the select runs (``dcp_topk_select``).
+
+    ``published``: the producer of ``packed`` already multicast its rows into
+    the round-1 mailbox (``dcp_topk_round1_mailbox``), so no pack kernel runs.
     Collective over the DCP group (see the module docstring).
     """
     if logits is None or row_ends is None:
@@ -2438,6 +3013,8 @@ def dcp_topk_merge_rows(
         )
     logits = _bound_logits(logits, max_local_len)
     mailbox = _mailbox_for(topk, local_topk)
+    if published and (mailbox is None or packed is None):
+        raise ValueError("published= needs packed= and the round-1 mailbox")
     if packed is None:
         num_rows = logits.shape[0]
         if mailbox is None:
@@ -2477,7 +3054,14 @@ def dcp_topk_merge_rows(
     if mailbox is not None:
         dcp_topk_select(
             _publish_round1(
-                mailbox, logits, row_ends, local_topk, packed, exact=exact, rows=rows
+                mailbox,
+                logits,
+                row_ends,
+                local_topk,
+                packed,
+                exact=exact,
+                rows=rows,
+                published=published,
             ),
             local_topk,
             ids_out,
@@ -2485,6 +3069,8 @@ def dcp_topk_merge_rows(
             rows=rows,
             exact=exact,
             mailbox=mailbox,
+            release=release,
+            early=early,
         )
         return
     dcp_topk_select(
@@ -2494,4 +3080,6 @@ def dcp_topk_merge_rows(
         topk=topk,
         rows=rows,
         exact=exact,
+        release=release,
+        early=early,
     )

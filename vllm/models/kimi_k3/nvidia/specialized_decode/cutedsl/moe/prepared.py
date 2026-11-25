@@ -84,7 +84,9 @@ JOIN = {8: "9-16:0", 16: "8:0"}
 # once the front kernel completed). M64 (B8 verify; SharedDown on its split SMs): the
 # experts' launch and prologue overlap routing, -0.68 / -0.70 us per layer (release
 # after the front) in a one-GPU MoE layer proxy (391 / 293 distinct experts),
-# outputs bitwise identical.
+# outputs bitwise identical. M9-63 stay released at routing's exit: their routing is
+# polled and an after-front release puts a completion wait at its entry (16 ranks: B2
+# +0.18 ms/step; ``front.RELEASE_AFTER_FRONT_WIDE``).
 RELEASE_EARLY_WIDE = "3-8:1,64:1"
 
 

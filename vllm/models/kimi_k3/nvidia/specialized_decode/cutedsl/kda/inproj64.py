@@ -153,9 +153,17 @@ class KdaInProj64(SplitKTmemGemm64):
         if tid == 0:
             cute.arch.mbarrier_init(self.norm_bar, 1)
         cute.arch.mbarrier_init_fence()
-        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
         out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
         self.body(mA, mB, mC, a_map, out)
+
+    @cute.jit
+    def epilogue_entry(self, epi_tid, out):
+        """``prefetch`` on the epilogue warps at their entry, under the MMAs. (Run by
+        every thread ahead of the GEMM, its dependent loads accepted -> slot -> conv
+        taps held the Q / K / V CTAs' weight stream back ~1.5 us; VR200 1-GPU chain at
+        B8 x q8: 18.75 -> 18.07 us per layer, same loads and values.)"""
+        _, _, conv_w, bias, conv_state, slots, accepted, _ = out
+        self.prefetch(epi_tid + 128, conv_w, bias, conv_state, slots, accepted)
 
     @cute.jit
     def prefetch(self, tid, conv_w, bias, conv_state, slots, accepted):
@@ -372,7 +380,6 @@ class KdaInProjQ(KdaInProj64):
         if tid == 0:
             cute.arch.mbarrier_init(self.norm_bar, 1)
         cute.arch.mbarrier_init_fence()
-        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
         out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
         self.body(mA, mB, mC, a_map, out, x_map=x_map)
 

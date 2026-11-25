@@ -234,6 +234,113 @@ def _reinterpret_u64_as_i64(value: int) -> int:
     return value if value < (1 << 63) else value - (1 << 64)
 
 
+# Record-format temporal states (Kimi K3's FP32 KDA state under the deferred-verify
+# protocol: ``specialized_decode/cutedsl/kda/verify_defer.py``). A request's slot 0
+# holds the state after token 0 of the previous verify and, per head, slot 1's page
+# holds that verify's records of tokens 1 .. q - 1: rows ``t - 1`` the keys k_t, rows
+# ``RECORD_DECAY_ROW + t - 1`` the decays exp(g_t), rows ``RECORD_V_ROW + t - 1`` the
+# corrections v_new_t (one per state row), and word 0 of row ``RECORD_TAG_ROW`` the
+# format tag (a NaN payload no finite state holds). Slots 2 .. q - 1 are not written.
+# An untagged slot 1 is the stock format: every token's state at its slot.
+RECORD_DECAY_ROW = 8
+RECORD_V_ROW = 16
+RECORD_TAG_ROW = 23
+RECORD_TAG_BITS = 0x7FCDEF01
+RECORD_HEAD_BYTES = 128 * 128 * 4
+# (the jit functions' copies)
+_DECAY_ROW = tl.constexpr(RECORD_DECAY_ROW)
+_V_ROW = tl.constexpr(RECORD_V_ROW)
+_TAG_ROW = tl.constexpr(RECORD_TAG_ROW)
+_TAG_BITS = tl.constexpr(RECORD_TAG_BITS)
+_HEAD_BYTES = tl.constexpr(RECORD_HEAD_BYTES)
+_CHUNK = tl.constexpr(32)
+
+
+@triton.jit
+def record_fold_head(state0, records, dst, pending):
+    """One head's [128, 128] FP32 state (rows: value dim, columns: key dim) after the
+    ``pending`` recorded tokens 1 .. pending, from the state after token 0
+    (``state0``) and the records (``records``: the head's rows of slot 1), stored to
+    ``dst`` (fp32 pointers to each head's page). The token loop's two instructions per
+    element in its order: S = S * decay_t, then S = fma(k_t, v_new_t, S); bit for bit
+    the stock checkpoint. In 32-row chunks (few registers: the align copies' early
+    exits keep their occupancy), the record rows' chunk (rows 0 .. 31) last, so
+    ``dst`` may alias ``state0`` or ``records``: every load of a chunk precedes the
+    barrier before its store, and no later chunk reads what it stores."""
+    rows = tl.arange(0, _CHUNK)
+    cols = tl.arange(0, 128)
+    for cc in tl.static_range(128 // _CHUNK):
+        r = (128 // _CHUNK - 1 - cc) * _CHUNK + rows
+        offsets = r[:, None] * 128 + cols[None, :]
+        state = tl.load(state0 + offsets)
+        for i in range(0, pending):
+            k = tl.load(records + i * 128 + cols)
+            decay = tl.load(records + (_DECAY_ROW + i) * 128 + cols)
+            v_new = tl.load(records + (_V_ROW + i) * 128 + r)
+            state = state * decay[None, :]
+            state = tl.fma(k[None, :], v_new[:, None], state)
+        tl.debug_barrier()
+        tl.store(dst + offsets, state)
+
+
+@triton.jit
+def record_copy_head(source, dst):
+    """One head's [128, 128] FP32 page, in record_fold_head's chunks."""
+    rows = tl.arange(0, _CHUNK)
+    cols = tl.arange(0, 128)
+    for c in tl.static_range(128 // _CHUNK):
+        offsets = (c * _CHUNK + rows)[:, None] * 128 + cols[None, :]
+        tl.store(dst + offsets, tl.load(source + offsets))
+
+
+@triton.jit
+def record_tagged(records):
+    """Whether a head's slot-1 rows (``records``, fp32 pointer) hold records."""
+    tag = (records + _TAG_ROW * 128).to(tl.pointer_type(tl.uint32))
+    word = tl.load(tag)
+    return word == _TAG_BITS
+
+
+@triton.jit
+def _copy_record_state_block(
+    heads,
+    block_table_base,
+    src_col,
+    dst_col,
+    token_bias,
+    state_base_addr,
+    state_block_stride,
+    tile_idx,
+    TEMPORAL_TILES: tl.constexpr,
+):
+    """The state after token ``token_bias`` of the request's slots at ``src_col``
+    (slot t = column src_col + t) into column ``dst_col``: per head, folded from slot 0
+    and slot 1's records when slot 1 is tagged, else slot ``token_bias``'s page (stock).
+    The destination may be slot 0 or slot 1 itself (the fold stores after its loads)."""
+    dst_block = tl.load(block_table_base + dst_col).to(tl.int64)
+    slot0 = tl.load(block_table_base + src_col).to(tl.int64)
+    slot1 = tl.load(block_table_base + src_col + 1).to(tl.int64)
+    stock = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    for h in range(tile_idx, heads, TEMPORAL_TILES):
+        head = h.to(tl.int64) * _HEAD_BYTES
+        dst = (state_base_addr + dst_block * state_block_stride + head).to(
+            tl.pointer_type(tl.float32)
+        )
+        state0 = (state_base_addr + slot0 * state_block_stride + head).to(
+            tl.pointer_type(tl.float32)
+        )
+        records = (state_base_addr + slot1 * state_block_stride + head).to(
+            tl.pointer_type(tl.float32)
+        )
+        if record_tagged(records):
+            record_fold_head(state0, records, dst, token_bias)
+        elif stock != dst_block:
+            source = (state_base_addr + stock * state_block_stride + head).to(
+                tl.pointer_type(tl.float32)
+            )
+            record_copy_head(source, dst)
+
+
 @triton.jit
 def _copy_mamba_state_block(
     state_idx,
@@ -256,6 +363,8 @@ def _copy_mamba_state_block(
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    state_record_heads_ptr=None,
+    HAS_RECORDS: tl.constexpr = False,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -299,6 +408,25 @@ def _copy_mamba_state_block(
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
+
+    # Record-format temporal state (RECORD_TAG_ROW): the state after the accepted
+    # token ``token_bias`` may only exist as slot 0 + slot 1's records.
+    if HAS_RECORDS:
+        if (conv_width == 0) & (token_bias > 0):
+            record_heads = tl.load(state_record_heads_ptr + state_idx)
+            if record_heads > 0:
+                _copy_record_state_block(
+                    record_heads,
+                    block_table_base,
+                    src_col,
+                    dst_col,
+                    token_bias,
+                    state_base_addr,
+                    state_block_stride,
+                    tile_idx,
+                    TEMPORAL_TILES,
+                )
+                return
 
     if CONV_STATE_DIM_FIRST and is_conv_state:
         # Conv states are small; only tile 0 does the copy. Higher tiles
@@ -467,6 +595,10 @@ def postprocess_mamba_fused_kernel(
     # the caller neither scatters it nor snapshots the buffer (needs idx_mapping).
     num_sampled_ptr=None,
     FROM_NUM_SAMPLED: tl.constexpr = False,
+    # HAS_RECORDS: per-state head counts of record-format temporal states
+    # (_copy_record_state_block); 0 = a plain state.
+    state_record_heads_ptr=None,
+    HAS_RECORDS: tl.constexpr = False,
 ):
     """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
@@ -565,6 +697,8 @@ def postprocess_mamba_fused_kernel(
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
+        state_record_heads_ptr,
+        HAS_RECORDS,
     )
 
 
@@ -644,6 +778,8 @@ def precopy_mamba_align_fused_kernel(
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
     launch_pdl: tl.constexpr = False,
+    state_record_heads_ptr=None,
+    HAS_RECORDS: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -702,6 +838,8 @@ def precopy_mamba_align_fused_kernel(
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
+        state_record_heads_ptr,
+        HAS_RECORDS,
     )
 
 
@@ -840,6 +978,27 @@ class MambaCopyBuffers:
         )
 
 
+
+def record_state_heads(layer: Any, state: torch.Tensor) -> int:
+    """Head count of a record-format temporal state (``RECORD_TAG_ROW``): a layer
+    whose ``state_records`` is set, an FP32 [blocks, heads, 128, 128] state, dense
+    within the block. 0: a plain state."""
+    if getattr(layer, "state_records", False) is not True:
+        return 0
+    if (
+        state.dtype != torch.float32
+        or state.dim() != 4
+        or tuple(state.shape[2:]) != (128, 128)
+        or tuple(state.stride()[1:]) != (128 * 128, 128, 1)
+    ):
+        raise ValueError(
+            "record-format state needs an FP32 [blocks, heads, 128, 128] layout "
+            f"dense within the block, got {tuple(state.shape)} / {state.stride()} "
+            f"{state.dtype}"
+        )
+    return state.size(1)
+
+
 @dataclasses.dataclass
 class MambaSpecDecodeGPUContext:
     """Context for GPU-side Mamba state copy operations during the
@@ -900,6 +1059,10 @@ class MambaSpecDecodeGPUContext:
     num_draft_tokens_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
+
+    # int32 [num_states]: head count of each record-format temporal state
+    # (_copy_record_state_block), 0 elsewhere; None: no record-format state.
+    state_record_heads: torch.Tensor | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1130,6 +1293,13 @@ class MambaSpecDecodeGPUContext:
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
+                        heads = record_state_heads(attention, state)
+                        if heads:
+                            if self.state_record_heads is None:
+                                self.state_record_heads = torch.zeros_like(
+                                    self.state_conv_widths
+                                )
+                            self.state_record_heads[idx] = heads
                         # Temporal copies vectorize with uint64 loads/stores.
                         # The kernel's head/tail handles misalignment for
                         # correctness, but unaligned base/stride costs in
@@ -1324,6 +1494,7 @@ class MambaSpecDecodeGPUContext:
                 CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
                 HAS_IDX_MAPPING=idx_mapping is not None,
                 launch_pdl=current_platform.is_arch_support_pdl(),
+                **self.record_kwargs(),
             ),
         )
 
@@ -1392,8 +1563,16 @@ class MambaSpecDecodeGPUContext:
                 launch_pdl=current_platform.is_arch_support_pdl(),
                 num_sampled_ptr=num_sampled,
                 FROM_NUM_SAMPLED=num_sampled is not None,
+                **self.record_kwargs(),
             ),
         )
+
+    def record_kwargs(self) -> dict:
+        """The align kernels' record-format arguments (the per-state head counts), or
+        none."""
+        if self.state_record_heads is None:
+            return {}
+        return dict(state_record_heads_ptr=self.state_record_heads, HAS_RECORDS=True)
 
 
 @dataclasses.dataclass

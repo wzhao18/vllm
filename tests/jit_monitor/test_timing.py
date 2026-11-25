@@ -322,6 +322,59 @@ def test_deepgemm_watch_after_ready_is_logging_only(tmp_path):
         watch.stop()
 
 
+def test_deepgemm_load_before_activate_is_a_startup_event(tmp_path):
+    """A kernel that warmup loaded, not yet polled by the watch thread when
+    warmup ends, is a startup event: ``activate()`` reports the pending
+    events first. (Reported at the thread's next poll, up to its interval
+    later, it read as a load inside the first step: the DCP ShardQ layer
+    test's JIT check then failed on the ranks whose poll fell in its step.)"""
+    watch = jit_monitor._DeepGemmCacheWatch(str(tmp_path), interval=3600)
+    jit_monitor._deepgemm_watch = watch  # conftest's reset stops it
+    entry = tmp_path / "sm100_mqa_logits.abc"
+    entry.mkdir()
+    (entry / ".committed").write_text("")
+    with (
+        mock.patch.object(jit_monitor.logger, "error") as err,
+        mock.patch.object(jit_monitor.logger, "info"),
+    ):
+        jit_monitor.activate(mode="error")
+        watch.poll()  # the thread's next poll: nothing left to report
+    assert _messages(err) == []
+    assert jit_monitor.compile_stats("startup")["DeepGEMM"][0] == 1
+    assert "DeepGEMM" not in jit_monitor.compile_stats("serving")
+
+
+def test_poll_cache_watches_reports_pending_events_once(tmp_path):
+    import os
+    import threading
+
+    watch = jit_monitor._DeepGemmCacheWatch(str(tmp_path), interval=3600)
+    jit_monitor._deepgemm_watch = watch
+    jit_monitor._timing_installed = True
+    entry = tmp_path / "sm100_mqa_logits.abc"
+    entry.mkdir()
+    (entry / ".committed").write_text("")
+    with mock.patch.object(jit_monitor.logger, "info") as info:
+        jit_monitor.poll_cache_watches()  # now, not at the thread's next poll
+        assert len(_messages(info)) == 1
+        os.utime(entry / ".committed", (4e9, 4e9))  # a later load
+        threads = [
+            threading.Thread(target=jit_monitor.poll_cache_watches) for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    lines = _messages(info)
+    assert len(lines) == 2, lines
+    assert lines[1].startswith("JIT_COMPILE DeepGEMM kernel load")
+
+
+def test_poll_cache_watches_without_watch_is_a_no_op():
+    assert jit_monitor._deepgemm_watch is None
+    jit_monitor.poll_cache_watches()
+
+
 def test_cpp_extension_load_timed():
     cpp = cast(Any, ModuleType("torch.utils.cpp_extension"))
     cpp.load = mock.MagicMock(return_value="mod")

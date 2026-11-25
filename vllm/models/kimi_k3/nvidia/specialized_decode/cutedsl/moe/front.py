@@ -480,6 +480,10 @@ SITU_FUSED_WIDE = {384: "3-8:1"}
 # rows 1 us later), us per layer: -0.24 (B8), -0.05..-0.11 (B5). Bitwise identical.
 # M64 (B8 verify): the merged front kernel triggers at entry, so an entry release
 # brings the 208-CTA grid up beside it; after it: -0.7 us per layer (one-GPU proxy).
+# M9-63 (B2-B7 verify): NOT released after the front. Their routing is lean + polled
+# (logits by mailbox, no completion wait); the release's entry griddepcontrol_wait
+# serializes all of routing after the front GEMM's completion: 16 ranks (L13 ABBA,
+# prod cfg) B2 +0.18 ms/step (RouteSitu 3.90 -> 6.24 us per layer), B4 +0.006.
 RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,64:1"}
 # Those devices, TP16 B3-8 (lean polled routing): each thread's four exact sigmoids
 # share one div.rn fallback branch (``primitives.sigmoids``, bitwise equal on all 2^32

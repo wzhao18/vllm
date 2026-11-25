@@ -10,6 +10,7 @@ top-K of the union of all ranks' logits. Each world size spawns one group
 and runs every case inside it.
 """
 
+import functools
 import time
 
 import pytest
@@ -240,6 +241,98 @@ def _check_cases(group, ws, n: int) -> None:
             _assert_rows(group, ids2, rows_out, valid_out, req_id, block_table)
 
 
+def _check_published(group, ws, n: int) -> None:
+    """A producer that multicasts its B' rows into the round-1 mailbox itself
+    (the fused DCP indexer's IndexerLocalTopk, ``published=``): the merge runs no
+    pack kernel and selects exactly what the DeepSelect + pack path selects; so
+    does the select with the rescue folded in (``release=``)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
+        IndexerLocalTopk,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge import packed_row_words
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge_rows,
+        dcp_topk_round1_mailbox,
+    )
+
+    if n >= 1024:  # IndexerLocalTopk's scanned counts (LOCAL_ABOVE_BITS)
+        return
+    world, rank = group.world_size, group.rank_in_group
+    box = dcp_topk_round1_mailbox(TOPK, n)
+    assert box is not None
+    long = [100_000, 40_000, 9_000, 70_123, 150_000, 6_000]
+    cases = [
+        ("normal", [100_000, 40_000, 9_000, 70_123, 2_049, 1, 0, world * 66_000], []),
+        ("sat1", long, [world - 1]),
+        ("short", [300, 1_000, 3_000, 9_000, 20_000, 120], [0]),
+    ]
+    for seed, (name, lengths, sat) in enumerate(cases):
+        num_rows = len(lengths)
+        logits, ends = _make_case(lengths, seed=seed + 100)
+        if sat:
+            logits = _boost(logits, sat, slice(None), world)
+        local, local_end = _shard(logits, ends, world, rank)
+        pitch = local.shape[1]
+        req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+        block_table = _block_table(num_rows, int(local_end.max()))
+        results = []
+        # Rows <= SMs: the rescue inside the select ("folded": release=).
+        for mode in ("logits", "published", "folded"):
+            rows_out = torch.full(
+                (num_rows, TOPK), -7, dtype=torch.int32, device="cuda"
+            )
+            valid_out = torch.full((num_rows,), -7, dtype=torch.int32, device="cuda")
+            ids = torch.full_like(rows_out, -7)
+            packed = None
+            if mode == "published":
+                packed = torch.zeros(
+                    (num_rows, packed_row_words(n)), dtype=torch.int32, device="cuda"
+                )
+                counts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+                args = (
+                    to_cute(local.view(torch.int16).reshape(-1)),
+                    to_cute(local_end, 4),
+                    to_cute(packed, 4),
+                    to_cute(counts, 4),
+                    to_cute(box.ordinals[:num_rows], 4),
+                    cutlass.Int64(box.box_mc),
+                    cutlass.Int32(box.rank),
+                    cutlass.Int32(box.max_rows),
+                    stream(torch.device("cuda")),
+                )
+                select = IndexerLocalTopk(num_rows, n, pitch, world)
+                cute.compile(select, *args)(*args)
+            dcp_topk_merge_rows(
+                logits=local,
+                row_ends=local_end,
+                packed=packed,
+                published=packed is not None,
+                release=mode == "folded",
+                local_topk=n,
+                topk=TOPK,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=_BLOCK,
+                stride_rows=_BLOCK,
+                dcp_rank=rank,
+                rows_out=rows_out,
+                valid_out=valid_out,
+                ids_out=ids,
+            )
+            _assert_exact(ids, logits, ends)
+            _assert_same_on_every_rank(group, ids, f"{name}/{mode}")
+            _assert_rows(group, ids, rows_out, valid_out, req_id, block_table)
+            results.append(_as_lists(ids))
+        assert results[0] == results[1] == results[2], name
+
+
 def _check_nonfinite(group, n: int) -> None:
     """NaN / +-inf logits: ids stay in range, never select a NaN, agree on
     every rank, and rows without a NaN keep the exact top-K."""
@@ -343,6 +436,118 @@ def _check_cuda_graph(group, ws, n: int) -> None:
         # Two merges per replay: each saturated row advances twice.
         assert torch.equal(ws.seq2[:num_rows], seq + 2 * triggered), i
         seq = ws.seq2[:num_rows].clone()
+
+
+@functools.cache
+def _pdl_copy_kernels():
+    """Two PDL consumers copying a buffer: ``early`` reads before its
+    griddepcontrol.wait (as FlashInfer's trtllm-gen reads its counts),
+    ``late`` after it (as the DSA sparse core)."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def early(src, dst, numel, BLOCK_N: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < numel
+        v = tl.load(src + offs, mask=mask, volatile=True)
+        tl.extra.cuda.gdc_wait()
+        tl.store(dst + offs, v, mask=mask)
+
+    @triton.jit
+    def late(src, dst, numel, BLOCK_N: tl.constexpr):
+        tl.extra.cuda.gdc_wait()
+        offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < numel
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+    return early, late
+
+
+def _pdl_copy(kernel, src: torch.Tensor, dst: torch.Tensor) -> None:
+    numel = src.numel()
+    kernel[(-(-numel // 1024),)](src, dst, numel, BLOCK_N=1024, launch_pdl=True)
+
+
+def _check_pdl_consumers(group, ws, n: int) -> None:
+    """The rescue's PDL release (``release``) in a CUDA graph: a consumer that
+    reads the rows and counts before its PDL wait right after a merge without
+    ``release`` (FlashInfer's trtllm-gen), and one that reads after its wait
+    right after a merge with ``release`` (the DSA sparse core), both see the
+    rescue's rewritten rows of saturated rows on every replay."""
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
+
+    if not current_platform.has_device_capability(90):
+        return
+    early, late = _pdl_copy_kernels()
+    world, rank = group.world_size, group.rank_in_group
+    lengths = [100_000, 40_000, 9_000, 70_123, 150_000, 6_000, 3_000, 220_000]
+    num_rows = len(lengths)
+    base, ends = _make_case(lengths, seed=31)
+    variants = [
+        _boost(base, [0], slice(None), world),
+        base,
+        _boost(base, list(range((TOPK - 1) // n)), slice(None), world),
+        _boost(base, [world - 1], slice(3, 5), world),
+    ]
+    shards = [_shard(v, ends, world, rank) for v in variants]
+    static = shards[0][0].clone()
+    local_end = shards[0][1]
+    req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+    block_table = _block_table(num_rows, int(local_end.max()))
+    outs = []
+    for _ in range(2):
+        ids = torch.empty((num_rows, TOPK), dtype=torch.int32, device="cuda")
+        rows_out = torch.empty_like(ids)
+        valid_out = torch.empty(num_rows, dtype=torch.int32, device="cuda")
+        seen = torch.empty_like(rows_out), torch.empty_like(valid_out)
+        outs.append((ids, rows_out, valid_out, seen))
+
+    def step() -> None:
+        for release, consumer, (ids, rows_out, valid_out, seen) in zip(
+            (False, True), (early, late), outs
+        ):
+            dcp_topk_merge_rows(
+                logits=static,
+                row_ends=local_end,
+                local_topk=n,
+                topk=TOPK,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=_BLOCK,
+                stride_rows=_BLOCK,
+                dcp_rank=rank,
+                rows_out=rows_out,
+                valid_out=valid_out,
+                ids_out=ids,
+                release=release,
+            )
+            _pdl_copy(consumer, valid_out, seen[1])
+            _pdl_copy(consumer, rows_out, seen[0])
+
+    step()  # compile outside capture
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with group.graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
+        step()
+    torch.accelerator.synchronize()
+    for i in range(3 * len(variants)):
+        v = i % len(variants)
+        static.copy_(shards[v][0])
+        for _, rows_out, valid_out, seen in outs:
+            # Stale rows a consumer would see before the merge writes them.
+            rows_out.fill_(-7)
+            valid_out.fill_(-7)
+            seen[0].fill_(-9)
+            seen[1].fill_(-9)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for release, (ids, rows_out, valid_out, seen) in zip((False, True), outs):
+            _assert_exact(ids, variants[v], ends)
+            _assert_rows(group, ids, rows_out, valid_out, req_id, block_table)
+            assert torch.equal(seen[1], valid_out), (i, release, "counts")
+            assert torch.equal(seen[0], rows_out), (i, release, "rows")
+        sat = [int(m != 0) for m in _sat_masks(ws, num_rows)]
+        assert any(sat) == (v != 1), (i, sat)
 
 
 def _check_late_peer(group, ws, n: int) -> None:
@@ -927,6 +1132,7 @@ def run_worker(
                 _check_error_after_publish(group, n)
                 return
             if mailbox:
+                _check_published(group, ws, n)
                 _check_exchange_ab(group, ws, n)
                 _check_late_publisher(group, n)
                 _check_graph_stress(group, ws, n, stress_replays)
@@ -934,6 +1140,7 @@ def run_worker(
             _check_deterministic(group, ws, n)
             _check_nonfinite(group, n)
             _check_cuda_graph(group, ws, n)
+            _check_pdl_consumers(group, ws, n)
             _check_late_peer(group, ws, n)
         finally:
             set_dcp_topk_merge_exchange("auto")

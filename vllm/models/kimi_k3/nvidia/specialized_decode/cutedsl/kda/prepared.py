@@ -22,11 +22,15 @@ from .kernel import KdaSplit
 from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
 from .verify_feed import KdaVerifyFeed
+from .verify_half import KdaVerifyHalfPair, KdaVerifyHalfStock
 from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
 from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
 from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
+from .cols_defer import KdaVerifyColsDefer
+from .split_defer import KdaSplitDefer
+from .verify_defer import KdaVerifyHalfDefer, KdaVerifyLoopDefer
 from .window import check_conv_cache
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
@@ -223,10 +227,42 @@ FP32_VERIFY_WIDE: dict = {
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
 WIDE_KINDS = (
     KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
-    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed,
+    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfPair,
+    KdaVerifyHalfStock,
 )
+# Under the deferred-verify record protocol (``record_protocol``) an FP32 state's
+# stock-math kinds run their record forms (``verify_defer``); KdaVerifyFeed has none,
+# so its rows run LoopDefer.
+RECORD_FORMS = {
+    KdaVerifyLoopStock: KdaVerifyLoopDefer,
+    KdaVerifyFeed: KdaVerifyLoopDefer,
+    KdaVerifyHalfStock: KdaVerifyHalfDefer,
+    # HalfPair (the halves' DSMEM output exchange) has none: its rows (q8 B11-17) run
+    # HalfStock's record form (two CTAs per item, scratch + counter exchange)
+    KdaVerifyHalfPair: KdaVerifyHalfDefer,
+}
+# The verify kernels' state protocol is a deployment's (every verify kernel, the stock
+# verify and the align copies agree): the record protocol (no per-token checkpoint
+# stores, user 2026-11-24) where every kernel at the verify length has a record form
+# and it is validated (multi-step exactness vs the stock protocol: lanes/KDA round 8):
+# Rubin, an FP32 state, q8, 6 heads per rank (TP16). Elsewhere the stock protocol.
+# ``RECORDS`` False: the stock protocol everywhere (benches build the dev arm with it).
+RECORDS = True
+RECORD_SHAPES = {((10, 7), 8, 6)}  # (capability, verify length, heads per rank)
+
+
+def record_protocol(tokens, bf16_state, heads, capability=None) -> bool:
+    """Whether a deployment's verify kernels (and its stock verify / align copies,
+    ``KimiK3DeltaAttention.state_records``) run the deferred-verify record protocol."""
+    if not RECORDS or bf16_state:
+        return False
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    return (tuple(capability), tokens, heads) in RECORD_SHAPES
+
+
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
-              "loop", "loopstock", "feed")
+              "loop", "loopstock", "feed", "halfstock", "halfscratch")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
 # staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
 # constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
@@ -254,6 +290,26 @@ BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
 # item per CTA (B12-35: +0.4..+1.1) stays LoopStock.
 FP32_FEED: dict = {(10, 7): {4: "41-:1"}}
 FP32_FEED_KIND = 8
+# FP32 state: request counts per q whose FP32_WIDE rows run ``KdaVerifyHalfStock``
+# (9, kda.verify_half: LoopStock bit for bit with each item's 128 state rows on two
+# 8-warp CTAs) instead of ``KdaVerifyLoopStock``. At one item per CTA LoopStock is
+# bound by each item's SM (VR200 1-GPU verify alone, q8, us per layer: B4 11.89, B8
+# 12.77, B16 13.20; per-CTA stamps at B16: 16 warps' token loops ~7.3 us at the SM's
+# instruction issue and checkpoint store rates, warps 0-3 +2.7 us of prologue);
+# two CTAs per item halve each SM's share. Keyed by q and heads (TP16's 6; other
+# head counts, e.g. the SP decode's 24, keep their rows).
+# The halves run as a cluster of two and exchange their outputs over DSMEM
+# (``KdaVerifyHalfPair``, bitwise): 1-GPU KDA chain (carve-out-100 AttnRes stand-in ->
+# the production in-projection -> verify -> o-proj stand-in, 69 layers, FP32 state +
+# conv, us per layer) q8 B16 25.82 -> 24.18 vs the global scratch + arrival counter
+# exchange (10, "halfscratch"), B17 32.93 -> 31.35. With the DSMEM exchange the rows
+# take precedence over FP32_SPLIT_Q (checked first): q8 B11-15 vs that table's / the
+# default KdaSplitStock, B11 23.73 -> 22.67, B12 23.37 -> 22.60, B13 23.65 -> 23.56,
+# B14 23.88 -> 23.74, B15 (1.8.4.4) 30.22 -> 23.84; B9 / B10 keep KdaSplitStock
+# (HalfPair +0.42 / +0.81).
+FP32_HALF: dict = {(10, 7): {8: {6: "11-17:1"}}}
+FP32_HALF_KIND = 9
+HALF_KINDS = (9, 10)  # kinds that take the scratch + counter operands
 # FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
 # at the geometry given ("early.lanes.occupancy.cluster", as SPEC_SCHEDULE), in place
 # of FP32_VERIFY_WIDE / FP32_FEED's kernel and on top of DEVICE_SPEC_SCHEDULE(_Q)'s
@@ -283,7 +339,7 @@ FP32_FEED_KIND = 8
 FP32_SPLIT_Q: dict = {
     (10, 7): {
         4: {6: "41-42:1.8.3.4"},
-        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
+        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},  # q8 B11-17: FP32_HALF first
     },
 }
 
@@ -342,6 +398,11 @@ class KdaSplitStock(RecoverKdaSplit):
         self.narrow_fb = True
 
 
+# The FP32 KdaSplit verify kernel and its record form (``record_protocol``).
+SPLIT_STOCK, SPLIT_RECORD = KdaSplitStock, KdaSplitDefer
+# The prepared transposed verify kernel and its record form (FP32).
+COLS_KIND, COLS_RECORD = KdaVerifyCols, KdaVerifyColsDefer
+
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -382,6 +443,10 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     KdaSplit (an FP32 state: ``KdaSplitStock``)."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
+    if not bf16_state:  # LoopStock on two CTAs per item (bitwise), FP32_HALF's rows
+        halves = FP32_HALF.get(capability, {}).get(tokens, {}).get(heads, "")
+        if batch_table(halves).get(requests):
+            return FP32_HALF_KIND
     if not bf16_state and requests in fp32_split_table(capability, tokens, heads):
         return 0  # KdaSplitStock at FP32_SPLIT_Q's geometry (``schedule_of``)
     table = wide_table(capability, tokens, bf16_state)
@@ -454,16 +519,23 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     wide = wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
     # (the prepared kernels compute the stock verify's math for an FP32 state, on
     # ``KdaInProj64(stock=True)``'s operands)
+    records = tokens > 1 and record_protocol(tokens, bf16_state, heads, capability)
     if prepared and cols is not None:  # the transposed recurrence
-        return KdaVerifyCols(*options, cols)
+        return (COLS_RECORD if records else COLS_KIND)(*options, cols)
+    if records and (prepared or (wide and WIDE_KINDS[wide - 1] not in RECORD_FORMS)):
+        raise NotImplementedError(
+            f"KDA verify {requests} x q{tokens}: no record form (record_protocol)"
+        )
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
         return KdaVerifyRows(*options, *rows)
     if prepared:  # the gates and betas arrive activated (the in-projection epilogue)
         return KdaVerifyPrepared(*options)
     if wide:  # one or two CTAs per (request, head), or the chunked verify
-        return WIDE_KINDS[wide - 1](*options)
+        kind = WIDE_KINDS[wide - 1]
+        return (RECORD_FORMS[kind] if records else kind)(*options)
     if not bf16_state:  # stock math (FP32 state): verify, q = 1, TP8
-        return KdaSplitStock(*options[:6])
+        split = (SPLIT_RECORD if records else SPLIT_STOCK) if tokens > 1 else KdaSplitStock
+        return split(*options[:6])
     lean = tokens > 1 and capability in LEAN_VERIFY
     norm = verify_table("load_norm", capability, tokens).get(requests)
     return KdaSplit(*options, lean, bool(norm))
@@ -492,6 +564,8 @@ class PreparedKda:
         self.scalars = tuple(map(cutlass.Float32, scalars))
         self.conv_dim_first, self.kernels = conv_dim_first, {}
         self.prepared, self.prepared_kernels = frozenset(prepared), {}
+        # KdaVerifyHalfStock keys: the layer's output scratch and arrival counters
+        self.halves: dict = {}
         # KdaVerifyPrepared's F_A reader counts per request (its last reader re-arms)
         requests = max((r for r, _ in self.prepared), default=0)
         self.readers = torch.zeros(requests, dtype=torch.int32, device=self.device)
@@ -523,6 +597,16 @@ class PreparedKda:
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
             operands = self._operands(caches, projected, slots, out, accepted)
+            capability = torch.cuda.get_device_capability(self.device)
+            bf16_state = caches[1].dtype == torch.bfloat16
+            kind = wide_kind(requests, tokens, capability, bf16_state, mode, self.heads)
+            if kind in HALF_KINDS and tokens > 1 and key not in self.prepared:
+                items, device = requests * self.heads, self.device
+                self.halves[key] = (
+                    torch.zeros(items, 2 * tokens * 128, dtype=torch.float32, device=device),
+                    torch.zeros(items, dtype=torch.int32, device=device),
+                )
+                operands += self.halves[key]
             specs = tuple(map(layout, operands))
             options = (self.heads, mode, self.has_bias, self.device.index, tokens)
             self.kernels[key] = executable(specs, *options)
@@ -546,6 +630,8 @@ class PreparedKda:
                 slots = slots.contiguous()
         tensors = self._operands(caches, projected, slots[:rows], out, accepted)
         kernel = self.kernels[key]
+        if key in self.halves:  # KdaVerifyHalfStock: scratch + counters
+            tensors += self.halves[key]
         if prepared is not None:
             tensors = (prepared, *tensors[1:], self.readers[:rows])
             kernel = self.prepared_kernels[key]

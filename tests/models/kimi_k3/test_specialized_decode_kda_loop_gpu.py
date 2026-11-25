@@ -39,6 +39,10 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7
 
 os.environ.setdefault("VLLM_SSM_CONV_STATE_LAYOUT", "DS")  # the decode's conv layout
 
+from tests.models.kimi_k3.kda_protocol import (  # noqa: E402
+    accepted_states,
+    record_input,
+)
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.models.kimi_k3.nvidia import kda as kda_module  # noqa: E402
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention  # noqa: E402
@@ -77,7 +81,7 @@ LOOP_SHAPES = [
 STOCK_SHAPES = [
     *(pytest.param(q, b, HEADS, False, id=f"q{q}-B{b}") for q, b in (
         (4, 1), (4, 4), (4, 8), (4, 14), (4, 36), (4, 40),
-        (8, 1), (8, 4), (8, 8), (8, 14),
+        (8, 1), (8, 4), (8, 8), (8, 14), (8, 16),
     )),
     *(pytest.param(*p.values, HEADS, False, id=p.id) for p in LOOP_SHAPES),
     pytest.param(4, 8, HEADS, True, id="q4-B8-bias"),
@@ -219,12 +223,15 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     """The production kernel at this shape (``PreparedKda`` with an FP32 state: a
     stock-math kind) against the stock verify."""
     name = prepared.verify_kernel(requests, q, RUBIN, False, 0, heads)
-    assert name in ("loopstock", "feed", "kdasplit"), name
+    assert name in ("loopstock", "feed", "kdasplit", "halfstock"), name
     schedule = prepared.schedule_of(heads, requests, 0, q, RUBIN, False)
     kernel = prepared.make_kernel((heads, requests, 0, bias, schedule, q, False), RUBIN)
     stock_kinds = (
-        prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock
-    )
+        prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
+        prepared.KdaVerifyHalfPair,
+        # their deferred-verify record forms (the FP32 default)
+        prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer, prepared.KdaVerifyHalfDefer,
+    )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
     slots = requests * q + 1
@@ -233,7 +240,13 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     projected = projected_rows(requests * q, pitch=pitch_of(heads))
     core = prepared.PreparedKda(attention, {(requests, q): (pitch_of(heads), 0)}, True)
     core.prepare_caches(base)  # the production kernel at this shape
-    out, state = run(core, projected, base, table, accepted)
+    start = base
+    if type(kernel) in prepared.RECORD_FORMS.values() or type(kernel) is (
+        prepared.SPLIT_RECORD
+    ):  # a record form starts from the same accepted states in its format
+        start = record_input(tuple(t.clone() for t in base)[1], table, accepted)
+        start = (base[0], start)
+    out, state = run(core, projected, start, table, accepted)
     want, want_state = stock_verify(
         attention, projected, base, table, accepted, q, monkeypatch
     )
@@ -242,7 +255,10 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     untouched = torch.ones(slots, dtype=torch.bool, device=DEVICE)
     untouched[used] = False
     assert_bitwise("untouched slots", state[1][untouched], base[1][untouched])
-    state_error = relative_error(state[1][used], want_state[1][used])
+    # the accepted states a = 1 .. q (either state protocol: kda_protocol)
+    state_error = relative_error(
+        accepted_states(state[1], table), accepted_states(want_state[1], table)
+    )
     assert state_error < 2e-7, state_error  # FP32 order; KdaSplit's math: ~2.1e-3
     torch.testing.assert_close(out.float(), want.float(), rtol=1e-2, atol=1e-2)
     off = (bits(out) != bits(want)).sum().item()
@@ -256,6 +272,9 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
 )
 @pytest.mark.parametrize("kind", ["packed", "loop"])
 def test_packed_and_loop_equal_wide(monkeypatch, q, requests, kind):
+    # stock-format kernels compared with each other (no record forms: the stock
+    # protocol)
+    monkeypatch.setattr(prepared, "RECORDS", False)
     attention = kda_attention()
     slots = requests * q + 1
     base = caches(slots, q)
@@ -302,6 +321,57 @@ def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
     assert_bitwise("output", got[0], want[0])
     assert_bitwise("recurrent state", got[1][1], want[1][1])
     assert_bitwise("conv state", got[1][0], want[1][0])
+
+
+# HalfStock vs LoopStock: its production rows (q8 B16 / B17), a short batch (B4), and
+# q4 / odd q (the conv window is written after both halves read its taps: at q4 / q5
+# an early writer raced the other half's tap loads before that fix).
+HALF_SHAPES = [(8, 16), (8, 17), (8, 11), (8, 15), (8, 4), (4, 16), (5, 8)]
+
+
+@pytest.mark.parametrize("q,requests", HALF_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
+@pytest.mark.parametrize("kind", ["halfstock", "halfscratch"])  # DSMEM pair / scratch
+def test_half_equals_loopstock(monkeypatch, q, requests, pad, kind):
+    # the stock-format kernels (HalfPair's DSMEM / HalfStock's scratch exchange) vs
+    # LoopStock; their record form (HalfDefer) is checked by the record-protocol runs
+    monkeypatch.setattr(prepared, "RECORDS", False)
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    if pad:  # every third request is padding
+        padded = torch.arange(requests, device=DEVICE) % 3 == 1
+        table[padded] = -1
+        accepted[padded] = 0
+    projected = projected_rows(requests * q)
+    half = core_of(attention, requests, q, kind, base, monkeypatch)
+    want = run(
+        core_of(attention, requests, q, "loopstock", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    for _ in range(2):  # the second call: counters re-armed by the first
+        got = run(half, projected, base, table, accepted)
+        assert_bitwise("output", got[0], want[0])
+        assert_bitwise("recurrent state", got[1][1], want[1][1])
+        assert_bitwise("conv state", got[1][0], want[1][0])
+    # scratch: two arrivals per live item and call, none for a padding request; the
+    # DSMEM pair never touches the counters
+    counts = set(half.halves[(requests, q)][1].tolist())
+    if kind == "halfscratch":
+        assert counts <= {0, 4} and 4 in counts, counts
+    else:
+        assert counts == {0}, counts
+
+
+def test_half_policy_rows():
+    """q8 B11-17 run HalfStock (the DSMEM pair) for an FP32 state; a BF16 state never
+    does."""
+    for requests in range(11, 18):
+        assert prepared.verify_kernel(requests, 8, RUBIN, False) == "halfstock"
+        assert prepared.verify_kernel(requests, 8, RUBIN, True) != "halfstock"
+    for requests in (9, 10, 18, 32, 64):
+        assert prepared.verify_kernel(requests, 8, RUBIN, False) != "halfstock"
 
 
 def test_feed_refuses_long_verify():

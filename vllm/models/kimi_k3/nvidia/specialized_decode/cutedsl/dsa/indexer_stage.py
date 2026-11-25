@@ -30,9 +30,10 @@ from .index import DIM, fp4_query_views, is_fp4_cache
 class IndexerStage:
     """``indexer``: the layer's KimiK3DSAIndexer; ``rows``: the most decode rows
     of a step (sizes the DCP merge's outputs; 0: no direct DCP merge); ``impl``:
-    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets."""
+    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets; ``buffers``:
+    the merge's (rows, counts) outputs to use (default: this stage's own)."""
 
-    def __init__(self, indexer, rows=0, impl=None):
+    def __init__(self, indexer, rows=0, impl=None, buffers=None):
         self.indexer = indexer
         self.impl = impl
         self.k_cache_name = _encode_layer_name(indexer.k_cache.prefix)
@@ -61,8 +62,14 @@ class IndexerStage:
             # K wide: the exact merge gives a rank up to K of a row's keys (a
             # saturated row: more than its N local candidates).
             shape = (rows, self.topk)
-            self.dcp_rows = torch.full(shape, -1, dtype=torch.int32, device=device)
-            self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
+            if buffers is not None:  # (rows, counts) shared with other layers
+                self.dcp_rows, self.dcp_valid = buffers
+                assert tuple(self.dcp_rows.shape) == shape, (self.dcp_rows.shape, shape)
+            else:
+                self.dcp_rows = torch.full(
+                    shape, -1, dtype=torch.int32, device=device
+                )
+                self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
         # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
         # -----------------------------------------------------------------------
@@ -152,7 +159,17 @@ class IndexerStage:
             return "merge", rows
         return None, 0
 
-    def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
+    def merge_rows(
+        self,
+        q_fp8,
+        head_w,
+        metadata,
+        stride_rows,
+        batch,
+        q=1,
+        release=False,
+        after_logits=None,
+    ):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
         row) and their counts, as ``dcp_stage.local_slots`` of the op's global
@@ -161,7 +178,11 @@ class IndexerStage:
         the DCP group, so every rank takes the same branch. The logits must hold
         no NaN: DeepSelect then returns out-of-range ids, on which the merge's
         pack faults; no per-step check here (finite query, head weights and
-        cached keys keep them finite)."""
+        cached keys keep them finite). ``release``: the consumer (the DSA sparse
+        core) reads the rows after its PDL wait, so the merge's rescue launches
+        it early (``dcp_topk_merge_rows``); False for FlashInfer's decode.
+        ``after_logits``: called once the logits are enqueued (the late query fork,
+        overlap.QUERY_FORK_AT)."""
         from vllm.forward_context import get_forward_context
         from vllm.model_executor.layers.indexer_topk import (
             SparseIndexerTopk,
@@ -199,17 +220,25 @@ class IndexerStage:
             rows_out=slots[:rows],
             valid_out=valid[:rows],
             ids_out=ids,
+            release=release,
         )
         fused = self.fused
-        if fused is not None and decode.seq_lens.numel() == rows:
+        if (
+            fused is not None
+            and decode.seq_lens.numel() == rows
+            and (batch, q) in fused.kernels
+        ):
             # The logits stay valid until the merge returns (stream order): a
             # saturated rank re-reads its row in the exact merge's second round.
             packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
+            if after_logits is not None:
+                after_logits()
             dcp_topk_merge_rows(
                 logits=logits[:rows],
                 row_ends=ends[:rows],
                 packed=None if packed is None else packed[:rows],
                 max_local_len=max_local_len,
+                published=packed is not None and fused.publishes(rows),
                 **merge,
             )
             if rows < batch:  # rows past the requests attend nothing
@@ -217,6 +246,8 @@ class IndexerStage:
                 valid[rows:].zero_()
             return slots, valid
         logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+        if after_logits is not None:
+            after_logits()
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
         reqs = decode.decode_lens.shape[0]

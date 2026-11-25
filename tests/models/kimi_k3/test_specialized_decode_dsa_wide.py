@@ -144,6 +144,30 @@ def test_index_policies_wide_rows():
     assert policies[64] == (64, 64, 1, 4)
     assert policies[72] == policies[96] == policies[128] == (64, 64, 2, 6)
     assert 256 not in policies and 768 not in policies
+    # Rubin: one K pass per CTA from 17 rows on (measured table), still none above 128
+    rubin = index_policies([8, 32, 64, 72, 128, 256], rubin=True)
+    assert rubin[8] == (128, 8, 3, 4) and rubin[32] == (64, 32, 1, 8)
+    assert rubin[64] == rubin[72] == rubin[128] == (64, 64, 1, 7)
+    assert 256 not in rubin
+
+
+def test_query_stage_index_policies():
+    """QueryStage's wq_b table: GB300 maps every row count to a split-K tactic (64-row
+    N tiles above 64); Rubin uses the same table as WideDsa and none above 128 rows
+    (``QueryStage.run_index``: cuBLAS there)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import query_stage
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        index_policies,
+    )
+
+    rows = [8, 16, 32, 64, 72, 128, 256, 512]
+    gb300 = query_stage.index_policies(rows)
+    assert gb300[32] == (64, 32, 1, 8)
+    assert gb300[72] == gb300[256] == gb300[512] == (64, 64, 1, 4)
+    rubin = query_stage.index_policies(rows, rubin=True)
+    assert rubin == index_policies(rows, rubin=True)
+    assert sorted(rubin) == [8, 16, 32, 64, 72, 128]
+    assert rubin[128] == (64, 64, 1, 7)
 
 
 def dcp16_core_specs(heads=6):
@@ -382,6 +406,65 @@ def test_fp8_query_and_cache_insert(batch, gap, k_scale):
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 
 
+@pytest.mark.parametrize("batch", [128, 384, 512])
+def test_fp8_query_48_row_tiles_bitwise(batch):
+    """WideDsa's 48-request MlaQuery tiles (wide.WIDE_QUERY_TOKENS: 6 heads, a DCP16
+    rank's query on Rubin) write the same FP8 query rows, q_c rows and FP8 KV rows as
+    the 32-request tiles they replace, bit for bit (the same arithmetic per row)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        prepare_shared_carveout,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        query_tokens,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
+        MlaQuery,
+    )
+
+    heads, dev, bf = 6, "cuda", torch.bfloat16
+    assert (
+        query_tokens(heads, batch, 212) == 48 and query_tokens(heads, batch, 148) == 0
+    )
+    torch.manual_seed(batch)
+    pitch = 2112 + heads * 128 + 128 + 32
+    projected = torch.randn(batch, pitch, device=dev, dtype=bf)
+    q_norm = torch.rand(1536, device=dev, dtype=bf) + 0.5
+    kv_norm = torch.rand(512, device=dev, dtype=bf) + 0.5
+    q_b = torch.randn(heads * 192, 1536, device=dev, dtype=bf) / 40
+    w_uk = torch.randn(heads, 128, 512, device=dev, dtype=bf) / 12
+    blocks, block = -(-batch // 64) + 2, 64
+    slots = torch.randperm(blocks * block - 1, device=dev)[:batch]
+    slots[0] = blocks * block - 1  # the last row
+    slots[1] = -1  # a padded row writes nothing
+    q_scale = torch.full((1,), 0.5, device=dev)
+    k_scale = torch.full((1,), 0.875, device=dev)
+    outs, grids = [], []
+    for tokens in (0, 48):  # 0: the default (32-request) tile
+        mla = packed_cache(blocks, block, FP8_ROW, GAP)
+        query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
+        q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
+        args = (to_cute(projected), to_cute(q_norm), to_cute(kv_norm), to_cute(q_b))
+        args += (to_cute(w_uk), to_cute(mla), to_cute(slots, 8))
+        args += (to_cute(1 / q_scale, 4), to_cute(k_scale, 4), cutlass.Float32(EPS))
+        args += (to_cute(query), to_cute(q_c), stream(dev))
+        mla_query = MlaQuery(heads, batch, dsa=True, fp8=True, tokens=tokens)
+        kernel = cute.compile(mla_query, *args)
+        kernel = prepare_shared_carveout(kernel, torch.cuda.current_device(), 100)
+        kernel(*args)
+        torch.cuda.synchronize()
+        outs.append((query, q_c, mla))
+        grids.append(mla_query.grid)
+    assert grids[0][2] == batch // 32 and grids[1][2] == -(-batch // 48), grids
+    for ours, ref in zip(outs[1], outs[0]):
+        assert torch.equal(ours, ref)
+    assert outs[0][0].any() and outs[0][2].any()
+
+
 @pytest.mark.parametrize("gap", [0, GAP, FAR])
 @pytest.mark.parametrize("batch", [72, 96])
 def test_indexer_inputs(batch, gap):
@@ -488,11 +571,12 @@ def test_indexer_inputs(batch, gap):
     assert (index_blocks(index)[~written] == 0).all()
 
 
-@pytest.mark.parametrize("batch", [8, 64, 72, 96, 128])
+@pytest.mark.parametrize("batch", [8, 16, 32, 64, 72, 96, 128])
 def test_index_projection_rows(batch):
     """WideDsa's replicated wq_b projection (N 4096, K 1536) on its split-K
-    tactic at every prepared row count up to 128 (``index_policies``; wide rows 65-128
-    the generic (64, 64, 2, 6)) against an FP32 GEMM of the same BF16 operands."""
+    tactic at every prepared row count up to 128 (``index_policies`` on this device:
+    Rubin's measured table, else GB300's with the generic (64, 64, 2, 6) at 65-128)
+    against an FP32 GEMM of the same BF16 operands."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
         index_policies,
     )
@@ -504,7 +588,8 @@ def test_index_projection_rows(batch):
     bf, dev = torch.bfloat16, "cuda"
     wq = (torch.randn(32 * 128, 1536, device=dev) / 1536**0.5).to(bf)
     q_c = torch.randn(batch, 1536, device=dev).to(bf)
-    projection = PreparedProjection(wq, index_policies([batch])).prepare()
+    rubin = torch.cuda.get_device_capability(dev) == (10, 7)
+    projection = PreparedProjection(wq, index_policies([batch], rubin)).prepare()
     out = torch.full((batch, 32 * 128), float("nan"), device=dev, dtype=bf)
     projection.run(q_c, out)
     ref = q_c.float() @ wq.float().t()
@@ -907,3 +992,62 @@ def test_dsa_wide_kernels_resident_past_512(q):
                 args = value, heads, 16, rows, q, sms, device
                 grid = wide.check_value_residency(*args)
             assert grid[0] * grid[1] * grid[2] <= sms, (rows, partials, grid)
+
+
+def _merge_rows_worker(rank, size, port, cases):
+    """One rank of the DSA chain bench's WideDsa (MXFP4 indexer cache, 6 heads per
+    rank, an index top-k of 512, ~2K local keys per row) at ``cases`` rows (q8): the
+    #63 merge's rows of each step against the stock op's global top-k filtered to
+    this rank's rows (bench ``check``), per row as sets."""
+    import importlib.util
+    import os
+
+    from vllm.config import set_current_vllm_config
+
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(size),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+    )
+    root = os.path.join(os.path.dirname(__file__), "../../..")
+    path = os.path.join(root, "benchmarks/kernels/bench_k31_dsa_chain.py")
+    spec = importlib.util.spec_from_file_location("bench_k31_dsa_chain", path)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    local, topk = 2000, 512
+    mp = pytest.MonkeyPatch()
+    bench.patch(mp, local * size + 4096, 6, topk)
+    bench.init(size, rank, rank, topk)
+    for rows in cases:
+        case = bench.build(rows, 8, size, local, topk)
+        with set_current_vllm_config(case.config), case.context:
+            info = case.info()
+            assert info["merge"] == f"('merge', {rows})", info
+            assert info["core"].startswith("WideDsa: #63 merge rows"), info
+            result = case.check()
+        assert result is not None and result["rows_mismatch"] == 0, (rows, result)
+        del case
+    mp.undo()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
+def test_wide_dsa_merge_rows_match_op():
+    """WideDsa's merge rows (WIDE_MERGE: 65-256 rows) on DCP4 over one node: every
+    row's selected KV rows equal the stock sparse_attn_indexer op's global top-k
+    filtered to this rank's rows (the path they replace), at 128 and 256 rows (q8)."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    args = (4, get_open_port(), (128, 256))
+    context = mp.start_processes(
+        _merge_rows_worker, args=args, nprocs=4, join=False, start_method="spawn"
+    )
+    deadline = time.monotonic() + 1200
+    while not context.join(timeout=10):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                process.kill()
+            pytest.fail("WideDsa merge rows: no progress in 20 min (a hang?)")

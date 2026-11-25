@@ -76,6 +76,14 @@ class _Dist:
         self.tmp.cleanup()
 
 
+@pytest.fixture
+def should_do_global_cleanup_after_test():
+    """No per-case global cleanup (tests/conftest.py's ``cleanup_fixture``): it tore
+    the module-scoped ``dist`` groups down after the first case, so the next case
+    found no TP group; ``dist`` cleans up once at module end."""
+    return False
+
+
 @pytest.fixture(scope="module")
 def dist():
     torch = _torch()
