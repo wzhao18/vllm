@@ -2940,17 +2940,19 @@ class _ExpertReadRows:
         self._mapper = mapper
         self._owners: dict[str, Any] = {}
 
-    def _owner(self, prefix: str):
+    def _owner(self, prefix: str) -> RoutedExperts | None:
+        """The RoutedExperts holding ``{prefix}.w13_weight`` (the MoE runner at
+        *prefix* holds it as ``routed_experts``), or None."""
         if prefix not in self._owners:
             owner = None
             try:
-                param = self._root.get_parameter(f"{prefix}.w13_weight")
+                module = self._root.get_submodule(prefix)
             except AttributeError:
-                param = None
-            loader = getattr(param, "weight_loader", None)
-            candidate = getattr(loader, "__self__", None)
-            if isinstance(candidate, RoutedExperts):
-                owner = candidate
+                module = None
+            if not isinstance(module, RoutedExperts):
+                module = getattr(module, "routed_experts", None)
+            if isinstance(module, RoutedExperts):
+                owner = module
             self._owners[prefix] = owner
         return self._owners[prefix]
 
