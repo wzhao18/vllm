@@ -1261,7 +1261,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             # prefill-workspace addressing; the copies of the peers' context
             # rows must have landed.
             assert context is not None
-            context.wait_mla()
+            context.before_attend(layer_cache)
             remap_kwargs = dict(
                 HAS_PREFILL_WORKSPACE=True,
                 prefill_workspace_starts=rank_major.starts_by_req,

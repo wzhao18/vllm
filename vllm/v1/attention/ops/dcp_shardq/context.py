@@ -639,6 +639,24 @@ class DcpShardQContext:
             return self.rank_major.slot_mapping
         return self.slot_mapping
 
+    def before_attend(self, mla_cache: torch.Tensor) -> None:
+        """Before a sparse attention of the DSA layer of ``mla_cache`` over this
+        context (under ``rank_major``): order the current stream after the
+        layer's context MLA rows landed (``wait_mla``). A repeated attention of
+        the layer that already consumed its copies reads the workspace as it is,
+        which is only sound while no next-layer prefetch is overwriting it: the
+        prefetch issued after the first attention packs into this rank's region
+        and copies into the peers' regions on the side stream, unordered with
+        this one. Raises then instead of racing."""
+        if self.mla_in_flight is None and self.mla_attended == mla_cache.data_ptr():
+            if self.mla_prefetch is not None:
+                raise RuntimeError(
+                    "DCP ShardQ: a repeated attention of a DSA layer while the next "
+                    "layer's context rows are being copied into the workspace it reads"
+                )
+            return
+        self.wait_mla()
+
     def wait_mla(self) -> None:
         """Order the current stream after every rank's context MLA rows landed
         in this rank's workspace (a no-op without ``rank_major``)."""
