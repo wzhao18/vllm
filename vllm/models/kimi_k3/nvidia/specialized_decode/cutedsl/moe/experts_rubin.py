@@ -484,7 +484,7 @@ class RubinExpertsKernel(ExpertsKernel):
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
         dies=(), static_groups=False, fast_exchange=False, warm=True, match_fc1=True,
-        head=0,
+        head=0, warp_match=False,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
@@ -514,6 +514,11 @@ class RubinExpertsKernel(ExpertsKernel):
         # rank equal to this CTA, so the first stages of every rank are in flight
         # while the CTAs match; the matched CTA's TMA then hits L2.
         self.head = head if self.match_fc1 else 0
+        # warp_match (match_fc1): warp 0 takes the census ticket before its route poll
+        # and, right after its dedupe, ballots the 2 x grid home bits itself (seven
+        # rounds of 32 ranks) and matches both lists in registers; the ranks travel to
+        # the other warps with the routed barrier (no MATCHED barriers, no smem bits).
+        self.warp_match = warp_match and self.match_fc1
         if self.match_fc1:
             self.ws_census = (self.workspace_bytes + 15) // 16 * 16
         if fast_exchange:
@@ -1279,7 +1284,8 @@ class RubinExpertsKernel(ExpertsKernel):
         (``RubinGroupedExpertsKernel.ticket``); the value before is consumed in
         ``matched_fc1``, so the atomic's round trip overlaps the routing."""
         before = Uint64(0)
-        if (thread()[1] == 2) & (thread()[2] == 0):
+        issuer = 0 if self.warp_match else 2
+        if (thread()[1] == issuer) & (thread()[2] == 0):
             increment = Uint64(1) + (Uint64(self.die()) << Uint64(32))
             before = census_add(workspace.iterator + self.ws_census, increment)
         return before
@@ -1343,6 +1349,48 @@ class RubinExpertsKernel(ExpertsKernel):
         else:
             named_barrier(MATCHED, 384)
         return ranks[0], ranks[1]
+
+    @cute.jit
+    def match_warp(self, sm, workspace, before, distinct):
+        """``warp_match``: ``matched_fc1`` by warp 0 alone after ``route_warp``; lane 0
+        holds the census value. Ranks into off_match + 80 (the routed barrier
+        publishes them)."""
+        lane = thread()[2]
+        cute.arch.sync_warp()
+        experts = view(sm.iterator, self.off_misc + 1140, Int32, 128)
+        words: cutlass.Constexpr = (self.grid + 31) // 32
+        bits: list = [[], []]
+        for i in cutlass.range_constexpr(words):
+            rank = lane + 32 * i
+            ranges = ExpertsKernel.partition(self, distinct, rank)
+            for group in cutlass.range_constexpr(2):
+                lo, hi = (ranges[group, 2], ranges[group, 3])
+                mid = (lo + hi) // 2
+                tile = 3 * ranges[group, 0] + mid // 14
+                row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
+                address = Int64(row) * 1792 + mid % 14 * 128
+                live = (rank < self.grid) & (lo < hi)
+                home = live & ((address >> 21 & 1) != 0)
+                bits[group].append(Uint32(cute.arch.vote_ballot_sync(home)))
+        counts = before + Uint64(1)
+        low = Int32(Uint32(counts & Uint64(4294967295)))
+        high = Int32(Uint32(counts >> Uint64(32)))
+        arrivals = Uint32(cute.arch.shuffle_sync(low, 0))
+        ones = Uint32(cute.arch.shuffle_sync(high, 0))
+        require_below(arrivals, Uint32(self.grid))
+        die = self.die()
+        k = Int32(arrivals) - Int32(ones)
+        if die == 1:
+            k = Int32(ones)
+        if (lane == 0) & (arrivals == Uint32(self.grid - 1)):
+            base = workspace.iterator + self.ws_census
+            mailbox_store(base, (Uint32(4294967295), Uint32(4294967295)))
+        a = match_rank_popc(bits[0], self.grid, die, k)
+        b = match_rank_popc(bits[1], self.grid, die, k)
+        if lane == 0:
+            ranks = view(sm.iterator, self.off_match + 80, Int32, 2)
+            ranks[0], ranks[1] = (a, b)
+        cute.arch.sync_warp()
 
     @cute.jit
     def match_fc2(self, sm, workspace, experts, distinct):
@@ -1637,6 +1685,8 @@ class RubinExpertsKernel(ExpertsKernel):
                 distinct = self.route_warp(sm, source, batch)
                 if lane == 0:
                     shared_distinct[0] = distinct
+                if cutlass.const_expr(self.warp_match):
+                    self.match_warp(sm, workspace, before, distinct)
                 named_barrier(ROUTED, 384, arrive=True)
             else:
                 named_barrier(ROUTED, 384)
@@ -1664,7 +1714,11 @@ class RubinExpertsKernel(ExpertsKernel):
             if warp == 1:
                 self.prefetch_head(maps, w13_scales, base, experts, lane)
         if cutlass.const_expr(self.match_fc1):
-            fc1 = self.matched_fc1(sm, workspace, before, distinct, experts)
+            if cutlass.const_expr(self.warp_match):
+                matched = view(sm.iterator, self.off_match + 80, Int32, 2)
+                fc1 = (matched[0], matched[1])
+            else:
+                fc1 = self.matched_fc1(sm, workspace, before, distinct, experts)
             for g in cutlass.range_constexpr(2):
                 matched = ExpertsKernel.partition(self, distinct, fc1[g])
                 for i in cutlass.range_constexpr(4):
