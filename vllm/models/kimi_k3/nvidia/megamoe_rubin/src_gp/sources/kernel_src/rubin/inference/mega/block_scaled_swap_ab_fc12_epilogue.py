@@ -2107,51 +2107,55 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             wrap_into_copy_standard_layout(tmem_half_in_first_load_view[None, 1]),
             wrap_into_copy_standard_layout(up_token_32),
         )
-        pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_32, up_token_32, alpha_val)
-        token_tmem_trans = TmemTranspose16x32(tmem_half.iterator, Region.Top, reg_tensor=pre_quant_pre_trans)
-        # Each lane: token token_col_base + lane, this warp's 16 intermediate outputs.
-        token_pre_quant = token_tmem_trans.from_r1_perm_until_last_store()
+        if cutlass.const_expr(PR2_PROBE not in ("fc1tmemonly", "epitmemonly")):  # PR2 EXPERIMENT ONLY
+            if cutlass.const_expr(PR2_PROBE == "fc1noact"):  # PR2 EXPERIMENT ONLY: no gated activation math
+                pre_quant_pre_trans = gate_token_32
+            else:
+                pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_32, up_token_32, alpha_val)
+            token_tmem_trans = TmemTranspose16x32(tmem_half.iterator, Region.Top, reg_tensor=pre_quant_pre_trans)
+            # Each lane: token token_col_base + lane, this warp's 16 intermediate outputs.
+            token_pre_quant = token_tmem_trans.from_r1_perm_until_last_store()
 
-        self.fc1_quant_token_half(
-            work_tile_info=work_tile_info,
-            token_values=token_pre_quant,
-            topk_score=topk_score,
-            norm_const=norm_const,
-            intermediate_output_size=cute.size(fc1_output, 1),
-            fc1_output_sf=fc1_output_sf,
-            subtile_idx=subtile_idx,
-            token_idx=token_idx,
-        )
+            self.fc1_quant_token_half(
+                work_tile_info=work_tile_info,
+                token_values=token_pre_quant,
+                topk_score=topk_score,
+                norm_const=norm_const,
+                intermediate_output_size=cute.size(fc1_output, 1),
+                fc1_output_sf=fc1_output_sf,
+                subtile_idx=subtile_idx,
+                token_idx=token_idx,
+            )
 
-        # Both warpgroups write their token rows of this subtile's stage; one TMA store takes the whole stage once
-        # both are in (barrier 4 + subtile over the 256 threads of both warpgroups).
-        fc1_smem = self.smem_tensor[None, None, subtile_idx]
-        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // 2))[
-            None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0
-        ]
-        fc1_gmem_subtile_view = cute.flat_divide(
-            fc1_gmem_cta_view, (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize)
-        )[None, None, subtile_idx, 0]
-        tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
-            self.fc1_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(fc1_smem, 0, 2),
-            cute.group_modes(fc1_gmem_subtile_view, 0, 2),
-        )
-        subtile_bar_id = subtile_idx + cutlass.Int32(SwapABGatedActEpilogue._EpilogueAsyncBarIdBase)
-        tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
-            barrier_id=subtile_bar_id, num_threads=2 * self._EpilogueWarpCnt * 32
-        )
-        cute.arch.fence_proxy("async.shared", space="cta")
-        if (self.warp_idx == subtile_idx) & (self.warpgroup_idx == subtile_idx % cutlass.Int32(2)):
-            tma_ready_to_read_smem_named_barrier.arrive_and_wait()
-            with cute.arch.elect_one():
-                if cutlass.const_expr(PR2_PROBE != "nofc1st"):
-                    cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
-                cute.arch.cp_async_bulk_commit_group()
-        else:
-            tma_ready_to_read_smem_named_barrier.arrive()
+            # Both warpgroups write their token rows of this subtile's stage; one TMA store takes the whole stage once
+            # both are in (barrier 4 + subtile over the 256 threads of both warpgroups).
+            fc1_smem = self.smem_tensor[None, None, subtile_idx]
+            fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // 2))[
+                None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0
+            ]
+            fc1_gmem_subtile_view = cute.flat_divide(
+                fc1_gmem_cta_view, (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize)
+            )[None, None, subtile_idx, 0]
+            tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
+                self.fc1_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(fc1_smem, 0, 2),
+                cute.group_modes(fc1_gmem_subtile_view, 0, 2),
+            )
+            subtile_bar_id = subtile_idx + cutlass.Int32(SwapABGatedActEpilogue._EpilogueAsyncBarIdBase)
+            tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
+                barrier_id=subtile_bar_id, num_threads=2 * self._EpilogueWarpCnt * 32
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            if (self.warp_idx == subtile_idx) & (self.warpgroup_idx == subtile_idx % cutlass.Int32(2)):
+                tma_ready_to_read_smem_named_barrier.arrive_and_wait()
+                with cute.arch.elect_one():
+                    if cutlass.const_expr(PR2_PROBE != "nofc1st"):
+                        cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
+                    cute.arch.cp_async_bulk_commit_group()
+            else:
+                tma_ready_to_read_smem_named_barrier.arrive()
 
     @cute.jit
     def fc1_quant_token_half(
@@ -2864,22 +2868,23 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         loaded = process_pipeline.tmem_acc_load(tmem_subtile_tensor=tmem_subtile_tensor, epi=self)
         iket.range_pop()
 
-        iket.range_push("fc2.f2fp_reorder")
-        casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val, batch_invariant=self.batch_invariant)
-        # reorder returns a bare RMEM fragment in the store's expected pre-store
-        # distribution; reorder + store are paired 1:1 inside the pipeline.
-        pre_store = process_pipeline.post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile_tensor)
-        iket.range_pop()
-        iket.range_push("fc2.store")
-        process_pipeline.store_function(
-            epi=self,
-            subtile=pre_store,
-            work_tile_info=work_tile_info,
-            epilogue_iter_idx=epilogue_iter_idx,
-            subtile_idx=subtile_idx,
-            fc2_output_router=fc2_output_router,
-        )
-        iket.range_pop()
+        if cutlass.const_expr(PR2_PROBE not in ("fc2tmemonly", "epitmemonly")):  # PR2 EXPERIMENT ONLY
+            iket.range_push("fc2.f2fp_reorder")
+            casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val, batch_invariant=self.batch_invariant)
+            # reorder returns a bare RMEM fragment in the store's expected pre-store
+            # distribution; reorder + store are paired 1:1 inside the pipeline.
+            pre_store = process_pipeline.post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile_tensor)
+            iket.range_pop()
+            iket.range_push("fc2.store")
+            process_pipeline.store_function(
+                epi=self,
+                subtile=pre_store,
+                work_tile_info=work_tile_info,
+                epilogue_iter_idx=epilogue_iter_idx,
+                subtile_idx=subtile_idx,
+                fc2_output_router=fc2_output_router,
+            )
+            iket.range_pop()
 
 
 @dataclasses.dataclass(frozen=True)
