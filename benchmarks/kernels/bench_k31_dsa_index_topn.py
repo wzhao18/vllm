@@ -55,7 +55,7 @@ def graph_us(fn, layers, reps):
     per = defaultdict(float)
     for e in prof.events():
         if e.device_type.name == "CUDA":
-            per[e.name[:60]] += e.device_time / (3 * layers)
+            per[e.name[:40] + "~" + e.name[-50:]] += e.device_time / (3 * layers)
     return ts[len(ts) // 2], dict(per)
 
 
@@ -102,8 +102,24 @@ def main():
         idx = torch.arange(rows, dtype=torch.int32, device="cuda")
         sched = get_paged_mqa_logits_metadata(lens, 64, get_num_sms(), idx)
 
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            kv_cache_as_quant_view,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.index import (
+            fp4_query_views,
+        )
+        from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+
+        qp, qs = fp4_query_views(x.q_rows, rows, rows)
+        dg_q = (qp.view(torch.int8).unsqueeze(1), qs.unsqueeze(1))
+        dg_kv = kv_cache_as_quant_view(x.index, 128, True)
+        dg_table = x.table.repeat_interleave(q, 0).contiguous()
+
         def stock():
-            logits = deepgemm_fp4_logits(x, q, pitch, sched)
+            logits = fp8_fp4_paged_mqa_logits(
+                dg_q, dg_kv, x.weights, lens, dg_table, sched,
+                max_model_len=pitch, indices=idx,
+            )  # fmt: skip
             dcp_topk_pack(logits, x.ends, n, out=out, max_local_len=fused.max_local_len)
 
         def new():
@@ -113,14 +129,18 @@ def main():
         packed, logits, _ = fused.run_dcp(x.q_rows, x.weights, decode, rows, q)
         ref = deepgemm_fp4_logits(x, q, pitch)
         torch.cuda.synchronize()
-        bad = 0
+        bad_logits = bad_sets = 0
         for t in range(rows):
             e = int(x.ends[t])
-            bad += int((logits[t, :e].view(torch.int16) != ref[t, :e].view(torch.int16)).sum())
-            a = (out[t, :n].long() & 0xFFFFFFFF).sort().values
-            b = (packed[t, :n].long() & 0xFFFFFFFF).sort().values
-            same = torch.equal(a >> 16, b >> 16)  # same score multiset
-            bad += 0 if same else 1
+            got, want = logits[t, :e].view(torch.int16), ref[t, :e].view(torch.int16)
+            bad_logits += int((got != want).sum())
+            a = (out[t, :n].long() & 0xFFFFFFFF) >> 16
+            b = (packed[t, :n].long() & 0xFFFFFFFF) >> 16
+            if not torch.equal(a.sort().values, b.sort().values):
+                bad_sets += 1
+                print(f"  row {t}: stock {a.sort().values[:6].tolist()} fused "
+                      f"{b.sort().values[:6].tolist()} counts {int(fused.valid[t])}")
+        bad = (bad_logits, bad_sets)
         print(f"CHECK requests {reqs} rows {rows}: mismatches {bad}", flush=True)
         for name, fn in (("stock", stock), ("fused", new)):
             us, per = graph_us(fn, args.layers, args.reps)
