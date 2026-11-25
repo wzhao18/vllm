@@ -56,7 +56,11 @@ def dump(case):
 
 def buffer(tag, rows):
     """(ring address, counter address) of (tag, rows) as Python ints (trace time)."""
-    key = (tag, int(rows))
+    try:  # static rows (a per-shape kernel); a dynamic-rows kernel serves every
+        rows = int(rows)  # batch with one trace: key -1, the per-case dump separates them
+    except Exception:
+        rows = -1
+    key = (tag, rows)
     if key not in _BUFS:
         dev = torch.cuda.current_device()
         ring = torch.zeros(RING, CTAS, SLOTS, dtype=torch.int64, device=dev)
