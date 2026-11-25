@@ -243,7 +243,7 @@ def build(batch, q, world, local_len, topk):
             layers.append(p.prepare_cache(mla))
         out = torch.empty(batch, dsa.HEADS * 128, device=dev, dtype=bf)
         p0 = layers[0]
-        info = dict(
+        info = lambda: dict(  # noqa: E731  (inside the forward context)
             overlap=p0.overlaps[batch, q],
             core=p0.coverage_note(batch, q),
             local_topk=p0.indexer_stage.local_topk,
@@ -275,6 +275,7 @@ def bench(case, args, rank):
     group = get_dcp_group()
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     with set_current_vllm_config(case.config), case.context:
+        case.info = case.info()
         for i in range(4):  # eager warm-up (compiles), both parities
             case.run(case.layers[i % 2])
         torch.accelerator.synchronize()
