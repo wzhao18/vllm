@@ -230,7 +230,8 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
         prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock,
         prepared.KdaVerifyHalfPair,
         # their deferred-verify record forms (the FP32 default)
-        prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer, prepared.KdaVerifyHalfDefer,
+        prepared.KdaVerifyLoopDefer, prepared.KdaVerifyLoopDefer4, prepared.KdaSplitDefer,
+        prepared.KdaVerifyHalfDefer,
     )  # fmt: skip
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
@@ -447,7 +448,7 @@ def test_loopdefer4_equals_loopdefer(monkeypatch, q, requests, pad):
 
     def two_steps(kind):
         forms = {
-            k: (kind if v is KdaVerifyLoopDefer else v)
+            k: (kind if v in (KdaVerifyLoopDefer, KdaVerifyLoopDefer4) else v)
             for k, v in prepared.RECORD_FORMS.items()
         }
         monkeypatch.setattr(prepared, "RECORD_FORMS", forms)
