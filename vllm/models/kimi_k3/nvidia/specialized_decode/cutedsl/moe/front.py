@@ -562,8 +562,12 @@ SITU_SPLIT_WIDE = {16: ("", "8:56")}
 # this many SMs launched on the side stream before the merged front (``SharedDown``
 # writers: its W ring fills meanwhile, its h load polls the front's gate/up CTAs'
 # count), so it is done shortly after h, before the routed experts need the SMs: their
-# grid spans every SM (``moe.prepared``) instead of leaving SharedDown's.
-EARLY_DOWN_WIDE = {16: ("", "")}
+# grid spans every SM (``moe.prepared``) instead of leaving SharedDown's. B2 / B4 / B8
+# MoE layer proxy (lanes/SHX shx_proxy2.py: real SharedDown, stand-in front / routing /
+# experts), us per layer vs SharedDown on 8 / 8 / 4 SMs beside the experts after
+# routing: 24 SMs -0.56 / -1.19 / -0.43, 56 SMs -0.60 / -1.21 / -0.53 (no shared
+# expert -1.09 / -1.76 / -1.08). Same SharedDown math: bitwise the plain kernel's rows.
+EARLY_DOWN_WIDE = {16: ("", "16:56,32:56,64:56")}
 
 
 def split_table(tp, verify, wide):
