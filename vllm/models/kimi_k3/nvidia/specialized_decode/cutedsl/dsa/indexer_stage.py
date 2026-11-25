@@ -47,6 +47,16 @@ class IndexerStage:
         # Optional [>= rows, K] int32: the merge also writes the global ids (tests).
         self.dcp_ids: torch.Tensor | None = None
         if self.local_topk:
+            from vllm.v1.attention.ops.dcp_topk_merge import (
+                dcp_topk_merge_has_mailbox,
+            )
+
+            # Round 1 of the merge by multicast mailbox, never the all-gather.
+            if not dcp_topk_merge_has_mailbox(self.topk, self.local_topk):
+                raise RuntimeError(
+                    "specialized DCP decode: the DSA top-k merge has no "
+                    "multicast mailbox over the DCP group"
+                )
             device = indexer.topk_indices_buffer.device
             # K wide: the exact merge gives a rank up to K of a row's keys (a
             # saturated row: more than its N local candidates).

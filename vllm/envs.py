@@ -61,7 +61,6 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_DSA_BPRIME_CHECK: bool = False
-    VLLM_DSA_BPRIME_MAILBOX: bool = False
     VLLM_DSA_DCP_PREFILL_HIST_MERGE: bool = False
     VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1128,12 +1127,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP rank 0 logs the rows that differ beyond ties at the K-th score
     # (vllm/v1/attention/ops/dcp_topk_merge/check.py). Slows decode.
     "VLLM_DSA_BPRIME_CHECK": lambda: bool(int(os.getenv("VLLM_DSA_BPRIME_CHECK", "0"))),
-    # DSA DCP decode top-k merge (interleave 1): round 1 through a multicast
-    # mailbox the pack writes and the select polls, instead of the NCCL
-    # all-gather (vllm/v1/attention/ops/dcp_topk_merge/kernels.py).
-    "VLLM_DSA_BPRIME_MAILBOX": lambda: bool(
-        int(os.getenv("VLLM_DSA_BPRIME_MAILBOX", "0"))
-    ),
     # Kimi K3.1 DSA prefill under DCP at interleave 1: merge each chunk's top-k
     # by histogram exchange instead of all-gathering every (score, id)
     # candidate (vllm/models/kimi_k3/nvidia/dsa_kernels/dcp_prefill_topk_merge).
@@ -2670,7 +2663,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_REQUEST_BODY_LOG_LEVEL",
         # Read when the DSA indexer's (splitting) op sets up its merges.
         "VLLM_DSA_BPRIME_CHECK",
-        "VLLM_DSA_BPRIME_MAILBOX",
         "VLLM_DSA_DCP_PREFILL_HIST_MERGE",
         # Read by the Mooncake store's prefix lookups only, outside the model.
         "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE",
