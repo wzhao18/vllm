@@ -62,7 +62,22 @@ ROWS_TOKENS: dict = {"*": "193-384:2"}
 # (back-to-back graph, us one token vs two): 512 rows nb 6 12.01 vs 10.83, nb 7 13.48
 # vs 11.43, nb 8 13.96 vs 11.82; nb <= 5 one token wins (7.9-9.8 vs 8.3-10.3); 3 or 4
 # tokens per cluster lose at every block count and row count measured (128-512).
-ROWS_TOKENS_BLOCKS: dict = {6: "385-512:2"}
+# Those 3 / 4 token runs were not one wave: at their natural allocation (T4 113
+# registers) the 896 CTAs of 512 rows do not fit and the later CTAs start after the
+# first ones finish. With the launch bound of ``ROWS_MIN_BLOCKS`` (T4: 96 registers,
+# no spills) all 128 clusters are resident: the saved-block half (block statistics,
+# softmax weights, the FP32 mixture U per token: ``pre_rows``) of every row runs before
+# the delta lands and only the post half follows the landing. VR200, 1 GPU, 512 rows,
+# delta landed over NVLink by a peer GPU 30 us after launch (TPCW-3, us after the last
+# landing, inputs from HBM): T4 bound 0.77-0.93 at nb 4 / 6 / 8 vs one token 1.5
+# (nb 4) .. 6.6 (nb 8) and two tokens (nb >= 6) 2.7; landed before launch (back to
+# back) T4 bound 10.40 / 12.51 / 14.78 vs one token 10.69 / - / 15.81, two tokens
+# 14.53 (nb 8). The landing (12.7 us) and the block reads do not slow each other
+# (+0.1 us landing, pre within 0.4 us).
+ROWS_TOKENS_BLOCKS: dict = {1: "385-512:4"}
+# Launch bound (CTAs per SM) of the token-batched codes by tokens per cluster, so that
+# the cluster count of their widest rows is resident at once (T4: 128 clusters of 7).
+ROWS_MIN_BLOCKS = {4: 5}
 
 
 def rows_tokens(rows, nb=0):
@@ -142,7 +157,8 @@ class PreparedAttnRes:
         carveout = None if self.ring_only and not ring else self.carveout
         shape = (*self.key, slots, cap, arch, aux, sanitize, carveout)
         shape += (first, spread)
-        code = compile_consumer(*shape, vote, 0, out_mc, tokens)
+        bound = ROWS_MIN_BLOCKS.get(tokens, 0)
+        code = compile_consumer(*shape, vote, bound, out_mc, tokens)
         # The register budget keeps one-token CTAs resident beside the in-projection;
         # the token-batched variant has a fraction of their CTAs.
         budget = RUBIN_VOTE_REGISTERS.get(self.key[0]) if vote and tokens == 1 else None

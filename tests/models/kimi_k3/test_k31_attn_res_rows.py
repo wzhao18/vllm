@@ -39,7 +39,7 @@ def _inputs(rows, seed=0):
     )
 
 
-def _run(nb, write, final, tokens, x):
+def _run(nb, write, final, tokens, x, min_blocks=0):
     import cutlass
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
@@ -57,8 +57,9 @@ def _run(nb, write, final, tokens, x):
     prefix, blocks = x["prefix"].clone(), x["blocks"].clone()
     out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
     code = compile_consumer(
-        nb, True, write, final, 0, 0, architecture(device), tokens=tokens
-    )
+        nb, True, write, final, 0, 0, architecture(device), tokens=tokens,
+        min_blocks=min_blocks,
+    )  # fmt: skip
     weights = (to_cute(x[k].reshape(-1)) for k in ("norm", "query", "out_norm"))
     views = map(dynamic_view, (x["delta"], prefix, blocks))
     eps = cutlass.Float32(EPS)
@@ -77,8 +78,9 @@ CASES = [
 
 
 def test_rows_tokens_policy():
-    """Two tokens per cluster at 193-384 rows; at 385-512 rows only from 6 saved
-    blocks; one token elsewhere; every picked count has a compiled variant."""
+    """Two tokens per cluster at 193-384 rows; four at 385-512 rows from one saved
+    block (one wave under ``ROWS_MIN_BLOCKS``); one token elsewhere; every picked
+    count has a compiled variant."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
         rows_tokens,
         token_counts,
@@ -87,9 +89,39 @@ def test_rows_tokens_policy():
     for nb in range(MAX_BLOCKS + 1):
         assert rows_tokens(128, nb) == 1 and rows_tokens(192, nb) == 1
         assert rows_tokens(256, nb) == 2 and rows_tokens(384, nb) == 2
-        assert rows_tokens(512, nb) == (2 if nb >= 6 else 1)
+        assert rows_tokens(385, nb) == rows_tokens(512, nb) == (4 if nb else 1)
         assert rows_tokens(1024, nb) == 1
-        assert token_counts(nb) == {2}
+        assert token_counts(nb) == ({2, 4} if nb else {2})
+
+
+@gpu
+@pytest.mark.parametrize("final", [False, True], ids=["mix", "final"])
+@pytest.mark.parametrize("nb", [1, 4, 6, 8])
+def test_rows_launch_bound_bitwise(nb, final):
+    """The 512-row form (``ROWS_TOKENS_BLOCKS``: four tokens per cluster under the
+    ``ROWS_MIN_BLOCKS`` launch bound, so all 128 clusters are resident) fits the
+    bound's register budget and equals the one-token kernel bitwise."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
+        ROWS_MIN_BLOCKS,
+        compile_consumer,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        architecture,
+        kernel_registers,
+    )
+
+    bound = ROWS_MIN_BLOCKS[4]
+    code = compile_consumer(
+        nb, True, -1, final, 0, 0, architecture(torch.device("cuda")), tokens=4,
+        min_blocks=bound,
+    )  # fmt: skip
+    assert kernel_registers(code, 0) <= 64 * 1024 // (128 * bound)
+    x = _inputs(509, seed=nb)
+    write = -1 if final else nb % MAX_BLOCKS
+    ref = _run(nb, write, final, 1, x)
+    got = _run(nb, write, final, 4, x, min_blocks=bound)
+    for a, b in zip(ref, got):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
 
 
 @gpu
