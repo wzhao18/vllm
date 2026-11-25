@@ -244,7 +244,8 @@ def _check_cases(group, ws, n: int) -> None:
 def _check_published(group, ws, n: int) -> None:
     """A producer that multicasts its B' rows into the round-1 mailbox itself
     (the fused DCP indexer's IndexerLocalTopk, ``published=``): the merge runs no
-    pack kernel and selects exactly what the DeepSelect + pack path selects."""
+    pack kernel and selects exactly what the DeepSelect + pack path selects; so
+    does the select with the rescue folded in (``release=``)."""
     import cutlass
     import cutlass.cute as cute
 
@@ -282,7 +283,8 @@ def _check_published(group, ws, n: int) -> None:
         req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
         block_table = _block_table(num_rows, int(local_end.max()))
         results = []
-        for mode in ("logits", "published"):
+        # "folded": the rescue inside the select (release=, rows <= SMs).
+        for mode in ("logits", "published", "folded"):
             rows_out = torch.full(
                 (num_rows, TOPK), -7, dtype=torch.int32, device="cuda"
             )
@@ -312,6 +314,7 @@ def _check_published(group, ws, n: int) -> None:
                 row_ends=local_end,
                 packed=packed,
                 published=packed is not None,
+                release=mode == "folded",
                 local_topk=n,
                 topk=TOPK,
                 req_id=req_id,
@@ -327,7 +330,7 @@ def _check_published(group, ws, n: int) -> None:
             _assert_same_on_every_rank(group, ids, f"{name}/{mode}")
             _assert_rows(group, ids, rows_out, valid_out, req_id, block_table)
             results.append(_as_lists(ids))
-        assert results[0] == results[1], name
+        assert results[0] == results[1] == results[2], name
 
 
 def _check_nonfinite(group, n: int) -> None:
