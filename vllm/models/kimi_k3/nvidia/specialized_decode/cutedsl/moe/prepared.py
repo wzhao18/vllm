@@ -169,7 +169,7 @@ class PreparedMoE:
         # the persistent expert grid spans every SM, beside the front only. Split: its
         # gate/up half beside the front, its down rows beside the experts.
         before = self.experts.grid_for(b) >= self.sms and not self.front.down_first(b)
-        if self.front.merged_batch(b) and self.front.down_first(b):
+        if self.front.merged_batch(b) and self.front.fork_first(b):
             # SharedDown forks first: its weights stream while the merged front runs,
             # its h load polls the front's count, and it exits before the experts need
             # its SMs.

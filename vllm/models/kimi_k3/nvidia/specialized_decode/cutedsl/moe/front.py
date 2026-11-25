@@ -789,6 +789,7 @@ class SharedFront:
         # down code); the count (Int32 [2], re-armed by SharedDown)
         self.early_down: dict[int, object] = {}
         self.h_ready = torch.zeros(2, dtype=torch.int32, device=packed.device)
+        self.front_launched: set[int] = set()  # ``fork_first``
         for b in sorted(self.merged):
             if tmem.get(b):
                 split_rows, hidden = packed.shape[0] - shard, gate_up.shape[0] // 2
@@ -922,6 +923,19 @@ class SharedFront:
         """SharedDown done before the routed experts need its SMs (``situ_down`` behind
         the SiTU GEMM; ``early_down`` polling the merged front's h count)."""
         return batch in self.situ_down or batch in self.early_down
+
+    def fork_first(self, batch):
+        """``early_down`` batches: SharedDown may launch before the merged front. Not on
+        a batch's first eager call: the front's module loads lazily at its first launch,
+        and that load waits for the device, i.e. for the SharedDown already polling for
+        the front (a hang). That call launches the front first (SharedDown then finds
+        the count complete); captures and later calls fork first."""
+        if batch not in self.early_down:
+            return False
+        if batch in self.front_launched or torch.cuda.is_current_stream_capturing():
+            return True
+        self.front_launched.add(batch)
+        return False
 
     def planned(self, batch):
         return bool(self.plans[batch][5])

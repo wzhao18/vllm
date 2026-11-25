@@ -138,6 +138,13 @@ def _main():
             refs.append((box[0, :rows].clone(), h[:rows].clone(), out))
         # early: SharedDown first on the side stream, then the counting front; back to
         # back (only the per-call join, no host sync); the box is checked per call
+        # the counting front launched once first: its lazy module load waits for the
+        # device, i.e. would wait for a SharedDown already polling (``fork_first``)
+        warm = torch.zeros(64, HIDDEN, dtype=torch.bfloat16, device=dev)
+        ready_front(*front_args(xs[0], warm), *ptrs, c.Int64(count.data_ptr()), stream(dev))
+        torch.cuda.synchronize()
+        assert count.tolist() == [writers, 0], count.tolist()
+        count.zero_()
         hs = [torch.zeros(64, HIDDEN, dtype=torch.bfloat16, device=dev) for _ in xs]
         outs = [boxes() for _ in xs]
         got_box = []
