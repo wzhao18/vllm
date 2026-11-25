@@ -237,6 +237,20 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             stamp_at(Int64(self.trace) + Int64(thread()[3]) * 512, slot)
 
     @cute.jit
+    def diag_die(self, sm):
+        """DIAG (never merge): this CTA's die, or -1 without dies / trace."""
+        die = Int32(-1)
+        if cutlass.const_expr(self.trace != 0 and len(self.dies) > 0):
+            die = view(sm.iterator, self.off_misc + 2688, Int32, 4)[0]
+        return die
+
+    @cute.jit
+    def diag_store(self, slot: cutlass.Constexpr[int], a, b):
+        if cutlass.const_expr(self.trace != 0):
+            pointer = Int64(self.trace) + Int64(thread()[3]) * 512 + 16 * slot
+            store_words(pointer, (Uint32(a), Uint32(b), Uint32(7), Uint32(7)))
+
+    @cute.jit
     def __call__(self, *args):
         options = dict(grid=(self.grid, 1, 1), block=(384, 1, 1), cluster=(1, 1, 1))
         maps = self.encode_maps(args[-3], args[-2])
@@ -399,7 +413,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         sm = ring[0]
         lo, hi = (ranges[1, 4], ranges[1, 5] - self.zone_jobs(ranges))
         base, bars = self.claim_queue(sm)
+        mydie, locs, tots, locp, totp = (self.diag_die(sm), Int32(0), Int32(0), Int32(0), Int32(0))
         for j in cutlass.range(ranges[0, 4], ranges[0, 5], unroll=1):
+            if cutlass.const_expr(self.trace != 0):
+                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                tots += 1
+                if home == mydie:
+                    locs += 1
             state = self.fc2_job(ring, state, maps, experts, ranges, j, False)
         # The first claim goes out ``POOL_LEAD`` static jobs before the end, so its
         # grain is there when the static jobs are issued.
@@ -409,6 +429,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         for j in cutlass.range(lo, hi, unroll=1):
             if j == kick:
                 cute.arch.mbarrier_arrive(bars.iterator + 2)
+            if cutlass.const_expr(self.trace != 0):
+                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                tots += 1
+                if home == mydie:
+                    locs += 1
             state = self.fc2_job(ring, state, maps, experts, ranges, j, False)
         if hi <= kick:
             cute.arch.mbarrier_arrive(bars.iterator + 2)
@@ -422,7 +447,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 ended = True
             else:
                 for j in cutlass.range(first, first + self.pool_grain, unroll=1):
+                    if cutlass.const_expr(self.trace != 0):
+                        home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                        totp += 1
+                        if home == mydie:
+                            locp += 1
                     state = self.fc2_job(ring, state, maps, experts, ranges, j, True)
+        self.diag_store(21, locs, tots)
+        self.diag_store(22, locp, totp)
         slot, phase, issued, pushed, current = state
         self.push_unit(sm, pushed, Int32(-1))
         return slot, phase, issued
@@ -482,6 +514,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
         ring = (sm, barriers, metadata, w2_scales)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        mydie, loc1, tot1 = (self.diag_die(sm), Int32(0), Int32(0))
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
             ks, tile = (lo % 14, 3 * ranges[group, 0] + lo // 14)
@@ -489,6 +522,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             expert = experts[index]
             for _ in cutlass.range(lo, hi, unroll=1):
                 row = expert * self.w13_rows + r * 128
+                if cutlass.const_expr(self.trace != 0):
+                    home = Int32((Int64(row) * 1792 + ks * 128) >> 21 & 1)
+                    tot1 += 1
+                    if home == mydie:
+                        loc1 += 1
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
                 tma = (w13, w13_scales, row, ks, offset, Int32(1024))
                 slot, phase, issued = self.issue(
@@ -503,6 +541,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
         self.stamp(4)
+        self.diag_store(20, loc1, tot1)
         state = (slot, phase, issued, Int32(0), Int32(-1))
         work = (ring, state, maps, experts, ranges, *steal)
         slot, phase, issued = self.fc2_pool(*work)
@@ -875,6 +914,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         scale = self.off_xsf + lane // 8 * 128 + (lane & 7) * 16
         sources = cute.make_rmem_tensor(5, Int32)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        mydie, loc1, tot1 = (self.diag_die(sm), Int32(0), Int32(0))
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
             ks, r = (lo % 14, lo // 14 % 3)
