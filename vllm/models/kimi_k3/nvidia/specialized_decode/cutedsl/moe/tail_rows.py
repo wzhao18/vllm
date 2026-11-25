@@ -112,7 +112,10 @@ UP_GEMM = "cublas"
 # 93 layers, 32k), us/step: B9 (72 rows) 9615 -> 9396, B10 (80) 9992 -> 9827, B8 +7.
 # At 96-256 rows it was neutral (comm3 4o, ds25). 129-256 rows on ds35 (axhb, 16 ranks,
 # 93 layers, 32k, us/step vs the cuBLAS up): B17 -66, B24 -32, B28 -98, B32 -35.
-UP_ROWS = {16: "65-80:1,129-256:1"}
+# 128 rows (B16 verify): cuBLAS picks a split-K nvjet + splitKreduce pair there (~4.3
+# us per layer on the critical path, 16 ranks, prod cfg); the fused up replaces it and
+# OutRows with one PDL-chained kernel.
+UP_ROWS = {16: "65-80:1,128-256:1"}
 
 # Rows whose NormRows skips the PDL dependency wait (``NormRows(polled=True)``): its
 # inputs are Lamport-polled (the gather rows, the RS slots) or static (gamma), and
