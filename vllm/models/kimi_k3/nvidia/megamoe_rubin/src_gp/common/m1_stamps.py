@@ -16,7 +16,7 @@ import os
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op, extract_mlir_values, new_from_mlir_values
 
 ENABLED = os.environ.get("M1_STAMPS", "0") == "1"
 
@@ -191,6 +191,13 @@ class M1Writer:
     def __init__(self, rec: Int64, pred: Int32):
         self.rec = rec
         self.pred = pred
+
+    def __extract_mlir_values__(self):
+        return extract_mlir_values(self.rec) + extract_mlir_values(self.pred)
+
+    def __new_from_mlir_values__(self, values):
+        n = len(extract_mlir_values(self.rec))
+        return M1Writer(new_from_mlir_values(self.rec, values[:n]), new_from_mlir_values(self.pred, values[n:]))
 
     def addr(self, word: int) -> Int64:
         return self.rec + Int64(word * 8)

@@ -3735,6 +3735,18 @@ class _M1AccWaitTimer:
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_m1_inner"), name)
 
+    def __extract_mlir_values__(self):
+        from cutlass.cutlass_dsl import extract_mlir_values
+
+        return extract_mlir_values(self._m1_inner) + extract_mlir_values(self._m1_writer)
+
+    def __new_from_mlir_values__(self, values):
+        from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
+
+        n = len(extract_mlir_values(self._m1_inner))
+        return _M1AccWaitTimer(new_from_mlir_values(self._m1_inner, values[:n]),
+                               new_from_mlir_values(self._m1_writer, values[n:]))
+
     def consumer_wait(self, *args, **kwargs):
         t0 = m1_stamps.clk()
         result = self._m1_inner.consumer_wait(*args, **kwargs)
