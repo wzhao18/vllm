@@ -22,6 +22,7 @@ from .kernel import KdaSplit
 from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
 from .verify_feed import KdaVerifyFeed
+from .verify_half import KdaVerifyHalfStock
 from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
 from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
@@ -223,10 +224,10 @@ FP32_VERIFY_WIDE: dict = {
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
 WIDE_KINDS = (
     KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
-    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed,
+    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed, KdaVerifyHalfStock,
 )
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
-              "loop", "loopstock", "feed")
+              "loop", "loopstock", "feed", "halfstock")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
 # staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
 # constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
@@ -254,6 +255,16 @@ BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
 # item per CTA (B12-35: +0.4..+1.1) stays LoopStock.
 FP32_FEED: dict = {(10, 7): {4: "41-:1"}}
 FP32_FEED_KIND = 8
+# FP32 state: request counts per q whose FP32_WIDE rows run ``KdaVerifyHalfStock``
+# (9, kda.verify_half: LoopStock bit for bit with each item's 128 state rows on two
+# 8-warp CTAs) instead of ``KdaVerifyLoopStock``. At one item per CTA LoopStock is
+# bound by each item's SM (VR200 1-GPU verify alone, q8, us per layer: B4 11.89, B8
+# 12.77, B16 13.20; per-CTA stamps at B16: 16 warps' token loops ~7.3 us at the SM's
+# instruction issue and checkpoint store rates, warps 0-3 +2.7 us of prologue);
+# two CTAs per item halve each SM's share. Keyed by q and heads (TP16's 6; other
+# head counts, e.g. the SP decode's 24, keep their rows).
+FP32_HALF: dict = {(10, 7): {8: {6: "16-17:1"}}}
+FP32_HALF_KIND = 9
 # FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
 # at the geometry given ("early.lanes.occupancy.cluster", as SPEC_SCHEDULE), in place
 # of FP32_VERIFY_WIDE / FP32_FEED's kernel and on top of DEVICE_SPEC_SCHEDULE(_Q)'s
@@ -393,6 +404,10 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
         feed = batch_table(FP32_FEED.get(capability, {}).get(tokens, ""))
         if feed.get(requests):  # LoopStock with feed warps (bitwise)
             kind = FP32_FEED_KIND
+        halves = FP32_HALF.get(capability, {}).get(tokens, {}).get(heads, "")
+        halves = batch_table(halves)
+        if halves.get(requests):  # LoopStock, two CTAs per item (bitwise)
+            kind = FP32_HALF_KIND
     if kind in BF16_ONLY and tokens > 4:
         kind = KIND_WIDE
     return kind or 0
@@ -492,6 +507,8 @@ class PreparedKda:
         self.scalars = tuple(map(cutlass.Float32, scalars))
         self.conv_dim_first, self.kernels = conv_dim_first, {}
         self.prepared, self.prepared_kernels = frozenset(prepared), {}
+        # KdaVerifyHalfStock keys: the layer's output scratch and arrival counters
+        self.halves: dict = {}
         # KdaVerifyPrepared's F_A reader counts per request (its last reader re-arms)
         requests = max((r for r, _ in self.prepared), default=0)
         self.readers = torch.zeros(requests, dtype=torch.int32, device=self.device)
@@ -523,6 +540,16 @@ class PreparedKda:
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
             operands = self._operands(caches, projected, slots, out, accepted)
+            capability = torch.cuda.get_device_capability(self.device)
+            bf16_state = caches[1].dtype == torch.bfloat16
+            kind = wide_kind(requests, tokens, capability, bf16_state, mode, self.heads)
+            if kind == FP32_HALF_KIND and tokens > 1 and key not in self.prepared:
+                items, device = requests * self.heads, self.device
+                self.halves[key] = (
+                    torch.zeros(items, 2 * tokens * 128, dtype=torch.float32, device=device),
+                    torch.zeros(items, dtype=torch.int32, device=device),
+                )
+                operands += self.halves[key]
             specs = tuple(map(layout, operands))
             options = (self.heads, mode, self.has_bias, self.device.index, tokens)
             self.kernels[key] = executable(specs, *options)
@@ -546,6 +573,8 @@ class PreparedKda:
                 slots = slots.contiguous()
         tensors = self._operands(caches, projected, slots[:rows], out, accepted)
         kernel = self.kernels[key]
+        if key in self.halves:  # KdaVerifyHalfStock: scratch + counters
+            tensors += self.halves[key]
         if prepared is not None:
             tensors = (prepared, *tensors[1:], self.readers[:rows])
             kernel = self.prepared_kernels[key]
