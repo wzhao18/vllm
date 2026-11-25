@@ -269,7 +269,7 @@ def _error(x, ref):
 
 @pytest.mark.parametrize("pattern", ["balanced", "skewed"])
 @pytest.mark.parametrize("rows", [8, 16])
-@pytest.mark.parametrize("variant", ["2x16s2", "1x16", "8x16s4", "4x32s2"])
+@pytest.mark.parametrize("variant", ["2x16s3", "2x16s2", "1x16", "8x16s4", "4x32s2"])
 def test_dsa_core_dcp16_merge_vs_trtllm(variant, rows, pattern):
     """DCP16 on one GPU (16 emulated ranks, interleave 1, q8 rows of 96 gathered
     heads): the 16 ranks' cores push their partial rows and base-2 LSEs into the
@@ -299,7 +299,7 @@ def test_dsa_core_dcp16_merge_vs_trtllm(variant, rows, pattern):
     assert ours_error <= 1.1 * trtllm_error + 1e-3, (ours_error, trtllm_error)
 
 
-@pytest.mark.parametrize("variant", ["2x16s2", "8x16s4"])
+@pytest.mark.parametrize("variant", ["2x16s3", "2x16s2", "8x16s4"])
 def test_dsa_core_graph_replay_alternates_parities(variant):
     """Two DSA layers on alternating DcpBox parities (each its own q mailbox and
     selection, with saturated, empty and skewed rows) captured in one CUDA graph
@@ -414,7 +414,7 @@ def _ulps(a, b):
 @pytest.mark.parametrize("rows", [8, 14, 16])
 def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     """Stock precision, rank by rank (DCP16 q8 rows 8 / 14 / 16: trtllm-gen KV CTAs 8 /
-    7 / 6 on VR200, the served 2x16s2): every rank's pushed partial rows and base-2
+    7 / 6 on VR200, the served 2x16s3): every rank's pushed partial rows and base-2
     LSEs against the stock trtllm-gen sparse MLA decode of the same rank's rows
     (attn_fi.trtllm's call), and both against the FP32 emulation of trtllm-gen's
     precision (``_emulate``), with local counts of up to 2048 (every piece size of
@@ -507,8 +507,8 @@ def test_dsa_core_policy():
             decode.parse_variant(bad)
     dsac = decode.DsacDecode(torch.device("cuda"), H)
     assert dsac.rows == decode.ROWS == 16
-    assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 2)
-    assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 2)  # every q2-q8
+    assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 3)
+    assert dsac.variant(8, 4) == dsac.variant(16, 2) == (2, 16, 3)  # every q2-q8
     assert dsac.variant(8, 1) is None  # (no verify: no table)
     assert dsac.variant(24, 8) is None  # past ROWS
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:4x32")
@@ -572,10 +572,11 @@ def test_dsa_core_rows_source():
         def merge_source(self, batch):
             return self.source
 
-        def merge_rows(self, *args, release=False):
+        def merge_rows(self, *args, release=False, after_logits=None):
             # The core reads its rows after its PDL wait: the merge's rescue
             # may release it early (FlashInfer's decode must not be).
             assert release is True
+            self.after_logits = after_logits  # (the late query fork's hook)
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
@@ -589,3 +590,9 @@ def test_dsa_core_rows_source():
         stage.source = step
         assert source.fits(64) is fits, step
     assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
+    hook = object()
+    assert source.rows(None, None, None, None, 64, q=8, after_logits=hook) == (
+        "sel",
+        "cnt",
+    )
+    assert stage.after_logits is hook
