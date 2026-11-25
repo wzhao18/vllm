@@ -100,6 +100,9 @@ ROWS = 16
 # 600 18.6-18.9 / 11.9-15.4. With the core's pushed DcpValue against the "proj" one the
 # chain then takes (r1 AUTO_PARTIALS: 7.0 / 9.6 vs 9.4 / 10.4 us at M8 / M16), -4.5 to
 # -6 us per DSA layer on balanced rows, even with one row at 384 entries.
+# 2x16s3 (L1 round 6): rows of up to 3 chunks solo, the pair splitting the latent dims
+# (csrc/dsa_core.cu dsplit): 1-node DSA chain (W4, 24 heads, q8, us per layer) 2x16s2
+# / 2x16s3 + dim split, rows 8 37.27 / 36.26, rows 16 39.23 / 38.15 (Rhea 136829).
 VARIANT = {
     **{q: "1-16:2x16s3" for q in range(2, 8)},  # q2-q7
     8: "1-16:2x16s3",  # q8: the original entry (928a80c56b), unchanged
