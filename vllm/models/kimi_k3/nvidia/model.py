@@ -326,17 +326,20 @@ def prefill_full_grid_shared_overlap(vllm_config: VllmConfig) -> bool:
     return pd_prefill_worker(vllm_config)
 
 
-_routed_priority_streams: dict[int, torch.cuda.Stream] = {}
+_routed_priority_streams: dict[tuple[int, int], torch.cuda.Stream] = {}
 
 
-def routed_priority_stream() -> torch.cuda.Stream:
+def routed_priority_stream(index: int = 0) -> torch.cuda.Stream:
     """The current device's high-priority stream (above the default priority 0 of
     the forward's stream) for the MegaMoE routing chain beside the shared expert
-    (``KimiMoE._overlapped_forward``), one per device."""
-    device = torch.accelerator.current_device_index()
-    stream = _routed_priority_streams.get(device)
+    (``KimiMoE._overlapped_forward``), one per device. ``index`` 1 is a second one
+    for the chain's own fork (latent down beside router + top-k): a normal-priority
+    side stream there would compete with the shared expert's GEMMs for SMs while
+    the chain joins on it."""
+    key = (torch.accelerator.current_device_index(), index)
+    stream = _routed_priority_streams.get(key)
     if stream is None:
-        stream = _routed_priority_streams[device] = torch.cuda.Stream(priority=-1)
+        stream = _routed_priority_streams[key] = torch.cuda.Stream(priority=-1)
     return stream
 
 
@@ -1154,6 +1157,7 @@ class KimiMoE(nn.Module):
                 self.experts.full_grid_beside_shared_expert()
                 self._shared_kernels_checked = False
                 self._routed_stream = routed_priority_stream()
+                self._routed_down_proj_stream = routed_priority_stream(1)
             else:
                 self.experts.reserve_sms_for_shared_expert()
             self._shared_stream = aux_stream()
@@ -1363,7 +1367,9 @@ class KimiMoE(nn.Module):
         with torch.cuda.stream(self._routed_stream):
             start.wait()
             routed_hidden_states, router_output, topk_ids = (
-                self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+                self._maybe_overlap_router_and_down_proj(
+                    hidden_states, mxfp8_input, self._routed_down_proj_stream
+                )
             )
             routed = self._routed_experts(routed_hidden_states, router_output, topk_ids)
             done.record()
@@ -1399,6 +1405,7 @@ class KimiMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         down_proj_input: "torch.Tensor | QuantizedActivation | None" = None,
+        side_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Compute the routed-expert down projection alongside the router,
         overlapping them on separate CUDA streams when latent MoE is enabled.
@@ -1411,6 +1418,11 @@ class KimiMoE(nn.Module):
 
         Returns:
             ``(routed_hidden_states, router_output, topk_ids)``.
+
+        ``side_stream``: the stream the down projection forks to when it
+        overlaps (default: the layer's aux stream). The priority-overlapped
+        prefill MoE passes its second high-priority stream, so the fork keeps
+        the chain's priority over the concurrent shared expert.
             ``routed_hidden_states`` is the down-projected latent (or the
             original ``hidden_states`` when latent MoE is disabled). For MegaMoE
             ``router_output`` holds the grouped top-k weights and ``topk_ids``
@@ -1434,7 +1446,7 @@ class KimiMoE(nn.Module):
                 lambda: down_proj(down_proj_input),
                 self._down_proj_events[0],
                 self._down_proj_events[1],
-                self._down_proj_stream
+                (side_stream or self._down_proj_stream)
                 if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
                 or num_tokens >= _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
                 else None,

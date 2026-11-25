@@ -116,6 +116,7 @@ def layer(full_grid, seed=0):
         _shared_stream=torch.cuda.Stream(),
         _shared_events=(torch.cuda.Event(), torch.cuda.Event()),
         _routed_stream=kimi.routed_priority_stream(),
+        _routed_down_proj_stream=kimi.routed_priority_stream(1),
         _shared_full_grid=full_grid, _shared_kernels_checked=False,
         _prefill_subcalls=None,
     )  # fmt: skip
@@ -144,6 +145,9 @@ def test_priority_stream_is_above_default():
     assert s is kimi.routed_priority_stream()  # one per device
     assert s.priority < torch.cuda.current_stream().priority
     assert s.priority < torch.cuda.Stream().priority
+    s1 = kimi.routed_priority_stream(1)  # the chain's own fork (latent down)
+    assert s1 is kimi.routed_priority_stream(1) and s1 != s
+    assert s1.priority == s.priority
 
 
 @pytest.mark.parametrize("full_grid", [False, True])
@@ -243,3 +247,36 @@ def test_capped_layer_keeps_the_stock_form():
     assert torch.equal(mlp.forward(h), want)
     assert mlp.experts.streams == [torch.cuda.current_stream()]
     assert mlp.shared_experts.streams == [mlp._shared_stream]
+
+
+class StreamLinear(Linear):
+    """A Linear that records the stream it runs on."""
+
+    def __init__(self, n, k, g):
+        super().__init__(n, k, g)
+        self.streams = []
+
+    def __call__(self, x):
+        self.streams.append(torch.cuda.current_stream())
+        return super().__call__(x)
+
+
+@pytest.mark.parametrize("n", [512, 4096])
+def test_latent_down_fork_keeps_chain_priority(n):
+    """Full-grid layer: from _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS rows the latent
+    down projection forks off the routing chain onto the chain's second
+    high-priority stream (never the normal-priority aux stream, where it would
+    compete with the concurrent shared expert while the chain joins on it); below,
+    it stays serial on the chain's stream. Bitwise equal to the serial order."""
+    torch.cuda.set_device(DEVICE)
+    mlp = layer(True, seed=4)
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    mlp.routed_expert_down_proj = StreamLinear(LATENT, HIDDEN, g)
+    h = inputs(n, 11)
+    want = serial(mlp, h)
+    mlp.routed_expert_down_proj.streams.clear()
+    assert torch.equal(mlp.forward(h), want)
+    fork = n >= kimi._ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
+    expect = mlp._routed_down_proj_stream if fork else mlp._routed_stream
+    assert mlp.routed_expert_down_proj.streams == [expect]
+    assert expect.priority < torch.cuda.Stream().priority
