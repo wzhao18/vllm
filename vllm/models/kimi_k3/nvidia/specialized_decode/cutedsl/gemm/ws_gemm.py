@@ -18,6 +18,7 @@ group behind, so only the last group's blocks follow the MMA loop.
 
 from typing import Any
 
+from ..common import diagstamp as _dg  # DIAG
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
@@ -120,6 +121,12 @@ class WsGemm:
         x, w = args[0:2]
         smem = cutlass.utils.SmemAllocator()
         block, _, _ = cute.arch.block_idx()
+        dtid, _, _ = cute.arch.thread_idx()
+        dbase = Int64(0)
+        if cutlass.const_expr(getattr(self, "diag", False)):  # DIAG stamps
+            dbase = args[-1].iterator.toint() + Int64(block) * 128
+            _dg.stamp_store(dbase, Int32(dtid == 0))
+            _dg.smid_store(dbase + 15 * 8, Int32(dtid == 0))
         cta, kpart = block // self.ks, block % self.ks
         tid, _, _ = cute.arch.thread_idx()
         lane, warp = tid % 32, tid // 32
@@ -171,6 +178,8 @@ class WsGemm:
         if cutlass.const_expr(not self.early):
             wr = self.load_weights(wp, live)
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(getattr(self, "diag", False)):
+            _dg.stamp_store(dbase + 8, Int32(dtid == 0))
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.grouped):
             if warp == 0:
@@ -245,6 +254,8 @@ class WsGemm:
             if cutlass.const_expr(self.ks > 1):
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
+        if cutlass.const_expr(getattr(self, "diag", False)):
+            _dg.stamp_store(dbase + 16, Int32(dtid == 0))
 
     def load_weights(self, wp, live=None):
         """This warp's register-resident weight fragments (``rb`` K blocks; traced

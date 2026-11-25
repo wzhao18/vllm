@@ -247,6 +247,14 @@ class FrontRows:
             hidden = shared if b in self.merged else 0
             front = compile_front_rows(valid, split, shard, hidden, rows, dev, n)
             self.plans[b] = views, route, situ, args, blocks, front
+            from ..common import diagstamp  # DIAG
+            from .front import RSLOTS
+
+            if not hasattr(self, "rkey"):
+                self.rkey, self.rstamps, self.sstamps = diagstamp.ordinal("route"), {}, {}
+            n_route = 2 * b  # rows > 64: no copy halves
+            self.rstamps[b] = to_cute(diagstamp.buffer("route", self.rkey, b, n_route, self.device, RSLOTS))
+            self.sstamps[b] = to_cute(diagstamp.buffer("situ", self.rkey, b, b, self.device, RSLOTS))
         from .front import diag_stamps
 
         self.diag = diag_stamps(packed.device, sorted(batches), "rows")
@@ -274,7 +282,7 @@ class FrontRows:
     def route_only(self, x):
         """``route``'s routing kernel, after ``front``."""
         views, route, _, args, blocks, _ = self.plans[x.shape[0]]
-        route(*args, blocks, stream(self.device))
+        route(*args, blocks, self.rstamps[x.shape[0]], stream(self.device))
         return views[2], views[3], views[6]
 
     def push_down(self, x, push):
@@ -298,7 +306,7 @@ class FrontRows:
             self.gate_situ.run(x, h)
         elif b not in self.merged:
             torch.mm(x, self.gate_up_weight.t(), out_dtype=torch.float32, out=views[1])
-            situ(*args, stream(self.device))
+            situ(*args, self.sstamps[b], stream(self.device))
         if b in self.down.kernels:
             self.down.run(h, out)
         else:

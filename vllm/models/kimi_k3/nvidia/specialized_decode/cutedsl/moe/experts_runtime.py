@@ -391,9 +391,11 @@ def compile_rubin64(
     dies when the weights were ``place``d; ``static``: constant epilogue-group
     barrier ids (``ExpertsKernel.static_groups``); ``zone``: the FC2 tail pool's
     (``POOL_ZONE``)."""
+    from ..common import diagstamp  # DIAG
+
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static,
+        static_groups=static, trace=diagstamp.expert_ring(f"cuda:{device}"),
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()

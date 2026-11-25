@@ -36,6 +36,9 @@ from .experts_rubin import ROUTE_WORDS, count_image, image_chunk
 from .experts_runtime import polled, rubin
 from .shared import compile_down, compile_shared, situ, weight_maps
 from .tail_runtime import CAP
+from ..common.diagstamp import smid_store, stamp_store
+
+RSLOTS = 256  # DIAG: route stamp row (0-15 phases, 16 + tid: poll landed)
 
 
 @asm(Int32)
@@ -105,6 +108,9 @@ class RouteSitu:
         signal = args[11 + bool(self.plan)] if self.signal else None
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
+        self.sbase = args[-1].iterator.toint() + c.Int64(cta) * (RSLOTS * 8)
+        self.st(0, tid == 0)
+        smid_store(self.sbase + 15 * 8, Int32(tid == 0))
         token, role = cta % self.batch, cta // self.batch
         if c.const_expr(self.halves):  # CTAs [B, 3B): the two copy halves of each token
             role = Int32(cta >= self.batch)
@@ -112,6 +118,7 @@ class RouteSitu:
             # Release the experts once this rank's front GEMM has completed: their
             # launch then never overlaps it (they still wait for this kernel's end).
             cute.arch.griddepcontrol_wait()
+            self.st(1, tid == 0)
             cute.arch.griddepcontrol_launch_dependents()
         elif c.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
@@ -129,6 +136,7 @@ class RouteSitu:
                             # The CTA's image part, then its count (release), then
                             # the mailbox re-arm (not ahead of the count's release).
                             cute.arch.sync_threads()
+                            self.st(6, tid == 0)
                             if tid == 0:
                                 count_image(signal.iterator + 128)
                             if tid < 224:
@@ -153,9 +161,15 @@ class RouteSitu:
                             up = c.Float32(c.BFloat16(pair[i, 1]))
                             value = situ(gate, up, beta, linear_beta)
                             hidden[token, tid + 256 * i] = c.BFloat16(value)
+        self.st(8, tid == 0)
         # Late release: the persistent experts must not take SMs from the down GEMM.
         if c.const_expr(not self.early):
             cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def st(self, slot, when):
+        """DIAG: %globaltimer into this CTA's stamp ``slot`` where ``when``."""
+        stamp_store(self.sbase + slot * 8, Int32(when))
 
     @cute.jit
     def select(self, key, threshold, buffers, signal=None, token=None):
@@ -267,6 +281,7 @@ class RouteSitu:
         chunk = (cta - self.batch) // self.batch * 224 + tid
         base = mailbox.iterator + token * mailbox.shape[2] + chunk * 8
         got = poll(base, 0, 1)
+        self.st(16 + tid, True)
         dst = latent.iterator + token * latent.stride[0] + chunk * 8
         words = [got[0, k] for k in range(4)]
         store_words(dst, words)
@@ -283,6 +298,7 @@ class RouteSitu:
     @cute.jit
     def copy(self, base, latent, token, tid, count: c.Constexpr[int], plan=None):
         got = poll(base, 2048, count)
+        self.st(16 + tid, True)
         if c.const_expr(self.sync_copy):  # every thread of the CTA: once per path
             cute.arch.sync_threads()
         for i in c.range_constexpr(count):
@@ -330,6 +346,7 @@ class RouteSitu:
             if tid < 224:
                 cell = mailbox.iterator + token * mailbox.shape[2] + 3584 + tid * 8
                 got = poll(cell, 0, 1)
+                self.st(16 + tid, True)
                 rearm(cell)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
@@ -343,6 +360,7 @@ class RouteSitu:
                         key[i] = ordered(scores[i] + offsets[i])
             if c.const_expr(not self.lean):
                 cute.arch.griddepcontrol_wait()
+                self.st(2, tid == 0)
         else:
             cute.arch.griddepcontrol_wait()
             for i in c.range_constexpr(4):
@@ -374,11 +392,14 @@ class RouteSitu:
             if lane == 0:
                 cutoff[0] = low
         cute.arch.sync_threads()
+        self.st(3, tid == 0)
         if c.const_expr(self.lean):
             dense = view(cand.iterator, 0, Uint64, (1024,))
             buffers = (dense, sig, chosen, picked, found)
             self.select(key, cutoff[0], buffers, signal, token)
+            self.st(4, tid == 0)
             self.publish(chosen, picked, ids, weights, scale, token, signal)
+            self.st(5, tid == 0)
             return
         threshold, offset = cutoff[0], Int32(0)
         for i in c.range_constexpr(4):
@@ -442,6 +463,7 @@ class RouteSitu:
                 if c.const_expr(self.renorm):
                     value = div_rn(value, total + c.Float32(1e-20))
                 weights[token, lane] = c.BFloat16(value)
+        self.st(5, tid == 0)
 
 
 # Front GEMM geometry "ks.kb.tg.rt.ch" per batch, by packed rows (TP8 560, TP16 288),
@@ -649,7 +671,9 @@ def compile_route(
     args += (fake((batch, shared)), *(f32(v) for v in (1, 4, 25)))
     blocks = -(-batch // 64)
     args += (fake((blocks * PLAN_BYTES,), None, c.Uint8),) * bool(plan)
-    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal + (make_fake_stream(),)
+    args += (fake((ROUTE_WORDS,), None, c.Int32),) * signal
+    ctas = (sum(map(bool, roles)) + kernel.halves) * batch
+    args += (fake((ctas, RSLOTS), None, c.Int64), make_fake_stream())  # DIAG stamps
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
@@ -675,26 +699,13 @@ def compile_front_tmem(split, valid, shard, hidden, device):
         return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
 
-_DIAG: list = []
-
-
 def diag_stamps(device, batches, tag):
     """DIAGNOSTIC ONLY (never merged): per-batch [1024, 16] int64 globaltimer stamps of
-    the front kernel, dumped at exit."""
-    import atexit
-    import os
+    the front kernel (``diagstamp`` buffers, dumped by the forward bench)."""
+    from ..common import diagstamp
 
-    bufs = {b: torch.zeros(1024, 16, dtype=torch.int64, device=device) for b in batches}
-    if not _DIAG:
-        def dump():
-            out = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/sol16/L4diag"
-            run = os.environ.get("SLURM_JOB_ID", "j") + "." + os.environ.get("SLURM_STEP_ID", "s")
-            os.makedirs(f"{out}/{run}", exist_ok=True)
-            rank = os.environ.get("SLURM_PROCID", "0")
-            data = [(t, {b: v.cpu() for b, v in d.items()}) for t, d in _DIAG]
-            torch.save(data, f"{out}/{run}/rank{rank}.pt")
-        atexit.register(dump)
-    _DIAG.append((tag, bufs))
+    key = diagstamp.ordinal(tag)
+    bufs = {b: diagstamp.buffer(tag, key, b, 1024, device) for b in batches}
     return {b: to_cute(v) for b, v in bufs.items()}
 
 
@@ -710,8 +721,11 @@ def compile_publish(n, split, valid, batch, device, ks, geometry=None, wide=Fals
     kernel = WsGemm(
         n, 7168, batch, rt, kq, staged, split, valid, ks, tg, ch, early, tiles
     )
+    kernel.diag = True  # DIAG: stamp rows last
     args: tuple = (fake((batch, 7168)), fake((n, 7168)), fake((1, 64, WIDTH)))
     args += (c.Int64(0), c.Int32(0), c.Int32(0), fake((batch, 896), None, c.Float32))
+    assert kernel.grid <= 1024
+    args += (fake((1024, 16), None, c.Int64),)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args, make_fake_stream())
 
@@ -797,6 +811,7 @@ class SharedFront:
         carve = ROUTE_CARVEOUT_WIDE.get(n, "") if wide and verify else ""
         self.route_carveout = {b for b, on in batch_table(carve).items() if on}
         self.plans: dict[int, tuple] = {}
+        self.rstamps, self.sstamps, self.wstamps = {}, {}, {}  # DIAG
         self.route_keys: dict[int, tuple] = {}
         self.route_opts: dict[int, dict] = {}
         for b in batches:
@@ -841,6 +856,14 @@ class SharedFront:
             elif b in fused:
                 code = compile_shared(tp, b, dev)
             self.plans[b] = views, front, route, situ, args + self.scalars, extra, code
+            from ..common import diagstamp  # DIAG
+
+            rkey = (diagstamp.ordinal("route") if not hasattr(self, "rkey") else self.rkey)
+            self.rkey = rkey
+            n_route = (2 + bool(self.route_opts[b].get("halves") and b <= 64)) * b
+            self.rstamps[b] = to_cute(diagstamp.buffer("route", rkey, b, n_route, self.device, RSLOTS))
+            self.sstamps[b] = to_cute(diagstamp.buffer("situ", rkey, b, b, self.device, RSLOTS))
+            self.wstamps[b] = to_cute(diagstamp.buffer("wsgemm", rkey, b, 1024, self.device))
 
     def route(self, x):
         """Router logits + published down shard, then top16 and the latent copy (and
@@ -858,8 +881,8 @@ class SharedFront:
             work += (Int32(0), Int32(0), Int32(CAP), *self.scalars[1:], *self.box[1:])
             code[0](*work, s)
         else:
-            front(to_cute(x), self.packed, *self.box, args[0], s)
-        route(*args, *extra, s)
+            front(to_cute(x), self.packed, *self.box, args[0], self.wstamps[x.shape[0]], s)
+        route(*args, *extra, self.rstamps[x.shape[0]], s)
         return views[2], views[3], views[6]
 
     def release_early(self, batches):
@@ -918,7 +941,7 @@ class SharedFront:
             self.gate_situ.run(x, views[4])  # h straight from the gate/up GEMM
         else:
             self.gate_up.run(x, views[1])
-            situ(*args, s)
+            situ(*args, self.sstamps[x.shape[0]], s)
         shared = self.down.run(views[4], views[5])
         tail.push(shared)
         return shared, None

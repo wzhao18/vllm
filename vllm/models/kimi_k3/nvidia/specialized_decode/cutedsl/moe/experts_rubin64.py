@@ -19,6 +19,7 @@ keeps up with the MMAs."""
 
 import cutlass
 import cutlass.cute as cute
+from ..common import diagstamp as _dg  # DIAG
 from cutlass import Float32, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
@@ -233,7 +234,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def stamp(self, slot: cutlass.Constexpr[int]):
-        if cutlass.const_expr(self.trace != 0):
+        if cutlass.const_expr(False):  # DIAG: ``trace`` holds the ticket ring
             stamp_at(Int64(self.trace) + Int64(thread()[3]) * 512, slot)
 
     @cute.jit
@@ -1199,12 +1200,19 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         x, ids, _, w13_scales, w2_scales, workspace, output, batch, *scalars = args
         tid, warp, lane, cta = thread()
         sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem_bytes, 1024)
-        if tid == 0:
-            self.stamp(0)
+        # DIAG: one ring row per CTA call (ticket), (%globaltimer, smid) per slot
+        drow = Int64(0)
+        if cutlass.const_expr(self.trace != 0):
+            if tid == 0:
+                n = _dg.ticket(Int64(self.trace))
+                drow = Int64(self.trace) + 256 + Int64(n % _dg.EXPERT_ROWS) * 256
+                stamp_at(drow, 0)
+                _dg.store_u64(drow + 15 * 16, Int64(cta))
         tmem_base = self.initialize(sm, maps, batch)
         cute.arch.griddepcontrol_wait()
-        if tid == 0:
-            self.stamp(1)
+        if cutlass.const_expr(self.trace != 0):
+            if tid == 0:
+                stamp_at(drow, 1)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
         # Images and rearm alternate over grouped calls; ``x`` is the plan.
         routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
@@ -1212,8 +1220,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if cutlass.const_expr(len(self.dies) > 0):
             arrival = self.ticket(workspace)
         self.group(sm, ids, workspace, batch, arrival=arrival)
-        if tid == 0:
-            self.stamp(2)
+        if cutlass.const_expr(self.trace != 0):
+            if tid == 0:
+                stamp_at(drow, 2)
         distinct, call_count, generation = (routed[0], routed[1], routed[2])
         experts = self.tables(sm)[0]
         fence_tmem()
@@ -1223,8 +1232,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ranges = self.matched_ranges(sm, distinct)
         else:
             ranges = self.partition(distinct, cta)
-        if tid == 0:
-            self.stamp(11)
+        if cutlass.const_expr(self.trace != 0):
+            if tid == 0:
+                stamp_at(drow, 3)
+                _dg.store_u64(drow + 14 * 16, Int64(routed[1]))
         if warp == 0:
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
@@ -1259,8 +1270,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if tid == 128:
                     self.stamp(10)
         release_tmem(tmem, 512, warp, 3)
-        if tid == 0:
-            self.stamp(13)
+        if cutlass.const_expr(self.trace != 0):
+            if tid == 0:
+                stamp_at(drow, 4)
             counters[cta] = call_count + 1
             if cta < self.slots - self.grid:
                 counters[self.grid + cta] = call_count + 1
