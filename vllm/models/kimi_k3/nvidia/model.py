@@ -1868,7 +1868,16 @@ class KimiDecoderLayer(nn.Module):
         evs = dsa_dp.P.new_layer(self._layer_kind) if dsa_dp.PROF else None
         dsa_dp.rec(evs)
         pre_mxfp8, post_mxfp8 = self._attn_res_mxfp8_consumers(prefix_sum)
-        if pre_mxfp8:
+        sp_mxfp8 = self._sp_mxfp8_gather(prefix_sum)
+        if sp_mxfp8:
+            # SP prefill: the AttnRes writes the shard of the KDA in_proj's
+            # MXFP8 input and the gather pushes MXFP8 (ops/sp_all_gather.py
+            # kimi_sp_all_gather_mxfp8: bitwise the quantization of the
+            # gathered BF16 rows that in_proj ran before).
+            _, hidden_states, prefix_sum = self._attn_res_mxfp8(
+                prefix_sum, hidden_states, residual, pre=True
+            )
+        elif pre_mxfp8:
             # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
             # only consumer) instead of BF16.
             _, hidden_states, prefix_sum = self._attn_res_mxfp8(
@@ -1902,7 +1911,10 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             dsa_dp.rec(evs)
             return hidden_states, prefix_sum, residual
-        if self.use_sequence_parallel:
+        if sp_mxfp8:
+            M = positions.shape[0]
+            hidden_states = sp_ag.kimi_sp_all_gather_mxfp8(hidden_states, M)
+        elif self.use_sequence_parallel:
             hidden_states = sp_ag.kimi_sp_all_gather(hidden_states)
             # Remove SP padding before attention.
             hidden_states = hidden_states[: positions.shape[0]]
@@ -2008,6 +2020,33 @@ class KimiDecoderLayer(nn.Module):
             )
             caps = self._attn_res_mxfp8_caps = (pre, post)
         return caps
+
+    def _sp_mxfp8_gather_capable(self) -> bool:
+        """Under SP, the KDA in_proj (the pre-attention AttnRes' only consumer)
+        is an online-MXFP8 projection that takes a pre-quantized activation:
+        its input can be quantized per shard and gathered as MXFP8."""
+        cap = getattr(self, "_sp_mxfp8_cap", None)
+        if cap is None:
+            cap = self._sp_mxfp8_cap = (
+                self.use_attn_res
+                and self.use_sequence_parallel
+                and not getattr(self, "_dsa_scatter", False)
+                and not getattr(self, "_dsa_dp", False)
+                and isinstance(self.self_attn, KimiK3DeltaAttention)
+                and takes_mxfp8_activation(self.self_attn.in_proj_qkvgfab)
+            )
+        return cap
+
+    def _sp_mxfp8_gather(self, prefix_sum: torch.Tensor | None) -> bool:
+        """This step's SP gather goes as MXFP8: the capability, a prefill
+        shard of the native AttnRes contract, and a shard size the MXFP8
+        gather takes (``sp_ag.mxfp8_gather_rows_ok``: a multiple of 128 rows
+        on the symmetric-memory push; the Lamport all-gather stays BF16)."""
+        if prefix_sum is None or not self._sp_mxfp8_gather_capable():
+            return False
+        return prefill_attn_res_mxfp8.supported(
+            prefix_sum, 0, True
+        ) and sp_ag.mxfp8_gather_rows_ok(prefix_sum.shape[0], prefix_sum.shape[1])
 
     def _attn_res_mxfp8_consumers(
         self, prefix_sum: torch.Tensor | None
@@ -2922,6 +2961,7 @@ class KimiLinearForCausalLM(
             mxfp8_act.warmup()
             if any(
                 any(layer._attn_res_mxfp8_capabilities())
+                or layer._sp_mxfp8_gather_capable()
                 for layer in self.modules()
                 if isinstance(layer, KimiDecoderLayer)
             ):
