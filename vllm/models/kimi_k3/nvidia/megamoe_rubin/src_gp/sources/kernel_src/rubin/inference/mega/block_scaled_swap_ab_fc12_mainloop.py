@@ -1078,7 +1078,13 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 # the peer's barrier (whose one arrival is the peer's).
                 compact_barrier = self.compact_sfa_mbarriers + stage_index
                 source = compact_source + cutlass.Int64(k_tile_idx * Int32(compact_bytes))
-                with cute.arch.elect_one():
+                import os as _os
+                if cutlass.const_expr("nobulk" in _os.environ.get("P8X", "")):
+                    with cute.arch.elect_one():
+                        if self.mma_cta_index != Int32(0):
+                            cute.arch.mbarrier_arrive(compact_barrier)
+                else:
+                  with cute.arch.elect_one():
                     if self.mma_cta_index == Int32(0):
                         tma_load_1d_to_cta(
                             compact_smem + stage_index * Int32(2 * compact_bytes) - Int32(compact_bytes),
