@@ -641,12 +641,12 @@ class OprojReduce:
     weight preload while the owners wait for the other ranks' chunks. Args (recv,
     gather, gather multicast, rank, stream). Same sums, bitwise."""
 
-    def __init__(self, batch):
-        self.batch = batch
+    def __init__(self, batch, threads=32):
+        self.batch, self.threads = batch, threads  # 112 x 32 threads in all
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, 112, 32)
+        launch(self.kernel, args, 112 * 32 // self.threads, self.threads)
 
     @cute.kernel
     def kernel(self, args):
@@ -656,7 +656,7 @@ class OprojReduce:
         per: Constexpr = recv.shape[2] // 8
         rounds: Constexpr = -(-self.batch * per // (112 * 32))
         for j in cutlass.range_constexpr(rounds):
-            g = cta * 32 + tid + 112 * 32 * j
+            g = cta * self.threads + tid + 112 * 32 * j
             if g < self.batch * per:
                 token, local = g // per, g % per
                 column = rank * recv.shape[2] + local * 8

@@ -256,14 +256,16 @@ def producer_reduce(tp, batch, device):
 # runs as its own lean grid (``OprojReduce``: 112 x 32 threads, no shared memory)
 # between the producer and the consumer, so the producer's 135-196 KB CTAs exit right
 # after their pushes instead of holding their SMs until the other ranks' chunks land.
-# Same reduction, bitwise.
+# Value: threads per CTA (1: 32), 112 x 32 threads in all. Same reduction, bitwise.
 LEAN_REDUCE: dict[int, str] = {16: ""}
 
 
 def lean_reduce(tp, batch, device):
+    """The lean reduce grid's threads per CTA at ``batch``, or 0."""
     if torch.cuda.get_device_capability(device) != (10, 7):
-        return False
-    return bool(batch_table(LEAN_REDUCE.get(tp, "")).get(batch))
+        return 0
+    threads = batch_table(LEAN_REDUCE.get(tp, "")).get(batch, 0)
+    return 32 if threads == 1 else threads
 
 
 # Rubin (compute capability 10.7) two-shot batches per TP whose tcgen05 producer holds
@@ -375,8 +377,9 @@ def compile_oproj(
         tail = (recv, peers, slot, box, mc, mc)  # + gather, its multicast, x's map
         kernel = OprojUmmaRows(k, chunk=chunk)
         return cute.compile(kernel, x, w, *tail, make_fake_stream())
-    if kind == "reduce":  # LEAN_REDUCE: the owner reduce as its own grid
-        return cute.compile(OprojReduce(batch), recv, box, mc, slot, make_fake_stream())
+    if kind.startswith("reduce"):  # LEAN_REDUCE: reduce<threads per CTA>
+        kernel = OprojReduce(batch, int(kind[6:]))
+        return cute.compile(kernel, recv, box, mc, slot, make_fake_stream())
     if kind.startswith("producer"):  # producer_mma / producer_umma: engine A/B
         kernel = producer(
             k, batch, tp, mla, twoshot, kind[9:] or None, reduced, resident, xmc
@@ -545,7 +548,7 @@ class PreparedOproj:
                 for kind in kinds
             )
             if lean:  # codes[2]: the lean owner reduce
-                reduce_args = ("reduce", *shape, False, 64, True)
+                reduce_args = (f"reduce{lean}", *shape, False, 64, True)
                 self.codes[b] += (compile_oproj(*reduce_args),)
             extra = (False, False, False, 1, vote)  # batched, reduced, resident, xmc
             carve = consumer_carveout(tp, b, self.device) if twoshot else None

@@ -1707,6 +1707,7 @@ OSMALL_VARIANTS = {
     # the owner reduce as its own lean grid (OprojReduce): the producer exits after
     # its pushes; bitwise-checked against prod before timing
     "lean": (tuple(range(17, 65)), dict(LEAN_REDUCE={16: "17-64:1"})),
+    "lean128": (tuple(range(17, 65)), dict(LEAN_REDUCE={16: "17-64:128"})),
     "prod2": (None, {}),  # production again (order / drift check)
 }
 
