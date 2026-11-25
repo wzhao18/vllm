@@ -1012,6 +1012,8 @@ class RubinExpertsKernel(ExpertsKernel):
         for t in cutlass.range_constexpr(8):
             bad |= words[j, t] == Uint32(4294967295)
         ready = cute.arch.vote_all_sync(not bad)
+        if cutlass.const_expr(getattr(self, "oracle", 0) & 2):
+            ready = True  # DIAG: no wait on the K-split peers (timing bound)
         sgn, sgt = spin_start()
         while not ready:
             bad = False

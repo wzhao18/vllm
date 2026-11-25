@@ -721,6 +721,8 @@ class ExpertsKernel(ExpertsGeometry):
             if valid_bytes > 0:
                 bad |= has_ff_byte(scale & mask)
             ready = cute.arch.vote_all_sync(not bad)
+            if cutlass.const_expr(getattr(self, "oracle", 0) & 1):
+                ready = True  # DIAG: no wait on the hidden image (timing bound)
             sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
         image = sm.iterator + self.off_h + buffer * self.h_image_bytes
         for v in cutlass.range_constexpr(chunks):
