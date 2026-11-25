@@ -247,10 +247,10 @@ class KdaVerifyLoopRecords(KdaVerifyLoopStock):
                     for r in cutlass.range_constexpr(2):
                         for c in cutlass.range_constexpr(CHUNKS):
                             values4 = [history[r, c, e] for e in range(4)]
-                            pointer = at(
+                            target = at(
                                 destination, head, row0 + 4 * r, 4 * (j + 8 * c)
                             )
-                            store_f32x4(pointer, values4)
+                            store_f32x4(target, values4)
 
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
