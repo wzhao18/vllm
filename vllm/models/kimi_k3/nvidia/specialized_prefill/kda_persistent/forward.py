@@ -71,9 +71,11 @@ def _get_compiled(
     cluster_size: int = 1,
     partial_tma: bool = True,
     state_rows: bool = False,
+    gswz: bool = False,
 ):
     key = (
         state_rows,
+        gswz,
         dev.index,
         torch.cuda.get_device_capability(dev),
         H,
@@ -177,6 +179,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                GSWZ_=1 if gswz else 0,
             )
             kw.update(_DEV)
             return cute.compile(
@@ -350,6 +353,7 @@ def _launch_forward(
     partial_tma=True,
     srow=None,
     compile_only=False,
+    gswz=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -427,6 +431,7 @@ def _launch_forward(
         gate_roll=gate_roll,
         state_rows=srow is not None,
         partial_tma=partial_tma,
+        gswz=gswz,
     )
     if compile_only:
         return None
@@ -910,7 +915,14 @@ def fwd(
     # slower when every chunk is full (4x4k, 2x8k), so all-full packed shapes
     # keep the plain recurrence.  Whether every chunk is full is a static
     # property of the lengths, and a -5 lower bound folds into the gate.
-    # There are no per-head-count settings.
+    # Per-shape dispatch for the TP8 head shard (H = 12, VR200, 1-GPU A/B at
+    # 8 / 16 x 2048 packed full chunks; PR-5 loop 1): the prep warps' gate
+    # cumsum reads use the bank-swizzled layout (GSWZ), and all-full packed
+    # sequences take the row-paired GATE2 route without the gate roll or the
+    # partial-chunk TMA (-4.2% / -4.5%). Both are data movement only: output and
+    # final state are bitwise identical to the other routes.
+    tp8 = q.shape[2] == 12
+    rowpair_full = tp8 and full_chunks and not fixed
     return _launch_forward(
         q,
         k,
@@ -926,19 +938,20 @@ def fwd(
         final_state=final_state,
         cu_seqlens=cu32,
         sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
-        gate2=1 if (fixed or not full_chunks) else 0,
+        gate2=1 if (fixed or not full_chunks or rowpair_full) else 0,
         has_split=has_split,
         beta_tma=beta_tma_supported(beta),
-        qk_rowpair=4 if fixed else 8,
+        qk_rowpair=4 if (fixed or rowpair_full) else 8,
         restore_tail=False,
         reg_mode=2,
         full_chunks=full_chunks,
         lower_bound_m5=lower_bound == -5.0,
         approximate_split=False,
-        gate_roll=not fixed,
-        partial_tma=not fixed,
+        gate_roll=not (fixed or rowpair_full),
+        partial_tma=not (fixed or rowpair_full),
         srow=srow,
         compile_only=compile_only,
+        gswz=tp8,
     )
 
 
