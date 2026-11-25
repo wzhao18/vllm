@@ -205,6 +205,7 @@ class IndexerStage:
                 row_ends=ends[:rows],
                 packed=None if packed is None else packed[:rows],
                 max_local_len=max_local_len,
+                published=packed is not None and fused.publishes(rows),
                 **merge,
             )
             if rows < batch:  # rows past the requests attend nothing

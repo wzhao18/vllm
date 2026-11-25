@@ -2054,6 +2054,23 @@ def _mailbox_for(topk: int, local_topk: int) -> _Mailbox | None:
     return ws.mailbox
 
 
+def dcp_topk_round1_mailbox(topk: int, local_topk: int) -> _Mailbox | None:
+    """The round-1 mailbox of the (K, N) merge (None: the all-gather) for a
+    producer that publishes its packed rows itself (``published=`` of
+    ``dcp_topk_merge_rows``): row ``r`` of a call goes to slot ``[ordinals[r] &
+    1, r, rank]`` of every rank's ``box`` (``box_mc``, ``box_words(N)`` u32
+    words in the pack kernel's layout), after the producer's PDL wait."""
+    return _mailbox_for(topk, local_topk)
+
+
+def box_words(local_topk: int) -> int:
+    """u32 words of one round-1 mailbox slot (``_box_words``)."""
+    return _box_words(local_topk)
+
+
+multimem_st_v4 = _multimem_st_v4
+
+
 def register_dcp_topk_merge_warmup(
     topk: int,
     local_topk: int,
@@ -2340,6 +2357,7 @@ def _publish_round1(
     *,
     exact: _ExactArgs,
     rows: _RowsOutput | None = None,
+    published: bool = False,
 ) -> torch.Tensor:
     """Round 1 through the mailbox: this rank's local top-N (DeepSelect, or
     ``packed``) published to every rank; returns the select's ``gathered``.
@@ -2352,7 +2370,9 @@ def _publish_round1(
             f"({mailbox.max_rows} rows)"
         )
     _check_exact(mailbox.gathered[:, :num_rows], exact.topk, local_topk, rows, exact)
-    if packed is None:
+    if published:  # the producer multicast ``packed`` into the mailbox itself
+        assert packed is not None
+    elif packed is None:
         from vllm.model_executor.layers.indexer_topk import deep_select_topk
 
         local_idx = deep_select_topk(logits, local_topk, end=row_ends)
@@ -2449,6 +2469,7 @@ def dcp_topk_merge_rows(
     group: Any = None,
     max_local_len: int | None = None,
     release: bool = False,
+    published: bool = False,
 ) -> None:
     """Exact DCP top-K merge straight to this rank's physical KV rows.
 
@@ -2476,6 +2497,8 @@ def dcp_topk_merge_rows(
     runs. Leave False for any consumer that reads them before its wait
     (FlashInfer's trtllm-gen counts, prims_ts) or that is not audited.
 
+    ``published``: the producer of ``packed`` already multicast its rows into
+    the round-1 mailbox (``dcp_topk_round1_mailbox``), so no pack kernel runs.
     Collective over the DCP group (see the module docstring).
     """
     if logits is None or row_ends is None:
@@ -2484,6 +2507,8 @@ def dcp_topk_merge_rows(
         )
     logits = _bound_logits(logits, max_local_len)
     mailbox = _mailbox_for(topk, local_topk)
+    if published and (mailbox is None or packed is None):
+        raise ValueError("published= needs packed= and the round-1 mailbox")
     if packed is None:
         num_rows = logits.shape[0]
         if mailbox is None:
@@ -2523,7 +2548,14 @@ def dcp_topk_merge_rows(
     if mailbox is not None:
         dcp_topk_select(
             _publish_round1(
-                mailbox, logits, row_ends, local_topk, packed, exact=exact, rows=rows
+                mailbox,
+                logits,
+                row_ends,
+                local_topk,
+                packed,
+                exact=exact,
+                rows=rows,
+                published=published,
             ),
             local_topk,
             ids_out,
