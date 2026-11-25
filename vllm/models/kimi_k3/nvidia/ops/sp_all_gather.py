@@ -528,7 +528,9 @@ class SymmSpAllGather:
     def _arrive(self, lo: int = 0, hi: int = 0, ncl: int = 0, add: int = 0) -> None:
         """Arrival word = this gather's index: this rank's stream finished every
         read of the slot's previous gather (pushers wait for it)."""
-        if self.idle_sms:
+        # A captured forward is all stock gathers (barriers); no arrival words
+        # in graphs (a replay would write a stale index).
+        if self.idle_sms and not torch.cuda.is_current_stream_capturing():
             _ag_module().sp_ag_arrive(
                 self.flags.data_ptr(), self.gidx, lo, hi, ncl, _AG_FLAG_WORDS - 64, add
             )
@@ -537,7 +539,7 @@ class SymmSpAllGather:
         """A stock push after an overlapped gather: no barrier since, so wait
         for every peer's arrival at this gather before writing its slot."""
         self._arrive()
-        if self.last_overlapped:
+        if self.last_overlapped and not torch.cuda.is_current_stream_capturing():
             _ag_module().sp_ag_arrivals(self.peer_flags, self.world, self.gidx, _AG_SPIN_NS)
         self.last_overlapped = False
 
