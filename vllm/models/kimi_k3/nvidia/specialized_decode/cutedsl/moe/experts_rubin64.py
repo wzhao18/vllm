@@ -788,6 +788,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             scalars[1], scalars[2] = (calls, grouped)
         cute.arch.sync_threads()
+        if tid == 0:
+            self.stamp(15)
         for k in cutlass.range_constexpr(rounds):
             pair = tid + threads * k
             if pair < batch * 16:
@@ -796,6 +798,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 word = masks.iterator + 2 * mine[k] + (token >> 5)
                 cute.arch.atomic_or(word, bit, sem="relaxed", scope="cta")
         cute.arch.sync_threads()
+        if tid == 0:
+            self.stamp(16)
         span: cutlass.Constexpr = (self.experts + threads - 1) // threads
         units = cute.make_rmem_tensor(span, Int32)
         count = Int32(0)
@@ -813,6 +817,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if lane == 31:
             totals[warp] = total
         cute.arch.sync_threads()
+        if tid == 0:
+            self.stamp(17)
         start = total - count
         for w in cutlass.range_constexpr(threads // 32 - 1):
             if warp > w:
@@ -831,9 +837,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if cutlass.const_expr(len(self.dies) > 0):  # the ticket has long returned
             self.arrive(sm, workspace, arrival)
         cute.arch.sync_threads()
+        if tid == 0:
+            self.stamp(18)
         if cutlass.const_expr(len(self.dies) > 0):  # before warp 0 starts streaming
             self.home_bits(sm, experts, scalars[0])
             cute.arch.sync_threads()
+            if tid == 0:
+                self.stamp(19)
             if warp == 0:
                 self.matched(sm)
             cute.arch.sync_threads()
