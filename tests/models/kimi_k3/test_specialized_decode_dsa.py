@@ -25,55 +25,6 @@ pytestmark = pytest.mark.skipif(
 NOT_PORTED = pytest.mark.skip(reason="round 1 keeps its own runtime / MLA / AttnRes")
 
 
-@pytest.fixture(scope="module")
-def dist_init():
-    """tests/conftest.py's ``dist_init`` (world size 1, TP = PP = 1), once per module
-    instead of once per case. Creating and destroying vLLM's process groups (gloo +
-    NCCL) for every case, plus the global cleanup's ``gc.collect`` after it, cost
-    ~2.5 s per case: ~12 of this file's 15 minutes on one Rubin GPU, against ~0.1-0.6
-    s of test body. No case here changes the groups. A group that is already up (an
-    8 / 16-rank launch's ``dcp8_group``) is reused as is."""
-    import contextlib
-    import tempfile
-
-    from tests.utils import ensure_current_vllm_config
-    from vllm.distributed import (
-        cleanup_dist_env_and_memory,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm.distributed.parallel_state import model_parallel_is_initialized
-
-    if model_parallel_is_initialized():
-        yield
-        return
-    fd, temp_file = tempfile.mkstemp()
-    os.close(fd)
-    try:
-        with ensure_current_vllm_config():
-            init_distributed_environment(
-                world_size=1,
-                rank=0,
-                distributed_init_method=f"file://{temp_file}",
-                local_rank=0,
-                backend="nccl",
-            )
-            initialize_model_parallel(1, 1)
-            yield
-        cleanup_dist_env_and_memory()
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(temp_file)
-
-
-@pytest.fixture
-def should_do_global_cleanup_after_test():
-    """No per-case global cleanup (tests/conftest.py's ``cleanup_fixture``): it would
-    tear down the module's ``dist_init`` groups (and an 8 / 16-rank launch's
-    ``dcp8_group``) after every case; ``dist_init`` cleans up once at module end."""
-    return False
-
-
 def no_prims_ts():
     """Why FlashInfer's prims_ts sparse MLA cannot run here, else None (SM107:
     FlashInfer 0.7.2 has none, 0.7.3 accepts SM100 / SM103 only)."""
@@ -2677,6 +2628,35 @@ def test_rubin_dcp_policy():
     assert not prepared.RUBIN_DCP_FUSED_INDEXER
 
 
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fp4_scorer_policy(topk):
+    """The MXFP4 DCP scorer (IndexerScoreFp4) runs or raises (NQ-NOFALLBACK): on an
+    MXFP4 indexer cache it serves every captured DCP16 shape at any top-k (it selects
+    nothing); on another cache layout a target deployment refuses instead of keeping
+    DeepGEMM's logits, and elsewhere it is off with the reason per shape."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
+        fp4_scorer_policy,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Uncovered
+
+    shapes = [(b * q, q) for b in (1, 2, 4, 8, 16, 32, 64) for q in (1, 8)]
+
+    def indexer(entry):
+        cache = torch.empty((4, 64, entry), dtype=torch.uint8)
+        return SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=cache), topk_tokens=topk
+        )
+
+    mxfp4 = indexer(128 // 2 + 128 // 32)
+    assert fp4_scorer_policy(mxfp4, shapes, strict=True) == []
+    fp8 = indexer(128 + 4)
+    with pytest.raises(Uncovered, match="MXFP4 DCP scorer"):
+        fp4_scorer_policy(fp8, shapes, strict=True)
+    reasons = fp4_scorer_policy(fp8, shapes, strict=False)
+    assert len(reasons) == len(shapes) and all("MXFP4" in r for r in reasons)
+    assert fp4_scorer_policy(fp8, (), strict=True) == []
+
+
 # One DCP16 rank's local contexts (interleave 1: ~1/16 of each request's), q8.
 DCP16_INDEXER_CASES = {
     "c1": [11200],  # C1: one request at ~178K
@@ -3019,13 +2999,9 @@ def dcp8_group():
     )
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-    from vllm.distributed.parallel_state import model_parallel_is_initialized
-
     rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
     local = int(os.environ["SLURM_LOCALID"])
     assert world == (16 if DCP16_INIT else 8), world
-    if model_parallel_is_initialized():  # the module's world-1 dist_init groups
-        cleanup_dist_env_and_memory()
     torch.accelerator.set_device_index(local)
     heads = HEADS
     if world == 16:
@@ -3900,9 +3876,12 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     keys = (
         select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
         rescue.dispatch(**key, block_size=1024),
+        # The variant that releases the DSA sparse core early (MergeRows.rows).
+        rescue.dispatch(**key, block_size=1024, release=True),
     )
     stage.warm(1024)
-    assert keys[0] in select._compiled_cache and keys[1] in rescue._compiled_cache
+    assert keys[0] in select._compiled_cache
+    assert keys[1] in rescue._compiled_cache and keys[2] in rescue._compiled_cache
     warm = MagicMock()
     monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
     stage.warm(1024)
