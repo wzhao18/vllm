@@ -55,6 +55,7 @@ from ..common.tensormap import GridMap, map_address, prefetch_map
 from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
+    HOME_SHIFT,
     RubinExpertsKernel,
     die_words,
     nth_set,
@@ -974,7 +975,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
                         address = Int64(row) * 128
                     live = (tid < self.grid) & (lo < hi)
-                    dies.append(live & ((address >> 21 & 1) != 0))
+                    dies.append(live & ((address >> HOME_SHIFT & 1) != 0))
             for p in cutlass.range_constexpr(4):
                 ballot = cute.arch.vote_ballot_sync(dies[p])
                 if lane == 0:
