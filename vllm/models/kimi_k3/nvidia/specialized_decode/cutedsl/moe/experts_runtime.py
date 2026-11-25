@@ -35,12 +35,7 @@ from .experts_rubin import (
     peers_bytes,
     peers_offset,
 )
-from .experts_rubin64 import (
-    CENSUS_BYTES,
-    IDS_COUNT,
-    IDS_WORDS,
-    RubinGroupedExpertsKernel,
-)
+from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
 from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
@@ -153,12 +148,6 @@ FAST_EXCHANGE = {16: "8:1"}
 POOL_ZONE = {16: "9-16:0,17-32:6"}
 
 
-def polled64(tp, batch, q=1):
-    """Grouped-kernel rows whose experts poll the grouped ids mailbox (``POLLED64``);
-    the caller checks the rows run ``RubinGroupedExpertsKernel``."""
-    return q > 1 and bool(batch_table(POLLED64.get(tp, "")).get(batch, 0))
-
-
 def polled(tp, batch, device):
     """Batches whose experts poll the route mailbox (routing must then signal)."""
     if not rubin(tp, batch, device):
@@ -218,13 +207,6 @@ RUBIN64 = {16: "64:1"}
 # routes (first M rows), placed and die-matched vs the grouped ``ExpertsKernel``: M16
 # 25.9 -> 22.4, M32 37.0 -> 30.9, M48 44.4 -> 35.1 us per call.
 RUBIN64_VERIFY = {16: "9-63:1"}
-# Verify steps (q > 1), by TP: rows on ``RubinGroupedExpertsKernel`` whose routing
-# kernel also writes the ids into the grouped ids mailbox (``scratch``'s "ids"), which
-# the experts poll: released after the front kernel, they group, partition and start
-# their weight stream while routing (and its latent copy) still run, instead of after
-# routing's grid completes (``RubinGroupedExpertsKernel.polled``). Same ids, plan and
-# arithmetic: bitwise-identical outputs.
-POLLED64 = {16: "9-64:1"}
 # Verify steps (q > 1), by TP: row counts above 64 on the wide grouped engines at
 # capacity ceil(rows / 64) x 64 (out: this rank's partial latent rows, ``publish``
 # "local") when B64 runs the grouped kernel (the weights are placed), by stream width:
@@ -402,17 +384,16 @@ def place(routed):
 
 @functools.cache
 def compile_rubin64(
-    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12,
-    polled=False,
+    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
 ):  # fmt: skip
     """``compile_experts``' arguments (plan, publish modes incl. two-shot) for
     ``RubinGroupedExpertsKernel``, then the w13 / w2 addresses; ``dies``: the SMs'
     dies when the weights were ``place``d; ``static``: constant epilogue-group
     barrier ids (``ExpertsKernel.static_groups``); ``zone``: the FC2 tail pool's
-    (``POOL_ZONE``); ``polled``: ids are the grouped ids mailbox (``POLLED64``)."""
+    (``POOL_ZONE``)."""
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static, polled=polled,
+        static_groups=static,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
@@ -422,8 +403,7 @@ def compile_rubin64(
         box = (fake((48, 64, 224)), fake((16,), None, c.Int64), c.Int32(0))
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
     out = flat(batch * 16 * (1 if publish else 3584), c.BFloat16)
-    ids = flat(IDS_WORDS if polled else batch * 16, c.Int32)
-    tensors = (flat(PLAN_BYTES), ids, flat(256, align=64))
+    tensors = (flat(PLAN_BYTES), flat(batch * 16, c.Int32), flat(256, align=64))
     tensors += (*scales, flat(moe.workspace_bytes), out)
     scalars = (c.Int32(batch), *map(c.Float32, (100, 0.25, 0.04)), *box)
     scalars += (c.Int64(0), c.Int64(0))  # the w13 / w2 addresses
@@ -511,10 +491,7 @@ def scratch(tp, device, rows=64):
     start = -workspace.data_ptr() % chunk
     workspace = workspace[start : start + size]
     plan = torch.empty(plan_bytes, device=device, dtype=u8)
-    # The grouped ids mailbox (``POLLED64``): ids armed all ones, then the read count.
-    ids = torch.full((IDS_WORDS,), -1, device=device, dtype=torch.int32)
-    ids[IDS_COUNT:] = 0
-    return {"workspace": workspace, "plan": plan, "ids": ids}
+    return {"workspace": workspace, "plan": plan}
 
 
 # Persistent grid and per-batch overrides by (TP, SMs); other SM counts take the 152-SM
@@ -559,8 +536,6 @@ class PersistentExperts:
         self.static = batch_table(STATIC_GROUPS.get(self.tp, "") if q > 1 else "")
         self.fast = batch_table(FAST_EXCHANGE.get(self.tp, "") if q > 1 else "")
         self.rows64 = batch_table(RUBIN64_VERIFY.get(self.tp, "") if q > 1 else "")
-        self.q = q
-        self.ids_box: dict = {}  # polled grouped rows: the ids mailbox (``POLLED64``)
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
         self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
@@ -648,14 +623,10 @@ class PersistentExperts:
             return
         if planned and batch > 8 and self.grouped64(batch):
             grid = self.grid_for(batch)
-            poll = polled64(self.tp, batch, self.q) and "ids" in buffers
             code = compile_rubin64(
                 self.experts, batch, grid, self.device.index, mode, self.slots,
                 self.dies, bool(self.static.get(batch)), self.zones.get(batch, 12),
-                poll,
             )  # fmt: skip
-            if poll:
-                self.ids_box[batch] = tensor(buffers["ids"])
             check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
             ws = tensor(buffers["workspace"])
             plan = (tensor(buffers["plan"]),)
@@ -801,9 +772,7 @@ class PersistentExperts:
             source = plan[0]
         if group is not None and not group[2]:
             self.launch_group(ids, group)
-        mailbox = self.ids_box.get(key)  # polled grouped rows read the ids mailbox
-        ids = mailbox if mailbox is not None else tensor(ids)
-        args = (source, ids, maps, *self.views[1:], workspace, output)
+        args = (source, tensor(ids), maps, *self.views[1:], workspace, output)
         extra = self.addresses.get(key, ())
         code(*args, c.Int32(batch), *self.scalars, *box, *extra, stream(self.device))
         return out
