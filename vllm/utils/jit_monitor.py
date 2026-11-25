@@ -99,6 +99,9 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
     _setup_triton_autotuning_print()
     _install_jit_hooks()
+    # Warmup's cache-directory events not yet polled are startup events: the
+    # watch thread would report them after _active flips, as post-warmup ones.
+    poll_cache_watches()
     # Before _active flips: the startup totals are final here.
     log_compile_summary("startup")
     _active = True
@@ -1021,11 +1024,17 @@ class _DeepGemmCacheWatch:
     from the entry's oldest file to the commit); a newer ``.committed`` mtime
     on an existing entry is a load (DeepGEMM touches it). The directory is
     shared by the processes that use it, so an event may come from another
-    process; with a per-run cache directory they are this run's."""
+    process; with a per-run cache directory they are this run's.
+
+    The thread reports an event at its next poll, up to ``interval`` after it
+    happened; ``poll_cache_watches()`` reports the pending ones at once, at a
+    phase boundary (``activate()``), so each lands in the phase it happened
+    in. Polls are serialized: an event is reported once."""
 
     def __init__(self, root: str, interval: float = 2.0):
         self.root = root
         self.interval = interval
+        self._lock = threading.Lock()
         self.seen = self._scan()
         self._stop = threading.Event()
         self.thread = threading.Thread(
@@ -1044,6 +1053,10 @@ class _DeepGemmCacheWatch:
         return seen
 
     def poll(self) -> None:
+        with self._lock:
+            self._poll()
+
+    def _poll(self) -> None:
         now = self._scan()
         for name, mtime in now.items():
             before = self.seen.get(name)
@@ -1076,6 +1089,16 @@ class _DeepGemmCacheWatch:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def poll_cache_watches() -> None:
+    """Report the cache-directory watches' pending events now, on this thread.
+
+    A watch thread reports an event (a DeepGEMM kernel build or load) at its
+    next poll, up to its interval after the event. Call at a phase boundary
+    (``activate()`` does) so the events before it are reported before it."""
+    if _deepgemm_watch is not None:
+        _deepgemm_watch.poll()
 
 
 def _setup_deepgemm_watch() -> None:
