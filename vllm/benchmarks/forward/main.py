@@ -189,12 +189,33 @@ def apply_eplb_load(runner, path: str) -> dict[str, Any]:
         stats[key] = {"before": _rank_balance(load, model_state, ep.world_size)}
     if not matched:
         raise ValueError(f"--eplb-load {path}: shape {tuple(load.shape)} matches no MoE model.")
+    import time as _time
+
+    before = {
+        k: m.physical_to_logical_map.cpu().clone() for k, m in state.model_states.items()
+    }
+    free0 = torch.cuda.mem_get_info()[0]
+    torch.accelerator.synchronize()
+    t0 = _time.perf_counter()
     state.rearrange()
     torch.accelerator.synchronize()
+    wall = _time.perf_counter() - t0
+    free1 = torch.cuda.mem_get_info()[0]
     for key, model_state in state.model_states.items():
         if key in stats:
             stats[key]["after"] = _rank_balance(load, model_state, ep.world_size)
             model_state.expert_load_window.zero_()
+            after = model_state.physical_to_logical_map.cpu()
+            changed = before[key] != after
+            per_rank = changed.reshape(changed.shape[0], ep.world_size, -1).sum(-1)
+            stats[key]["moved_slots"] = {
+                "total": int(changed.sum()),
+                "per_layer_max": int(changed.sum(-1).max()),
+                "per_rank_layer_max": int(per_rank.max()),
+                "busiest_rank_total": int(per_rank.sum(0).max()),
+            }
+    stats["rearrange_wall_s"] = round(wall, 4)
+    stats["rearrange_free_mem_delta_mib"] = round((free1 - free0) / 2**20, 1)
     logger.info("EPLB load %s applied: busiest/mean rank load %s", path, stats)
     return stats
 
@@ -210,7 +231,37 @@ def _rank_balance(load: torch.Tensor, model_state, ep_size: int) -> dict[str, fl
     return {"mean": round(ratio.mean().item(), 4), "max": round(ratio.max().item(), 4)}
 
 
+_SAVE_CASE: list[str] = []
+
+
+def _install_save_hidden() -> None:
+    """Bench-only (EPLB-ZM output check): with VLLM_BENCH_FWD_SAVE_HIDDEN=<dir>,
+    EP rank 0 of each DP group saves the first model output of every case (the
+    eager reference) as <dir>/<case>.rank<r>.pt, so arms can be compared."""
+    out = os.environ.get("VLLM_BENCH_FWD_SAVE_HIDDEN")
+    if not out:
+        return
+    from vllm.benchmarks.forward import capture
+    from vllm.distributed.parallel_state import get_world_group
+
+    os.makedirs(out, exist_ok=True)
+    first = capture._first_tensor
+    seen: set[str] = set()
+
+    def save_first(output):
+        t = first(output)
+        name = _SAVE_CASE[-1] if _SAVE_CASE else "case"
+        rank = get_world_group().rank
+        if name not in seen and rank in (0, 4):
+            seen.add(name)
+            torch.save(t.detach().cpu(), os.path.join(out, f"{name}.rank{rank}.pt"))
+        return t
+
+    capture._first_tensor = save_first
+
+
 def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any]:
+    _SAVE_CASE.append(case.name)
     required_drafts = max((r.num_draft_tokens for r in case.requests), default=0)
     if required_drafts > runner.num_speculative_steps:
         raise ValueError(
@@ -326,6 +377,7 @@ def main(args: argparse.Namespace) -> None:
     world = get_world_group()
     results = []
     with torch.inference_mode(), set_current_vllm_config(runner.vllm_config):
+        _install_save_hidden()
         if args.eplb_load:
             apply_eplb_load(runner, args.eplb_load)
         for case in cases:
