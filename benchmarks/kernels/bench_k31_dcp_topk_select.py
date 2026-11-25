@@ -23,13 +23,21 @@ def _ord16(x: torch.Tensor) -> torch.Tensor:
     return torch.where(neg, (~bits) & 0xFFFF, bits | 0x8000)
 
 
-def case(w, n, rows, levels, seed):
-    """Gathered [W, rows, N + N/32] int32 B' words of distinct local ids."""
+def case(w, n, rows, levels, seed, dist="relu"):
+    """Gathered [W, rows, N + N/32] int32 B' words of distinct local ids.
+    ``dist``: relu (relu(randn + 0.3): ~38% exact zeros, a tie-heavy cut) or
+    tail (each rank's top-N of 8250 randn logits, as DeepSelect sends them)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    score = torch.randn((w, rows, n), generator=gen, device="cuda")
+    if dist == "tail":
+        score = torch.randn((w, rows, 8250), generator=gen, device="cuda")
+        score = score.to(torch.bfloat16).float().topk(n, dim=2).values
+    else:
+        score = torch.randn((w, rows, n), generator=gen, device="cuda")
     if levels:
         score = torch.floor(score * levels) / levels
-    score = torch.relu(score + 0.3).to(torch.bfloat16)
+    if dist != "tail":
+        score = torch.relu(score + 0.3)
+    score = score.to(torch.bfloat16)
     base = torch.randint(0, 1 << 17, (w, rows, 1), generator=gen, device="cuda")
     local = (base + torch.arange(n, device="cuda") * 641) % (1 << 17)
     words = (_ord16(score) << 16) | (0xFFFF - (local & 0xFFFF))
@@ -61,8 +69,20 @@ def main():
     ap.add_argument("--rows", default="8,16,32,64,128,256,512")
     ap.add_argument("--shapes", default="4x192x512,16x192x2048", help="WxNxK,...")
     ap.add_argument("--levels", default="0,4", help="score quantization (0: none)")
+    ap.add_argument("--dist", default="relu", help="relu | tail (see case())")
+    ap.add_argument(
+        "--per-pass",
+        action="store_true",
+        help="the per-pass radix (non-folded select) instead of the cut-only one",
+    )
     ap.add_argument("--calls", type=int, default=20)
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument(
+        "--stamps",
+        action="store_true",
+        help="also run the stamped select (%globaltimer per CTA phase) and print "
+        "the phase deltas: start->keys, passes, row emission, tail",
+    )
     args = ap.parse_args()
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         _DCP_TOPK_SELECT_KERNEL,
@@ -73,7 +93,7 @@ def main():
         w, n, k = map(int, shape.split("x"))
         for levels in map(int, args.levels.split(",")):
             for rows in map(int, args.rows.split(",")):
-                packed = case(w, n, rows, levels, seed=rows + levels)
+                packed = case(w, n, rows, levels, seed=rows + levels, dist=args.dist)
                 blocks = (1 << 17) // BLOCK + 1
                 table = torch.randint(
                     0, 1 << 20, (rows, blocks), device="cuda", dtype=torch.int32
@@ -83,8 +103,12 @@ def main():
                 req = torch.arange(rows, dtype=torch.int32, device="cuda")
                 ro = _RowsOutput(req, table, rows_out, valid, w - 1, BLOCK, 64)
 
-                def call(packed=packed, ro=ro, n=n, k=k):
-                    _DCP_TOPK_SELECT_KERNEL(packed, None, local_topk=n, topk=k, rows=ro)
+                fast = not args.per_pass
+
+                def call(packed=packed, ro=ro, n=n, k=k, fast=fast):
+                    _DCP_TOPK_SELECT_KERNEL(
+                        packed, None, local_topk=n, topk=k, rows=ro, fast=fast
+                    )
 
                 for _ in range(3):
                     call()
@@ -108,6 +132,41 @@ def main():
                 ts.sort()
                 med = ts[len(ts) // 2]
                 dur, cnt = cupti_us(lambda g=g: [g.replay() for _ in range(3)])
+                if args.stamps:
+                    st = torch.zeros((rows, 8), dtype=torch.int64, device="cuda")
+                    acc = []
+                    for _ in range(20):
+                        st.zero_()
+                        _DCP_TOPK_SELECT_KERNEL(
+                            packed,
+                            None,
+                            local_topk=n,
+                            topk=k,
+                            rows=ro,
+                            stamps=st,
+                            fast=fast,
+                        )
+                        torch.cuda.synchronize()
+                        acc.append(st.clone())
+                    t = torch.stack(acc[5:]).double() / 1000.0
+                    t0 = t[..., 0]
+                    ph = {
+                        "keys": t[..., 3] - t0,
+                        "passes": t[..., 4] - t[..., 3],
+                        "rows": t[..., 5] - t[..., 4],
+                        "tail": t[..., 7] - t[..., 5],
+                        "npasses": t[..., 6] * 1000.0,
+                        "total": t[..., 7] - t0,
+                        "cta_start_spread": t0 - t0.min(dim=1, keepdim=True).values,
+                    }
+                    print(
+                        f"STAMP W{w} N{n} K{k} rows {rows:4d} levels {levels}: "
+                        + " ".join(
+                            f"{name} {v.mean():.2f} [{v.max():.2f}]"
+                            for name, v in ph.items()
+                        ),
+                        flush=True,
+                    )
                 print(
                     f"REC select W{w} N{n} K{k} rows {rows:4d} levels {levels}: "
                     f"{med:7.2f} us/call (min {ts[0]:.2f}) kernel {dur:6.2f} us "
