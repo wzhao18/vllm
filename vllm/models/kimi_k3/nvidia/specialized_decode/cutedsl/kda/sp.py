@@ -71,6 +71,7 @@ from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
 from .specialized import KdaWS
 from .stream import KdaStream
+from .verify_loop_records import KdaVerifyLoopRecords
 from .wide import KdaWide
 from .window import check_conv_cache
 
@@ -114,10 +115,10 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "loop")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide", "flow")
+FOLDS = ("fused", "fused_ws", "wide", "flow", "loop")
 MODES = ("deferred", "triton", "none")
 
 
@@ -200,6 +201,11 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
         return KdaSplit(heads, requests, mode, has_bias, schedule, tokens, record)
     if kind == "wide":
         return KdaWide(heads, tokens, record, mode, has_bias, 2 * sms)
+    if kind == "loop":  # LoopStock's persistent 16-warp verify with records + fold
+        if not record or tokens < 2:
+            raise Unsupported("kda", shape, "loop: RecoverSSM verify records only")
+        return KdaVerifyLoopRecords(heads, requests, mode, has_bias, (0, 0, 0), tokens,
+                                    False)  # fmt: skip
     if kind == "fused":
         split = next(s for bound, s in FUSED_SPLIT if items < bound)
         return KdaFused(heads, tokens, mode, has_bias, split)
@@ -270,7 +276,9 @@ def decode_conv_weight(weight):
 
 
 class SpKdaCore:
-    """One KDA layer's verify core at every captured R (``rows``) of the SP decode.
+    """One KDA layer's verify core at every captured R (``rows``) of the SP decode, and
+    of the TP8 / TP16 decode's verify rows under ``--use-replayssm`` (``providers``:
+    the in-projection rows of B requests, the same operands at the rank's heads).
 
     ``records``: ``recoverssm.prepare_recoverssm``'s mode (module docstring). Every R
     is served by a specialized core; a shape or layout the cores cannot run raises
@@ -280,8 +288,6 @@ class SpKdaCore:
     def __init__(self, attention, rows, *, records, ctx, mx_out=False):
         if records not in MODES:
             raise Unsupported("kda", None, f"RecoverSSM records mode {records!r}")
-        if not ctx.sequence_parallel:
-            raise Unsupported("kda", None, "SpKdaCore serves the SP decode only")
         self.mode, self.q = records, ctx.q
         self.heads = heads = attention.A_log.numel()
         self.dim, self.has_bias = heads * K, attention.conv1d.bias is not None
