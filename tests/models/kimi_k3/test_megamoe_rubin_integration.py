@@ -1079,6 +1079,52 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
     assert native != ep32
 
 
+def test_ep8_prefill_worker_dedup_bucket_splits_by_tile_n():
+    """EP8 P/D prefill (dedup bucket): N256 tiles at >= RUBIN_PREFILL_WIDE_N_MIN_TOKENS
+    tokens per rank, the main capacity's N128 record below; both admitted. Decode
+    servers, other EP sizes and non-dedup prefill buckets keep their buckets."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    main, _ = X.select_rubin_bucket(problem, 8, 8192)
+    buckets, notes = X.select_rubin_buckets(problem, 8, 8192, prefill_worker=True)
+    small, wide = buckets
+    assert small == dataclasses.replace(
+        X._prefill_dedup(main), max_tokens=X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS - 1
+    )
+    assert small.knobs.mma_tiler_mnk == (256, 128, 256)
+    assert wide.max_tokens == 8192 and wide.variant == X.RUBIN_DEDUP_VARIANT
+    assert wide.knobs == X.RUBIN_PREFILL_WIDE_N_KNOBS
+    assert wide.knobs.mma_tiler_mnk == (256, 256, 256)
+    assert any("N256 tiles" in n for n in notes)
+    assert not any("decode bucket" in n for n in notes)
+    for b in buckets:
+        C.RubinMoeConfig.make(problem, b, rank=0, world_size=8)
+    # the wide knobs are the EP8 i2048 phase-interleaved record (dedup token back)
+    rec, _, _ = C.resolve_knobs(
+        C.SHIPPED_KNOBS, problem=problem, variant="inference", world_size=8,
+        max_tokens=2048,
+    )  # fmt: skip
+    assert X.RUBIN_PREFILL_WIDE_N_KNOBS == dataclasses.replace(
+        rec, token_back_mode=X.RUBIN_DEDUP_TOKEN_BACK_MODE
+    )
+    # per-forward dispatch by tokens per rank (DP1)
+    module = SimpleNamespace(buckets=buckets, max_num_tokens=8192, dp_size=1)
+    pick = X.KimiK3MegaMoEExperts.select_bucket
+    for n in (1, 128, 512, X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS - 1):
+        assert pick(module, n) is small
+    for n in (X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS, 2048, 4096, 8192):
+        assert pick(module, n) is wide
+    # unchanged: decode servers, EP16 / EP4 prefill, capacity below the threshold
+    decode, _ = X.select_rubin_buckets(problem, 8, 8192, prefill_worker=False)
+    assert all(b.knobs.mma_tiler_mnk[1] == 128 for b in decode)
+    for world in (4, 16):
+        same, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=True)
+        stock, _ = X.select_rubin_bucket(problem, world, 8192)
+        assert same == (X._prefill_dedup(stock),)
+    small_server, _ = X.select_rubin_buckets(problem, 8, 512, prefill_worker=True)
+    assert [b.max_tokens for b in small_server] == [512]
+
+
 @pytest.mark.parametrize("world", [4, 16])
 def test_prefill_worker_nvfp4_runs_dedup_combine(world):
     """Prefill-sized NVFP4 buckets run the refreshed dedup-combine kernel with the
