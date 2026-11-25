@@ -2391,11 +2391,18 @@ def initialize_model_parallel(
                         coord_store=coord_store,
                     )
             else:
+                # Only the pynccl EPLB communicator uses this group's device
+                # communicator (its PyNccl comm); the others use the torch
+                # device / CPU process groups. Building it unconditionally cost
+                # ~0.6 GiB/GPU of NCCL buffers on VR200 EP8 (Available KV).
                 _EPLB = init_model_parallel_group(
                     group_ranks,
                     get_world_group().local_rank,
                     backend,
                     group_name="eplb",
+                    use_device_communicator=(
+                        config.parallel_config.eplb_config.communicator == "pynccl"
+                    ),
                 )
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
