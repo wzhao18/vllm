@@ -88,22 +88,30 @@ def _config(kv_role=None, moe_backend="deep_gemm_mega_moe", tp=8, dp=1):
     )
 
 
-@pytest.mark.parametrize(
-    "kv_role,expected",
-    [
-        ("kv_both", True),  # the P/D prefill workers of the recipes
-        ("kv_producer", True),
-        ("kv_consumer", False),  # decode keeps plain TP / SP (C512's SP topology)
-        (None, False),  # unified serving: as before (off)
-    ],
-)
-def test_moe_token_shard_role(kv_role, expected):
-    from vllm.models.kimi_k3.nvidia.model import use_moe_token_shard
+@pytest.mark.parametrize("kv_role", ["kv_both", "kv_producer", "kv_consumer", None])
+@pytest.mark.parametrize("moe_backend", ["deep_gemm_mega_moe", "kimi_k3_mega_moe"])
+def test_sequence_parallel_every_role(kv_role, moe_backend):
+    """Sequence parallelism is a property of the layout, not of the role: the P/D
+    prefill workers (kv_both / kv_producer: TP8+DCP8 EP8 MegaMoE) run SP + EP like
+    decode and unified serving (no MoE token shard)."""
+    from vllm.models.kimi_k3.nvidia.model import use_sequence_parallel
 
-    assert use_moe_token_shard(_config(kv_role)) is expected
-    assert use_moe_token_shard(_config(kv_role, tp=1)) is False
-    assert use_moe_token_shard(_config(kv_role, dp=4)) is False
-    assert use_moe_token_shard(_config(kv_role, moe_backend="auto")) is False
+    assert use_sequence_parallel(_config(kv_role, moe_backend=moe_backend))
+    assert use_sequence_parallel(_config(kv_role, moe_backend=moe_backend, dp=4))
+    assert not use_sequence_parallel(_config(kv_role, moe_backend=moe_backend, tp=1))
+    # Non-MegaMoE EP: SP only with DP > 1.
+    assert not use_sequence_parallel(_config(kv_role, moe_backend="auto"))
+    assert use_sequence_parallel(_config(kv_role, moe_backend="auto", dp=4))
+
+
+def test_no_moe_token_shard():
+    """The MoE token shard (GEMM-AR over a replicated stream) is gone: no role
+    policy, no env switch."""
+    from vllm import envs
+    from vllm.models.kimi_k3.nvidia import model
+
+    assert not hasattr(model, "use_moe_token_shard")
+    assert not any("MOE_TOKEN_SHARD" in name for name in envs.environment_variables)
 
 
 @pytest.mark.parametrize(

@@ -265,15 +265,6 @@ def test_dsa_dp_supported_only_on_the_sdec_dsa_dp_layout(monkeypatch):
     assert not dsa_dp.supported(c512)
 
 
-def test_moe_token_shard_is_not_sp(monkeypatch):
-    """The MoE token shard replaces SP in the stock decoder: not the SP topology."""
-    from vllm.models.kimi_k3.nvidia import model
-
-    monkeypatch.setattr(model, "use_moe_token_shard", lambda config: True)
-    assert not sp_topology(deployment())
-    assert "TP other than 8/16" in unsupported(deployment())
-
-
 def test_tp16_gate_unchanged():
     """TP16 = DCP16 (K3.1's decode role) passes as before, with the SP fields at their
     defaults; ReplaySSM and EP stay refused there."""

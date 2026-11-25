@@ -181,8 +181,6 @@ def nvfp4_moe_cause(module):
 
     if getattr(module, "use_mega_moe", False):
         return "MegaMoE (expert parallel)"
-    if getattr(module, "moe_token_shard", 0):
-        return "a token-sharded MoE"
     if getattr(module, "_packed_moe", None) is not None:
         return "packed MoE projections"
     runner = getattr(module, "experts", None)
