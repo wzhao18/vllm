@@ -3157,7 +3157,8 @@ def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.conste
         src = base + k * region_words
         c = tl.load(src + lane).to(tl.int32)
         ovf = ovf | (c >= slots) | (total + c >= slots)
-        for s in range(0, slots):
+        # only the row's longest column of this copy (typically ~20 of 96 slots)
+        for s in range(0, tl.minimum(tl.max(c, axis=0), slots)):
             m = (s < c) & (total + s < slots)
             v = tl.load(src + (1 + s) * tile + lane, mask=m)
             tl.store(base + (1 + total + s) * tile + lane, v, mask=m)
@@ -3175,8 +3176,9 @@ def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLI
               sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas,
               mode=mode, n_items=sp.n_items)
         return cand
-    # a range with no tiles of a row never writes that row's counts
-    cand.view(split, sp.t + 1, REGION)[1:, :, :TILE].zero_()
+    # a range with no tiles of a row (short rows: range 0 can be empty too) never
+    # writes that row's counts in its copy
+    cand.view(split, sp.t + 1, REGION)[:, :, :TILE].zero_()
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.pub_items,
           sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
           n_items=sp.n_pub_items)
