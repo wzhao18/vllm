@@ -83,8 +83,12 @@ JOIN = {8: "9-16:0", 16: ""}
 # once the front kernel completed). M64 (B8 verify; SharedDown on its split SMs): the
 # experts' launch and prologue overlap routing, -0.68 / -0.70 us per layer (release
 # after the front) in a one-GPU MoE layer proxy (391 / 293 distinct experts),
-# outputs bitwise identical.
-RELEASE_EARLY_WIDE = "3-8:1,64:1"
+# outputs bitwise identical. M9-63 (B2-B7 verify, the grouped experts beside SharedDown):
+# with the late release the experts launch when routing exits and their launch and
+# prologue (0.7 + 0.8 us) sit between routing and the grouping; released after the
+# front they are resident and their dependency wait returns ~0.5 us after routing
+# exits (one-GPU chain: RouteSitu -> grouped experts, CUDA graph, 16 / 32 rows).
+RELEASE_EARLY_WIDE = "3-8:1,9-64:1"
 
 
 class PreparedMoE:
@@ -154,6 +158,8 @@ class PreparedMoE:
                 publish = (*publish, flat(shared), tail.peers, Int32(CAP))
             twoshot = b in tail.twoshots
             experts.prepare(b, buffers, expanded, publish, planned, twoshot, True)
+            if b in experts.ids_box:  # the experts poll the grouped ids mailbox
+                front.poll_ids(b, buffers["ids"])
 
     def run(self, x, out, *, consume=None):
         state, b = self.state, x.shape[0]
