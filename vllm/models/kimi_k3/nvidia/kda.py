@@ -440,8 +440,8 @@ def frost_out_feeds_o_norm(
     ``core_attn_out``) whose gated o_norm is the MXFP8 prefill kernel, the one
     o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``).
     Every other o_norm (the in-place ``kda_norm.rmsnorm_gated_`` that runs when
-    o_proj takes a BF16 tensor, e.g. the TP fused GEMM-AR o_proj, which then
-    quantizes it to MXFP8 itself for the MXFP8 o_proj) normalizes
+    o_proj takes a BF16 tensor, i.e. a BF16 or non-online-MXFP8 o_proj; the TP
+    fused GEMM-RS/AR of an MXFP8 o_proj takes the MXFP8 o_norm output) normalizes
     ``core_attn_out`` itself, so the output must land there first: skipping the
     copy left it uninitialized (NaN / non-reproducible TP8 + DCP8 prefill)."""
     return (
@@ -1154,7 +1154,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 return gemm.add_into(qa, prefix)
             return gemm.store_into(qa, prefix)
         if o_mxfp8 is not None:
-            return self.o_proj(o_mxfp8.activation())[0]
+            qa = o_mxfp8.activation()
+            if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(qa):
+                # The fused GEMM-RS/AR consumes the MXFP8 activation the gated
+                # o_norm wrote (the same codes and F8_128x4 scales its own
+                # mxfp8_e4m3_quantize of the BF16 norm output would give), so
+                # the BF16 norm output and its separate quantize pass are gone.
+                return self.gemm_rs_ar.apply(qa, self.o_proj, copy_out=False)
+            return self.o_proj(qa)[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
             # Same precision as the stock o_proj: for the MXFP8 o_proj the fused
@@ -1272,10 +1279,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if self._o_norm_mxfp8_ok is None:
             from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
 
-            self._o_norm_mxfp8_ok = (
-                self.gemm_rs_ar is None
-                and takes_mxfp8_activation(self.o_proj)
-            )
+            # The fused GEMM-RS/AR takes the MXFP8 activation as well (apply()).
+            self._o_norm_mxfp8_ok = takes_mxfp8_activation(self.o_proj)
         return (
             self._o_norm_mxfp8_ok
             and core_attn_out.is_contiguous()
