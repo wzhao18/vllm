@@ -149,6 +149,10 @@ def build(batch, q, world, local_len, topk):
         topk_buffer = torch.full((batch, topk), -1, dtype=torch.int32, device=dev)
         attn = dsa.dsa_layer(config, topk_buffer, dsa.HEADS * world)
         layer, indexer = attn.mla_attn.mla_attn, attn.dsa_indexer
+        # The model's W_UV is a latent-contiguous view of kv_b_proj (mla.py's
+        # absorption), which DcpValue reads; the harness's stock layer keeps a dense copy.
+        uv = layer.W_UV.detach()
+        layer.W_UV.data = uv.transpose(1, 2).contiguous().transpose(1, 2)
         packed = pack_dsa_projection(attn)
         spec = layer.get_kv_cache_spec(config)
         builder = layer.attn_backend.get_builder_cls()(
