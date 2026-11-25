@@ -14,6 +14,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
+from ..common import l5diag
 from ..common.primitives import (
     alloc,
     asm,
@@ -711,6 +712,11 @@ class KdaVerifyCols(KdaVerifyRows):
         token = request * T
         lane, warp = thread % 32, thread // 32
         value_base = partition * ROWS
+        # DIAG (L5): this CTA's stamp row (thread 0 stamps, then bumps at its end)
+        dblock = partition + self.cluster * (head + self.heads * request)
+        drow = self.diag.row(dblock)
+        l5diag.stamp(drow, 0, thread == 0)
+        l5diag.smid(drow, thread == 0)
         smem = cutlass.utils.SmemAllocator()
         shared_q, shared_k, shared_decay = (
             alloc(smem, Float32, 128 * T) for _ in range(3)
@@ -746,8 +752,10 @@ class KdaVerifyCols(KdaVerifyRows):
                 if thread < T:  # the tokens' checkpoint slots, for the rolled loop
                     slot_rows[thread] = slots[request, thread]
                 nw = norm_weight[thread]
+                l5diag.stamp(drow, 1, thread == 0)
 
                 cute.arch.griddepcontrol_wait()
+                l5diag.stamp(drow, 2, thread == 0)
                 # q / k of every token (4 KB each) by 16-byte cp.async; thread i also
                 # loads V row i % 16 of token i // 16, and threads < q the betas.
                 for c in cutlass.range_constexpr(4):
@@ -782,7 +790,9 @@ class KdaVerifyCols(KdaVerifyRows):
                     shared_beta[thread] = beta
                 cute.arch.cp_async_wait_group(0)
                 named_barrier(1, 128)  # q, k, v, betas, slot_rows
+                l5diag.stamp(drow, 3, thread == 0)
                 wait(gate_barrier)
+                l5diag.stamp(drow, 4, thread == 0)
 
                 # Rolled token loop: two register operand buffers (q, k, decays of a
                 # token's 4 columns) alternate; token t's query dot is reduced with
@@ -830,9 +840,11 @@ class KdaVerifyCols(KdaVerifyRows):
                 out_last = self.round_output(out_last)
                 if lane % 8 == 0:  # lane 8 r: row r
                     local_o[(T - 1) * ROWS + 4 * warp + lane // 8] = out_last
+                l5diag.stamp(drow, 5, thread == 0)
                 # Thread i pushes row i % 16 of token i // 16 to the token's owner.
                 named_barrier(1, 128)
                 cute.arch.cluster_wait()
+                l5diag.stamp(drow, 6, thread == 0)
                 position = self.output_position(value_base + thread % ROWS)
                 owner = thread // ROWS
                 pointer = shared_o.iterator + position
@@ -848,6 +860,8 @@ class KdaVerifyCols(KdaVerifyRows):
                 else:
                     if partition < T:
                         self.cols_norm(shared_o, barrier, operands, args)
+                l5diag.stamp(drow, 7, thread == 0)
+        self.diag.bump(dblock, thread == 0)
 
     @cute.jit
     def cols_norm(self, shared_o, barrier, values, args):

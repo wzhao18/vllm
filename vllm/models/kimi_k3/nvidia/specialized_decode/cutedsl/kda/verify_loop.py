@@ -34,6 +34,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 
+from ..common import l5diag
 from ..common.primitives import (
     alloc,
     at,
@@ -111,6 +112,11 @@ class KdaVerifyLoop(KdaVerifyPacked):
         group, j = lane // 8, lane % 8
         first = Int32(self.items * cta // self.ctas)
         count = Int32(self.items * (cta + 1) // self.ctas) - first
+        # DIAG (L5): this CTA's stamp row (thread 0 stamps)
+        drow = self.diag.row(cta)
+        self.drow = drow
+        l5diag.stamp(drow, 0, thread == 0)
+        l5diag.smid(drow, thread == 0)
 
         smem = cutlass.utils.SmemAllocator()
         page = alloc(smem, Float32, K * K, align=1024)
@@ -173,6 +179,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
                         output[token + t, head * 128 + thread] = BFloat16(0)
             else:
                 wait(state_full, phase, scope="cta")
+                l5diag.stamp(drow, 1, (thread == 0) & (item_index == 0))
                 history = zeros((2, CHUNKS, 4), Float32)
                 for r in cutlass.range_constexpr(2):
                     for c in cutlass.range_constexpr(CHUNKS):
@@ -190,6 +197,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
                     self.loop_prologue(args, thread, token, head, offset, conv_slot,
                                        shared_q, shared_k, shared_v, reductions,
                                        shared_beta, own_gates, ready)  # fmt: skip
+                    l5diag.stamp(drow, 3, (thread == 0) & (item_index == 0))
                 elif thread < 128 + 32 * 8:
                     self.loop_gate(args, thread // 32 - 4, lane, head, token,
                                    shared_decay, own_gates)  # fmt: skip
@@ -204,6 +212,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr(t % 2 == 0):  # token pair t // 2's operands
                         cute.arch.mbarrier_wait(ready + t // 2, phase)
+                        if cutlass.const_expr(t == 0):
+                            l5diag.stamp(drow, 4, (thread == 0) & (item_index == 0))
                     self.loop_token(history, t, group, j, row0, shared_q, shared_k,
                                     shared_decay, shared_v, shared_beta, shared_o,
                                     state, meta, item_index, head)  # fmt: skip
@@ -219,6 +229,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
                     row = row0 + 4 * (j // 4)
                     position = (T - 1) * 128 + self.output_position(row)
                     shared_o[position] = self.round_out(owned)
+                l5diag.stamp(drow, 5, (thread == 0) & (item_index == 0))
                 cute.arch.sync_threads()
                 t, c, glane = thread // 64, thread % 64, thread % 32
                 if t < T:
@@ -226,7 +237,11 @@ class KdaVerifyLoop(KdaVerifyPacked):
                                     token, head)  # fmt: skip
                 # the item's shared operands and outputs are free for the next one
                 cute.arch.sync_threads()
+                l5diag.stamp(drow, 6, (thread == 0) & (item_index == 0))
+                l5diag.stamp(drow, 7, thread == 0)
         cute.arch.griddepcontrol_launch_dependents()
+        l5diag.stamp(drow, 8, thread == 0)
+        self.diag.bump(cta, thread == 0)
 
     @cute.jit
     def stage(self, state, page, state_full, meta, live_items, first, n):
@@ -469,6 +484,8 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
                 for t in cutlass.range_constexpr(T):
                     accum[3 * t + s] = Float32(bias[s * dim + channel])
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(getattr(self, "drow", None) is not None):  # DIAG (L5)
+            l5diag.stamp(self.drow, 2, thread == 0)
         inputs = cute.make_rmem_tensor(3 * T, BFloat16)
         for t in cutlass.range_constexpr(T):
             for s in cutlass.range_constexpr(3):
