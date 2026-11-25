@@ -382,7 +382,7 @@ def dsa_on_flashinfer(attention) -> bool:
 
 # Wide rows whose #63 merge reads IndexerScoreFp4's logits (MXFP4 indexer cache);
 # the others DeepGEMM's paged MQA logits (both bit for bit the same logits).
-WIDE_SCORER = "65-:1"
+WIDE_SCORER = ""
 # The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
 # rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
 WIDE_LOCAL_TOPK = False
