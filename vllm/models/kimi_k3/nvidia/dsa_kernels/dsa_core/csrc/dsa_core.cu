@@ -204,12 +204,21 @@ __device__ __forceinline__ void mma_f16(float* c, uint32_t a0, uint32_t a1, uint
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-// two E4M3 bytes (lo, hi) -> f16x2 (exact)
-__device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t two) {
-  uint32_t out;
-  uint16_t in = (uint16_t)two;
-  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(out) : "h"(in));
-  return out;
+// four E4M3 bytes b0..b3 of ``q`` -> f16x2 (b0, b1) and (b2, b3), exact for every
+// finite code (the KV insert writes finite codes only): each byte to the high byte of a
+// half (prmt), its exponent and mantissa one bit down (sign kept) -> the half's bits
+// read as E4M3 x 2^-8 (normal and subnormal alike), x 2^8 in FP16 (exact). Integer and
+// FMA pipes instead of the conversion unit's (cvt.f16x2.e4m3x2) lower throughput.
+__device__ __forceinline__ void e4m3x4_to_f16x2x2(uint32_t q, uint32_t& lo, uint32_t& hi) {
+  const uint32_t a = __byte_perm(q, 0u, 0x1404);  // [0, b0, 0, b1]
+  const uint32_t b = __byte_perm(q, 0u, 0x3424);  // [0, b2, 0, b3]
+  const uint32_t fa = (a & 0x80008000u) | ((a >> 1) & 0x3F803F80u);
+  const uint32_t fb = (b & 0x80008000u) | ((b >> 1) & 0x3F803F80u);
+  const __half2 k256 = __halves2half2(__ushort_as_half(0x5C00), __ushort_as_half(0x5C00));
+  const __half2 ha = __hmul2(*reinterpret_cast<const __half2*>(&fa), k256);
+  const __half2 hb = __hmul2(*reinterpret_cast<const __half2*>(&fb), k256);
+  lo = *reinterpret_cast<const uint32_t*>(&ha);
+  hi = *reinterpret_cast<const uint32_t*>(&hb);
 }
 __device__ __forceinline__ bool armed(uint4 v) {
   return v.x == kSent || v.y == kSent || v.z == kSent || v.w == kSent;
@@ -432,10 +441,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
         uint32_t h[8];
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-          h[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
-          h[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
-        }
+        for (int k = 0; k < 4; ++k) e4m3x4_to_f16x2x2(ws[k], h[2 * k], h[2 * k + 1]);
         uint4* dst = reinterpret_cast<uint4*>(sVh + r * kVStr + 16 * c16);
         dst[0] = make_uint4(h[0], h[1], h[2], h[3]);
         dst[1] = make_uint4(h[4], h[5], h[6], h[7]);
