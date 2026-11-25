@@ -415,3 +415,56 @@ def test_loop_padding_requests(monkeypatch, kind):
     assert_bitwise("live outputs", rows[live].reshape(n * q, DIM), alone)
     assert_bitwise("recurrent state", state[1], alone_state[1])
     assert_bitwise("conv state", state[0], alone_state[0])
+
+
+# LoopDefer4 (4 rows per thread) vs LoopDefer: one item per CTA (B32), two (B64),
+# CTA ranges across a head boundary (B40 / B100), short (B12); two verify steps so
+# the second folds the first's real records.
+ROWS4_SHAPES = [(8, 12), (8, 32), (8, 40), (8, 64), (8, 100)]
+
+
+@pytest.mark.parametrize("q,requests", ROWS4_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
+def test_loopdefer4_equals_loopdefer(monkeypatch, q, requests, pad):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.verify_defer import (  # noqa: E501
+        KdaVerifyLoopDefer,
+        KdaVerifyLoopDefer4,
+    )
+
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    if pad:  # every third request is padding
+        padded = torch.arange(requests, device=DEVICE) % 3 == 1
+        table[padded] = -1
+        accepted[padded] = 0
+    start = (base[0], record_input(base[1].clone(), table, accepted))
+    steps = [projected_rows(requests * q, seed=s) for s in (4, 5)]
+    second = spec_inputs(requests, q, slots, seed=3)[1]
+    if pad:
+        second[padded] = 0
+
+    def two_steps(kind):
+        forms = {
+            k: (kind if v is KdaVerifyLoopDefer else v)
+            for k, v in prepared.RECORD_FORMS.items()
+        }
+        monkeypatch.setattr(prepared, "RECORD_FORMS", forms)
+        core = core_of(attention, requests, q, "loopstock", start, monkeypatch)
+        index = prepared.WIDE_NAMES.index("loopstock")
+        with monkeypatch.context() as patch:
+            patch.setattr(prepared, "wide_kind", lambda *args, **kwargs: index)
+            schedule = prepared.schedule_of(HEADS, requests, 0, q, RUBIN, False)
+            options = (HEADS, requests, 0, False, schedule, q, False)
+            assert type(prepared.make_kernel(options, RUBIN)) is kind
+        out0, state = run(core, steps[0], start, table, accepted)
+        out1, state = run(core, steps[1], state, table, second)
+        return out0, out1, state
+
+    want = two_steps(KdaVerifyLoopDefer)
+    got = two_steps(KdaVerifyLoopDefer4)
+    assert_bitwise("step 0 output", got[0], want[0])
+    assert_bitwise("step 1 output", got[1], want[1])
+    assert_bitwise("recurrent state + records", got[2][1], want[2][1])
+    assert_bitwise("conv state", got[2][0], want[2][0])
