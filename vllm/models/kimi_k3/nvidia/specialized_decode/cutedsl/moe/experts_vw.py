@@ -244,13 +244,23 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         span: cutlass.Constexpr = (self.experts + threads - 1) // threads
         counts = cute.make_rmem_tensor(span, Int32)  # streams << 16 | sub-units
         count = Int32(0)
+        # Each expert's mask words into registers first, then its running counts: the
+        # stores into ``prefix`` would otherwise order every later mask load behind them
+        # (one shared-memory round trip per word; 16 words at 512 rows).
+        held = cute.make_rmem_tensor((span, words), Uint32)
+        for j in cutlass.range_constexpr(span):
+            e = span * tid + j
+            for w in cutlass.range_constexpr(words):
+                held[j, w] = Uint32(0)
+                if e < self.experts:
+                    held[j, w] = masks[stride * e + w]
         for j in cutlass.range_constexpr(span):
             counts[j], e = (Int32(0), span * tid + j)
             if e < self.experts:
                 n = Int32(0)
                 for w in cutlass.range_constexpr(words):
                     prefix[stride * e + w] = Int16(n)
-                    n += Int32(cute.arch.popc(masks[stride * e + w]))
+                    n += Int32(cute.arch.popc(held[j, w]))
                 counts[j] = (n + self.wide - 1) // self.wide << 16 | (n + 7) >> 3
             count += counts[j]
         total = count
@@ -304,14 +314,21 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             if warp == 0:
                 self.matched(sm)
             cute.arch.sync_threads()
+        # Every pair's row slot first (loads only), then the stores: a store into
+        # ``rows`` would order the next pair's table loads behind it.
+        places = cute.make_rmem_tensor(rounds, Int32)
         for k in cutlass.range_constexpr(rounds):
             pair = tid + threads * k
+            places[k] = Int32(-1)
             if pair < batch * 16:
                 e, token = (mine[k], pair >> 4)
                 at = stride * e + (token >> 5)
                 below = (Uint32(1) << (token & 31)) - 1
                 rank = Int32(prefix[at]) + Int32(cute.arch.popc(masks[at] & below))
-                rows[(base[e] + (rank >> 3)) * 8 + (rank & 7)] = Int16(pair)
+                places[k] = (base[e] + (rank >> 3)) * 8 + (rank & 7)
+        for k in cutlass.range_constexpr(rounds):
+            if places[k] >= 0:
+                rows[places[k]] = Int16(tid + threads * k)
         if tid == 0:
             self.stamp(19)
         cute.arch.fence_proxy("async.shared", space="cta")
