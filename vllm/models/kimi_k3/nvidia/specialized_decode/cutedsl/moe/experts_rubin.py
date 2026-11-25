@@ -157,6 +157,14 @@ ROUTED = 2
 # Descriptor start addresses are 18 bits: every MMA / tcgen05.cp operand must sit in
 # the first 256 KiB of the shared window (the dynamic base is 1 KiB in).
 DESCRIPTOR_LIMIT = 262144 - 1024
+# Routed weight placement (``experts_runtime.place``): the w13 / w2 bytes sit in runs of
+# 2^HOME_RUN 2 MiB chunks alternating die 0 / 1, so a byte at offset a of the tensor is
+# homed on die (a >> HOME_SHIFT) & 1. Runs rather than single chunks: the partitions'
+# contiguous rank ranges walk the sorted experts' weights in address order, and a range
+# rarely crosses a run (single alternating chunks put 12-18% of the stream on the other
+# die at 16-64 rows).
+HOME_RUN = 4
+HOME_SHIFT = 21 + HOME_RUN
 
 
 @asm(Uint32)
@@ -1180,7 +1188,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 if (rank < self.grid) & (lo < hi):
                     mid = (lo + hi) // 2
                     row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                    home = Int32(Int64(row) * 128 >> 21 & 1)
+                    home = Int32(Int64(row) * 128 >> HOME_SHIFT & 1)
                 ballot = cute.arch.vote_ballot_sync(home != 0)
                 if lane == 0:
                     bits[g * words + i] = Uint32(ballot)
