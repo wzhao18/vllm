@@ -314,13 +314,8 @@ class KdaSplitDefer(RecoverKdaSplit):
                             # every CTA's token-0 outputs arrived: all have folded,
                             # so the head's k / decay records may be overwritten
                             if records > 0:
-                                for u in cutlass.range_constexpr(1, T):
-                                    record_page[head, u - 1, thread] = shared_k[
-                                        128 * u + thread
-                                    ]
-                                    record_page[head, DECAY_ROW + u - 1, thread] = (
-                                        shared_decay[128 * u + thread]
-                                    )
+                                self.key_records(record_page, head, thread, shared_k,
+                                                 shared_decay)  # fmt: skip
                             for section in cutlass.range_constexpr(2):
                                 channel = section * dim + qk_channel
                                 window = (taps[section, 1], taps[section, 2])
@@ -329,6 +324,13 @@ class KdaSplitDefer(RecoverKdaSplit):
                                 )
                                 for i, value in enumerate(window):
                                     conv_page[channel, i] = conv_type(value)
+
+    @cute.jit
+    def key_records(self, record_page, head, thread, shared_k, shared_decay):
+        """Column ``thread``'s k / decay records of tokens 1 .. q - 1."""
+        for u in cutlass.range_constexpr(1, self.tokens):
+            record_page[head, u - 1, thread] = shared_k[128 * u + thread]
+            record_page[head, DECAY_ROW + u - 1, thread] = shared_decay[128 * u + thread]
 
     @cute.jit
     def fold(self, history, rec, pending, value_base, group, group_lane):

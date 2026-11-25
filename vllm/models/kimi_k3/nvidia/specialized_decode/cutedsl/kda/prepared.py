@@ -355,6 +355,8 @@ class KdaSplitStock(RecoverKdaSplit):
 
 # The FP32 KdaSplit verify kernel (the record form under the deferred protocol).
 SPLIT_STOCK = KdaSplitStock
+# The prepared transposed verify kernel (the record form under the deferred protocol).
+COLS_KIND = KdaVerifyCols
 
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
@@ -473,7 +475,7 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     # (the prepared kernels compute the stock verify's math for an FP32 state, on
     # ``KdaInProj64(stock=True)``'s operands)
     if prepared and cols is not None:  # the transposed recurrence
-        return KdaVerifyCols(*options, cols)
+        return COLS_KIND(*options, cols)
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
         return KdaVerifyRows(*options, *rows)
     if prepared:  # the gates and betas arrive activated (the in-projection epilogue)

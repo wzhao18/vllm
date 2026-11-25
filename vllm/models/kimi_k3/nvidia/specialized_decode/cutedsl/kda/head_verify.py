@@ -656,7 +656,7 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
     cta_k = tile[1]
-    kernel = KdaHeadVerify(
+    kernel = HEAD_VERIFY_KIND(
         heads, stages=VERIFY_STAGES, cta_k=cta_k, tmem_tiles=VERIFY_TMEM_TILES,
         early_loads=VERIFY_EARLY_LOADS, hidden=hidden, bf16_state=bf16_state,
         has_bias=has_bias,
@@ -677,3 +677,5 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
 # -> experts, 24 layers, arms alternated in one process, 5 processes x 8 rounds): -0.10
 # .. -0.21 us/layer; 17 early tiles lose (+0.27 at 4 ranks). Outputs bitwise.
 VERIFY_STAGES, VERIFY_TMEM_TILES, VERIFY_EARLY_LOADS = 10, 15, 21
+# The class ``compile_head_verify`` builds (``head_defer.set_head_protocol``).
+HEAD_VERIFY_KIND = KdaHeadVerify
