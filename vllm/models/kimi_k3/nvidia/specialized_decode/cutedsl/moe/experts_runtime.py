@@ -38,7 +38,7 @@ from .experts_rubin import (
 )
 from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
-from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
+from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel, zero_fold
 
 logger = init_logger(__name__)
 
@@ -735,6 +735,9 @@ class PersistentExperts:
         )
         if self.dies and "homes" not in buffers:  # once per scratch (every capacity)
             buffers["homes"] = stage_homes(buffers["workspace"], kernel)
+        if "folded" not in buffers:  # once per scratch: the FC2 fold's FP32 sums
+            zero_fold(buffers["workspace"], kernel)
+            buffers["folded"] = True
         ws = tensor(buffers["workspace"])
         box: tuple = (c.Int64(partial.data_ptr()),)
         if twoshot:  # ("twoshot", receive slots, owners' bases, this rank's slot)

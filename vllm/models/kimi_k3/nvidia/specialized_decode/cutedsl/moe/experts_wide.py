@@ -33,12 +33,14 @@ capacity.
   nothing; the shared grouped images and claim counters keep the
   64-row kernels' protocol (this call re-arms the last grouped call's, and reports no
   shared images of its own).
-- Outputs: unpublished (``publish`` False: every pair's FC2 row), or ``"local"``: the
-  units' finalize sums each token's 16 staged rows with its routing weights (the
-  output argument) into this rank's partial latent row (BF16 [rows, 3584] at the
-  address after the SiTU scalars): the stock experts' output contract, before the
-  tail's reduction. With ``dies``, each die's warps finalize the units homed on
-  their die.
+- Outputs: unpublished (``publish`` False: every pair's FC2 row), or ``"local"`` /
+  ``"twoshot"``: the FC2 epilogue folds each pair's row (rounded to BF16 as the stock
+  experts' per-expert output, times its routing weight, the output argument) into
+  the token's FP32 accumulator row with unordered ``red.add`` (same dtypes as stock,
+  FP32 reassociation only), and the finalize packs the sums into this rank's partial
+  latent row (BF16 [rows, 3584] at the address after the SiTU scalars) or pushes
+  them to their owners: the stock experts' output contract, before the tail's
+  reduction.
 """
 
 import cutlass
@@ -49,14 +51,16 @@ from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 
 from ..common.primitives import (
     alloc,
+    asm,
     bf16,
+    bits_float,
     fence_tmem,
-    fma,
     launch,
     load_volatile,
     load_words,
     pack_pair,
     release_tmem,
+    shared_address,
     sleep_ns,
     store_relaxed,
     store_words,
@@ -68,11 +72,15 @@ from .experts import PLAN_BYTES, ExpertsGeometry, ExpertsPlanKernel, plan_chunk
 from .experts_rubin import (
     ROUTE_IDS,
     ROUTE_WORDS,
+    claim_last,
+    count_image,
+    load_acquire,
+    store_shared_if,
     generation_bytes,
     peers_bytes,
     peers_offset,
 )
-from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
+from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel, stage_bits
 
 # The most token rows a wide engine serves (DL3 q4 B192). Every wide engine's hidden
 # images and staged rows sit at offsets derived from it (``image_units``).
@@ -80,6 +88,26 @@ WIDE_MAX = 768
 # Shared memory a CTA may use: the default opt-in cap (module docstring: not the
 # oversized mode).
 SMEM_DEFAULT = 227 * 1024
+# The FC2 fold's FP32 accumulator [capacity, 3584] sits ACC_OFFSET bytes past
+# ``ws_stage``; the first two words there are its counts (``finalize``).
+ACC_OFFSET = 256
+
+
+@asm()
+def red_add_f32x4(pointer, a, b, c, d):
+    """Fire-and-forget FP32 add of four consecutive words (no return, no ordering)."""
+    code = "red.global.add.v4.f32 [$0], {$1,$2,$3,$4};"
+    return code, "l,f,f,f,f,~{memory}", (pointer, a, b, c, d)
+
+
+def zero_fold(workspace, kernel):
+    """Zero the FP32 accumulator of every wide engine sharing ``workspace`` (once per
+    scratch, before the first call; each call's finalize re-zeroes what it read). The
+    two counts before it keep the scratch's all-ones fill (armed: -1)."""
+    start = kernel.ws_stage + ACC_OFFSET
+    end = min(workspace.numel(), start + WIDE_MAX * 3584 * 4)
+    workspace[start:end].zero_()
+
 
 
 class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
@@ -424,75 +452,99 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         cute.arch.sync_threads()
 
     @cute.jit
-    def finalize(self, workspace, weights, batch, box, sm=None):
-        """The staged rows' units (``unit``) into this rank's partial latent rows at
-        ``box[0]`` (``"local"``), over ten warps a CTA (the hidden loader, the gather
-        warp and the eight epilogue warps). Die oblivious: unit 10 cta + warp - 2,
-        stride 10 grid. ``dies``: pages 2i and 2i + 1 sit on opposite dies (the home of
-        a default allocation's 4 KiB page k of a 2 MiB chunk is parity(k & 0x1DB) ^ c,
-        c per chunk in ``ws_homes``, ``common.dies``), so pair i gives each die one
-        unit. Die d's job j holds its units of pairs j, j + 5 grid, ...; warp rank
-        r = 10 k + warp - 2 (k: the CTA's census rank on its die, ``arrive``) takes job
-        r of its die, past 5 grid the other die's job 10 grid - 1 - r (``matched``'s
-        overflow). Every unit is finalized once whatever the home bits; they set only
-        the locality (die-local reads and re-arms: ~1 us at 96-128 rows)."""
-        _, warp, lane, cta = thread()
-        stage = workspace.iterator + self.ws_stage
-        if cutlass.const_expr(len(self.dies) > 0):
-            info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
-            die, k = (info[0], info[3])
-            homes = view(workspace.iterator, self.ws_homes, Uint32, 2)
-            half: cutlass.Constexpr = self.grid * 5
-            rank = k * 10 + warp - 2
-            target, job = (die, rank)
-            if rank >= half:
-                target, job = (1 - die, 2 * half - 1 - rank)
-            address = stage.toint()
-            for i in range(job, batch * 14, half):
-                page = address + Int64(i) * 8192
-                bits = Uint32(Int32(page >> 12) & Int32(0x1DB))
-                c = Int32((page >> 21) - (address >> 21))
-                if cutlass.const_expr(self.capacity <= 512):  # 32 chunks at most
-                    word = homes[0] >> Uint32(c)
-                else:  # the staged rows span up to 44 chunks: two words
-                    word = homes[c >> 5] >> Uint32(c & 31)
-                h = (Int32(cute.arch.popc(bits)) ^ Int32(word)) & 1
-                self.unit(stage, weights, box, 2 * i + Int32(h != target), lane)
+    def fc2(self, sm, workspace, output, values, unit, tile, ranges):
+        """Published: the FC2 fold. ``RubinGroupedExpertsKernel.fc2``'s shared
+        transpose (each lane then holds 8 consecutive BF16 columns of one token's
+        row segment, ``store_stage_half``'s bits: the staged value), each scaled by
+        the pair's routing weight (``output``) in FP32 and added into the token's
+        FP32 accumulator row with two fire-and-forget ``red.add.v4.f32``: no staged
+        rows, no ordering; the finalize reads the sums once (``finalize``)."""
+        if cutlass.const_expr(not self.publish):
+            RubinGroupedExpertsKernel.fc2(
+                self, sm, workspace, output, values, unit, tile, ranges
+            )
         else:
-            for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):
-                self.unit(stage, weights, box, unit, lane)
+            _, warp, lane, _ = thread()
+            t = lane // 4
+            word = self.tables(sm)[2][4 * unit + (t >> 1)]
+            if t & 1 == 0:
+                word = word << 16
+            pair = Int32(word) >> 16  # the Int16 pair index, sign-extended
+            weight = Float32(0)
+            if pair >= 0:  # in flight during the transpose
+                weight = Float32(output[pair])
+            low = lane % 16
+            pos = (lane - 8 * (low // 8)) % 16
+            half = 4 * (4 * (pos // 2) + 2 * (pos % 2) + lane // 16) + 2 * (low // 8)
+            buffer = sm.iterator + self.off_fc2s + (warp - 4) * 512
+            cute.arch.sync_warp()  # the previous tile's reads of the buffer
+            for k in cutlass.range_constexpr(8):
+                cell = shared_address(buffer + k * 64 + half)
+                store_shared_if(cell, stage_bits(values[k]), Uint32(1), kind="u16")
+            cute.arch.sync_warp()
+            part = lane % 4 * 16
+            chunk = load_words(
+                shared_address(buffer + t * 64 + part), count=4, shared=True
+            )
+            if pair >= 0:
+                column = tile * 128 + (warp & 3) * 32 + lane % 4 * 8
+                row = Int64(pair >> 4) * 3584 + column
+                dst = workspace.iterator + self.ws_stage + ACC_OFFSET + row * 4
+                f = [
+                    bf16(chunk[j // 2], j % 2 == 1) * weight
+                    for j in range(8)
+                ]  # fmt: skip
+                red_add_f32x4(dst, f[0], f[1], f[2], f[3])
+                red_add_f32x4(dst + 16, f[4], f[5], f[6], f[7])
 
     @cute.jit
-    def unit(self, stage, weights, box, unit, lane):
-        """``RubinGroupedExpertsKernel.finalize``'s line (the same polls, re-arm and FMA
-        chains in slot order) on one unit, token unit // 28, columns 128 (unit % 28) +
-        [0, 128): 16 slots x 256 B at stage + 4 KiB unit, two words a lane a slot."""
-        token, column = (unit // 28, unit % 28 * 128)
-        source = stage + Int64(unit) * 4096 + lane * 8
-        words = cute.make_rmem_tensor(32, Uint32)
-        scale = cute.make_rmem_tensor(16, Float32)
-        ones = Uint32(4294967295)
-        for slot in cutlass.range_constexpr(16):
-            scale[slot] = Float32(weights[token * 16 + slot])
-        ready = False
+    def finalize(self, workspace, weights, batch, box, sm=None):
+        """The FC2 fold's sums into this rank's partial latent rows at ``box[0]``
+        (``"local"``) or their owners (``"twoshot"``), over ten warps a CTA (the
+        hidden loader, the gather warp and the eight epilogue warps), unit
+        10 cta + warp - 2 (token unit // 28, columns 128 (unit % 28) + [0, 128)),
+        stride 10 grid. Counts (``ws_stage`` words 0 / 1, armed -1 by the scratch
+        fill): each epilogue warp adds 1 to the first with a release after its
+        last fold (cumulative over the warp barrier); every finalize warp acquires
+        8 grid - 1 before its first read, and the last of the 10 grid finalize warps
+        (acq_rel claim on the second) re-arms both. The next wide call's folds run
+        after this grid completed (every kernel in between waits on its
+        predecessor). ``weights``: unused here (folded in ``fc2``)."""
+        _, warp, lane, cta = thread()
+        base = workspace.iterator + self.ws_stage
+        folded, done = (base, base + 4)
+        if warp >= 4:
+            cute.arch.sync_warp()
+            if lane == 0:
+                count_image(folded)
+        target = Uint32(8 * self.grid - 1)
+        seen = load_acquire(folded)
         sgn, sgt = spin_start()
-        while not ready:
-            bad = False
-            for slot in cutlass.range_constexpr(16):
-                pair = load_volatile(source + slot * 256, count=2)
-                words[2 * slot], words[2 * slot + 1] = pair
-                bad |= (pair[0] == ones) | (pair[1] == ones)
-            ready = cute.arch.vote_all_sync(not bad)
-            if not ready:
-                sleep_ns(64)
+        while seen != target:
+            sleep_ns(64)
+            seen = load_acquire(folded)
             sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
-        low = [Float32(0), Float32(0)]
-        high = [Float32(0), Float32(0)]
-        for slot in cutlass.range_constexpr(16):
-            for v in cutlass.range_constexpr(2):
-                low[v] = fma(bf16(words[2 * slot + v]), scale[slot], low[v])
-                high[v] = fma(bf16(words[2 * slot + v], True), scale[slot], high[v])
-        packed = [pack_pair(low[v], high[v], policy="latent") for v in range(2)]
+        acc = base + ACC_OFFSET
+        for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):
+            self.unit(acc, box, unit, lane)
+        cute.arch.sync_warp()
+        if lane == 0:
+            if claim_last(done) == Uint32(10 * self.grid - 2):
+                ones = Uint32(4294967295)
+                store_words(folded, (ones, ones))
+
+    @cute.jit
+    def unit(self, acc, box, unit, lane):
+        """One unit's 128 FP32 sums (4 a lane) packed as the latent words, pushed,
+        then zeroed (re-armed after the push: the consumer polls the pushed words)."""
+        token, column = (unit // 28, unit % 28 * 128)
+        source = acc + (Int64(unit) * 128 + lane * 4) * 4
+        words = load_volatile(source, count=4)
+        packed = [
+            pack_pair(bits_float(words[2 * v]), bits_float(words[2 * v + 1]),
+                      policy="latent")
+            for v in range(2)
+        ]  # fmt: skip
         if cutlass.const_expr(self.publish == "twoshot"):
             # box: the receive slots [parities x TP, capacity, 3584 / TP], the owners'
             # bases, this rank's slot (parity x TP + rank): the words LatentRows would
@@ -506,11 +558,8 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         else:
             dst = Int64(box[0]) + (Int64(token) * 3584 + column + 4 * lane) * 2
             store_words(dst, packed)
-        # The re-arm after the unit's push: the consumer polls the pushed words, and
-        # 16 re-arm stores queued ahead of the push delayed it (B-MOE-12: re-arms
-        # ~2 us of the M512 finalize). Same words, same addresses.
-        for slot in cutlass.range_constexpr(16):
-            store_words(source + slot * 256, (ones, ones))
+        zero = Uint32(0)
+        store_words(source, (zero, zero, zero, zero))
 
     def staged_word(self, pair, tile, warp):
         """``RubinGroupedExpertsKernel.staged_word`` in the unit layout: pair p's slot

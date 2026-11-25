@@ -36,7 +36,8 @@ kernel routes from logits). The reference reads the logical (checkpoint) weights
 - ``test_wide_experts_grouping_variance``: the same 768 tokens as one launch, 512 +
   256, 3 x 256, the last 256 alone on a fresh engine, the 768 again (determinism) and
   the 768 in reversed row order; per pair the differing rows, columns, FC2 tiles and
-  BF16 ulps. Determinism and the reference band are hard asserts; cross-grouping
+  BF16 ulps. Determinism up to FP32 reassociation (<= 1 BF16 ulp: the FC2 fold's
+  unordered FP32 adds) and the reference band are hard asserts; cross-grouping
   bitwise equality is xfail (strict=False) with the measured difference.
 - ``test_narrow_experts_reference_band``: control. The small-batch routed experts
   production runs at <= 64 rows (``PersistentExperts.prepare`` as ``moe.prepared.
@@ -842,7 +843,7 @@ class GroupingNotBitwise(AssertionError):
 )  # fmt: skip
 def test_wide_experts_grouping_variance(case):
     """The same 768 tokens in other single-launch groupings. Hard: the 768 launch is
-    deterministic (a fresh engine twice), and every grouping's rows stay within the
+    deterministic up to FP32 reassociation (a fresh engine twice, <= 1 BF16 ulp), and every grouping's rows stay within the
     reference band (each row's relative error <= BAND x the stock 768 launch's worst
     row, or the specialized 768 launch's own worst row without a stock arm). xfail:
     bitwise equality across groupings."""
@@ -897,8 +898,13 @@ def test_wide_experts_grouping_variance(case):
             lines.append(f"  row {r} ({name}): rel err 768 {mine:.3e}, {other:.3e}")
     summary = "\n".join(lines)
     print("\n" + summary)
-    again = pairs["768 again"]["rows"]
-    assert not again, "768-row launch not deterministic\n" + summary
+    # The FC2 fold adds each pair's weighted row into an FP32 accumulator with
+    # unordered red.global.add: run to run, a sum may round to the neighbouring BF16
+    # value (FP32 reassociation), never further.
+    again = pairs["768 again"]
+    assert again["max_ulp"] <= 1, (
+        "768-row launch differs by more than FP32 reassociation\n" + summary
+    )
     if outside:
         probe = "\n".join(contract_probe(case, one))
         raise AssertionError(
