@@ -259,6 +259,19 @@ class MooncakeStoreScheduler:
                 self.prune_policy,
                 self._prune_lag_ttl_s,
             )
+        # Store-side shared-prefix junction: pin request.shared_prefix_boundary
+        # where the store's full-attention hit runs at least this many tokens
+        # past the reusable hit (0 = off). Needs
+        # --enable-mamba-shared-prefix-checkpoint to take effect.
+        self.store_junction_min_gap = int(
+            kvc_extra_config.get("store_junction_min_gap", 0)
+        )
+        self._junction_stats = [0, 0, 0]  # lookups with attn hit, pinned, pinned tokens
+        if self.store_junction_min_gap > 0:
+            logger.info(
+                "Mooncake store junction detection on (min gap %d tokens)",
+                self.store_junction_min_gap,
+            )
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -483,6 +496,12 @@ class MooncakeStoreScheduler:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
         num_external_hit_tokens = lookup_result.hit_length
+        if self.store_junction_min_gap > 0 and lookup_result.attn_hit_length:
+            self._maybe_pin_store_junction(
+                request,
+                lookup_result.attn_hit_length,
+                max(num_external_hit_tokens, num_computed_tokens),
+            )
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
@@ -516,6 +535,36 @@ class MooncakeStoreScheduler:
 
     def confirm_load_before_step(self, request: Request) -> None:
         self._same_step_confirmed.add(request.request_id)
+
+    def _maybe_pin_store_junction(
+        self, request: Request, attn_hit: int, reusable: int
+    ) -> None:
+        """Pin a shared-prefix junction at the store's full-attention hit, as
+        ``KVCacheManager.get_computed_blocks`` does for a local hit, so this
+        request checkpoints the Mamba state there and later siblings that share
+        the prefix resume from it instead of recomputing it."""
+        stats = self._junction_stats
+        stats[0] += 1
+        junction = attn_hit // self._hash_block_size * self._hash_block_size
+        if (
+            junction - reusable >= self.store_junction_min_gap
+            and junction < request.num_prompt_tokens
+            and junction > request.shared_prefix_boundary
+        ):
+            request.shared_prefix_boundary = junction
+            stats[1] += 1
+            stats[2] += junction - reusable
+            if stats[1] % 200 == 1:
+                logger.info(
+                    "Mooncake store junctions: %d pinned of %d attn-deeper lookups, "
+                    "mean gap %.0f tokens (last: junction %d, reusable %d, prompt %d)",
+                    stats[1],
+                    stats[0],
+                    stats[2] / stats[1],
+                    junction,
+                    reusable,
+                    request.num_prompt_tokens,
+                )
 
     def update_state_after_alloc(
         self,

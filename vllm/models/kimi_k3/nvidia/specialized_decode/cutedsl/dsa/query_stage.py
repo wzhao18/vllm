@@ -21,6 +21,7 @@ from cutlass.cute.runtime import make_fake_stream
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
 from ..common.host import fake, prepare_shared_carveout, stream, to_cute
+from ..gemm.ltpin import LtPin, pinned_rows
 from ..gemm.projection import PreparedProjection, weight_map
 from ..mla.query import MlaQuery
 from .front import IndexFront
@@ -35,10 +36,52 @@ def gate_columns(heads):
     return 2112, 2112 + heads * 128
 
 
-def index_policies(batches):
+# Rubin (sm_107) wq_b tactics by padded rows, measured per row bin (1 GPU, chained
+# calls over cold weight copies): one K pass per CTA and a deeper ring from 33 rows
+# (the 64-row token tiles re-read the weight from L2, not HBM). Above 128 rows no
+# split-K tactic beats cuBLAS: those rows run torch.mm, as the stock ``wq_index``.
+RUBIN_INDEX_TACTICS = {
+    8: (128, 8, 3, 4),
+    16: (64, 16, 2, 6),
+    # 32 rows: (64, 32, 2, 6) wins chained but loses in the step (its doubled grid
+    # takes SMs from the concurrent MlaQuery / QueryWait): keep one K pass.
+    32: (64, 32, 1, 8),
+    64: (64, 64, 1, 7),
+    128: (64, 64, 1, 7),
+}
+
+
+def is_rubin(device):
+    return torch.cuda.get_device_capability(device) == (10, 7)
+
+
+# wq_b rows above the split-K table whose pinned cuBLASLt algorithm also wins in the
+# TP16 decode step (the 256-row pin is faster alone but slower in the step, beside
+# the concurrent MlaQuery).
+INDEX_PIN_ROWS = (512,)
+
+
+def index_pin(weight, batches, rubin):
+    """Rubin wq_b rows in ``INDEX_PIN_ROWS`` with a pinned cuBLASLt algorithm
+    (``ltpin``, measured at exactly these rows): one LtPin over them, else None (the
+    other rows above 128 run torch.mm, as the stock ``wq_index``)."""
+    pinned = pinned_rows("wq_b")
+    rows = [b for b in batches if b in INDEX_PIN_ROWS and b in pinned] if rubin else []
+    if not rows:
+        return None
+    return LtPin("wq_b", *weight.shape, rows, device=weight.device)
+
+
+def index_policies(batches, rubin=False):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9);
-    wider batches run 64-row N tiles."""
+    wider batches run 64-row N tiles. Rubin: ``RUBIN_INDEX_TACTICS`` up to 128 rows,
+    none above (``run_index``: cuBLAS)."""
+    if rubin:
+        tactics = RUBIN_INDEX_TACTICS
+        return {
+            b: tactics[next(n for n in tactics if b <= n)] for b in batches if b <= 128
+        }
     tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
     tactics[64] = (64, 64, 1, 4)
     return {b: tactics[next((n for n in tactics if b <= n), 64)] for b in batches}
@@ -240,9 +283,10 @@ class QueryStage:
             self.scales = q_scale_inv, self.unit if nvfp4 else k_scale
             shape = (max(pitches), self.heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=device)
-        policies = index_policies(sorted(pitches))
+        policies = index_policies(sorted(pitches), is_rubin(device))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
+        self.index_pin = index_pin(wq, sorted(pitches), is_rubin(device))
         self.wq_view = to_cute(wq)
         # The fused index front's weight TMA map (128-row boxes: one head).
         self.wq_map = weight_map(wq, 128)
@@ -285,7 +329,17 @@ class QueryStage:
         """wq_b, then the FP8 indexer query and head weights and the key into the
         indexer cache."""
         batch = projected.shape[0]
-        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
+        proj = self.index_projection  # (the SP decode swaps in a DecodeProjection)
+        if isinstance(proj, PreparedProjection) and batch not in proj.kernels:
+            # no split-K tactic at these rows (Rubin > 128): the pinned cuBLASLt
+            # algorithm where measured, else cuBLAS, as stock
+            wq, qc, iq = self.indexer.wq_index.weight, self.qc[:batch], self.iq[:batch]
+            if self.index_pin is not None and batch in self.index_pin.plans:
+                self.index_pin.run(wq, qc, iq)
+            else:
+                torch.mm(qc, wq.t(), out=iq)
+        else:
+            iq = proj.run(self.qc[:batch], self.iq[:batch])
         rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
         key = to_cute(self.indexer.k_cache.kv_cache), to_cute(index_slots[:batch], 8)
         s = stream(self.device)

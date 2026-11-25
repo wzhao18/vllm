@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, cast, overload
@@ -201,9 +202,13 @@ class KVCacheManager:
         # junction costs a forward pass and displaces the block-boundary stop.
         # Multi-module MTP is excluded because ``cache_blocks`` then hands the
         # manager ``num_computed - num_reprefillable`` rather than the chunk end.
+        # K31_JUNCTION_NO_EAGLE=1: also for non-EAGLE Mamba groups (cross-request
+        # shared-prefix junctions detected from the store; the partial-state
+        # registration path has no EAGLE-specific step).
+        _junc_no_eagle = os.environ.get("K31_JUNCTION_NO_EAGLE", "0") == "1"
         self.mamba_shared_prefix_checkpoint = (
             enable_mamba_shared_prefix_checkpoint
-            and bool(self.coordinator.eagle_group_ids)
+            and (bool(self.coordinator.eagle_group_ids) or _junc_no_eagle)
             and self.coordinator.enable_partial_hash_hits
             and self.coordinator.num_reprefillable_tokens == 0
         )

@@ -452,3 +452,45 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+def _align_state_for_precopy(monkeypatch: pytest.MonkeyPatch) -> MambaHybridModelState:
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._pending_precopy = None
+    state._mamba_ctx = Mock()
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32)
+    state._mamba_src_col_gpu = torch.full((4,), -1, dtype=torch.int32)
+    state._mamba_src_off_gpu = torch.zeros(4, dtype=torch.int32)
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+    monkeypatch.setattr(
+        state, "_get_mamba_group_info", lambda _cfg: ([0], SimpleNamespace(block_size=16))
+    )
+    monkeypatch.setattr(
+        mamba_hybrid, "preprocess_mamba_align_fused_kernel", {(1,): lambda *a, **k: None}
+    )
+    return state
+
+
+def test_state_precopy_waits_for_the_runner_launch(monkeypatch) -> None:
+    """The align pre-copy reads the source state block, which a same-step
+    connector load writes outside the CUDA streams: preprocess_state only stages
+    it, and launch_state_precopy (called once the load landed) enqueues it once."""
+    state = _align_state_for_precopy(monkeypatch)
+    idx_mapping = torch.tensor([2], dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=idx_mapping,
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+    )
+
+    state.preprocess_state(input_batch, (), Mock(), torch.zeros(4, dtype=torch.int32))
+    state._mamba_ctx.run_fused_precopy.assert_not_called()
+
+    state.launch_state_precopy()
+    state._mamba_ctx.run_fused_precopy.assert_called_once()
+    args = state._mamba_ctx.run_fused_precopy.call_args.args
+    assert args[0] == 1 and args[4] is idx_mapping
+
+    state.launch_state_precopy()
+    state._mamba_ctx.run_fused_precopy.assert_called_once()
