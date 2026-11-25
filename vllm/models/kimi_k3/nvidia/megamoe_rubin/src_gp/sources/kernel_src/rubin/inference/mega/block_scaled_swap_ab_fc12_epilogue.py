@@ -28,6 +28,7 @@ from cutlass._mlir.dialects import llvm, vector
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
+from .block_scaled_swap_ab_fc12_mainloop import PR2_PROBE  # PR2 EXPERIMENT ONLY
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32, ScalarF32
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.activation_variants import activation_accumulator
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
@@ -2043,7 +2044,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             cute.group_modes(fc1_smem, 0, 2),
             cute.group_modes(fc1_gmem_subtile_view, 0, 2),
         )
-        cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
+        if cutlass.const_expr(PR2_PROBE != "nofc1st"):
+            cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
 
     @cute.jit
     def run_subtile_token_half(
@@ -2145,7 +2147,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if (self.warp_idx == subtile_idx) & (self.warpgroup_idx == subtile_idx % cutlass.Int32(2)):
             tma_ready_to_read_smem_named_barrier.arrive_and_wait()
             with cute.arch.elect_one():
-                cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
+                if cutlass.const_expr(PR2_PROBE != "nofc1st"):
+                    cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
                 cute.arch.cp_async_bulk_commit_group()
         else:
             tma_ready_to_read_smem_named_barrier.arrive()

@@ -12,6 +12,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
+from .block_scaled_swap_ab_fc12_mainloop import PR2_PROBE  # PR2 EXPERIMENT ONLY
 from .....api import ImplDesc, ProblemDesc
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
@@ -158,6 +159,8 @@ def fc2_dedup_bulk_store_function(
     else:
         scratch_row = warp_idx * Int32(16) + lane_idx % Int32(16)
     copy_iters: cutlass.Constexpr[int] = fc2_output_router.mapping.domain.axis_size("iter_idx")
+    if cutlass.const_expr(PR2_PROBE == "nofc2st"):  # PR2 EXPERIMENT ONLY: no per-token bulk stores
+        copy_iters = 0
     for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
         if cutlass.const_expr(epi.two_epilogue_warpgroups):
             owned_subtile = lane_idx // Int32(8)
