@@ -330,11 +330,17 @@ def bench(case, args, rank):
             g.replay()
         torch.accelerator.synchronize()
         times = []
+        # The replays start together on every rank: a device-side all-reduce
+        # right before the start event (a host barrier leaves the ranks' launches
+        # tens of us apart, which the early ranks' first mailbox polls absorb
+        # into their timed span).
+        align = torch.zeros(1, device=dev)
         for _ in range(args.reps):
             group.barrier()
             torch.accelerator.synchronize()
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
+            torch.distributed.all_reduce(align, group=group.device_group)
             e0.record()
             g.replay()
             e1.record()
