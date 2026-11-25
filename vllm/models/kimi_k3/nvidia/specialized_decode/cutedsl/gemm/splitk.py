@@ -124,6 +124,12 @@ class SplitKGemm:
         )
         self.expected_transaction_bytes = self.mailbox_elements * 4
 
+    def launch_smem_bytes(self):
+        """Plain Python (outside the DSL's rewriting): the launch's shared memory."""
+        if self.launch_smem is None:
+            return utils.get_smem_capacity_in_bytes("sm_100")
+        return self.launch_smem
+
     @cute.experimental.jit
     def __call__(
         self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, bias: cute.Tensor,
@@ -138,9 +144,7 @@ class SplitKGemm:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(
-                self.launch_smem or utils.get_smem_capacity_in_bytes("sm_100")
-            ),
+            smem=cute.Int64(self.launch_smem_bytes()),
             stream=stream,
             use_pdl=True,
         )
