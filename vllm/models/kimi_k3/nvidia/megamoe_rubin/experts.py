@@ -142,18 +142,21 @@ RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
 RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_DEDUP_MIN_TOKENS = 4096
 
-# P/D prefill workers at EP8 (TP8+DCP8 SP+EP: 112 local experts per rank) split their
-# dedup bucket by tile N (per-shape dispatch, same variant and math): forwards of at
-# least RUBIN_PREFILL_WIDE_N_MIN_TOKENS tokens per rank run N256 tiles
-# (RUBIN_PREFILL_WIDE_N_KNOBS, the EP8 i2048 phase-interleaved record), smaller ones
-# keep the N128 record of the main capacity in a bucket of
-# RUBIN_PREFILL_WIDE_N_MIN_TOKENS - 1 tokens. Routing is skewed (a layer's hottest
-# local expert takes ~3.4x / ~7x the rows of the rank at 1024 / 2048 rows per rank),
-# and each N tile of an expert re-streams its weights: N128 runs 1426 k-tiles per
-# leader CTA at 2048 rows per rank, at ~130 ns of MMA-warp issue each. Measured on
-# VR200 (1 GPU, EP8 per-GPU shape: 112 experts, NVFP4, real per-expert counts of rank
-# 0, CUPTI, 12 layers): N128 / N256 main kernel 184.0 / 185.1, 227.1 / 224.8,
-# 283.9 / 271.4, 402.6 / 376.7 us at 128 / 512 / 1024 / 2048 rows per rank.
+# P/D prefill workers at EP8 (TP8+DCP8 SP+EP: 112 local experts per rank) pick the
+# dedup bucket's tile N per launch (per-shape dispatch, same variant and math):
+# launches of at least RUBIN_PREFILL_WIDE_N_MIN_TOKENS EP-uniform tokens per rank run
+# N256 tiles (RUBIN_PREFILL_WIDE_N_KNOBS, the EP8 i2048 phase-interleaved record),
+# smaller ones the bucket's N128 record, as the bucket's narrow kernel over the SAME
+# workspace (one arena carve: no memory beyond the one-bucket server; the session
+# checks the layouts, session.narrow_local_offsets). Routing is skewed (a layer's
+# hottest local expert takes ~3.4x / ~7x the rows of the rank at 1024 / 2048 rows per
+# rank), and each N tile of an expert re-streams its weights: N128 runs 1426 k-tiles
+# per leader CTA at 2048 rows per rank, at ~130 ns of MMA-warp issue each. Measured
+# on VR200 (1 GPU, EP8 per-GPU shape: 112 experts, NVFP4, real per-expert counts of
+# rank 0, CUPTI, 6 layers per size): N128 / N256 main kernel 191.3 / 196.5,
+# 230.5 / 230.5, 289.7 / 277.5, 409.8 / 388.0 us at 128 / 512 / 1024 / 2048 rows per
+# rank. 2-node TP8+DCP8 graph step (ABBA, bitwise-equal outputs): 2048 rows per rank
+# 211.62 -> 206.35 ms, 4096 rows 378.64 -> 365.96 ms.
 RUBIN_PREFILL_WIDE_N_EP_SIZES = (8,)
 RUBIN_PREFILL_WIDE_N_MIN_TOKENS = 1024
 RUBIN_PREFILL_WIDE_N_KNOBS = RubinKnobs(
@@ -343,13 +346,15 @@ def select_rubin_buckets(
         and main.knobs.mma_tiler_mnk[1] < RUBIN_PREFILL_WIDE_N_KNOBS.mma_tiler_mnk[1]
         and not buckets
     ):
-        buckets = [
-            dataclasses.replace(main, max_tokens=RUBIN_PREFILL_WIDE_N_MIN_TOKENS - 1)
-        ]
-        main = dataclasses.replace(main, knobs=RUBIN_PREFILL_WIDE_N_KNOBS)
+        main = dataclasses.replace(
+            main,
+            knobs=RUBIN_PREFILL_WIDE_N_KNOBS,
+            narrow=(RUBIN_PREFILL_WIDE_N_MIN_TOKENS, main.knobs),
+        )
         extra = (
             f"[{main.variant} {main.max_tokens}] N256 tiles at >= "
-            f"{RUBIN_PREFILL_WIDE_N_MIN_TOKENS} tokens/rank, the N128 record below",
+            f"{RUBIN_PREFILL_WIDE_N_MIN_TOKENS} tokens/rank, the N128 record below "
+            "(one workspace)",
         )
     else:
         extra = tuple(
