@@ -10,7 +10,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ......common.ptx_helpers import barrier_sync_unaligned
@@ -968,18 +968,16 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
         m1w = getattr(self, "_m1a", None)
+        m1acc = Int64(0)
+        if cutlass.const_expr(m1w is not None):
+            m1w.vmin(m1_stamps.W_TMAA_FIRST, m1_stamps.gtime())
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             if cutlass.const_expr(m1w is not None):
                 m1t0 = m1_stamps.clk()
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
             if cutlass.const_expr(m1w is not None):
-                m1dt = m1_stamps.clk() - m1t0
-                m1w.add(m1_stamps.C_TMAA_ACQ, m1dt)
-                if work_tile.phase == Int32(BlockPhase.Linear2):
-                    m1w.add(m1_stamps.C_TMAA_ACQ_FC2, m1dt)
-                if k_tile_idx == 0:
-                    m1w.vmin(m1_stamps.W_TMAA_FIRST, m1_stamps.gtime())
+                m1acc = m1acc + (m1_stamps.clk() - m1t0)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
@@ -1004,6 +1002,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         if cutlass.const_expr(m1w is not None):
             m1w.vmax(m1_stamps.W_TMAA_LAST, m1_stamps.gtime())
             m1w.add(m1_stamps.N_TMAA_TILES, 1)
+            m1w.add(m1_stamps.C_TMAA_ACQ, m1acc)
+            if work_tile.phase == Int32(BlockPhase.Linear2):
+                m1w.add(m1_stamps.C_TMAA_ACQ_FC2, m1acc)
         return ab_pipeline_state
 
     @cute.jit
@@ -1255,13 +1256,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
         m1w = getattr(self, "_m1b", None)
+        m1acc = Int64(0)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             if cutlass.const_expr(m1w is not None):
                 m1t0 = m1_stamps.clk()
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
             if cutlass.const_expr(m1w is not None):
-                m1w.add(m1_stamps.C_TMAB_ACQ, m1_stamps.clk() - m1t0)
+                m1acc = m1acc + (m1_stamps.clk() - m1t0)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
@@ -1284,6 +1286,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         if cutlass.const_expr(m1w is not None):
             m1w.vmax(m1_stamps.W_TMAB_LAST, m1_stamps.gtime())
             m1w.add(m1_stamps.N_TMAB_TILES, 1)
+            m1w.add(m1_stamps.C_TMAB_ACQ, m1acc)
         return ab_pipeline_state
 
     @cute.jit
@@ -1633,6 +1636,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             )
             mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
         m1w = getattr(self, "_m1m", None)
+        m1acc = Int64(0)
         use_n128_sfb_mapping = False
         if cutlass.const_expr(quant_kind == QuantKind.nvfp4 and self.cta_tile_n == 256):
             aligned_instruction_n = (work_tile.valid_tokens_in_cta_tile + Int32(15)) & Int32(-16)
@@ -1647,10 +1651,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     m1t0 = m1_stamps.clk()
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
                 if cutlass.const_expr(m1w is not None):
-                    m1dt = m1_stamps.clk() - m1t0
-                    m1w.add(m1_stamps.C_MMA_ABWAIT, m1dt)
-                    if work_tile.phase == Int32(BlockPhase.Linear2):
-                        m1w.add(m1_stamps.C_MMA_ABWAIT_FC2, m1dt)
+                    m1acc = m1acc + (m1_stamps.clk() - m1t0)
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
@@ -1703,10 +1704,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     m1t0 = m1_stamps.clk()
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
                 if cutlass.const_expr(m1w is not None):
-                    m1dt = m1_stamps.clk() - m1t0
-                    m1w.add(m1_stamps.C_MMA_ABWAIT, m1dt)
-                    if work_tile.phase == Int32(BlockPhase.Linear2):
-                        m1w.add(m1_stamps.C_MMA_ABWAIT_FC2, m1dt)
+                    m1acc = m1acc + (m1_stamps.clk() - m1t0)
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
@@ -1735,6 +1733,10 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
+        if cutlass.const_expr(m1w is not None):
+            m1w.add(m1_stamps.C_MMA_ABWAIT, m1acc)
+            if work_tile.phase == Int32(BlockPhase.Linear2):
+                m1w.add(m1_stamps.C_MMA_ABWAIT_FC2, m1acc)
         return ab_pipeline_state
 
     @cute.jit
