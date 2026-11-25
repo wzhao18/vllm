@@ -272,6 +272,7 @@ def _rank_balance(load: torch.Tensor, model_state, ep_size: int) -> dict[str, fl
 
 
 _SAVE_CASE: list[str] = []
+_SAVE_MODEL: list[Any] = []
 
 
 def _install_save_hidden() -> None:
@@ -285,6 +286,7 @@ def _install_save_hidden() -> None:
     from vllm.distributed.parallel_state import get_world_group
 
     os.makedirs(out, exist_ok=True)
+    out_dir = out
     first = capture._first_tensor
     seen: set[str] = set()
 
@@ -298,6 +300,28 @@ def _install_save_hidden() -> None:
         return t
 
     capture._first_tensor = save_first
+    # Per-layer MoE outputs (first sub-call of each case) at a few depths: tells a
+    # wrong-expert bug (differs at layer 0) from amplified combine-order noise.
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.experts import KimiK3MegaMoEExperts
+
+    model = _SAVE_MODEL[-1] if _SAVE_MODEL else None
+    if model is None:
+        return
+    layers = [m for m in model.modules() if isinstance(m, KimiK3MegaMoEExperts)]
+    picks = sorted({0, 1, 2, len(layers) // 2, len(layers) - 1})
+    for i in picks:
+
+        def hook(mod, args, out, i=i):
+            name = _SAVE_CASE[-1] if _SAVE_CASE else "case"
+            key = f"{name}.moe{i}"
+            rank = get_world_group().rank
+            if key in seen or rank != 0:
+                return
+            seen.add(key)
+            t = out[0] if isinstance(out, tuple) else out
+            torch.save(t.detach().cpu(), os.path.join(out_dir, f"{key}.rank{rank}.pt"))
+
+        layers[i].register_forward_hook(hook)
 
 
 def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any]:
@@ -417,6 +441,7 @@ def main(args: argparse.Namespace) -> None:
     world = get_world_group()
     results = []
     with torch.inference_mode(), set_current_vllm_config(runner.vllm_config):
+        _SAVE_MODEL.append(runner.get_model())
         _install_save_hidden()
         if args.eplb_load:
             apply_eplb_load(runner, args.eplb_load)
