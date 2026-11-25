@@ -380,6 +380,12 @@ def dsa_on_flashinfer(attention) -> bool:
     return isinstance(attention.mla_attn.mla_attn.impl, FlashInferMLASparseImpl)
 
 
+# Wide rows whose sparse decode reads the #63 merge's rows (IndexerStage.merge_rows)
+# instead of the stock sparse_attn_indexer op + Triton slot filter (same per-row
+# selection: chain bench --check). 1-node DSA chain (W4, 6 heads per rank, q8, us
+# per layer, op / merge rows): 128 rows 55.59 / 52.87, 256 77.46 / 74.72, 512 115.22
+# / 115.71 (L1 round 6, Rhea 136406).
+WIDE_MERGE = "65-256:1"
 # Wide rows whose #63 merge reads IndexerScoreFp4's logits (MXFP4 indexer cache);
 # the others DeepGEMM's paged MQA logits (both bit for bit the same logits). None:
 # beside the forked MlaQuery (side stream) the scorer's SM-wide grid loses to
@@ -552,6 +558,7 @@ class WideDsa:
                 "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
                 "the stock sparse_attn_indexer op and the Triton slot filter",
             )
+        self.merged = batch_table(WIDE_MERGE) if WIDE_MERGE else {}
         scored = batch_table(WIDE_SCORER) if WIDE_SCORER else {}
         self.scored = [s for s in self.shapes if s[0] in scored]
         self.scorer = bool(local_topk and self.scored) and self.indexer.use_fp4_cache
@@ -666,6 +673,9 @@ class WideDsa:
             "Triton slot filter where DcpExchange does not serve the step",
             "FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse",
         ]
+        if self.indexer_stage.local_topk and batch in self.merged:
+            # (the #63 merge's steps; DcpExchange's keep the op)
+            pieces[:2] = ["#63 merge rows (DeepGEMM logits) on merge steps"]
         if self.index_pin is not None and batch in self.index_pin.plans:
             pieces.append("wq_index pinned cuBLASLt (ltpin; no split-K tactic)")
         elif batch not in self.index_projection.kernels:
@@ -744,7 +754,8 @@ class WideDsa:
             stage = self.indexer_stage
             source = stage.merge_source(batch)[0] if stage.local_topk else None
             args = self.q_fp8, self.head_w, md, stride_rows, batch
-            merged = stage.merge_rows(*args, q) if source == "merge" else None
+            merge = source == "merge" and batch in self.merged
+            merged = stage.merge_rows(*args, q) if merge else None
             if merged is None and source is None and self.strict and full_capture():
                 # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
                 # would capture the stock indexer op and the slot filter.
