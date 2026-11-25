@@ -7,16 +7,18 @@ gathered the packed 6-wide aux rows)."""
 
 from unittest import mock
 
+import pytest
 import torch
 
 from vllm.models.kimi_k3.nvidia.ops import sp_local_aux
 from vllm.utils.torch_utils import weak_ref_tensors
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="weak_ref_tensor is a CUDA op")
 def test_weak_refs_keep_shard_local_type():
-    shards = [torch.zeros(4, 8), torch.ones(4, 8)]
+    shards = [torch.zeros(4, 8, device="cuda"), torch.ones(4, 8, device="cuda")]
     aux = sp_local_aux.SpLocalAux(shards, num_rows=32)
-    out = weak_ref_tensors((torch.zeros(32, 8), aux))
+    out = weak_ref_tensors((torch.zeros(32, 8, device="cuda"), aux))
     assert isinstance(out, tuple)
     ref = out[1]
     assert isinstance(ref, sp_local_aux.SpLocalAux)
