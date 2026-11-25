@@ -144,6 +144,7 @@ def layer(overlap, seed=0):
         _shared_stream=torch.cuda.Stream(),
         _shared_events=(torch.cuda.Event(), torch.cuda.Event()),
         _routed_stream=torch.cuda.Stream(priority=-1),
+        _shared_full_grid=False, _shared_kernels_checked=False,
         _prefill_subcalls=None,
     )  # fmt: skip
     for name in ("forward", "_maybe_overlap_router_and_down_proj",
