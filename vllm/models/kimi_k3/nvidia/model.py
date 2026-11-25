@@ -299,6 +299,12 @@ def _capped_shared_overlap_tokens(
     expert by stream priority instead. Decided by role, no switch."""
     from .megamoe_rubin.experts import RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
 
+    import os  # SE-EXP (bench-only, not for merge)
+
+    x = os.environ.get("SE_X_CAP_UPTO")
+    if x is not None and pd_prefill_worker(vllm_config):
+        x = int(x)
+        return None if x < 0 else x  # -1: all capped (base); 0: none capped
     if (
         not pd_prefill_worker(vllm_config)
         or max_tokens_per_rank <= RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS
@@ -1090,11 +1096,13 @@ class KimiMoE(nn.Module):
             and not self.shared_experts.shard_sequence_parallel
         )
         if self._shared_overlap:
-            self.experts.reserve_sms_for_shared_expert(
-                up_to_tokens=_capped_shared_overlap_tokens(
-                    vllm_config, self.experts.buckets[-1].max_tokens
-                )
+            _up = _capped_shared_overlap_tokens(
+                vllm_config, self.experts.buckets[-1].max_tokens
             )
+            if _up == 0:  # SE-EXP: no capped bucket
+                self.experts.sequence_parallel = True
+            else:
+                self.experts.reserve_sms_for_shared_expert(up_to_tokens=_up)
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
             # Full-grid buckets: the routing chain runs on a high-priority stream
@@ -1287,7 +1295,34 @@ class KimiMoE(nn.Module):
         Both forms fork and join inside this call (no eager break between), so
         they are also legal inside breakable CUDA graph segments."""
         start, done = self._shared_events
-        if self.experts.shared_overlap(hidden_states.shape[0]):
+        import os  # SE-EXP
+
+        mode = os.environ.get("SE_X_FULL", "prio")
+        capped = self.experts.select_bucket(hidden_states.shape[0]).max_sm_count is not None
+        if not capped and mode == "serial":
+            routed_hidden_states, router_output, topk_ids = (
+                self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+            )
+            routed = self._routed_experts(routed_hidden_states, router_output, topk_ids)
+            shared_output = self.shared_experts(shared_input)
+            return self.routed_output_transform(routed, residual=shared_output)
+        if not capped and mode in ("late", "same"):
+            routed_hidden_states, router_output, topk_ids = (
+                self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+            )
+            start.record()
+            with torch.cuda.stream(
+                self._routed_stream if mode == "late" else self._shared_stream
+            ):
+                start.wait()
+                routed = self._routed_experts(
+                    routed_hidden_states, router_output, topk_ids
+                )
+                done.record()
+            shared_output = self.shared_experts(shared_input)
+            done.wait()
+            return self.routed_output_transform(routed, residual=shared_output)
+        if capped:
             routed_hidden_states, router_output, topk_ids = (
                 self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
             )
