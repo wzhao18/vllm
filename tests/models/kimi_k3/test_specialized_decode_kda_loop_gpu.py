@@ -415,3 +415,38 @@ def test_loop_padding_requests(monkeypatch, kind):
     assert_bitwise("live outputs", rows[live].reshape(n * q, DIM), alone)
     assert_bitwise("recurrent state", state[1], alone_state[1])
     assert_bitwise("conv state", state[0], alone_state[0])
+
+
+@pytest.mark.parametrize("requests", [16, 32, 64], ids=lambda v: f"B{v}")
+@pytest.mark.parametrize("planes", [2, 6])
+def test_split_planes_equal_summed_rows(requests, planes):
+    """``PreparedKda(planes=P)`` on an in-projection's K-split FP32 partial planes
+    equals the production kernel on those planes summed in split order and rounded
+    once to BF16 (the in-projection exchange's sum) bit for bit: outputs, state
+    (records) and conv window. q8 B16 (HalfDefer), B32 / B64 (LoopDefer)."""
+    q = 8
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    rows = requests * q
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    parts = torch.randn(planes, rows, PITCH, generator=g, device=DEVICE) / planes
+    total = parts[0].clone()
+    for s in range(1, planes):
+        total = total + parts[s]
+    summed = total.bfloat16()
+    key = (requests, q)
+    want_core = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True)
+    got_core = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True, planes=planes)
+    want_core.prepare_caches(base)
+    got_core.prepare_caches(base)
+    want = run(want_core, summed, base, table, accepted)
+    got_state = tuple(t.clone() for t in base)
+    got_out = torch.empty(rows, got_core.dim, dtype=torch.bfloat16, device=DEVICE)
+    got_core.run(parts.view(planes * rows, PITCH), got_out, caches=got_state,
+                 slots=table, accepted=accepted)  # fmt: skip
+    torch.cuda.synchronize()
+    assert_bitwise("output", got_out, want[0])
+    assert_bitwise("recurrent state", got_state[1], want[1][1])
+    assert_bitwise("conv state", got_state[0], want[1][0])
