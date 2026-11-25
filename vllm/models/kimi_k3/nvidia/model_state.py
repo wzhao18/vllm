@@ -229,13 +229,7 @@ class KimiK3ModelState(MambaHybridModelState):
         if compile_only:
             self._prepped = None
             return
-        self._mamba_ctx.run_fused_precopy(
-            input_batch.num_reqs,
-            self._mamba_state_idx_gpu,
-            self._mamba_src_col_gpu,
-            self._mamba_src_off_gpu,
-            input_batch.idx_mapping,
-        )
+        self._stage_precopy(input_batch.num_reqs, input_batch.idx_mapping)
         for builder in step_prep.builders:
             builder.prestaged = (num_rows, input_batch.num_reqs)
         for group in step_prep.kernel_groups:

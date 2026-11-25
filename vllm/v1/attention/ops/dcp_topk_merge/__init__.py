@@ -174,11 +174,7 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
         and kv_transfer.is_kv_producer
         and not kv_transfer.is_kv_consumer
     )
-    mailbox = (
-        envs.VLLM_DSA_BPRIME_MAILBOX
-        and not prefill_only
-        and init_dcp_topk_mailbox(topk, local_topk, group)
-    )
+    mailbox = not prefill_only and init_dcp_topk_mailbox(topk, local_topk, group)
     if envs.VLLM_DSA_BPRIME_CHECK:
         from vllm.v1.attention.ops.dcp_topk_merge.check import (
             init_dcp_topk_merge_check,
@@ -203,12 +199,22 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
     )
     if mailbox:
         logger.info_once("DSA DCP top-k merge: round 1 by multicast mailbox.")
-    elif envs.VLLM_DSA_BPRIME_MAILBOX:
+    elif not prefill_only:
         logger.warning_once(
-            "DSA DCP top-k merge: VLLM_DSA_BPRIME_MAILBOX is set, but round 1 "
-            "stays on the all-gather (%s).",
-            "prefill-only instance"
-            if prefill_only
-            else "no multicast memory over the DCP group",
+            "DSA DCP top-k merge: no multicast memory over the DCP group; "
+            "round 1 stays on the all-gather."
         )
     return local_topk
+
+
+def dcp_topk_merge_has_mailbox(topk: int, local_topk: int) -> bool:
+    """Whether the merge of (K, N) takes round 1 through the multicast
+    mailbox (built by ``init_dcp_topk_merge`` on decode instances)."""
+    if not local_topk:
+        return False
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        get_dcp_topk_rescue_workspace,
+    )
+
+    ws = get_dcp_topk_rescue_workspace(topk, local_topk)
+    return ws is not None and ws.mailbox is not None

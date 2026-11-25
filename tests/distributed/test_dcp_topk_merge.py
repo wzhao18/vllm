@@ -477,7 +477,7 @@ def _check_exchange_ab(group, ws, n: int) -> None:
         num_rows = local.shape[0]
         req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
         block_table = _block_table(num_rows, int(local_end.max()))
-        set_dcp_topk_merge_exchange(exchange)
+        previous = set_dcp_topk_merge_exchange(exchange)
         try:
             ids = torch.full((num_rows, TOPK), -7, dtype=torch.int32, device="cuda")
             dcp_topk_merge(local, local_end, ids, n)
@@ -505,7 +505,7 @@ def _check_exchange_ab(group, ws, n: int) -> None:
                 )
                 outs += [rows_out, valid_out, ids2, ws.sat_word[:num_rows].clone()]
         finally:
-            set_dcp_topk_merge_exchange("auto")
+            set_dcp_topk_merge_exchange(previous)
         torch.accelerator.synchronize()
         return outs
 
@@ -619,7 +619,7 @@ def _check_graph_stress(group, ws, n: int, replays: int) -> None:
 
     refs: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
     refs7: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    set_dcp_topk_merge_exchange("all_gather")
+    previous = set_dcp_topk_merge_exchange("all_gather")
     try:
         for v in range(len(variants)):
             fill(v)
@@ -629,7 +629,7 @@ def _check_graph_stress(group, ws, n: int, replays: int) -> None:
             merge7()
             refs7[v] = ids7.clone(), ws.sat_word[:7].clone()
     finally:
-        set_dcp_topk_merge_exchange("auto")
+        set_dcp_topk_merge_exchange(previous)
     torch.accelerator.synchronize()
     assert any(bool((refs[0, v][1] >> 16).any()) for v in range(len(variants)))
 
@@ -672,11 +672,11 @@ def _check_graph_stress(group, ws, n: int, replays: int) -> None:
             bad[i, 2] = (ids7 != want7).sum() + (ws.sat_word[:7] != want7_sat).sum()
         if i % 25 == 24:
             got_ids, got_sats = ids[:count, :t].clone(), sats[:count, :t].clone()
-            set_dcp_topk_merge_exchange("all_gather")
+            previous = set_dcp_topk_merge_exchange("all_gather")
             try:
                 run(g)
             finally:
-                set_dcp_topk_merge_exchange("auto")
+                set_dcp_topk_merge_exchange(previous)
             assert torch.equal(ids[:count, :t], got_ids), f"replay {i}: ids"
             assert torch.equal(sats[:count, :t], got_sats), f"replay {i}: sat"
 
@@ -742,11 +742,11 @@ def _check_error_after_publish(group, n: int) -> None:
             torch.cuda._sleep(100_000_000)
         dcp_topk_merge(local, local_end, ids, n)
         ref = torch.full_like(ids, -7)
-        set_dcp_topk_merge_exchange("all_gather")
+        previous = set_dcp_topk_merge_exchange("all_gather")
         try:
             dcp_topk_merge(local, local_end, ref, n)
         finally:
-            set_dcp_topk_merge_exchange("auto")
+            set_dcp_topk_merge_exchange(previous)
         torch.accelerator.synchronize()
         same.append(torch.equal(ids, ref))
     every = group.all_gather(
@@ -856,15 +856,14 @@ def run_worker(
 ) -> None:
     """One DCP rank. Also callable from a multi-node launcher. ``check_hook``
     runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own;
-    ``mailbox`` takes round 1 through the multicast mailbox
-    (VLLM_DSA_BPRIME_MAILBOX) and adds its checks, including
+    the merge always builds the multicast mailbox; ``mailbox`` takes round 1
+    through it (else through the all-gather) and adds its checks, including
     ``stress_replays`` graph replays."""
     import os
     from types import SimpleNamespace
 
     if check_hook:
         os.environ["VLLM_DSA_BPRIME_CHECK"] = "1"
-    os.environ["VLLM_DSA_BPRIME_MAILBOX"] = str(int(mailbox))
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -880,6 +879,7 @@ def run_worker(
     )
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         get_dcp_topk_rescue_workspace,
+        set_dcp_topk_merge_exchange,
     )
 
     torch.accelerator.set_device_index(local_rank)
@@ -916,7 +916,10 @@ def run_worker(
             ws = get_dcp_topk_rescue_workspace(TOPK, n)
             assert ws is not None and ws.max_rows >= 8
             assert dcp_topk_merge_max_rows(TOPK, n) == ws.max_rows
-            assert (ws.mailbox is not None) == mailbox
+            # On by default on a decode instance (no env switch).
+            assert ws.mailbox is not None, "no round-1 mailbox"
+            if not mailbox:
+                set_dcp_topk_merge_exchange("all_gather")
             if check_hook:
                 _check_hook(group, n)
                 return
@@ -933,6 +936,7 @@ def run_worker(
             _check_cuda_graph(group, ws, n)
             _check_late_peer(group, ws, n)
         finally:
+            set_dcp_topk_merge_exchange("auto")
             cleanup_dist_env_and_memory()
 
 

@@ -92,6 +92,8 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        # (num_reqs, idx_mapping) of the pre-copy staged for launch_state_precopy.
+        self._pending_precopy: tuple[int, torch.Tensor] | None = None
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
@@ -233,12 +235,26 @@ class MambaHybridModelState(DefaultModelState):
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )
-        ctx.run_fused_precopy(
-            num_reqs,
+        self._stage_precopy(num_reqs, input_batch.idx_mapping)
+
+    def _stage_precopy(self, num_reqs: int, idx_mapping: torch.Tensor) -> None:
+        """Stage the pre-copy for launch_state_precopy: it reads the source
+        blocks, which a synchronous (same-step) connector load writes outside
+        the CUDA streams, so it must not be enqueued before that load landed."""
+        assert self._pending_precopy is None, "previous step's pre-copy not launched"
+        self._pending_precopy = (num_reqs, idx_mapping)
+
+    def launch_state_precopy(self) -> None:
+        pending, self._pending_precopy = self._pending_precopy, None
+        if pending is None:
+            return
+        assert self._mamba_ctx is not None
+        self._mamba_ctx.run_fused_precopy(
+            pending[0],
             self._mamba_state_idx_gpu,
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
-            input_batch.idx_mapping,
+            pending[1],
         )
 
     def prepare_attn(
