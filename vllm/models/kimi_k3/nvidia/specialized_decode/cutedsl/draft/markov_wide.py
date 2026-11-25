@@ -458,9 +458,7 @@ class MarkovWide:
         return launch_ordinal
 
     @cute.jit
-    def noise(
-        self, args, noise, i, warp, quarter, rows, rank, batch, temps_s, seeds_s
-    ):
+    def noise(self, args, noise, i, warp, quarter, rows, rank, batch, temps_s, seeds_s):
         """``sampled``: draft position ``i``'s Gumbel log terms (``gumbel_log``; the
         noise is its negation) of the lane's (N tile t, row r, request n) into
         ``noise[t, 2 r + n]`` (the tiles this warp computes; temperature 0 / padding:
