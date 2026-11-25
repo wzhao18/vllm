@@ -1692,6 +1692,9 @@ OSMALL_VARIANTS = {
         TWOSHOT_BATCHED={8: "33-64:1", 16: "9-64:1"},
         CONSUMER_CARVEOUT={8: "32:100,64:100", 16: "16:100,32:100,64:100"},
     )),
+    "chunk80": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80,128:80,192-256:96"})),
+    "chunk96": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80,128:96,192-256:96"})),
+    "chunk64": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80"})),
     "xmc2": ((32, 64), dict(X_MULTICAST={16: "17-64:2"})),
     "noxmc": ((32, 64), dict(X_MULTICAST={16: "17-64:1"})),
     "pcarve100": ((32, 64), dict(PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
@@ -1742,13 +1745,17 @@ def _osmall_impl(args, d, res, dog):
     mailbox = op.OprojMailbox(d.group, dev, TP, rank)
     box = TwoShot(d.group, dev, TP, rank, H, cap, parities=2)
     patch_twoshot(box, world, dev)
-    x_buffer = rnd(cap, k)
-    prefix0, blocks = rnd(cap, H), rnd(cap, 8, H)
-    out = torch.empty(cap, H, dtype=torch.bfloat16, device=dev)
+    wcap = max([cap, *rows_all])
+    wcap = -(-wcap // 128) * 128
+    if wcap > cap:  # wide rows: the rows box PreparedOproj takes, emulated owners
+        patch_twoshot(box.rows_box(wcap), world, dev)
+    x_buffer = rnd(wcap, k)
+    prefix0, blocks = rnd(wcap, H), rnd(wcap, 8, H)
+    out = torch.empty(wcap, H, dtype=torch.bfloat16, device=dev)
     width = H // TP
     mb_pat = rnd(TP - world, cap, H, scale=0.05)
-    recv_pat = rnd(TP - world, cap, width, scale=0.05)
-    gather_pat = rnd(cap, H - width * world, scale=0.05)
+    recv_pat = rnd(TP - world, wcap, width, scale=0.05)
+    gather_pat = rnd(wcap, H - width * world, scale=0.05)
     names = [v for v in (args.variants.split(",") if args.variants else OSMALL_VARIANTS)]
     for rows in rows_all:
         b = rows
@@ -1766,12 +1773,15 @@ def _osmall_impl(args, d, res, dog):
                                          x_buffer=x_buffer)
                         for dec in decoders
                     ]  # fmt: skip
-                twoshot = b in preps[0].twoshots
+                wide = b in preps[0].wide
+                twoshot = wide or b in preps[0].twoshots
+                tbox = box.rows_box(wcap) if wide else box
 
                 def fill(parity):
                     if twoshot:
-                        box.recv[parity, world:, :b].copy_(recv_pat[:, :b])
-                        box.gather[parity, 0, :b, width * world :].copy_(gather_pat[:b])
+                        tbox.recv[parity, world:, :b].copy_(recv_pat[:, :b])
+                        tbox.gather[parity, 0, :b, width * world :].copy_(
+                            gather_pat[:b])
                     else:
                         mailbox.buffer[parity, world:, :b].copy_(mb_pat[:, :b])
 
@@ -1788,7 +1798,7 @@ def _osmall_impl(args, d, res, dog):
                 us_c, how = time_region(chain, prefill=None, dist=d,
                                         samples=args.samples)  # fmt: skip
                 per = (us_c - us_f) / args.layers
-                form = "two-shot" if twoshot else "one-shot"
+                form = "wide" if wide else "two-shot" if twoshot else "one-shot"
                 res.add(dict(case="oproj-small", rows=rows, variant=name,
                              prod="1" if name == "prod" else "0", spec_us=per,
                              tactic=f"{form} {how} layers {args.layers} "
