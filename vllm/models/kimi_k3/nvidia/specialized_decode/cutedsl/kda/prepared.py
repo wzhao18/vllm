@@ -280,21 +280,19 @@ FP32_FEED_KIND = 8
 # one-wave capacity ends between 672 and 720 CTAs, not the 848 slots) and 2-CTA
 # clusters at q4 B36-44 (14.52-15.04 vs 1.8.3.4's 13.25-14.12: four passes per CTA
 # cost more than 1.8.3.4's second wave).
-# 2026-11-24 (DCP16 SOL, FP32 conv state as served): q8 B4 1.8.3.8.1 (8 lanes, three
-# CTAs per SM, four CTAs per head, checkpoint stores evict-first) in place of
-# DEVICE_SPEC_SCHEDULE's 1.16.2.8.1, whose B4 crossover was tuned with a BF16 state.
-# Same sweep (1 GPU, verify alone, own cold FP32 state + FP32 conv slots, us per
-# layer, two passes): 1.16.2.8.1 6.74 / 6.74, 1.8.3.8.1 6.10 / 6.10 (1.8.3.8 6.09,
-# 1.16.3.8 6.15, 1.8.0.8 6.33, 1.8.2.8 6.36, 1.8.x.4 6.61-6.70); outputs bitwise
-# (8 or 16 lanes per row reduce in the same tree). Measured in the TP16 step, not
-# adopted: q8 B16-17 on 2-CTA clusters (1.8.0.2) won the 1-GPU sweep (11.50 vs
-# LoopStock 13.14) but lost 4.5 us per layer in the step (the core starts PDL-early
-# beside the in-projection and the o-projection producer, so its 192 one-per-SM
-# CTAs do not find free SM pairs; LoopStock's 96 CTAs do).
+# 2026-11-24 (DCP16 SOL, FP32 conv state as served), measured in the TP16 step (same
+# 4-node hold, A B B A, 69 layers), not adopted: both won the 1-GPU verify-alone sweep
+# above and lost in the step, where the core starts PDL-early beside the
+# in-projection and the o-projection producer, so its CTAs compete for SMs those
+# hold. q8 B16-17 on 2-CTA clusters (1.8.0.2): 1 GPU 11.50 vs LoopStock 13.14 us per
+# layer, step +0.32 ms (+4.5 us per layer; 192 one-per-SM CTAs vs LoopStock's 96).
+# q8 B4 at 1.8.3.8.1 instead of DEVICE_SPEC_SCHEDULE's 1.16.2.8.1: 1 GPU 6.10 vs
+# 6.74, step +0.08 ms (as the in-projection -> verify -> o-projection chain that
+# picked 1.16.2.8.1 predicted). Tune these rows on the chain or in the step only.
 FP32_SPLIT_Q: dict = {
     (10, 7): {
         4: {6: "41-42:1.8.3.4"},
-        8: {6: "4:1.8.3.8.1,12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
+        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
     },
 }
 
