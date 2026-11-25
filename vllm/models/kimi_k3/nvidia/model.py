@@ -2666,6 +2666,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # (_aux_copy_keeps_prefix).
         aux_dst: torch.Tensor | None = None
         dense = dense_dwdp.get()
+        # A DCP ShardQ prefill step: the first DSA layer's context rows move
+        # to the peers under the layers before it.
+        from vllm.v1.attention.ops.dcp_shardq.context import (
+            prefetch_first_context_rows,
+        )
+
+        prefetch_first_context_rows()
         breadcrumb.crumb(breadcrumb.OP_FWD_BEGIN, self.start_layer)
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
