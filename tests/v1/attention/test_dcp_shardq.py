@@ -10,6 +10,10 @@ caches.
 """
 
 import dataclasses
+import os
+import sys
+import time
+import traceback
 from functools import partial
 from types import SimpleNamespace
 
@@ -20,6 +24,25 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
 from vllm.utils.import_utils import has_cutedsl
+
+
+def _exit_failed_rank() -> None:
+    """Exit a spawned rank whose body raised, at once and without the
+    collective teardown.
+
+    A check that fails on some ranks only (each rank checks its own result)
+    leaves the others in the step's next NCCL collective, which waits for the
+    failed ranks forever; the failed rank's ``cleanup_dist_env_and_memory()``
+    (``destroy_process_group``) then blocks on those communicators, so the
+    rank never exits and ``mp.spawn`` never sees a failure: the test hangs
+    instead of failing. Exiting here lets ``mp.spawn`` report the failure and
+    terminate the peers. The traceback goes to stderr (the spawn error only
+    names the exit code)."""
+    traceback.print_exc()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
 
 pytestmark = pytest.mark.skipif(
     not (current_platform.is_device_capability_family(100) and has_cutedsl()),
@@ -1040,6 +1063,8 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
                 )
                 assert torch.equal(dcp_topk, tp_topk)
                 assert torch.equal(dcp_out, tp_out)
+        except BaseException:
+            _exit_failed_rank()
         finally:
             cleanup_dist_env_and_memory()
 
@@ -1408,6 +1433,10 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 # The DCP path's kernels, which the runner's dummy runs warm.
                 forward(dcp_metadata)
 
+                # Cache-directory events (DeepGEMM loads) so far belong to the
+                # warmup above, not to the step: the watch thread would report
+                # them at its next poll, up to its interval later.
+                jit_monitor.poll_cache_watches()
                 monitoring[0] = True
                 metadata = builder.build(0, step)
                 index_metadata = index_builder.build(0, index_step)
@@ -1432,6 +1461,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 local_topk = topk_buffer[num_decode_tokens:num_rows].clone()
                 out = forward(metadata).clone()
                 torch.accelerator.synchronize()
+                # The step's own cache-directory events, reported now.
+                jit_monitor.poll_cache_watches()
                 monitoring[0] = False
                 assert not compiled, (name, compiled)
                 # The keys of the DCP path's cross-rank top-k merge, up to the
@@ -1584,6 +1615,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             config.parallel_config._allow_auto_resolve_cp_interleave_size = False
             prefill_attn = _dsa_layer(config, topk_buffer, layer_index=4)
             assert prefill_attn.mla_attn.mla_attn.use_shardq
+        except BaseException:
+            _exit_failed_rank()
         finally:
             cleanup_dist_env_and_memory()
 
@@ -1601,6 +1634,77 @@ def test_dsa_layer_runs_dcp_prefill_as_shardq(cache_dtype, kernel, tmp_path):
         args=(world, str(tmp_path / "dist_init"), cache_dtype, kernel),
         nprocs=world,
     )
+
+
+def _one_rank_fails_worker(rank, world, init_file):
+    """The ShardQ layer test's failure shape: one rank's check fails while
+    the others go on into the step's next collective (an all-gather on the TP
+    group, as the layer test's replicated query)."""
+    from tests.v1.attention.utils import create_vllm_config
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    torch.accelerator.set_device_index(rank)
+    config = create_vllm_config(
+        model_name=LAYER_MODEL, tensor_parallel_size=world, max_model_len=8192
+    )
+    config.parallel_config.decode_context_parallel_size = world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        try:
+            x = torch.full((4, 8), float(rank), device="cuda")
+            # Every rank's communicators are up (as after the layer test's
+            # warmup steps).
+            get_tp_group().all_gather(x, dim=0)
+            torch.accelerator.synchronize()
+            assert rank != world - 1, "this rank's check fails"
+            # The other ranks wait here for the failed rank.
+            get_tp_group().all_gather(x, dim=0)
+            torch.accelerator.synchronize()
+        except BaseException:
+            _exit_failed_rank()
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+def test_a_check_failing_on_one_rank_fails_the_spawn(tmp_path):
+    """A check that fails on one rank only must fail the test, not hang it:
+    test_dsa_layer_runs_dcp_prefill_as_shardq hung (3 of 4 runs) when its
+    JIT check failed on some ranks only (the failed ranks blocked in
+    ``destroy_process_group`` while the others waited in the next
+    all-gather)."""
+    import torch.multiprocessing as mp
+
+    world = 2
+    context = mp.spawn(
+        _one_rank_fails_worker,
+        args=(world, str(tmp_path / "dist_init")),
+        nprocs=world,
+        join=False,
+    )
+    deadline = time.monotonic() + 180
+    try:
+        with pytest.raises(mp.ProcessExitedException, match="exit code 1"):
+            while not context.join(timeout=5):
+                assert time.monotonic() < deadline, "the spawn hung"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
 
 
 def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8"):
@@ -1821,6 +1925,8 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
             torch.accelerator.synchronize()
             monitoring[0] = False
             assert not [c for c in compiled if "_dcp_a2a" in c], compiled
+        except BaseException:
+            _exit_failed_rank()
         finally:
             torch.distributed.all_to_all_single = nccl_a2a
             cleanup_dist_env_and_memory()
@@ -2046,6 +2152,8 @@ def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size)
             )
             assert chunked_peak < claim, (chunked_peak, claim)
             assert single_peak > 2 * claim, (single_peak, claim)
+        except BaseException:
+            _exit_failed_rank()
         finally:
             cleanup_dist_env_and_memory()
 
