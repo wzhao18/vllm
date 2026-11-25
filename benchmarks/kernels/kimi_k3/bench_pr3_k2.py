@@ -50,7 +50,9 @@ def main():
     with set_current_vllm_config(config):
         dev = torch.device("cuda", lr)
         torch.accelerator.set_device_index(dev)
-        init_distributed_environment()
+        init_distributed_environment(
+            world_size=world, rank=rank, distributed_init_method="env://", local_rank=lr
+        )
         initialize_model_parallel(tensor_model_parallel_size=world)
         import torch.distributed as dist
 
