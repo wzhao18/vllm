@@ -462,6 +462,11 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
+    _asm_void([Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
     i32 = T.i32()
     value = llvm.inline_asm(
@@ -601,6 +606,8 @@ def _make_radix_select(
     emit_ids: bool,
     block_size: int,
     table_cache: int = 0,
+    stamps: bool = False,
+    fast: bool = False,
 ) -> Any:
     """Top-``topk`` of the CTA's register keys ``(ord16 << gid_bits) | ~gid``
     (0 = empty) under (score desc, global id asc): writes the ids and/or this
@@ -608,7 +615,13 @@ def _make_radix_select(
     selected ord16 (0x10000 when none). The select and the rescue share it, so
     both emit bit-identical rows for the same candidate set. ``table_cache``:
     the row's first block-table entries are in shared ``tab`` (the caller
-    loaded them before its poll), the rest are read from ``block_table``."""
+    loaded them before its poll), the rest are read from ``block_table``.
+    ``fast``: the passes only find the cut (two histogram buffers and the score
+    range: ``hist`` holds ``2 * num_bins + 2 * num_warps`` words), one selection
+    loop after them; else one selection loop per pass (``num_bins`` words). Same
+    selected set and order. The folded select uses it; the non-folded select
+    (rows > SMs) and the rescue kernel keep the per-pass loop, whose smaller
+    footprint is faster in-step at 256 rows (16-rank A/B L1-r9e23e)."""
     emit_rows = block_size > 0
     # One selected-key bit per register key, in 64-bit words.
     num_sel_words = -(-keys_per_thread // 64)
@@ -652,78 +665,246 @@ def _make_radix_select(
         dcp_rank: Int32,
         stride_rows: Int32,
         tab: cute.Tensor = None,
+        dbg: Int64 = None,
     ) -> Int32:
-        # scalars: [committed, owned, threshold, take_all]
-        sel_min = Int32(0x10000)
-        # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
-        # written after the passes, in (thread, key) order at block-scan
-        # offsets, so they come out in the same order on every run (warp-order
-        # atomics would vary it, and with it the downstream sparse attention's
-        # summation order).
-        sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
-        for w in cutlass.range_constexpr(num_sel_words):
-            sel_bits[w] = Uint64(0)
-        if tid == Int32(0):
-            scalars[0] = Int32(0)
-            scalars[1] = Int32(0)
-            scalars[3] = Int32(0)
-            prefix_ptr.store(Uint64(0))
-        cute.arch.sync_threads()
-
-        for p in cutlass.range_constexpr(num_passes):
-            shift, pbits = passes[p]
-            if scalars[3] == Int32(0):
-                prefix = prefix_ptr.load()
-                hist[tid] = Int32(0)
-                cute.arch.sync_threads()
+        if cutlass.const_expr(fast):
+            # scalars: [committed, owned, final pass, done]
+            sel_min = Int32(0x10000)
+            # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
+            # written after the passes, in (thread, key) order at block-scan
+            # offsets, so they come out in the same order on every run (warp-order
+            # atomics would vary it, and with it the downstream sparse attention's
+            # summation order).
+            sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+            for w in cutlass.range_constexpr(num_sel_words):
+                sel_bits[w] = Uint64(0)
+            if tid == Int32(0):
+                scalars[0] = Int32(0)
+                scalars[1] = Int32(0)
+                scalars[2] = Int32(0)
+                scalars[3] = Int32(0)
+                prefix_ptr.store(Uint64(0))
+            hist[tid] = Int32(0)
+            hist[Int32(num_bins) + tid] = Int32(0)
+            # The candidates' score range (empty keys excluded): a row's top
+            # candidates usually span < num_bins ord16 values, and one pass over
+            # ord16 - lo then resolves the score (instead of the 9 + 7 bit pair).
+            lo = Int32(0xFFFF)
+            hi = Int32(0)
+            for i in cutlass.range_constexpr(keys_per_thread):
+                key = keys[i]
+                if key != Uint64(0):
+                    score = Int32(key >> Uint64(gid_bits))
+                    lo = cutlass.min(lo, score)
+                    hi = cutlass.max(hi, score)
+            lo = cute.arch.warp_redux_sync(lo, "min")
+            hi = cute.arch.warp_redux_sync(hi, "max")
+            if lane == Int32(0):
+                hist[Int32(2 * num_bins) + warp] = lo
+                hist[Int32(2 * num_bins + num_warps) + warp] = hi
+            cute.arch.sync_threads()
+            for w in cutlass.range_constexpr(num_warps):
+                lo = cutlass.min(lo, hist[Int32(2 * num_bins + w)])
+                hi = cutlass.max(hi, hist[Int32(2 * num_bins + num_warps + w)])
+            narrow = hi - lo < Int32(num_bins)
+            if narrow:
+                # Score pass on ord16 - lo (buffer 1; buffer 0 stays zero for the
+                # first gid pass); its cut is a 16-bit score = passes[1]'s level.
                 for i in cutlass.range_constexpr(keys_per_thread):
                     key = keys[i]
-                    if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
-                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                    if key != Uint64(0):
+                        b = Int32(key >> Uint64(gid_bits)) - lo
                         cute.arch.atomic_add(
-                            hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
+                            hist.iterator + (b + Int32(num_bins)),
+                            Int32(1),
+                            sem="relaxed",
+                            scope="cta",
                         )
                 cute.arch.sync_threads()
-
-                # Bins high to low: tid t scans bin num_bins - 1 - t.
-                need = Int32(topk) - scalars[0]
-                count = hist[Int32(num_bins - 1) - tid]
+                need = Int32(topk)
+                count = hist[Int32(2 * num_bins - 1) - tid]
                 incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
-                # The committed count grows by the keys selected below: the
-                # bins above the threshold (and the threshold bin when done).
-                # Every thread read scalars[0] before the scan's barriers.
                 if count > Int32(0) and incl >= need and incl - count < need:
-                    scalars[2] = Int32(num_bins - 1) - tid
+                    prefix_ptr.store(Uint64(lo + Int32(num_bins - 1) - tid))
                     if incl == need:
+                        scalars[2] = Int32(1)
+                        scalars[3] = Int32(1)
+                        scalars[0] = incl
+                    else:
+                        scalars[0] = incl - count
+                if tid == Int32(tb_size - 1) and incl < need:
+                    # Fewer candidates than needed: keep them all.
+                    prefix_ptr.store(Uint64(0))
+                    scalars[2] = Int32(1)
+                    scalars[3] = Int32(1)
+                    scalars[0] = incl
+                cute.arch.sync_threads()
+
+            # The passes only find the K-th key's digits: pass p histograms the
+            # keys under the current prefix into hist buffer p % 2 (the other
+            # buffer is zeroed meanwhile: its last reader, pass p - 1's scan, is
+            # behind a barrier), and the thread whose bin holds the K-th key
+            # appends its digit to the prefix. The selected keys are then the
+            # non-empty keys >= the final prefix at the final pass's shift (a key
+            # is either above the cut at the first digit where it leaves the
+            # prefix, or below it, or equal on every digit up to the take-all /
+            # exact cut): the same set as selecting bins above the threshold pass
+            # by pass, with one selection loop instead of one per pass.
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                cur = (p % 2) * num_bins
+                nxt = ((p + 1) % 2) * num_bins
+                if scalars[3] == Int32(0) and (p >= 2 or not narrow):
+                    prefix = prefix_ptr.load()
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            cute.arch.atomic_add(
+                                hist.iterator + (b + Int32(cur)),
+                                Int32(1),
+                                sem="relaxed",
+                                scope="cta",
+                            )
+                    if cutlass.const_expr(p + 1 < num_passes):
+                        hist[Int32(nxt) + tid] = Int32(0)
+                    cute.arch.sync_threads()
+
+                    # Bins high to low: tid t scans bin num_bins - 1 - t.
+                    need = Int32(topk) - scalars[0]
+                    count = hist[Int32(cur + num_bins - 1) - tid]
+                    incl = _block_scan_inclusive(
+                        count, lane, warp, warp_totals, num_warps
+                    )
+                    # Every thread read scalars[0] before the scan's barriers.
+                    if count > Int32(0) and incl >= need and incl - count < need:
+                        prefix_ptr.store(
+                            (prefix << Uint64(pbits))
+                            | Uint64(Int32(num_bins - 1) - tid)
+                        )
+                        if incl == need:
+                            scalars[2] = Int32(p)
+                            scalars[3] = Int32(1)
+                            scalars[0] = scalars[0] + incl
+                        else:
+                            scalars[0] = scalars[0] + incl - count
+                    if tid == Int32(tb_size - 1) and incl < need:
+                        # Fewer matching candidates than needed: keep them all.
+                        prefix_ptr.store(prefix << Uint64(pbits))
+                        scalars[2] = Int32(p)
                         scalars[3] = Int32(1)
                         scalars[0] = scalars[0] + incl
-                    else:
-                        scalars[0] = scalars[0] + incl - count
-                if tid == Int32(tb_size - 1) and incl < need:
-                    # Fewer matching candidates than needed: keep them all.
-                    scalars[2] = Int32(0)
-                    scalars[3] = Int32(1)
-                    scalars[0] = scalars[0] + incl
-                cute.arch.sync_threads()
+                    cute.arch.sync_threads()
+                    if cutlass.const_expr(stamps):  # noqa: SIM102
+                        if tid == Int32(0):
+                            _st_i64(
+                                dbg + Int64(row) * Int64(64) + Int64(48), Int64(p + 1)
+                            )
 
-                thr = scalars[2]
-                done = scalars[3] != Int32(0)
-                for i in cutlass.range_constexpr(keys_per_thread):
-                    key = keys[i]
-                    selected = False
-                    if key != Uint64(0) and (key >> Uint64(shift + pbits)) == prefix:
-                        b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
-                        selected = b > thr or (done and b == thr)
-                    if selected:
-                        score = Int32(key >> Uint64(gid_bits))
-                        if score < sel_min:
-                            sel_min = score
-                        sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
-                cute.arch.sync_threads()
-                if tid == Int32(0) and not done:
-                    prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
-                cute.arch.sync_threads()
+            cut = prefix_ptr.load()
+            last = scalars[2]
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                if last == Int32(p):
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if key != Uint64(0) and (key >> Uint64(shift)) >= cut:
+                            score = Int32(key >> Uint64(gid_bits))
+                            if score < sel_min:
+                                sel_min = score
+                            sel_bits[i // 64] = sel_bits[i // 64] | Uint64(
+                                1 << (i % 64)
+                            )
+        else:
+            # The per-pass select (kept where the folded select does not run:
+            # rows > SMs, the rescue kernel; see ``fast``).
+            # scalars: [committed, owned, threshold, take_all]
+            sel_min = Int32(0x10000)
+            # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
+            # written after the passes, in (thread, key) order at block-scan
+            # offsets, so they come out in the same order on every run (warp-order
+            # atomics would vary it, and with it the downstream sparse attention's
+            # summation order).
+            sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+            for w in cutlass.range_constexpr(num_sel_words):
+                sel_bits[w] = Uint64(0)
+            if tid == Int32(0):
+                scalars[0] = Int32(0)
+                scalars[1] = Int32(0)
+                scalars[3] = Int32(0)
+                prefix_ptr.store(Uint64(0))
+            cute.arch.sync_threads()
 
+            for p in cutlass.range_constexpr(num_passes):
+                shift, pbits = passes[p]
+                if scalars[3] == Int32(0):
+                    prefix = prefix_ptr.load()
+                    hist[tid] = Int32(0)
+                    cute.arch.sync_threads()
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            cute.arch.atomic_add(
+                                hist.iterator + b, Int32(1), sem="relaxed", scope="cta"
+                            )
+                    cute.arch.sync_threads()
+
+                    # Bins high to low: tid t scans bin num_bins - 1 - t.
+                    need = Int32(topk) - scalars[0]
+                    count = hist[Int32(num_bins - 1) - tid]
+                    incl = _block_scan_inclusive(
+                        count, lane, warp, warp_totals, num_warps
+                    )
+                    # The committed count grows by the keys selected below: the
+                    # bins above the threshold (and the threshold bin when done).
+                    # Every thread read scalars[0] before the scan's barriers.
+                    if count > Int32(0) and incl >= need and incl - count < need:
+                        scalars[2] = Int32(num_bins - 1) - tid
+                        if incl == need:
+                            scalars[3] = Int32(1)
+                            scalars[0] = scalars[0] + incl
+                        else:
+                            scalars[0] = scalars[0] + incl - count
+                    if tid == Int32(tb_size - 1) and incl < need:
+                        # Fewer matching candidates than needed: keep them all.
+                        scalars[2] = Int32(0)
+                        scalars[3] = Int32(1)
+                        scalars[0] = scalars[0] + incl
+                    cute.arch.sync_threads()
+
+                    thr = scalars[2]
+                    done = scalars[3] != Int32(0)
+                    for i in cutlass.range_constexpr(keys_per_thread):
+                        key = keys[i]
+                        selected = False
+                        if (
+                            key != Uint64(0)
+                            and (key >> Uint64(shift + pbits)) == prefix
+                        ):
+                            b = Int32((key >> Uint64(shift)) & Uint64((1 << pbits) - 1))
+                            selected = b > thr or (done and b == thr)
+                        if selected:
+                            score = Int32(key >> Uint64(gid_bits))
+                            if score < sel_min:
+                                sel_min = score
+                            sel_bits[i // 64] = sel_bits[i // 64] | Uint64(
+                                1 << (i % 64)
+                            )
+                    cute.arch.sync_threads()
+                    if tid == Int32(0) and not done:
+                        prefix_ptr.store((prefix << Uint64(pbits)) | Uint64(thr))
+                    cute.arch.sync_threads()
+
+        if cutlass.const_expr(stamps):  # noqa: SIM102
+            if tid == Int32(0):
+                _st_i64(dbg + Int64(row) * Int64(64) + Int64(32), _globaltimer())
         if cutlass.const_expr(emit_ids):
             count = Int32(0)
             for w in cutlass.range_constexpr(num_sel_words):
@@ -862,9 +1043,15 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         # (fold) dependents launch at this grid's completion: a consumer that
         # reads the rows before its PDL wait (FlashInfer's trtllm-gen counts).
         hold: bool = False
+        # Debug: per-CTA %globaltimer phase stamps to ``dbg`` (int64 [T, 8]).
+        stamps: bool = False
+        # Cut-only radix passes (``_make_radix_select``); dispatch: = fold.
+        fast: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
+        stamps = compile_key.stamps
+        fast = compile_key.fast
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
         exact = compile_key.exact
@@ -882,6 +1069,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
+        # The cut-only radix keeps two histograms + the score range.
+        hist_words = 2 * num_bins + 2 * num_warps if fast else num_bins
         topk = compile_key.topk
         local_topk = compile_key.local_topk
         world_size = compile_key.world_size
@@ -904,6 +1093,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             emit_ids=emit_ids,
             block_size=block_size,
             table_cache=table_cache,
+            stamps=stamps,
+            fast=fast,
         )
         num_r1 = world_size * local_topk
         rescue_keys = num_r1 + num_slots * topk
@@ -915,6 +1106,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             emit_ids=emit_ids,
             block_size=block_size,
             table_cache=table_cache,
+            fast=fast,
         )
 
         @cute.jit
@@ -1045,7 +1237,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
 
         @cute.struct
         class SharedStorage:
-            hist: cute.struct.MemRange[Int32, num_bins]
+            hist: cute.struct.MemRange[Int32, hist_words]
             warp_totals: cute.struct.MemRange[Int32, num_warps]
             scalars: cute.struct.MemRange[Int32, 8]
             notsat: cute.struct.MemRange[Int32, 16]
@@ -1284,14 +1476,19 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
         ):
             row, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
             lane = cute.arch.lane_idx()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            dbg_row = dbg + Int64(row) * Int64(64)
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row, _globaltimer())
             smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage, 16)
-            hist = storage.hist.get_tensor(cute.make_layout((num_bins,)))
+            hist = storage.hist.get_tensor(cute.make_layout((hist_words,)))
             warp_totals = storage.warp_totals.get_tensor(cute.make_layout((num_warps,)))
             scalars = storage.scalars.get_tensor(cute.make_layout((8,)))
             notsat = storage.notsat.get_tensor(cute.make_layout((16,)))
@@ -1313,7 +1510,13 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 ordinal = ordinals[row]
                 poll_row(stage, box, ordinal, row, max_rows, tid)
                 cute.arch.sync_threads()
+                if cutlass.const_expr(stamps):  # noqa: SIM102
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(8), _globaltimer())
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(stamps):  # noqa: SIM102
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(16), _globaltimer())
                 if cutlass.const_expr(early or (fold and not hold)):
                     # The rescue (PDL, ``early``) becomes resident now and waits
                     # for this grid; folded (no rescue), the consumer when it
@@ -1369,6 +1572,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             if cutlass.const_expr(exact):  # noqa: SIM102
                 if tid < Int32(16):
                     notsat[tid] = Int32(0)
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(24), _globaltimer())
 
             sel_min = radix_select(
                 keys,
@@ -1388,7 +1595,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 dcp_rank,
                 stride_rows,
                 tab,
+                dbg,
             )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(40), _globaltimer())
 
             if cutlass.const_expr(exact):
                 # tau16: the K-th selected key's ord16 (0 below K selected).
@@ -1516,6 +1728,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         max_rows,
                         tab,
                     )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(56), _globaltimer())
 
         @cute.jit
         def host_entrypoint(
@@ -1536,6 +1752,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             max_rows: Int32,
             box: Int64,
             ordinals: cute.Tensor,
+            dbg: Int64,
             stream,
         ):
             # Unused outputs / exact-only and mailbox inputs are placeholders.
@@ -1557,6 +1774,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 max_rows,
                 box,
                 ordinals,
+                dbg,
             ).launch(
                 grid=(gathered.shape[1], 1, 1),
                 block=(tb_size, 1, 1),
@@ -1579,6 +1797,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         early: bool = False,
         fold: bool = False,
         hold: bool = False,
+        stamps: bool = False,
+        fast: bool | None = None,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -1591,6 +1811,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             early=early and exact,
             fold=fold,
             hold=hold,
+            stamps=stamps,
+            fast=fold if fast is None else fast,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1606,6 +1828,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             ),
             Int64(0),
             make_fake_tensor(Int32, (cute.sym_int(),)),
+            Int64(0),
         )
 
     @kernel_launcher
@@ -1622,6 +1845,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         early: bool = False,
         fold: bool = False,
         hold: bool = False,
+        stamps: torch.Tensor | None = None,
+        fast: bool | None = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1634,6 +1859,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             early=early,
             fold=fold,
             hold=hold,
+            stamps=stamps is not None,
+            fast=fast,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
@@ -1643,6 +1870,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             *_select_args(gathered, out, rows, 0 if exact is None else exact.rank),
             *_exact_args(exact, gathered.device),
             *mailbox_args,
+            0 if stamps is None else stamps.data_ptr(),
         )
 
 
