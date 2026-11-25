@@ -77,7 +77,7 @@ from ..mla.query import Q_SENT, TILED_FROM
 QUERY_OVERLAP = {
     "tp": "1-20:late_front,21-320:fork",
     "dcp": "1-320:front",
-    "dcp_rubin": "1-16:front,17-320:fork",
+    "dcp_rubin": "1-64:front,65-320:fork",
 }
 # TP without the fused indexer (the late modes follow its select): the TP table the
 # stack ran before them.
