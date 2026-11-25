@@ -155,6 +155,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream, is_meta_module
 
@@ -1107,10 +1108,14 @@ class KimiMoE(nn.Module):
             and not self.shared_experts.shard_sequence_parallel
         )
         if self._shared_overlap:
-            if prefill_full_grid_shared_overlap(vllm_config):
+            # Fixed per layer: full grid on every bucket (P/D prefill) or the cap on
+            # every bucket (decode, unified serving); no per-forward bucket query.
+            self._shared_full_grid = prefill_full_grid_shared_overlap(vllm_config)
+            if self._shared_full_grid:
                 self.experts.full_grid_beside_shared_expert()
             else:
                 self.experts.reserve_sms_for_shared_expert()
+            self._shared_kernels_checked = False
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
             # Full-grid buckets: the routing chain runs on a high-priority stream
@@ -1306,19 +1311,20 @@ class KimiMoE(nn.Module):
         Raises if the shared expert would run a persistent or collective kernel
         (GEMM-RS/AR, the fused SiTU GEMM) beside the persistent MegaMoE grid, or if
         an eager break split a breakable capture segment between fork and join."""
-        shared = self.shared_experts
-        if shared.gemm_rs_ar is not None or shared._prefill_situ is not None:
-            raise RuntimeError(
-                "KimiMoE shared-expert overlap: the shared expert runs a persistent "
-                "kernel (GEMM-RS/AR or fused SiTU) that may not share SMs with the "
-                "persistent MegaMoE grid."
-            )
-        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
+        if not self._shared_kernels_checked:
+            # Checked at the first forward: load-time installs (fused SiTU) are done.
+            shared = self.shared_experts
+            if shared.gemm_rs_ar is not None or shared._prefill_situ is not None:
+                raise RuntimeError(
+                    "KimiMoE shared-expert overlap: the shared expert runs a "
+                    "persistent kernel (GEMM-RS/AR or fused SiTU) that may not share "
+                    "SMs with the persistent MegaMoE grid."
+                )
+            self._shared_kernels_checked = True
         capture = BreakableCUDAGraphCapture.current()
         breaks = None if capture is None else capture.num_eager_breaks
         start, done = self._shared_events
-        if self.experts.shared_overlap(hidden_states.shape[0]):
+        if not self._shared_full_grid:
             routed_hidden_states, router_output, topk_ids = (
                 self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
             )
