@@ -239,6 +239,41 @@ class IndexerScoreFp4:
         src = tcgen05.get_s2t_smem_desc_tensor(tiled, thr.partition_S(sc))
         return tiled, src, thr.partition_D(tc)
 
+    @cute.jit
+    def tile_out(self, taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane):
+        """One tile's logits of this thread's key for tokens tok0 .. tok0 + 3:
+        stock's epilogue (see the module docstring); frees the accumulator once
+        every load landed."""
+        Q = self.q
+        pitch = Int64(self.pitch)
+        for pair in cutlass.range_constexpr(2):
+            ta = tmem_ld32(taddr + (tok0 + 2 * pair) * HEADS)
+            tb = tmem_ld32(taddr + (tok0 + 2 * pair + 1) * HEADS)
+            vals = tmem_wait_n(*ta, *tb)
+            if cutlass.const_expr(pair == 1):
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    cute.arch.mbarrier_arrive(acc_empty)
+            for half in cutlass.range_constexpr(2):
+                tok = tok0 + 2 * pair + half
+                f = vals[32 * half : 32 * half + 32]
+                s0 = Uint32(0)
+                s1 = Uint32(0)
+                wrow = w_a + (qs * N + tok * HEADS) * 2
+                for h in cutlass.range_constexpr(0, HEADS, 8):
+                    w = load_words(wrow + h * 2, count=4, shared=True)
+                    s0 = fma_bf16x2(relu_bf16x2(f[h], f[h + 1]), w[0], s0)
+                    s1 = fma_bf16x2(relu_bf16x2(f[h + 2], f[h + 3]), w[1], s1)
+                    s0 = fma_bf16x2(relu_bf16x2(f[h + 4], f[h + 5]), w[2], s0)
+                    s1 = fma_bf16x2(relu_bf16x2(f[h + 6], f[h + 7]), w[3], s1)
+                pair_sum = add_bf16x2(s0, s1)
+                total = add_bf16x2(pair_sum, pair_sum >> Uint32(16))
+                if tok < Q:
+                    if key < sEnd[tok, qs]:
+                        element = row0 + Int64(tok) * pitch + Int64(key)
+                        store_b16(out_base + element * 2, total)
+
     @cute.kernel
     def kernel(
         self,
@@ -559,33 +594,9 @@ class IndexerScoreFp4:
                 for t in cutlass.range(ntile, unroll=1):
                     key = k0 + t * TILE + lt
                     cute.arch.mbarrier_wait(acc_full, it & 1)
-                    for pair in cutlass.range_constexpr(2):
-                        ta = tmem_ld32(taddr + (tok0 + 2 * pair) * HEADS)
-                        tb = tmem_ld32(taddr + (tok0 + 2 * pair + 1) * HEADS)
-                        vals = tmem_wait_n(*ta, *tb)
-                        if cutlass.const_expr(pair == 1):
-                            cute.arch.fence_view_async_tmem_load()
-                            cute.arch.sync_warp()
-                            if lane == 0:
-                                cute.arch.mbarrier_arrive(acc_empty)
-                        for half in cutlass.range_constexpr(2):
-                            tok = tok0 + 2 * pair + half
-                            f = vals[32 * half : 32 * half + 32]
-                            s0 = Uint32(0)
-                            s1 = Uint32(0)
-                            wrow = w_a + (qs * N + tok * HEADS) * 2
-                            for h in cutlass.range_constexpr(0, HEADS, 8):
-                                w = load_words(wrow + h * 2, count=4, shared=True)
-                                s0 = fma_bf16x2(relu_bf16x2(f[h], f[h + 1]), w[0], s0)
-                                s1 = fma_bf16x2(relu_bf16x2(f[h + 2], f[h + 3]), w[1], s1)
-                                s0 = fma_bf16x2(relu_bf16x2(f[h + 4], f[h + 5]), w[2], s0)
-                                s1 = fma_bf16x2(relu_bf16x2(f[h + 6], f[h + 7]), w[3], s1)
-                            pair_sum = add_bf16x2(s0, s1)
-                            total = add_bf16x2(pair_sum, pair_sum >> Uint32(16))
-                            if tok < Q:
-                                if key < sEnd[tok, qs]:
-                                    element = row0 + Int64(tok) * pitch + Int64(key)
-                                    store_b16(out_base + element * 2, total)
+                    self.tile_out(
+                        taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane
+                    )
                     it += 1
                 cute.arch.sync_warp()
                 if lane == 0:
