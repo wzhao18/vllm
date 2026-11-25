@@ -204,7 +204,7 @@ RUBIN_SHARED_OVERLAP_MAX_SMS = 148
 # 512 rows 77.72 -> 78.09, 1024 rows 125.10 -> 126.37 (all worse on the full grid);
 # 2048 rows 225.26 -> 218.22, 4096 rows 405.43 -> 385.37 (better). The crossover lies
 # between 1024 and 2048 rows; the small bucket ends at 1024.
-RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS = 1024
+RUBIN_PREFILL_SHARED_OVERLAP_MAX_TOKENS = 512
 
 
 # additional_config["megamoe_quant"] -> quant kind (FlashInfer's kind names).
