@@ -1672,7 +1672,7 @@ class PreparedKdaHead:
 
     def __init__(
         self, weight, core, batches, side, counter, fa_out, tile=HEAD_TILE, polled=(),
-        verify=(),
+        verify=(), x_poll=(),
     ):  # fmt: skip
         self.weight, self.core, self.side = weight, core, side
         self.counter, self.fa_out, self.batches = counter, fa_out, tuple(batches)
@@ -1692,6 +1692,9 @@ class PreparedKdaHead:
         # rows: the polled variant follows ``polled``
         self.verify = tuple(v for v in verify if tile is not None)
         self.verify_kernels: dict = {}
+        # KdaHeadVerify rows whose x comes from an ``x_ready`` AttnRes: x polled on its
+        # counter instead of the PDL wait (``KdaHeadVerify.x_poll``)
+        self.x_poll = tuple(x_poll)
 
     def runs(self, batch, q):
         """Whether steps of ``batch`` rows at verify length ``q`` run this head (the
@@ -1740,6 +1743,7 @@ class PreparedKdaHead:
                     self.verify_kernels[b, q] = compile_head_verify(
                         self.core.heads, bf16_state, self.core.has_bias, specs, arch,
                         self.tile, self.weight.shape[1], b in self.polled,
+                        b in self.x_poll,
                     )  # fmt: skip
                 else:  # several requests: KdaHeadMulti
                     self.verify_kernels[b, q] = compile_head_multi(
@@ -1748,7 +1752,7 @@ class PreparedKdaHead:
                     )  # fmt: skip
         return self
 
-    def run_verify(self, x, out, *, caches, slots, accepted, rearm=None):
+    def run_verify(self, x, out, *, caches, slots, accepted, rearm=None, x_ready=None):
         """``KdaHeadVerify`` of one request x q verify rows (``slots`` [1, q], vLLM's
         spec slots; ``accepted`` [1]), or ``KdaHeadMulti`` of b // q requests;
         ``rearm`` as ``run`` (the kernel is the polled variant when the batch is in
@@ -1775,11 +1779,18 @@ class PreparedKdaHead:
             raise ValueError("KdaHeadVerify: a polled batch needs the buffer to re-arm")
         address = rearm.data_ptr() if rearm is not None else 0
         target = self.fa_tiles * -(-b // fa_tactic[1])  # SignalGemm's tile owners
+        if (x_ready is None) != (b not in self.x_poll or b != q):
+            raise ValueError("KdaHeadVerify: an x_poll batch needs the x counter")
+        # KdaHeadVerify (b == q): the AttnRes's x counter and its 7 x b CTA adds
+        polled_x: tuple = ()
+        if b == q:
+            ready = 0 if x_ready is None else x_ready.data_ptr()
+            polled_x = (cutlass.Int64(ready), Int32(7 * b if ready else 0))
         self.verify_kernels[b, q](
             matrix_view(self.weight), matrix_view(x),
             cutlass.Int64(self.map.data_ptr()),
             *views, *self.core.scalars, counter, Int32(target),
-            cutlass.Int64(address), stream(self.device),
+            cutlass.Int64(address), *polled_x, stream(self.device),
         )  # fmt: skip
         return out
 
