@@ -1679,6 +1679,13 @@ OSMALL_VARIANTS = {
     "xmc2": ((32, 64), dict(X_MULTICAST={16: "17-64:2"})),
     "noxmc": ((32, 64), dict(X_MULTICAST={16: "17-64:1"})),
     "pcarve100": ((32, 64), dict(PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "xmc2-pcarve100": ((32, 64), dict(
+        X_MULTICAST={16: "17-64:2"},
+        PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "noxmc-pcarve100": ((32, 64), dict(
+        X_MULTICAST={16: "17-64:1"},
+        PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "prod2": (None, {}),  # production again (order / drift check)
 }
 
 
