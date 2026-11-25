@@ -127,7 +127,10 @@ class ScaleStaging:
         self.pending: int | None = None
         self.stream = None
         if slots[0].is_cuda:
-            self.stream = torch.cuda.Stream(slots[0].device)
+            # High priority: the ~30 us expansion must get SMs at the next wave boundary
+            # of the main stream's kernels instead of queueing behind them (measured on the
+            # TP8+DCP8 prefill critical path: 92 x ~30 us serialized before MegaMoE).
+            self.stream = torch.cuda.Stream(slots[0].device, priority=-1)
             self.go, self.done = torch.cuda.Event(), torch.cuda.Event()
 
     def _expand(self, o: int) -> None:
