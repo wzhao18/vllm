@@ -312,9 +312,23 @@ def narrow_local_offsets(wide, narrow) -> tuple[int, int]:
     ):
         raise RuntimeError("narrow kernel: local workspace state layouts differ.")
     offsets = (max(tail_n - tail_w, 0), max(tail_w - tail_n, 0))
-    if any(o % 128 for o in offsets):
-        raise RuntimeError(f"narrow kernel: local offsets {offsets} not 128-aligned.")
+    need = max(
+        ws.byte_alignment(r.name)
+        for ws in (ww, wn)
+        for r in ws.regions("local")
+    )
+    if narrow_local_align(offsets) < need:
+        raise RuntimeError(
+            f"narrow kernel: local offsets {offsets} break the {need}-byte region alignment."
+        )
     return offsets
+
+
+def narrow_local_align(offsets: tuple[int, int]) -> int:
+    """Alignment (bytes, <= 128) the narrow kernel's local base keeps when the main
+    kernel's base is 128-aligned."""
+    diff = abs(offsets[0] - offsets[1])
+    return 128 if diff % 128 == 0 else diff & -diff
 
 
 def _workspace_layout(kernel) -> tuple:
@@ -454,13 +468,16 @@ class RubinMegaMoeSession:
         self.topk_idx = torch.full(
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device=self.device
         )
+        # The main kernel's view (128-byte aligned); a narrow kernel launches on its
+        # own view of the same buffer (same persistent state, narrow_local_offsets).
+        off_w, off_n = self._local_offsets
+        lead = min(off_w, off_n)
         self._local_buffer = torch.zeros(
-            (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
+            (max(self.local_bytes - lead, 1) + 128,), dtype=torch.uint8, device=self.device
         )
-        # The main kernel's view; a narrow kernel launches on its own view of the
-        # same buffer (same persistent state, narrow_local_offsets).
-        self.local_workspace = self._local_buffer[self._local_offsets[0] :]
-        self._narrow_local = self._local_buffer[self._local_offsets[1] :]
+        pad = (-(self._local_buffer.data_ptr() + off_w - lead)) % 128
+        self.local_workspace = self._local_buffer[pad + off_w - lead :]
+        self._narrow_local = self._local_buffer[pad + off_n - lead :]
         self._write_spin_record_address()
         self._write_ep_balance_address()
         # Per-launch scratch of the refreshed inference kernel (src_gp; any content
@@ -494,7 +511,7 @@ class RubinMegaMoeSession:
         if (
             self.topk_idx.data_ptr() % 16
             or self.local_workspace.data_ptr() % 128
-            or self._narrow_local.data_ptr() % 128
+            or self._narrow_local.data_ptr() % narrow_local_align(self._local_offsets)
             or self.shared_workspace.data_ptr() % ALIGN
         ):
             raise RuntimeError("Rubin MegaMoE workspace alignment violated.")
@@ -676,7 +693,9 @@ class RubinMegaMoeSession:
     def _narrow_local_ptr(self):
         ptr = getattr(self, "_narrow_local_cute", None)
         if ptr is None:
-            ptr = self._narrow_local_cute = _to_cute_ptr(self._narrow_local)
+            ptr = self._narrow_local_cute = _to_cute_ptr(
+                self._narrow_local, narrow_local_align(self._local_offsets)
+            )
         return ptr
 
     def _shared_kwargs(self, shared: "FusedSharedArgs") -> dict:
