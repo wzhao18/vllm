@@ -676,4 +676,11 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
 # ~0.06. 16-rank KDA layer proxy (tail -> AttnRes -> head -> polled o-proj -> MoE front
 # -> experts, 24 layers, arms alternated in one process, 5 processes x 8 rounds): -0.10
 # .. -0.21 us/layer; 17 early tiles lose (+0.27 at 4 ranks). Outputs bitwise.
-VERIFY_STAGES, VERIFY_TMEM_TILES, VERIFY_EARLY_LOADS = 10, 15, 21
+# 2026-11-25 (KDA lane): 11 tensor-memory tiles instead of 15, the same 21 A tiles before
+# the wait (the AttnRes sees the same pre-wait stream). 1-GPU KDA chain (chain_kda.py:
+# carve-out-100 AttnRes stand-in 56 CTAs 3 us -> the polled head -> o-proj stand-in, 69
+# layers, FP32 state + conv, arms round-robin x 8, us per layer), B1 x q8: 15 -> 12.70,
+# 13 -0.15, 12 -0.16 / -0.18, 11 -0.20, 9 (19 early) -0.20, 6 (16 early) -0.08; early
+# 25 -0.05, 17 -0.02 at 15 (the pre-wait count is not the post-wait term). Same MMAs in
+# the same order: outputs and caches bitwise.
+VERIFY_STAGES, VERIFY_TMEM_TILES, VERIFY_EARLY_LOADS = 10, 11, 21

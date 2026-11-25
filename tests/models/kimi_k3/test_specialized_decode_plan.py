@@ -551,8 +551,8 @@ def row_bin(rows):
 def test_dsa_in_projection_takes_the_tensor_memory_tactics():
     """Rubin TP16: the DSA in-projection (3040 rows, 24 M tiles) stages its weights in
     tensor memory at up to 16 rows (split 4) and 33-64 rows (split 6), and keeps split-K
-    at 17-32 rows, above 64 (F5) and on GB300; the KDA and MLA rows keep their
-    tactics."""
+    at 17-32 rows, above 64 (F5) and on GB300; the MLA rows keep their tactics, the KDA
+    rows theirs except q8 17-32 rows (KDA_SPLITK_Q)."""
     dsa = projection_policies(16, PITCH, DL7_TUNED, sms=212, q=8)
     assert dsa == {m: DSA[row_bin(m)] for m in DL7_TUNED}
     assert dsa[24] == dsa[32] == SPLIT_K[32]
@@ -561,7 +561,16 @@ def test_dsa_in_projection_takes_the_tensor_memory_tactics():
     assert mla == {m: MLA[row_bin(m)] + polled.get(m, ()) for m in DL7_TUNED}
     kda = projection_policies(16, 3216, DL7_TUNED, sms=212, q=8)
     wide_kda = (128, 64, 6, 14, 14)
-    assert kda == {m: (64, 8, 2, 12) if m <= 8 else wide_kda for m in DL7_TUNED}
+    # q8 B3-B7: split-K with one N tile of the rows, the verify core resident beside
+    # it (KDA_SPLITK_Q); B8 keeps the fold's WIDE_B64 policy
+    splitk_kda = {24: (64, 32, 2, 8), 32: (64, 32, 2, 8), 40: (64, 40, 2, 8)}
+    splitk_kda.update({48: (64, 48, 2, 7), 56: (64, 56, 2, 7)})
+    assert kda == {
+        m: (64, 8, 2, 12) if m <= 8 else splitk_kda.get(m, wide_kda) for m in DL7_TUNED
+    }
+    # other q keep WIDE_B64 at those rows (KDA_SPLITK_Q is keyed by q)
+    kda_q4 = projection_policies(16, 3216, (24, 32), sms=212, q=4)
+    assert kda_q4 == dict.fromkeys((24, 32), wide_kda)
     wide = projection_policies(16, PITCH, (72, 96, 128), sms=212, q=8)
     assert wide == dict.fromkeys((72, 96, 128), (64, 64, 2, 6))
     gb300 = projection_policies(16, PITCH, DL7_TUNED, sms=152, q=8)
@@ -808,7 +817,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyFeed: "feed",
-        prepared.KdaVerifyHalfStock: "halfstock",
+        prepared.KdaVerifyHalfPair: "halfstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -852,7 +861,7 @@ FP32_Q4_RUNS = [
     (16, 35, "loopstock"), (36, 42, "kdasplit"), (43, 1024, "feed"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 15, "kdasplit"), (16, 17, "halfstock"), (18, 22, "kdasplit"),
+    (1, 10, "kdasplit"), (11, 17, "halfstock"), (18, 22, "kdasplit"),
     (23, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
@@ -897,7 +906,9 @@ def test_kda_fp32_policy_picks_the_measured_best():
     wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
     picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
     picks.update({(4, 41): "kdasplit", (4, 42): "kdasplit", (4, 43): "feed"})
-    picks.update({(4, 48): "feed", (8, 12): "kdasplit", (8, 15): "kdasplit"})
+    # q8 B11-15: HalfPair (DSMEM halves) ahead of FP32_SPLIT_Q since 2026-11-25
+    picks.update({(4, 48): "feed", (8, 12): "halfstock", (8, 15): "halfstock"})
+    picks.update({(8, 10): "kdasplit"})
     picks.update({(8, 16): "halfstock", (8, 17): "halfstock", (8, 18): "kdasplit"})
     picks.update({(8, 23): wide, (8, 48): wide})
     for (q, b), name in picks.items():
@@ -932,7 +943,7 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             kernel = kda_kernel(b, q, False)
             stock = (
                 prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
-                prepared.KdaSplitStock, prepared.KdaVerifyHalfStock,
+                prepared.KdaSplitStock, prepared.KdaVerifyHalfPair,
             )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (

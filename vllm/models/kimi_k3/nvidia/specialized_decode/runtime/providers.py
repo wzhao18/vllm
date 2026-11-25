@@ -170,6 +170,23 @@ WIDE_B64 = {
     2880: (128, 64, 7, 16, 14),
     3040: (128, 64, 6, 14, 14),
 }
+# Rubin TP16 KDA (3216) verify rows by q whose in-projection runs the split-K
+# ``SplitKGemm`` tactic given (one N tile of the rows: 102 CTAs) instead of WIDE_B64's
+# tensor-memory kernel (156 CTAs of ~220 KB). Behind the in-projection the verify core (KdaSplitStock, 192
+# CTAs at two per SM) is launched PDL-early: beside 102 projection CTAs every core CTA
+# is resident and has staged its state before the projection ends; beside 156 most
+# land only as the projection's CTAs exit. 1-GPU KDA chain (chain_inproj.py: carve-out
+# 100 AttnRes stand-in 56 CTAs 3 us -> in-projection -> PreparedKda verify -> o-proj
+# stand-in, 69 layers, FP32 state + conv, us per layer, arms round-robin x 8), q8:
+# B3 19.27 -> 17.47, B4 18.26 -> 16.97 (-0.124 / -0.089 ms per step), B5 (64, 40, 2, 8)
+# 19.70 -> 18.58, B6 (64, 48, 2, 7) 19.79 -> 19.13, B7 (64, 56, 2, 7) 19.93 -> 19.39
+# (the most stages that fit); (64, 64,
+# 2, 6) loses at B5 / B7 (+0.57 / +0.22), (64, 32, 4, 6) and (64, 32, 1, 8) at B4 (+1.65
+# / +0.97). B8 (64 rows) runs the fold (KDA_FOLD64_FP32). Split 2 sums K in two FP32 partials (WIDE_B64: six, rank order):
+# a stated accumulation reorder of the projected inputs, as WIDE_B64's was of split 2.
+KDA_SPLITK_Q: dict[int, dict[int, str]] = {
+    3216: {8: "17-32:64.32.2.8,33-40:64.40.2.8,41-48:64.48.2.7,49-56:64.56.2.7"}
+}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 MLA rows, 9-32 verify rows: the
 # WIDE_B8 kernel (SplitKTmemGemm: 15 tensor-memory tiles, a dedicated owner mailbox, no
 # cluster barrier before the reduce-scatter) with 16 / 32 token columns instead of the
@@ -292,7 +309,10 @@ def projection_policies(tp, rows, batches, sms=152, q=1):
             if tactic is not None:  # else cuBLAS (``Attention.project``)
                 policies[batch] = tactic
             continue
-        if sms > 152 and tp == 16 and n in WIDE_B16_32.get(rows, {}):
+        splitk_q = batch_table(KDA_SPLITK_Q.get(rows, {}).get(q, ""))
+        if sms > 152 and tp == 16 and batch in splitk_q:
+            tactic = tuple(splitk_q[batch])
+        elif sms > 152 and tp == 16 and n in WIDE_B16_32.get(rows, {}):
             tactic = WIDE_B16_32[rows][n]
         elif sms > 152 and n in (16, 32, 64) and tp == 16 and rows in WIDE_B64:
             tactic = WIDE_B64[rows]
