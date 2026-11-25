@@ -312,6 +312,7 @@ class SplitKTmemGemm64(SplitKGemm):
             grid_x, _, _ = cute.arch.grid_dim()
             cta = bidx + grid_x * by
             self.stamp_base = mS.iterator.toint() + Int64(cta) * 128
+        bidx, n_idx = self.cluster_tile(bidx, n_idx)
         # This rank's K tiles: [first, first + tiles)
         base_tiles = self.k_total // self.split_k
         tiles = base_tiles + Int32(split_rank < self.extra)
@@ -404,6 +405,11 @@ class SplitKTmemGemm64(SplitKGemm):
     def issue_a(self, dst, barrier, a_map, k0, row0):
         """One A K tile (128 rows from ``row0``, 64 columns from ``k0``) to ``dst``."""
         _tma_box(dst, barrier, a_map, k0, row0)
+
+    def cluster_tile(self, bidx, n_idx):
+        """(weight tile, token tile) a cluster computes, from its grid coordinates
+        (default: the grid's own)."""
+        return bidx, n_idx
 
     def owner_of(self, row, row0):
         """(owner rank, row in its share) of accumulator row ``row``."""

@@ -184,6 +184,29 @@ class MoeFrontRows(MoeFrontTmem64):
         self.gate_tiles = hidden // 64
         self.tiles = FRONT_TILES + self.gate_tiles
 
+    def cluster_tile(self, bidx, n_idx):
+        """Front tiles of every token tile first in the clusters' launch order (x
+        fastest), then the gate/up tiles: cluster L = bidx + tiles x n_idx computes
+        front tile L % 3 of token tile L // 3 for L < 3 x token tiles, else gate/up tile
+        3 + g % gate_tiles of token tile g // gate_tiles (g = L - 3 x token tiles).
+        The CTAs enter as the predecessor's SMs free up (16 ranks, 128 rows: the second
+        token tile's front CTAs entered 1.9 us after the first's, behind its six
+        gate/up clusters, and landed their weights 1.7 us after the PDL release; the
+        routing chain waits for them, h only feeds the shared down rows). Each (weight
+        tile, token tile) is computed by one cluster as before: same outputs."""
+        if cutlass.const_expr(self.gate_tiles == 0):
+            return bidx, n_idx
+        _, grid_y, _ = cute.arch.grid_dim()
+        fronts = grid_y // self.split_k * FRONT_TILES
+        cluster = bidx + self.tiles * n_idx
+        gate = cluster - fronts
+        front = cluster < fronts
+        tile = cutlass.select_(
+            front, cluster % FRONT_TILES, FRONT_TILES + gate % self.gate_tiles
+        )
+        column = cutlass.select_(front, cluster // FRONT_TILES, gate // self.gate_tiles)
+        return tile, column
+
     @cute.experimental.jit
     def __call__(
         self, packed: cute.Tensor, x: cute.Tensor, h: cute.Tensor, box: cute.Tensor,

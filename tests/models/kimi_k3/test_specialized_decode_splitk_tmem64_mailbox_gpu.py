@@ -41,10 +41,13 @@ def _run(weight, x, separate):
     projection.compile_projection_tmem.cache_clear()
     if not separate:
         cls.__init__ = barrier_init
+    if not front_first:
+        rows_cls.cluster_tile = cls.cluster_tile
     try:
         prepared = projection.PreparedProjection(weight, {x.shape[0]: TACTIC}).prepare()
     finally:
         cls.__init__ = init
+        rows_cls.cluster_tile = order
         projection.compile_projection_tmem.cache_clear()
     outs = []
     for _ in range(3):
@@ -105,7 +108,10 @@ def test_separate_only_below_the_lone_request():
 # The MoE front kernels (8 owners: every K split sums a 16-row share) on 2 GPUs: their
 # front box needs NVLink multicast memory (torchrun --nproc-per-node 2 <this file>).
 VALID, SPLIT, SHARD, HIDDEN, BOX_ROWS = 56, 64, 224, 384, 512
-FRONT_CASES = [(16, "tmem", 64), (32, "tmem", 64), (64, "tmem", 64), (128, "rows", 64)]
+FRONT_CASES = [
+    (16, "tmem", 64), (32, "tmem", 64), (64, "tmem", 64), (128, "rows", 64),
+    (256, "rows", 128),
+]
 
 
 def test_front_separate_mailboxes_torchrun():
@@ -119,12 +125,20 @@ def test_front_separate_mailboxes_torchrun():
     subprocess.run([*command, __file__], check=True, timeout=900)
 
 
-def _front(kind, rows, n, separate, dev):
+def _front(kind, rows, n, separate, dev, front_first=True):
+    """``front_first`` False: ``MoeFrontRows`` clusters in grid order (the base
+    ``cluster_tile``) instead of the front tiles first."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import splitk_tmem64
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import front, front_rows
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        front,
+        front_rows,
+        front_tmem,
+    )
 
     cls = splitk_tmem64.SplitKTmemGemm64
     init = cls.__init__
+    rows_cls = front_tmem.MoeFrontRows
+    order = rows_cls.__dict__["cluster_tile"]
 
     def barrier_init(self, *args, **kwargs):
         init(self, *args, **kwargs)
@@ -186,8 +200,9 @@ def _front_main():
         maps = (weight_map(packed, 128), weight_map(gate_up, 64))
         ptrs = tuple(c.Int64(m.data_ptr()) for m in maps)
         outs = []
-        for separate in (True, False, True):
-            code = _front(kind, rows, n, separate, dev)
+        # separate, barrier, separate again, clusters in grid order: all bitwise
+        for separate, first in ((True, True), (False, True), (True, True), (True, False)):
+            code = _front(kind, rows, n, separate, dev, first)
             h_rows = rows if kind == "rows" else 64  # MoeFrontTmem64: a 64-row h
             h = torch.zeros(h_rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
             box.view(torch.int32).fill_(-0x80000000)
@@ -204,7 +219,7 @@ def _front_main():
         ok = all(
             torch.equal(a[0].view(torch.int16), b[0].view(torch.int16))
             and torch.equal(a[1].view(torch.int16), b[1].view(torch.int16))
-            for a, b in zip(outs[1:], outs[:1] * 2)
+            for a, b in zip(outs[1:], outs[:1] * 3)
         )
         print(f"rank {rank}: {kind} rows {rows} n{n}: {'ok' if ok else 'FAIL'}",
               flush=True)  # fmt: skip
