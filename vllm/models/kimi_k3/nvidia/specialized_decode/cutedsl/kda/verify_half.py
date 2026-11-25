@@ -97,7 +97,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
     # (False) or as a cluster of two over DSMEM (``KdaVerifyHalfPair``).
     PAIRED = False
 
-    def cluster(self):
+    def pair_cluster(self):
         """Plain Python (outside the DSL's rewriting): the launch's cluster."""
         return 2 if self.PAIRED else None
 
@@ -112,7 +112,7 @@ class KdaVerifyHalfStock(KdaVerifyLoopStock):
         launch(
             self.kernel, args, ctas, ALL_THREADS, smem=HALF_SMEM,
             max_number_threads=[ALL_THREADS, 1, 1], min_blocks_per_mp=1,
-            cluster=self.cluster(),
+            cluster=self.pair_cluster(),
         )  # fmt: skip
 
     @cute.kernel
