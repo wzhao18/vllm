@@ -104,6 +104,9 @@ PROJ_ROWS = 32
 # 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
 TC_ROWS = 16
 TC_STAGES = 4
+# The warps whose lane 0 issues ring stage 0..3's TMA loads (warp 1 issues the
+# MMAs, TC_EPI.. TC_EPI + 3 run the epilogue; the others are free).
+TC_ISSUERS = (0, 2, 3, 8)
 TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
 # A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
 # a unit's push is in flight while the next one's epilogue writes).
@@ -613,14 +616,25 @@ class DcpValue:
         taddr = ld_shared_u32(slot_addr)
         self.mark(c, 1, tid)
         if cutlass.const_expr(self.knobs & 1 == 0):
-            if warp == 0:
-                if lane == 0:
-                    kc = Int32(0)
-                    for u in range(c, self.units, G):
-                        gh = u % DH
-                        t0 = (u // DH) * 128
-                        for k in cutlass.range_constexpr(8):
-                            st = (kc + k) % TC_STAGES
+            # One issuing thread per ring stage (TC_ISSUERS[st], lane 0): a thread
+            # completes about one stage per 0.25-0.37 us whatever the ring depth,
+            # so one issuer caps a unit's 256 KB at ~100 GB/s; four reach the SM's
+            # ingress (hwdb INDEX 15 / 34).
+            is_issuer = (lane == 0) & (
+                (warp == TC_ISSUERS[0]) | (warp == TC_ISSUERS[1])
+                | (warp == TC_ISSUERS[2]) | (warp == TC_ISSUERS[3]))
+            if is_issuer:
+                mine = Int32(0)
+                for s in cutlass.range_constexpr(TC_STAGES):
+                    if warp == TC_ISSUERS[s]:
+                        mine = Int32(s)
+                kc = Int32(0)
+                for u in range(c, self.units, G):
+                    gh = u % DH
+                    t0 = (u // DH) * 128
+                    for k in cutlass.range_constexpr(8):
+                        st = (kc + k) % TC_STAGES
+                        if st == mine:
                             ph = ((kc + k) // TC_STAGES) & 1
                             full = bars + Uint32(8) * Uint32(st)
                             dst = ring + Uint32(TC_STAGE) * Uint32(st)
@@ -628,10 +642,10 @@ class DcpValue:
                                 mbar_wait(
                                     bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
                                 mbar_arrive_tx(full, Uint32(TC_STAGE))
-                                _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k,
-                                       0, gh)
+                                _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full,
+                                       64 * k, 0, gh)
                             _tma3d(dst, tm_a, full, 64 * k, gh, t0)
-                        kc = kc + 8
+                    kc = kc + 8
         if warp == 1:
             if lane == 0:
                 kc = Int32(0)
