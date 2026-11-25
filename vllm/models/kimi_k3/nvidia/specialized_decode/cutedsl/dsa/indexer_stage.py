@@ -30,9 +30,10 @@ from .index import DIM, fp4_query_views, is_fp4_cache
 class IndexerStage:
     """``indexer``: the layer's KimiK3DSAIndexer; ``rows``: the most decode rows
     of a step (sizes the DCP merge's outputs; 0: no direct DCP merge); ``impl``:
-    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets."""
+    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets; ``buffers``:
+    the merge's (rows, counts) outputs to use (default: this stage's own)."""
 
-    def __init__(self, indexer, rows=0, impl=None):
+    def __init__(self, indexer, rows=0, impl=None, buffers=None):
         self.indexer = indexer
         self.impl = impl
         self.k_cache_name = _encode_layer_name(indexer.k_cache.prefix)
@@ -61,8 +62,14 @@ class IndexerStage:
             # K wide: the exact merge gives a rank up to K of a row's keys (a
             # saturated row: more than its N local candidates).
             shape = (rows, self.topk)
-            self.dcp_rows = torch.full(shape, -1, dtype=torch.int32, device=device)
-            self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
+            if buffers is not None:  # (rows, counts) shared with other layers
+                self.dcp_rows, self.dcp_valid = buffers
+                assert tuple(self.dcp_rows.shape) == shape, (self.dcp_rows.shape, shape)
+            else:
+                self.dcp_rows = torch.full(
+                    shape, -1, dtype=torch.int32, device=device
+                )
+                self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
         # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
         # -----------------------------------------------------------------------

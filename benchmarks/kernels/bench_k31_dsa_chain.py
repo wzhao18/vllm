@@ -236,21 +236,46 @@ def build(batch, q, world, local_len, topk):
         )
         box = dcp_box(runtime, dsa.HEADS, dsa=True, flashinfer=True)
         policy = dict(queries=(q,), core="auto", dcp=box, partials=DSA_PARTIALS)
+        wide = batch > 64  # providers.Attention: WideDsa past PreparedDsa's rows
+        if wide:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+                WideDsa,
+            )
+
+            # (the served policy: no partials override, r1.AUTO_PARTIALS)
+            policy = dict(queries=(q,), core="auto", dcp=box)
         layers = []
         for parity in (0, 1):
-            p = PreparedDsa(
-                attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=parity
-            )
+            cls = WideDsa if wide else PreparedDsa
+            p = cls(attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=parity)
             layers.append(p.prepare_cache(mla))
         out = torch.empty(batch, dsa.HEADS * 128, device=dev, dtype=bf)
         p0 = layers[0]
-        info = lambda: dict(  # noqa: E731  (inside the forward context)
-            overlap=p0.overlaps[batch, q],
-            core=p0.coverage_note(batch, q),
-            local_topk=p0.indexer_stage.local_topk,
-            merge=str(p0.indexer_stage.merge_source(batch)),
-            local_kv=local[0],
-        )
+
+        def info():  # (inside the forward context)
+            stage = getattr(p0, "indexer_stage", None)
+            if wide:
+                fused = stage is not None and stage.fused is not None
+                core = "WideDsa: " + (
+                    "#63 merge rows" + (" + IndexerScoreFp4" if fused else "")
+                    if stage is not None and stage.local_topk
+                    else p0.stock_pieces(batch)
+                )
+                return dict(
+                    overlap=p0.overlaps[batch],
+                    core=core,
+                    local_topk=stage.local_topk if stage is not None else 0,
+                    merge=str(stage.merge_source(batch)) if stage is not None else "op",
+                    partials=p0.dsa_box.mailbox(batch).format,
+                    local_kv=local[0],
+                )
+            return dict(
+                overlap=p0.overlaps[batch, q],
+                core=p0.coverage_note(batch, q),
+                local_topk=stage.local_topk,
+                merge=str(stage.merge_source(batch)),
+                local_kv=local[0],
+            )
 
         def run(prepared):
             prepared.run(
