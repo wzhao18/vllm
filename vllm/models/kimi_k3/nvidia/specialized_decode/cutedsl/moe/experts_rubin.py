@@ -484,6 +484,7 @@ class RubinExpertsKernel(ExpertsKernel):
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
         dies=(), static_groups=False, fast_exchange=False, warm=True, match_fc1=True,
+        head=0,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
@@ -508,6 +509,11 @@ class RubinExpertsKernel(ExpertsKernel):
         # the last CTA's epilogue 10.91 -> 10.30 us after the routes (the matching costs
         # ~0.4 us before the first stage; the die-local FC1 stream saves ~1 us).
         self.match_fc1 = match_fc1 and bool(dies) and fast_exchange
+        # head (match_fc1): right after the routes, warp 1 lane i < head L2-prefetches
+        # FC1(A) stage i and lane 16 + i FC1(B) stage i of the die-oblivious partition
+        # rank equal to this CTA, so the first stages of every rank are in flight
+        # while the CTAs match; the matched CTA's TMA then hits L2.
+        self.head = head if self.match_fc1 else 0
         if self.match_fc1:
             self.ws_census = (self.workspace_bytes + 15) // 16 * 16
         if fast_exchange:
@@ -1254,6 +1260,20 @@ class RubinExpertsKernel(ExpertsKernel):
             prefetch_bytes(scales.iterator + offset, 256)
 
     @cute.jit
+    def prefetch_head(self, maps, w13_scales, ranges, experts, lane):
+        """``head``: one FC1 stage's L2 prefetch per lane (see ``__init__``)."""
+        group = lane >> 4
+        i = lane & 15
+        lo, hi = (ranges[group, 2], ranges[group, 3])
+        s = lo + i
+        if (i < self.head) & (s < hi):
+            tile = 3 * ranges[group, 0] + s // 14
+            ks, expert, r = (s % 14, experts[tile // 3], tile % 3)
+            prefetch_tile(maps[0], expert * self.w13_rows + r * 128, ks)
+            offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
+            prefetch_bytes(w13_scales.iterator + offset, 1024)
+
+    @cute.jit
     def ticket(self, workspace):
         """``match_fc1``, warp 2 lane 0 before the routes: this CTA's census add
         (``RubinGroupedExpertsKernel.ticket``); the value before is consumed in
@@ -1640,6 +1660,9 @@ class RubinExpertsKernel(ExpertsKernel):
             for i in cutlass.range_constexpr(6):
                 ranges[g, i] = base[g, i]
             ranges[g, 6] = cta
+        if cutlass.const_expr(self.head > 0):
+            if warp == 1:
+                self.prefetch_head(maps, w13_scales, base, experts, lane)
         if cutlass.const_expr(self.match_fc1):
             fc1 = self.matched_fc1(sm, workspace, before, distinct, experts)
             for g in cutlass.range_constexpr(2):
