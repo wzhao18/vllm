@@ -572,10 +572,11 @@ def test_dsa_core_rows_source():
         def merge_source(self, batch):
             return self.source
 
-        def merge_rows(self, *args, release=False):
+        def merge_rows(self, *args, release=False, after_logits=None):
             # The core reads its rows after its PDL wait: the merge's rescue
             # may release it early (FlashInfer's decode must not be).
             assert release is True
+            self.after_logits = after_logits  # (the late query fork's hook)
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
@@ -589,3 +590,9 @@ def test_dsa_core_rows_source():
         stage.source = step
         assert source.fits(64) is fits, step
     assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
+    hook = object()
+    assert source.rows(None, None, None, None, 64, q=8, after_logits=hook) == (
+        "sel",
+        "cnt",
+    )
+    assert stage.after_logits is hook
