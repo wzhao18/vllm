@@ -42,7 +42,9 @@ from .shared_expert_mainloop import SharedKindMainloopMixin
 
 # PR2 EXPERIMENT ONLY (timing probes, wrong math except ""): PR2_PROBE = "" | dup (a second MMA window per weight
 # stage, same A stage, N = PR2_DUPN, plus its SFB copy: the marginal cost of a weight-stationary second token tile) |
-# nosf (scale-factor copies only on the first k-tile of a tile) | nomma (no MMA issued). Kernel name gains _pr2<probe>.
+# nosf (scale-factor copies only on the first k-tile of a tile) | nomma (no MMA issued) | breuse (odd pair M tiles load
+# no tokens: M512 B-reuse bytes) | ws (2nd+ token tile of an expert loads no weights: weight-stationary bytes) | bws (both).
+# Kernel name gains _pr2<probe>.
 PR2_PROBE = os.environ.get("PR2_PROBE", "")
 PR2_DUPN = int(os.environ.get("PR2_DUPN", "48"))
 
@@ -974,30 +976,39 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
         global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
+        load_a = True
+        a_tx = expected_tx
+        if cutlass.const_expr(PR2_PROBE in ("ws", "bws") and expected_tx is None):
+            # PR2 EXPERIMENT ONLY: weight-stationary byte emulation, an expert's 2nd+ token tile loads no weights.
+            load_a = work_tile.tile_n_idx == Int32(0)
+            a_tx = Int32(0)
+            if load_a:
+                a_tx = Int32(self.num_tma_load_bytes // 2)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
-            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=a_tx)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-            cute.copy(
+            if load_a:
+              cute.copy(
                 a_atom,
-                global_a_slice[(None, k_tile_idx)],
-                partitioned_smem_a[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=a_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
-            cute.copy(
-                sfa_atom,
-                global_sfa_slice[(None, k_tile_idx)],
-                partitioned_smem_sfa[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=sfa_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
+                  global_a_slice[(None, k_tile_idx)],
+                  partitioned_smem_a[(None, stage_index)],
+                  tma_bar_ptr=tma_barrier,
+                  tma_desc_ptr=a_descriptor_ptr,
+                  mcast_mask=multicast_mask,
+              )
+              cute.copy(
+                  sfa_atom,
+                  global_sfa_slice[(None, k_tile_idx)],
+                  partitioned_smem_sfa[(None, stage_index)],
+                  tma_bar_ptr=tma_barrier,
+                  tma_desc_ptr=sfa_descriptor_ptr,
+                  mcast_mask=multicast_mask,
+              )
         return ab_pipeline_state
 
     @cute.jit
@@ -1243,28 +1254,37 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
         global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
+        load_b = True
+        b_tx = expected_tx
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "bws") and expected_tx is None):
+            # PR2 EXPERIMENT ONLY: M512 B-reuse byte emulation, the odd pair M tile reuses the tokens (loads none).
+            load_b = (work_tile.tile_m_idx // Int32(self.mma_cta_count)) % Int32(2) == Int32(0)
+            b_tx = Int32(0)
+            if load_b:
+                b_tx = Int32(self.num_tma_load_bytes // 2)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
-            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=b_tx)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-            b_issue_atom = bind_executable_tma_load_fields(
-                b_exec_atom,
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=b_descriptor_ptr,
-                mcast_mask=b_multicast_mask,
-            )
-            cute.copy(b_issue_atom, global_b_slice[(None, k_tile_idx)], partitioned_smem_b[(None, stage_index)])
-            sfb_issue_atom = bind_executable_tma_load_fields(
-                sfb_exec_atom,
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=sfb_descriptor_ptr,
-                mcast_mask=sfb_multicast_mask,
-            )
-            cute.copy(sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)])
+            if load_b:
+              b_issue_atom = bind_executable_tma_load_fields(
+                  b_exec_atom,
+                  tma_bar_ptr=tma_barrier,
+                  tma_desc_ptr=b_descriptor_ptr,
+                  mcast_mask=b_multicast_mask,
+              )
+              cute.copy(b_issue_atom, global_b_slice[(None, k_tile_idx)], partitioned_smem_b[(None, stage_index)])
+              sfb_issue_atom = bind_executable_tma_load_fields(
+                  sfb_exec_atom,
+                  tma_bar_ptr=tma_barrier,
+                  tma_desc_ptr=sfb_descriptor_ptr,
+                  mcast_mask=sfb_multicast_mask,
+              )
+              cute.copy(sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)])
         return ab_pipeline_state
 
     @cute.jit
