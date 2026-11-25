@@ -881,6 +881,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             + self._shared_name_suffix()
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")
+            + _pr2_suffix()  # PR2 EXPERIMENT ONLY
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -2128,3 +2129,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
 
         self.token_comm.remove_device_members()
         workspace.remove_device_members()
+
+
+def _pr2_suffix() -> str:
+    """PR2 EXPERIMENT ONLY: compiled-kernel cache key of the mainloop timing probe."""
+    from .block_scaled_swap_ab_fc12_mainloop import PR2_DUPN, PR2_PROBE
+
+    if not PR2_PROBE:
+        return ""
+    return f"_pr2{PR2_PROBE}" + (f"{PR2_DUPN}" if PR2_PROBE == "dup" else "")
