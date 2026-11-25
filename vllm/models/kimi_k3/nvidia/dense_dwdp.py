@@ -151,6 +151,11 @@ class DenseDwdp:
         else:  # this engine's EP ranks
             n, me = g.world_size, g.rank_in_group
             self.streams, self.handles = edwdp.copy_streams()
+            if _SELECT is not None:
+                # shared-expert selector: one copy stream (7 copies per layer, not
+                # 28: a quarter of the host issue cost; the fabric copy rate is
+                # also highest with one stream, M-C0)
+                self.streams, self.handles = self.streams[:1], self.handles[:1]
         chunk = edwdp._dies().CHUNK
         device = torch.accelerator.current_device_index()
         store = edwdp.Store("dense", n, me) if x is not None else edwdp.GroupStore(g)
