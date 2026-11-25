@@ -113,6 +113,11 @@ TC_OUT = 128 * 128 * 2
 TC_EPI = 4
 # kind::f16: FP32 D, BF16 A and B (K-major), N = 128, M = 128
 TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
+# A unit split by N into two 64-column halves (N = 64), when twice the units still fit
+# one CTA each: at 1-128 rows the 96 units of 256 KB each kept 96 of 210 CTAs busy at
+# the per-SM L2 ingress rate (~180 GB/s/SM); halves read 192 KB (latent rows 128 KB +
+# half of W_UV 64 KB) on 192 CTAs. Same K order per output column: bitwise.
+TC_IDESC_N64 = (1 << 4) | (1 << 7) | (1 << 10) | ((64 >> 3) << 17) | ((128 >> 4) << 24)
 
 
 def projects_on_tc(batch):
@@ -381,6 +386,7 @@ class DcpValue:
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
         self.tc = False
+        self.halves = False
         self.preprojected = preprojected and self.projected
         self.rearm_q = rearm
         # Rows with nothing to merge send only their LSE (neither polled nor
@@ -402,8 +408,11 @@ class DcpValue:
             self.tc = not self.preprojected and per_row and projects_on_tc(batch)
             if self.tc:
                 self.mtiles = -(-batch // 128)
-                self.units = size * heads * self.mtiles
                 self.grid = (heads, max(1, sms // heads), 1)
+                self.units = size * heads * self.mtiles
+                self.halves = 2 * self.units <= heads * self.grid[1]
+                if self.halves:
+                    self.units = 2 * self.units
                 self.merge_tiles = -(-tiles // self.grid[1])
                 return
             merge = min(tiles, max(1, (sms - size * heads) // heads))
@@ -432,7 +441,7 @@ class DcpValue:
                 (1024, self.q_heads * 1024), (64, 1, 128), sw, l2)
             bm = tensormap.encode_map(
                 w_uv.iterator.toint(), bf, (512, 128, self.size * self.heads),
-                (1024, 128 * 1024), (64, 128, 1), sw, l2)
+                (1024, 128 * 1024), (64, 64 if self.halves else 128, 1), sw, l2)
             # The descriptors are grid-constant parameters (not tuple members, which
             # the kernel would copy to local memory, an invalid TMA source).
             self.kernel_tc(args[:-1], am, bm).launch(
@@ -566,6 +575,12 @@ class DcpValue:
         H, D, B = self.heads, self.size, self.batch
         G: cutlass.Constexpr = H * self.grid[1]
         DH: cutlass.Constexpr = D * H
+        # Units u: gathered head u % DH, rows 128 ((u // DH) % mtiles) .., value columns
+        # 64 (u // (DH mtiles)) .. + 63 with ``halves`` (else all 128).
+        DM: cutlass.Constexpr = DH * self.mtiles
+        NC: cutlass.Constexpr = 64 if self.halves else 128
+        TX: cutlass.Constexpr = TC_STAGE // 2 + NC * 128
+        IDESC: cutlass.Constexpr = TC_IDESC_N64 if self.halves else TC_IDESC
         cap = box.shape[2]
         smem = cutlass.utils.SmemAllocator()
         scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
@@ -599,9 +614,9 @@ class DcpValue:
                 if c < self.units:
                     for k in cutlass.range_constexpr(TC_STAGES):
                         full = bars + Uint32(8 * k)
-                        mbar_arrive_tx(full, Uint32(TC_STAGE))
+                        mbar_arrive_tx(full, Uint32(TX))
                         dst = ring + Uint32(TC_STAGE * k + TC_STAGE // 2)
-                        _tma3d(dst, tm_b, full, 64 * k, 0, c % DH)
+                        _tma3d(dst, tm_b, full, 64 * k, self.col0(c, DM), c % DH)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
         cute.arch.griddepcontrol_wait()
@@ -618,7 +633,7 @@ class DcpValue:
                     kc = Int32(0)
                     for u in range(c, self.units, G):
                         gh = u % DH
-                        t0 = (u // DH) * 128
+                        t0 = self.row0(u, DH)
                         for k in cutlass.range_constexpr(8):
                             st = (kc + k) % TC_STAGES
                             ph = ((kc + k) // TC_STAGES) & 1
@@ -627,9 +642,9 @@ class DcpValue:
                             if kc + k >= TC_STAGES:  # (else B issued before the wait)
                                 mbar_wait(
                                     bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
-                                mbar_arrive_tx(full, Uint32(TC_STAGE))
+                                mbar_arrive_tx(full, Uint32(TX))
                                 _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k,
-                                       0, gh)
+                                       self.col0(u, DM), gh)
                             _tma3d(dst, tm_a, full, 64 * k, gh, t0)
                         kc = kc + 8
         if warp == 1:
@@ -657,7 +672,7 @@ class DcpValue:
                                 ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
                                 bd = Uint64(SDESC_SW128) | Uint64(
                                     (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
-                                _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
+                                _mma_f16(acc, ad, bd, Uint32(IDESC),
                                          Uint32(1 if k + kk > 0 else 0))
                             tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
                     tc_commit(acc_full + Uint32(8) * Uint32(b))
@@ -669,7 +684,7 @@ class DcpValue:
             # Every unit's LSEs first (they do not wait for the projection): the
             # owners' weights are ready before the value rows land.
             if cutlass.const_expr(self.knobs & 2 == 0):
-                for u in range(c, self.units, G):
+                for u in range(c, DM, G):  # (one unit per row: the first half)
                     gh = u % DH
                     t = (u // DH) * 128 + row
                     if t < B:
@@ -681,7 +696,8 @@ class DcpValue:
             for u in range(c, self.units, G):
                 b = j & 1
                 gh = u % DH
-                t0 = (u // DH) * 128
+                t0 = self.row0(u, DH)
+                half = self.col0(u, DM) // 64
                 t = t0 + row
                 live = t < B
                 lse = Float32(EMPTY_LSE)
@@ -690,7 +706,9 @@ class DcpValue:
                 send = live & (lse > Float32(EMPTY_LSE))
                 owner = gh // H
                 base = ((parity * D + rank) * H + gh % H) * cap
-                if row == 0:  # this buffer's push (two units ago) has read it
+                if cutlass.const_expr(self.halves):  # (each row pushes itself)
+                    _bulk_read_wait1()
+                elif row == 0:  # this buffer's push (two units ago) has read it
                     _bulk_read_wait1()
                 _epi_sync()
                 mbar_wait(acc_full + Uint32(8) * Uint32(b), (j >> 1) & 1)
@@ -699,7 +717,7 @@ class DcpValue:
                 out = outs + Uint32(TC_OUT) * Uint32(b) + Uint32(256) * Uint32(row)
                 swz = row % 8  # chunk ^ (t % 8): conflict-free rows, as the mailbox
                 acc = taddr + Uint32(128) * Uint32(b) + quad
-                for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
+                for c4 in cutlass.range_constexpr(NC // 32):  # (warp-collective)
                     v = _tmem_ld32(acc + Uint32(32 * c4))
                     for q4 in cutlass.range_constexpr(4):
                         words = (Uint32(PAIR_SENT),) * 4
@@ -709,13 +727,22 @@ class DcpValue:
                                           policy="latent")
                                 for i in range(4))
                         chunk = Uint32(swz ^ Int32(4 * c4 + q4))
+                        if cutlass.const_expr(self.halves):
+                            chunk = Uint32(swz ^ (Int32(8) * half + Int32(4 * c4 + q4)))
                         _st_shared4(out + chunk * Uint32(16), *words)
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(b))  # TMEM read
                 _fence_async_shared()
                 _epi_sync()
                 if cutlass.const_expr(self.knobs & 2 == 0):
-                    if row == 0:
+                    if cutlass.const_expr(self.halves):
+                        # A half's 128 B of each row (chunks 8 half .. + 7 stay in
+                        # their half under the row swizzle): one bulk copy per row.
+                        if live:
+                            _bulk_push(
+                                peers[owner] + Int64(base + t) * 256 + Int64(128) * half,
+                                out + Uint32(128) * Uint32(half), Uint32(128))
+                    elif row == 0:
                         n = B - t0
                         if n > 128:
                             n = 128
@@ -723,7 +750,9 @@ class DcpValue:
                                    outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
                 self.mark(c, 3 + 2 * j, row)
                 j = j + 1
-            if row == 0:
+            if cutlass.const_expr(self.halves):
+                _bulk_wait0()
+            elif row == 0:
                 _bulk_wait0()
             self.mark(c, 8, row)
         cute.arch.sync_threads()
@@ -740,6 +769,18 @@ class DcpValue:
         if cutlass.const_expr(self.stamp_addr != 0):
             cute.arch.sync_threads()
         self.mark(c, 10, tid)
+
+    def row0(self, u, dh):
+        """Unit u's first row (its 128-row tile)."""
+        if cutlass.const_expr(self.halves):
+            return (u // dh) % self.mtiles * 128
+        return (u // dh) * 128
+
+    def col0(self, u, dm):
+        """Unit u's first value column (0 without ``halves``)."""
+        if cutlass.const_expr(self.halves):
+            return (u // dm) * 64
+        return Int32(0)
 
     @staticmethod
     def stale_chunk(words, k):
