@@ -91,6 +91,9 @@ struct Plan {
   static constexpr int kQPer = (kQChunks + kThreads - 1) / kThreads;
   static_assert(kSmem + 2048 <= 227 * 1024, "dsa_core shared memory");
   static_assert(HG * 512 * 4 <= 2 * kChunk * kRowS, "FP32 O staging over the KV buffers");
+  // a whole 128-key tile's V as FP16 over the KV buffers and the V buffer (one-tile CTAs)
+  static_assert(kVh == kKV + 2 * kChunk * kRowS, "KV and V buffers contiguous");
+  static_assert(kTile * kVStr * 2 <= 2 * kChunk * kRowS + kChunk * kVStr * 2, "tile V16");
 };
 
 struct Params {
@@ -464,6 +467,66 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         }
       }
     };
+    // ---- one-tile CTAs (two chunks, one piece, the common case): both chunks' V to
+    // FP16 at once over the KV and V buffers (tile row r at sKV + r * kVStr halves),
+    // read into registers before any is written, so the PV of the tile runs as one
+    // 8-step loop (the same MMA order as the two chunks' loops: bitwise the same)
+    __half* sV2 = reinterpret_cast<__half*>(sKV);
+    auto cast_tile = [&]() {
+      constexpr int kItems = kChunk * 32 / kThreads;  // 4 per chunk
+      const int vrows1 = (valid_of(1) + 15) & ~15;
+      uint4 w[2][kItems];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint8_t* buf = sKV + h * kChunk * kRowS;
+#pragma unroll
+        for (int j = 0; j < kItems; ++j) {
+          const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+          if (h == 0 || r < vrows1) w[h][j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
+        }
+      }
+      __syncthreads();  // (every FP8 row read, QK's included, before any FP16 write)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int j = 0; j < kItems; ++j) {
+          const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+          if (h == 1 && r >= vrows1) continue;
+          const uint32_t ws[4] = {w[h][j].x, w[h][j].y, w[h][j].z, w[h][j].w};
+          uint32_t hv[8];
+#pragma unroll
+          for (int k = 0; k < 4; ++k) {
+            hv[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
+            hv[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
+          }
+          uint4* dst = reinterpret_cast<uint4*>(sV2 + (h * kChunk + r) * kVStr + 16 * c16);
+          dst[0] = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+          dst[1] = make_uint4(hv[4], hv[5], hv[6], hv[7]);
+        }
+      }
+    };
+    auto pv_tile = [&]() {
+      const int valid = kChunk + valid_of(1);
+      const __half* vb = sV2 + (((lane >> 3) & 1) * 8 + (lane & 7)) * kVStr + 32 * warp +
+                         (lane >> 4) * 8;
+#pragma unroll
+      for (int ks = 0; ks < kTile / 16; ++ks) {
+        if (16 * ks >= valid) break;
+        uint32_t b[8];
+        ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * kVStr);
+        ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * kVStr + 16);
+#pragma unroll
+        for (int m2 = 0; m2 < MT; ++m2) {
+          uint32_t a0, a1, a2, a3;
+          ldsm_x4(a0, a1, a2, a3, sP + (16 * m2 + (lane & 15)) * kPStr + 16 * ks + (lane >> 4) * 8);
+          mma_f16(tacc[4 * m2 + 0], a0, a1, a2, a3, b[0], b[1]);
+          mma_f16(tacc[4 * m2 + 1], a0, a1, a2, a3, b[2], b[3]);
+          mma_f16(tacc[4 * m2 + 2], a0, a1, a2, a3, b[4], b[5]);
+          mma_f16(tacc[4 * m2 + 3], a0, a1, a2, a3, b[6], b[7]);
+        }
+      }
+    };
+    const bool one_tile = !P && nchunks == 2;
     if (nchunks > 0) issue(0);
     if (nchunks > 1) issue(1);
     for (int c = 0; c < nchunks; c += 2) {
@@ -509,7 +572,11 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         }
         }  // (8 nt < valid)
       }
-      cast_v(c);  // (chunk c's V while the softmax waits for every warp's S)
+      if (one_tile) {
+        cast_tile();  // (both chunks' V while the softmax waits for every warp's S)
+      } else {
+        cast_v(c);  // (chunk c's V while the softmax waits for every warp's S)
+      }
       __syncthreads();
       if (dbg && tid == 0 && c == 0) dbg[11] = clock64();
       // ---- softmax of the tile's 128 keys (base 2), one running max step of the piece
@@ -588,10 +655,15 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
           }
         }
       }
-      pv(c);
-      __syncthreads();
+      if (one_tile) {
+        pv_tile();
+        __syncthreads();
+      } else {
+        pv(c);
+        __syncthreads();
+      }
       if (c + 2 < nchunks) issue(c + 2);
-      if (nh > 1) {
+      if (nh > 1 && !one_tile) {
         cast_v(c + 1);
         __syncthreads();
         pv(c + 1);
