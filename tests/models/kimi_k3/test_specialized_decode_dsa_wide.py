@@ -406,6 +406,65 @@ def test_fp8_query_and_cache_insert(batch, gap, k_scale):
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 
 
+@pytest.mark.parametrize("batch", [128, 384, 512])
+def test_fp8_query_48_row_tiles_bitwise(batch):
+    """WideDsa's 48-request MlaQuery tiles (wide.WIDE_QUERY_TOKENS: 6 heads, a DCP16
+    rank's query on Rubin) write the same FP8 query rows, q_c rows and FP8 KV rows as
+    the 32-request tiles they replace, bit for bit (the same arithmetic per row)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        prepare_shared_carveout,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
+        query_tokens,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
+        MlaQuery,
+    )
+
+    heads, dev, bf = 6, "cuda", torch.bfloat16
+    assert (
+        query_tokens(heads, batch, 212) == 48 and query_tokens(heads, batch, 148) == 0
+    )
+    torch.manual_seed(batch)
+    pitch = 2112 + heads * 128 + 128 + 32
+    projected = torch.randn(batch, pitch, device=dev, dtype=bf)
+    q_norm = torch.rand(1536, device=dev, dtype=bf) + 0.5
+    kv_norm = torch.rand(512, device=dev, dtype=bf) + 0.5
+    q_b = torch.randn(heads * 192, 1536, device=dev, dtype=bf) / 40
+    w_uk = torch.randn(heads, 128, 512, device=dev, dtype=bf) / 12
+    blocks, block = -(-batch // 64) + 2, 64
+    slots = torch.randperm(blocks * block - 1, device=dev)[:batch]
+    slots[0] = blocks * block - 1  # the last row
+    slots[1] = -1  # a padded row writes nothing
+    q_scale = torch.full((1,), 0.5, device=dev)
+    k_scale = torch.full((1,), 0.875, device=dev)
+    outs, grids = [], []
+    for tokens in (0, 48):  # 0: the default (32-request) tile
+        mla = packed_cache(blocks, block, FP8_ROW, GAP)
+        query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
+        q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
+        args = (to_cute(projected), to_cute(q_norm), to_cute(kv_norm), to_cute(q_b))
+        args += (to_cute(w_uk), to_cute(mla), to_cute(slots, 8))
+        args += (to_cute(1 / q_scale, 4), to_cute(k_scale, 4), cutlass.Float32(EPS))
+        args += (to_cute(query), to_cute(q_c), stream(dev))
+        mla_query = MlaQuery(heads, batch, dsa=True, fp8=True, tokens=tokens)
+        kernel = cute.compile(mla_query, *args)
+        kernel = prepare_shared_carveout(kernel, torch.cuda.current_device(), 100)
+        kernel(*args)
+        torch.cuda.synchronize()
+        outs.append((query, q_c, mla))
+        grids.append(mla_query.grid)
+    assert grids[0][2] == batch // 32 and grids[1][2] == -(-batch // 48), grids
+    for ours, ref in zip(outs[1], outs[0]):
+        assert torch.equal(ours, ref)
+    assert outs[0][0].any() and outs[0][2].any()
+
+
 @pytest.mark.parametrize("gap", [0, GAP, FAR])
 @pytest.mark.parametrize("batch", [72, 96])
 def test_indexer_inputs(batch, gap):
