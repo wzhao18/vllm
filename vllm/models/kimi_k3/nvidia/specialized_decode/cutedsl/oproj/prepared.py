@@ -30,7 +30,7 @@ from ..common.host import (
 from ..common.policy import batch_table
 from ..gemm.projection import weight_map
 from .consumer import OprojConsumer, OprojFused
-from .producer import OprojProducer, OprojUmma, OprojUmmaRows
+from .producer import OprojProducer, OprojReduce, OprojUmma, OprojUmmaRows
 
 # The largest batch (token rows) of the tuned tables, the 64-row mailboxes and the
 # producers' owned-row reduce (``reduce_owned``).
@@ -252,6 +252,20 @@ def producer_reduce(tp, batch, device):
     return bool(batch_table(PRODUCER_REDUCE.get(tp, "")).get(batch))
 
 
+# Rubin (compute capability 10.7) PRODUCER_REDUCE batches per TP whose owner reduce
+# runs as its own lean grid (``OprojReduce``: 112 x 32 threads, no shared memory)
+# between the producer and the consumer, so the producer's 135-196 KB CTAs exit right
+# after their pushes instead of holding their SMs until the other ranks' chunks land.
+# Same reduction, bitwise.
+LEAN_REDUCE: dict[int, str] = {16: ""}
+
+
+def lean_reduce(tp, batch, device):
+    if torch.cuda.get_device_capability(device) != (10, 7):
+        return False
+    return bool(batch_table(LEAN_REDUCE.get(tp, "")).get(batch))
+
+
 # Rubin (compute capability 10.7) two-shot batches per TP whose tcgen05 producer holds
 # every K block in its ring (``OprojUmma(resident=True)``: all weights before the PDL
 # wait, no stage reuse) and, at ``X_MULTICAST`` batches, whose clusters of that many
@@ -361,6 +375,8 @@ def compile_oproj(
         tail = (recv, peers, slot, box, mc, mc)  # + gather, its multicast, x's map
         kernel = OprojUmmaRows(k, chunk=chunk)
         return cute.compile(kernel, x, w, *tail, make_fake_stream())
+    if kind == "reduce":  # LEAN_REDUCE: the owner reduce as its own grid
+        return cute.compile(OprojReduce(batch), recv, box, mc, slot, make_fake_stream())
     if kind.startswith("producer"):  # producer_mma / producer_umma: engine A/B
         kernel = producer(
             k, batch, tp, mla, twoshot, kind[9:] or None, reduced, resident, xmc
@@ -480,6 +496,7 @@ class PreparedOproj:
             batches = [b for b in batches if b <= OPROJ_ROWS]
         self.codes, self.twoshots = {}, twoshot_batches(tp) if self.twoshot else set()
         self.reduced: set[int] = set()  # two-shot batches reduced by the producer
+        self.lean: set[int] = set()  # ... by OprojReduce instead (``LEAN_REDUCE``)
         # X_MULTICAST batches: (x rows, the x tensor map) of ``x_buffer`` [:batch]
         self.xmaps: dict[int, tuple] = {}
         self.after_head: dict[int, tuple] = {}  # codes behind KdaHead (``PREFER_L1``)
@@ -496,8 +513,11 @@ class PreparedOproj:
             tail = (64, twoshot, staged_x, False, fence)
             batched = twoshot and twoshot_batched(tp, b, self.device)
             reduced = twoshot and producer_reduce(tp, b, self.device)
+            lean = reduced and lean_reduce(tp, b, self.device)
             if reduced:
                 self.reduced.add(b)
+            if lean:
+                self.lean.add(b)
             resident, xmc = (0, 1)
             if twoshot:
                 resident, xmc = producer_ring(tp, b, self.device)
@@ -517,13 +537,16 @@ class PreparedOproj:
                     publish and kind != "producer",
                     *tail,
                     batched and kind == "consumer",
-                    reduced,
+                    reduced and not (lean and kind == "producer"),
                     resident and kind == "producer",
                     xmc if kind == "producer" else 1,
                     vote and kind != "producer",
                 )
                 for kind in kinds
             )
+            if lean:  # codes[2]: the lean owner reduce
+                reduce_args = ("reduce", *shape, False, 64, True)
+                self.codes[b] += (compile_oproj(*reduce_args),)
             extra = (False, False, False, 1, vote)  # batched, reduced, resident, xmc
             carve = consumer_carveout(tp, b, self.device) if twoshot else None
             if carve is not None:  # every layer's consumer at this batch: one function
@@ -559,13 +582,16 @@ class PreparedOproj:
             codes[0](x, self.wview, *self.head, *rows)
         elif batch in self.twoshots:
             head, gather, tail = self.twoshot
-            extra = (gather, tail[1]) if batch in self.reduced else ()
+            lean = batch in self.lean
+            extra = (gather, tail[1]) if batch in self.reduced and not lean else ()
             if batch in self.xmaps:
                 mapped, _, address = self.xmaps[batch]
                 if local.data_ptr() != mapped.data_ptr():
                     raise RuntimeError("o-proj x multicast: x is not the mapped buffer")
                 extra += (address,)
             codes[0](x, self.wview, *head, *extra, s)
+            if lean:
+                codes[2](head[0], gather, tail[1], tail[2], s)
             codes[1](gather, *rows[:-1], *tail, s)
         else:
             extra = ()
