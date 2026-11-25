@@ -1930,7 +1930,7 @@ class PreparedKdaHead:
         b = x.shape[0]
         fa_tactic = FA_TACTIC_ROWS.get(b, FA_TACTIC)
         code = compile_xsignal(fa_tactic, architecture(self.device))
-        readers = CLUSTER * self.core.heads + self.x_signal_ctas(b)
+        readers = self.core.heads + self.x_signal_ctas(b)  # one poller per head cluster
         with torch.cuda.stream(self.side.fork()):
             code(
                 matrix_view(self.fa_weight), matrix_view(x),
@@ -1976,7 +1976,7 @@ class PreparedKdaHead:
         polled_x: tuple = ()
         if b == q:
             ready = 0 if x_ready is None else x_ready.data_ptr()
-            readers = CLUSTER * self.core.heads + (self.x_signal_ctas(b) if fa_x else 0)
+            readers = self.core.heads + (self.x_signal_ctas(b) if fa_x else 0)
             polled_x = (cutlass.Int64(ready), Int32(7 * b if ready else 0), Int32(readers))
         self.verify_kernels[b, q](
             matrix_view(self.weight), matrix_view(x),

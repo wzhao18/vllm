@@ -248,7 +248,7 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, x_readers, True)
+                    self.x_wait(bar_x, x_ready, x_target, x_readers, rank, True)
                     self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                     # completion order (successors' PDL waits are transitive through
                     # this grid; the polled output's re-arm below) off x's path
@@ -287,7 +287,7 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 if cutlass.const_expr(x_poll):
-                    self.x_wait(bar_x, x_ready, x_target, x_readers, False)
+                    self.x_wait(bar_x, x_ready, x_target, x_readers, rank, False)
                     self.x_resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
                 else:
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
@@ -325,25 +325,27 @@ class KdaHeadVerify(KdaHeadWide):
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
     @cute.jit
-    def x_wait(self, bar_x, x_ready, x_target, x_readers, poller: cutlass.Constexpr):
-        """``x_poll``: warp 1 (``poller``) spins on the AttnRes's x counter
-        (acquire) until all ``x_target`` CTA adds landed, re-arms it as its last reader
-        (every head CTA reads it once, of ``x_readers`` with an x-polled F_A GEMM) and releases ``bar_x``; the other x / weight
-        issuers wait on ``bar_x``. Then a proxy fence: x is read by TMA."""
+    def x_wait(self, bar_x, x_ready, x_target, x_readers, rank, poller: cutlass.Constexpr):
+        """``x_poll``: one thread per cluster (rank 0, warp 1) spins on the AttnRes's x
+        counter (acquire) until all ``x_target`` CTA adds landed, re-arms it as its last
+        reader (one per cluster, of ``x_readers`` with an x-polled F_A GEMM) and arrives
+        (release, cluster) on every cluster CTA's ``bar_x``; the x / weight issuers wait
+        on ``bar_x``. Then a proxy fence: x is read by TMA. (96 polling CTAs slowed the
+        AttnRes they waited for: +0.8 us per layer.)"""
         if cutlass.const_expr(poller):
-            if cute.arch.lane_idx() == 0:
+            if (rank == 0) & (cute.arch.lane_idx() == 0):
                 seen = Int32(_acquire_load(x_ready))
                 sgn, sgt = spin_start()
                 while seen < x_target:
                     seen = Int32(_acquire_load(x_ready))
                     sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
-                cute.arch.mbarrier_arrive(bar_x)
+                for peer in cutlass.range_constexpr(CLUSTER):
+                    cute.arch.mbarrier_arrive(bar_x, Int32(peer))
                 if Int32(_fetch_add(x_ready + 4)) == x_readers - 1:
                     _store_zero(x_ready)
                     _store_zero(x_ready + 4)
             cute.arch.sync_warp()
-        else:
-            wait(bar_x, scope="cta")
+        wait(bar_x)
         fence_proxy_async_global()
 
     @cute.experimental.jit
