@@ -1089,9 +1089,14 @@ class KimiMoE(nn.Module):
         # collective) runs on a side stream concurrently with the MegaMoE launch,
         # whose persistent grid is capped to leave it SMs; joined before the
         # up-projection adds it. Same kernels and math, only concurrent.
+        # Not on P/D prefill workers: their chunks are compute-bound, the capped grid
+        # costs MegaMoE ~1.3x (TP8+DCP8 p4k: 884 -> 1182 us per layer) while the
+        # shared expert hides only part of it; they keep the full grid and run the
+        # shared expert beside the routing front (_prefill_shared_stream).
         self._shared_overlap = (
             self.use_mega_moe
             and use_sequence_parallel
+            and not pd_prefill_worker(vllm_config)
             and vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE
             and isinstance(self.shared_experts, KimiMLP)
             and not self.shared_experts.shard_sequence_parallel
