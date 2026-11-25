@@ -43,7 +43,7 @@ class KdaSplitDefer(RecoverKdaSplit):
     # overlap them as the stock verify's do) instead of before the wait.
     fold_late = False
     # The fold unrolled over the record slots with selects (``fold_selected``).
-    fold_unrolled = False
+    fold_unrolled = True
 
     def __init__(self, heads, batch, gate_mode, has_bias, schedule, tokens):
         assert tokens >= 2, "KdaSplitDefer: verify only"
