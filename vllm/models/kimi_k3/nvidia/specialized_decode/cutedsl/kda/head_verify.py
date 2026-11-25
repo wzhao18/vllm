@@ -426,9 +426,7 @@ class KdaHeadVerify(KdaHeadWide):
             for m in cutlass.range_constexpr(2):
                 i = epi_tid + 128 * m
                 row, half = i // 2, i % 2
-                values = tuple(
-                    partial[row, 4 * half + j] for j in cutlass.range_constexpr(4)
-                )
+                values = tuple(partial[row, 4 * half + j] for j in range(4))
                 block = (split_rank * 2 + section) * rows + row
                 dst = recv_qk + cute.assume(block * T + 4 * half, divby=4)
                 for dest in cutlass.range_constexpr(KDA_CTAS):
@@ -446,7 +444,7 @@ class KdaHeadVerify(KdaHeadWide):
                 src = partial.iterator + cute.assume(src_off, divby=4)
                 dst = recv_vg.iterator + cute.assume(dst_off, divby=4)
                 v4 = load_f32x4(src, shared=True)
-                values = tuple(v4[e] for e in cutlass.range_constexpr(4))
+                values = tuple(v4[e] for e in range(4))
                 push_float(dst, values, bar_part, dest)
 
     @cute.jit
