@@ -341,7 +341,10 @@ def main():
 
     peer_ptrs = torch.tensor(bases, dtype=torch.int64, device=dev)
 
-    def run_today():
+    nccl_in = torch.empty(len(mine) * (data_b + sf_b), dtype=torch.uint8, device=dev)
+    nccl_out = torch.empty(W * nccl_in.numel(), dtype=torch.uint8, device=dev)
+
+    def run_today(barrier=True):
         for l in mine:
             d = raw[l * data_b : (l + 1) * data_b].view(torch.int32)
             s = raw[sf_base + l * sf_b : sf_base + (l + 1) * sf_b].view(torch.int32)
@@ -350,7 +353,8 @@ def main():
                 d, s, peer_ptrs, l * data_b // 4, (sf_base + l * sf_b) // 4,
                 d.numel(), s.numel(), me, WORLD=W, BLOCK=4096, num_warps=4,
             )  # fmt: skip
-        hb.barrier()
+        if barrier:
+            hb.barrier()
 
     sA = torch.cuda.Stream(device=dev)
     sB = torch.cuda.Stream(device=dev)
@@ -385,6 +389,27 @@ def main():
         sA.wait_stream(cur)
         sB.wait_stream(cur)
         res = {}
+        if mode in ("nccl", "tpush"):
+            with torch.cuda.stream(sA):
+                ext.gpu_sleep(skew_ns)
+                ext.stamp(ts, 0)
+                if mode == "nccl":
+                    dist.all_gather_into_tensor(nccl_out, nccl_in)
+                else:
+                    run_today(barrier=False)
+                ext.stamp(ts, 1)
+                if mode == "tpush":
+                    hb.barrier()
+                ext.stamp(ts, 2)
+                evA.record(sA)
+            cur.wait_stream(sA)
+            torch.cuda.synchronize()
+            tsv = ts.tolist()
+            res["ag_us"] = (tsv[1] - tsv[0]) / 1e3
+            res["ag_TBps"] = ingress / ((tsv[1] - tsv[0]) * 1e-9) / 1e12
+            if mode == "tpush":
+                res["barrier_us"] = (tsv[2] - tsv[1]) / 1e3
+            return res
         if mode == "today":
             with torch.cuda.stream(sA):
                 ext.gpu_sleep(skew_ns)
@@ -452,6 +477,7 @@ def main():
         if mode == "today":
             res["ag_us"] = (tsv[1] - tsv[0]) / 1e3
             res["chain_us"] = (tsv[2] - tsv[0]) / 1e3
+            res["ag_TBps"] = ingress / ((tsv[1] - tsv[0]) * 1e-9) / 1e12
         if mode in ("pull", "co", "coG"):
             c = cta.view(grid, 3).tolist()
             st = stamps.tolist()
