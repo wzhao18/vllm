@@ -110,6 +110,10 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
     # an upper bound of what a faster FC2 epilogue buys (benchmarks set it).
     diag_skip_fc2 = False
 
+    def diag_finalize(self):
+        """DIAG (never merge): whether the finalize runs (plain Python, compile time)."""
+        return bool(self.publish) and not self.diag_skip_fc2
+
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,
         trace=0, pool=(12, 6), dies=(), static_groups=False, fc2_base=1,
@@ -679,7 +683,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                     if cutlass.const_expr(not self.diag_skip_fc2):
                         self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
                 m += 2
-        if cutlass.const_expr(self.publish and not self.diag_skip_fc2):
+        if cutlass.const_expr(self.diag_finalize()):
             self.finalize(workspace, output, batch, scalars[3:], sm=sm)
 
     @cute.jit

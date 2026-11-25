@@ -264,7 +264,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 self.load_hidden(sm, workspace, ranges, wgen & 1)
                 if lane == 0:
                     self.stamp(12)
-                if cutlass.const_expr(self.publish and not getattr(self, "diag_skip_fc2", False)):
+                if cutlass.const_expr(self.diag_finalize()):
                     self.finalize(workspace, output, batch, scalars[3:], sm=sm)
             elif warp == 3:
                 self.gather_x(sm, x, ranges, batch)
@@ -274,7 +274,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 if lane == 0:
                     self.claims(sm, workspace, ranges, generation & 1)
                 cute.arch.sync_warp()
-                if cutlass.const_expr(self.publish and not getattr(self, "diag_skip_fc2", False)):
+                if cutlass.const_expr(self.diag_finalize()):
                     self.finalize(workspace, output, batch, scalars[3:], sm=sm)
             else:
                 self.epilogue(
@@ -507,6 +507,10 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         else:
             dst = Int64(box[0]) + (Int64(token) * 3584 + column + 4 * lane) * 2
             store_words(dst, packed)
+
+    def diag_finalize(self):
+        """DIAG (never merge): whether the finalize runs (plain Python, compile time)."""
+        return bool(self.publish) and not getattr(self, "diag_skip_fc2", False)
 
     def staged_word(self, pair, tile, warp):
         """``RubinGroupedExpertsKernel.staged_word`` in the unit layout: pair p's slot
