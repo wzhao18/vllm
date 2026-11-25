@@ -90,7 +90,7 @@ JOIN = {8: "9-16:0", 16: ""}
 # grouped experts, CUDA graph, K31_SPIN_GUARD=0), partition after the last logit:
 # M16 / 24 / 32 / 48 3.70 / 3.65 / 3.73 / 3.66 -> 3.48 / 3.42 / 3.44 / 3.33 us (ABAB,
 # M64 control unchanged). Same ids, plan and arithmetic.
-RELEASE_EARLY_WIDE = "3-8:1,9-64:1"
+RELEASE_EARLY_WIDE = "3-8:1,64:1"
 
 
 class PreparedMoE:

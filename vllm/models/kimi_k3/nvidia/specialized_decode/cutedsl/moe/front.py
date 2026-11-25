@@ -484,7 +484,7 @@ SITU_FUSED_WIDE = {384: "3-8:1"}
 # the experts' launch and prologue sat between routing and their grouping; released
 # after the front they are resident when routing exits (one-GPU RouteSitu -> grouped
 # experts chain, CUDA graph, K31_SPIN_GUARD=0: see ``moe.prepared``).
-RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,9-64:1"}
+RELEASE_AFTER_FRONT_WIDE = {288: "3-8:1,64:1"}
 # Those devices, TP16 B3-8 (lean polled routing): each thread's four exact sigmoids
 # share one div.rn fallback branch (``primitives.sigmoids``, bitwise equal on all 2^32
 # inputs) instead of a slow-path region per division, so their fast paths interleave:
@@ -512,7 +512,7 @@ COPY_SYNC_WIDE = {288: "64:1"}
 # B64 (B8 x q8): routing's 128 CTAs kept the M64 experts (212 KB) off their SMs the
 # same way (2.11 us p50 overlap in the ds16 B8 serving capture). M9-63: the experts
 # released after the front (``RELEASE_AFTER_FRONT_WIDE``) come up beside routing too.
-ROUTE_CARVEOUT_WIDE = {288: "8:1,9-64:1"}
+ROUTE_CARVEOUT_WIDE = {288: "8:1,64:1"}
 # Those devices, TP16 B3-8 (token-group geometry): the front GEMM issues its register
 # weight loads at entry, ahead of the barrier setup. Issued right before the PDL wait,
 # ptxas schedules the wait first and every weight load after it (SASS: ACQBULK, then the
