@@ -417,7 +417,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         mydie, locs, tots, locp, totp = (self.diag_die(sm), Int32(0), Int32(0), Int32(0), Int32(0))
         for j in cutlass.range(ranges[0, 4], ranges[0, 5], unroll=1):
             if cutlass.const_expr(self.trace != 0):
-                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> HOME_SHIFT & 1)
                 tots += 1
                 if home == mydie:
                     locs += 1
@@ -431,7 +431,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             if j == kick:
                 cute.arch.mbarrier_arrive(bars.iterator + 2)
             if cutlass.const_expr(self.trace != 0):
-                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> HOME_SHIFT & 1)
                 tots += 1
                 if home == mydie:
                     locs += 1
@@ -449,7 +449,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             else:
                 for j in cutlass.range(first, first + self.pool_grain, unroll=1):
                     if cutlass.const_expr(self.trace != 0):
-                        home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> 21 & 1)
+                        home = Int32((Int64(experts[j // self.jobs] * 3584 + j % self.jobs * 128) * 128) >> HOME_SHIFT & 1)
                         totp += 1
                         if home == mydie:
                             locp += 1
@@ -524,7 +524,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             for _ in cutlass.range(lo, hi, unroll=1):
                 row = expert * self.w13_rows + r * 128
                 if cutlass.const_expr(self.trace != 0):
-                    home = Int32((Int64(row) * 1792 + ks * 128) >> 21 & 1)
+                    home = Int32((Int64(row) * 1792 + ks * 128) >> HOME_SHIFT & 1)
                     tot1 += 1
                     if home == mydie:
                         loc1 += 1
