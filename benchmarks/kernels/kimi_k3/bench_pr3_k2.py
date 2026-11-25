@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--skew-us", type=float, default=0.0)
+    ap.add_argument("--form", default="conv", choices=["conv", "graph"],
+                    help="conv: fused Q|K|V+conv GEMM (eager); graph: ag q|k|v GEMM + cuBLAS "
+                    "g|f_a|beta vs one cuBLAS in_proj (the CUDA-graph path), captured")
     ap.add_argument("--out", default="")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
@@ -96,8 +99,60 @@ def main():
         sp_ag.begin_forward(1 << 30)
         skew = int(a.skew_us * 2000) if rank == world - 1 else 0
         res = {"stock": [], "overlap": []}
+        if a.form == "graph":
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+                AgPlainGemm,
+            )
+
+            REST = 1680
+            wr = (torch.randn(REST, HIDDEN, generator=gen) * 0.02).bfloat16().to(dev)
+            wfull, sfull = mxfp8_e4m3_quantize(torch.cat([w, wr]), is_sf_swizzled_layout=True)
+            wrq, wrs = mxfp8_e4m3_quantize(wr, is_sf_swizzled_layout=True)
+            agp = AgPlainGemm(wq, ws.view(torch.uint8).reshape(-1), gemm.tactic)
+            qkv0 = torch.empty(M, 3 * P, dtype=torch.bfloat16, device=dev)
+            agp(x0, sx0, qkv0, _LocalAg(zero.data_ptr(), M // cl))
+            e8 = torch.float8_e8m0fnu
+
+            def stock_g():
+                g = sp_ag.kimi_sp_all_gather_mxfp8(qa, M)
+                return torch._scaled_mm(g.data, wfull.t(), scale_a=g.scale.view(e8),
+                                        scale_b=sfull.view(e8), out_dtype=torch.bfloat16)  # fmt: skip
+
+            def over_g():
+                g = sp_ag.kimi_sp_all_gather_mxfp8_overlapped(qa, M, cl)
+                qkv = torch.empty(M, 3 * P, dtype=torch.bfloat16, device=dev)
+                agp(g.data, g.scale.view(torch.uint8).reshape(-1), qkv, sp_ag.take_pending(g))
+                rest = torch._scaled_mm(g.data, wrq.t(), scale_a=g.scale.view(e8),
+                                        scale_b=wrs.view(e8), out_dtype=torch.bfloat16)  # fmt: skip
+                return torch.cat([qkv, rest], dim=-1)
+
+            graphs = {}
+            for name, fn in (("stock", stock_g), ("overlap", over_g)):
+                for _ in range(2):
+                    fn()
+                torch.accelerator.synchronize()
+                gr = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gr):
+                    outg = fn()
+                graphs[name] = (gr, outg)
+            torch.accelerator.synchronize()
 
         def one(mode):
+            if a.form == "graph":
+                gr, outg = graphs[mode]
+                dist.barrier()
+                torch.accelerator.synchronize()
+                torch.cuda._sleep(4_000_000)
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                e0.record()
+                if skew:
+                    torch.cuda._sleep(skew)
+                gr.replay()
+                e1.record()
+                torch.accelerator.synchronize()
+                return e0.elapsed_time(e1) * 1e3, outg.clone(), outg[:1].clone()
+
             st = st0.clone()
             dist.barrier()
             torch.accelerator.synchronize()
@@ -138,7 +193,7 @@ def main():
         if rank == 0:
             s = {m: [r[m] for r in allm] for m in med}
             line = (
-                f"PR3K2 {a.tag} W{world} R{R} M{M} idle{idle} cl{cl} skew{a.skew_us}: "
+                f"PR3K2 {a.tag} {a.form} W{world} R{R} M{M} idle{idle} cl{cl} skew{a.skew_us}: "
                 f"stock med/max {statistics.median(s['stock']):.1f}/{max(s['stock']):.1f} us, "
                 f"overlap {statistics.median(s['overlap']):.1f}/{max(s['overlap']):.1f} us, "
                 f"delta(max) {max(s['overlap']) - max(s['stock']):+.1f} us; bitwise ok x{a.iters}"
