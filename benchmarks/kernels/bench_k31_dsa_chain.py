@@ -258,7 +258,9 @@ def build(batch, q, world, local_len, topk):
                 fused = stage is not None and stage.fused is not None
                 core = "WideDsa: " + (
                     "#63 merge rows" + (" + IndexerScoreFp4" if fused else "")
-                    if stage is not None and stage.local_topk
+                    if stage is not None
+                    and stage.local_topk
+                    and batch in getattr(p0, "merged", ())
                     else p0.stock_pieces(batch)
                 )
                 return dict(
