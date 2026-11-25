@@ -309,6 +309,7 @@ def test_coverage_has_no_stock_step(q):
     inproj = dict(
         projection=SimpleNamespace(fallback=SimpleNamespace(kernels=split_k)),
         lt_rows={},
+        inproj_pin=None,  # no ltpin plans: the unpinned notes
         weight=SimpleNamespace(shape=(3040, 0)),
     )
     kda = SimpleNamespace(kind="kda", oproj_wide=oproj_wide, **inproj)

@@ -62,7 +62,8 @@ from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
 from .overlap import QueryWait, index_stream, side_stream
-from .query_stage import compile_norm
+from .query_stage import compile_norm, index_pin, is_rubin
+from .query_stage import index_policies as query_index_policies
 from .r1 import DsaBox
 
 logger = init_logger(__name__)
@@ -352,11 +353,14 @@ def check_proj_residency(compiled, heads, dcp, batch, sms, device):
     return grid
 
 
-def index_policies(batches):
+def index_policies(batches, rubin=False):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9); wide
     rows up to 128 the in-projection's generic split-K tactic, above it none
-    (``WideDsa.run_index``: cuBLAS, as the stock ``wq_index``)."""
+    (``WideDsa.run_index``: cuBLAS, as the stock ``wq_index``). Rubin: the query
+    stage's table (``RUBIN_INDEX_TACTICS``, none above 128 rows either)."""
+    if rubin:
+        return query_index_policies(batches, rubin=True)
     tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
     tactics[64] = (64, 64, 1, 4)
     tactics[128] = (64, 64, 2, 6)
@@ -491,9 +495,10 @@ class WideDsa:
         self.kernels = {}
         self.waits = {}  # QueryWait per batch (publish-only rows; else None)
         self.norms = {}  # QueryNorm per forked batch
-        policies = index_policies(sorted(pitches))
+        policies = index_policies(sorted(pitches), is_rubin(self.device))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
+        self.index_pin = index_pin(wq, sorted(pitches), is_rubin(self.device))
         self.k_cache_name = _encode_layer_name(self.indexer.k_cache.prefix)
         self.max_model_len = self.indexer.max_model_len
         self.max_total = self.indexer.max_total_seq_len
@@ -586,7 +591,9 @@ class WideDsa:
             "Triton slot filter where DcpExchange does not serve the step",
             "FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse",
         ]
-        if batch not in self.index_projection.kernels:
+        if self.index_pin is not None and batch in self.index_pin.plans:
+            pieces.append("wq_index pinned cuBLASLt (ltpin; no split-K tactic)")
+        elif batch not in self.index_projection.kernels:
             pieces.append("wq_index cuBLAS (no split-K tactic)")
         return "; ".join(pieces) + " (vs the merge-rows path unmeasured: NQ-TUNE)"
 
@@ -802,9 +809,12 @@ class WideDsa:
         """FP8 indexer query and head weights; the key into the indexer cache."""
         if batch in self.index_projection.kernels:
             iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
-        else:  # no split-K tactic at these rows: cuBLAS, as the stock wq_index
-            wq = self.indexer.wq_index.weight
-            iq = torch.mm(self.qc[:batch], wq.t(), out=self.iq[:batch])
+        else:  # no split-K tactic: pinned cuBLASLt where measured, else cuBLAS
+            wq, qc, iq = self.indexer.wq_index.weight, self.qc[:batch], self.iq[:batch]
+            if self.index_pin is not None and batch in self.index_pin.plans:
+                self.index_pin.run(wq, qc, iq)
+            else:
+                torch.mm(qc, wq.t(), out=iq)
         rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
         key = to_cute(self.indexer.k_cache.kv_cache), to_cute(index_slots[:batch], 8)
         s = stream(self.device)
