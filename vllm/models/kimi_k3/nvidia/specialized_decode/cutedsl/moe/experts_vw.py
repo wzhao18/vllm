@@ -521,6 +521,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         h0 = smem_desc_rows(sm.iterator + self.off_h, 128)
         hsf0 = smem_desc(sm.iterator + self.off_hsf, False)
         uses, count = (Int32(0), Int32(0))
+        c_all = self.dclk()
         for g in cutlass.range_constexpr(2):  # FC1(A), FC1(B): the producer's order
             lo, hi = (ranges[g, 2], ranges[g, 3])
             ks, r = (lo % 14, lo // 14 % 3)
@@ -530,13 +531,17 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 k = sub0[index + 1] - sub0[index]
             for s in cutlass.range(lo, hi, unroll=1):
                 slot = count % stages
+                c0 = self.dclk()
                 self.sync(full.iterator + slot, count // stages & 1, True)
+                self.dacc(0, c0)
                 weights = (tmem + self.col_w + slot * 8, asf0 + slot * 64)
                 released = shared_address(empty.iterator + slot)
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
                 b = uses % self.big
                 if first:
+                    c0 = self.dclk()
                     self.acquire_big(accempty, b, uses)
+                    self.dacc(1, c0)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 completion = Uint32(0)
                 if last:
@@ -582,13 +587,17 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         for g in cutlass.range_constexpr(2):
             end = ranges[g, 5] - (zone if g == 1 else 0)
             for j in cutlass.range(ranges[g, 4], end, unroll=1):
+                c0 = self.dclk()
                 self.sync(full.iterator + state[0], state[1], True)
+                self.dacc(2, c0)
                 state = self.fc2_mma(state, mma, bars, j // self.jobs, j % self.jobs)
         accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
         pmeta = view(sm.iterator, self.off_misc + self.bar_pmeta, Uint64, 16)
         ended = False
         while not ended:
+            c0 = self.dclk()
             self.sync(full.iterator + state[0], state[1], True)
+            self.dacc(2, c0)
             kind, a, b = (meta[4 * state[0] + i] for i in range(3))
             if kind != 1:  # the end marker
                 ended = True
@@ -602,6 +611,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             uses += 1
         if (lane == 0) & (current >= 0) & (hbuffer < 2):
             commit(hempty.iterator + hbuffer)
+        self.dacc(5, c_all)
 
     @cute.jit
     def fc2_mma(self, state, mma, bars, unit, tile, pool=None):
@@ -624,7 +634,9 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             current = unit
             ordinal += 1
             hbuffer = ordinal & 1
+            c0 = self.dclk()
             self.sync(hfull.iterator + hbuffer, ordinal >> 1 & 1, True)
+            self.dacc(3, c0)
             if (thread()[2] == 0) & (ordinal == 0):
                 self.stamp(8)
             copy_scales = Uint32(1)
@@ -635,12 +647,16 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         b = uses % self.big
         if cutlass.const_expr(pool is None):
             if ahead == 0:
+                c0 = self.dclk()
                 for i in cutlass.range_constexpr(6, 8):
                     self.acquire_big(accempty, (uses + i) % self.big, uses + i)
+                self.dacc(4, c0)
                 ahead = Int32(8)
             ahead -= 1
         else:
+            c0 = self.dclk()
             self.acquire_big(accempty, b, uses)
+            self.dacc(4, c0)
         stage_vw(
             (tmem + b * self.wide, a0 + slot * 1024, hd),
             weights,
