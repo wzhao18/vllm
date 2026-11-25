@@ -179,12 +179,13 @@ WIDE_B64 = {
 # 100 AttnRes stand-in 56 CTAs 3 us -> in-projection -> PreparedKda verify -> o-proj
 # stand-in, 69 layers, FP32 state + conv, us per layer, arms round-robin x 8), q8:
 # B3 19.27 -> 17.47, B4 18.26 -> 16.97 (-0.124 / -0.089 ms per step), B5 (64, 40, 2, 8)
-# 19.70 -> 18.58, B7 (64, 56, 2, 7) 19.93 -> 19.39 (the most stages that fit); (64, 64,
+# 19.70 -> 18.58, B6 (64, 48, 2, 7) 19.79 -> 19.13, B7 (64, 56, 2, 7) 19.93 -> 19.39
+# (the most stages that fit); (64, 64,
 # 2, 6) loses at B5 / B7 (+0.57 / +0.22), (64, 32, 4, 6) and (64, 32, 1, 8) at B4 (+1.65
-# / +0.97). B6 (48 rows) and B8 run the fold (KDA_FOLD64_FP32). Split 2 sums K in two FP32 partials (WIDE_B64: six, rank order):
+# / +0.97). B8 (64 rows) runs the fold (KDA_FOLD64_FP32). Split 2 sums K in two FP32 partials (WIDE_B64: six, rank order):
 # a stated accumulation reorder of the projected inputs, as WIDE_B64's was of split 2.
 KDA_SPLITK_Q: dict[int, dict[int, str]] = {
-    3216: {8: "17-32:64.32.2.8,33-40:64.40.2.8,49-56:64.56.2.7"}
+    3216: {8: "17-32:64.32.2.8,33-40:64.40.2.8,41-48:64.48.2.7,49-56:64.56.2.7"}
 }
 # Devices with more SMs than GB300's 152 (Rubin), TP16 MLA rows, 9-32 verify rows: the
 # WIDE_B8 kernel (SplitKTmemGemm: 15 tensor-memory tiles, a dedicated owner mailbox, no

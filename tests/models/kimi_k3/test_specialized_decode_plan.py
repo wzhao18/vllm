@@ -561,11 +561,10 @@ def test_dsa_in_projection_takes_the_tensor_memory_tactics():
     assert mla == {m: MLA[row_bin(m)] + polled.get(m, ()) for m in DL7_TUNED}
     kda = projection_policies(16, 3216, DL7_TUNED, sms=212, q=8)
     wide_kda = (128, 64, 6, 14, 14)
-    # q8 B3-B5 / B7: split-K with one N tile of the rows, the verify core resident
-    # beside it (KDA_SPLITK_Q); B6 / B8 keep the fold's WIDE_B64 policy
-    splitk_kda = {
-        24: (64, 32, 2, 8), 32: (64, 32, 2, 8), 40: (64, 40, 2, 8), 56: (64, 56, 2, 7)
-    }
+    # q8 B3-B7: split-K with one N tile of the rows, the verify core resident beside
+    # it (KDA_SPLITK_Q); B8 keeps the fold's WIDE_B64 policy
+    splitk_kda = {24: (64, 32, 2, 8), 32: (64, 32, 2, 8), 40: (64, 40, 2, 8)}
+    splitk_kda.update({48: (64, 48, 2, 7), 56: (64, 56, 2, 7)})
     assert kda == {
         m: (64, 8, 2, 12) if m <= 8 else splitk_kda.get(m, wide_kda) for m in DL7_TUNED
     }
