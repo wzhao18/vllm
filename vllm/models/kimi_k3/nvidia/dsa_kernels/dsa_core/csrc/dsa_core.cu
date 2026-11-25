@@ -761,7 +761,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
           if (nchunks == 3) {
             const float ap = mp == -INFINITY ? 0.f : exp2f(mp - mp1);
             sAp[h] = ap;
-            piece_fold(h, mp1, lp0 * ap + sum1, sA, sB);
+            // (the loop's l_p = select(0, l_p x a_p) + sum: product and sum rounded apart)
+            piece_fold(h, mp1, __fadd_rn(__fmul_rn(lp0, ap), sum1), sA, sB);
           } else {
             piece_fold(h, mp, lp0, sA, sB);
           }
