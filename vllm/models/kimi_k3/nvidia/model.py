@@ -286,6 +286,34 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
     return not (backend == "latency_specialized" and kv_transfer.is_kv_consumer)
 
 
+# CUDA-graph capture ceiling (tokens) of a P/D prefill worker. Its steps are prefill
+# chunks, so graphs above the decode range pay off: on a TP8+DCP8 VR200 prefill worker
+# capturing to 8192 cut the request-weighted prefill step 8.7% vs 2048 (512-token
+# bin -33%), for 1.39 GiB/GPU of KV cache; 16384 added 0.4% for 1.06 GiB more.
+PD_PREFILL_CAPTURE_MAX_TOKENS = 8192
+# Below 2048 the sizes are vLLM's default grid; above it, one graph per power of two:
+# 4096 + 8192 measured the same as 3072/4096/6144/8192 (weighted step within 0.2%).
+_PD_PREFILL_FINE_GRID_MAX = 2048
+
+
+def pd_prefill_capture_sizes(max_num_batched_tokens: int) -> list[int]:
+    """Default CUDA-graph capture sizes of a P/D prefill worker (``pd_prefill_worker``).
+
+    vLLM's default grid to 2048 tokens (1, 2, 4, multiples of 8 below 256, multiples
+    of 16 from 256), then 4096 and 8192, capped at ``min(max_num_batched_tokens,
+    PD_PREFILL_CAPTURE_MAX_TOKENS)``; the cap itself is captured too, so a step of
+    exactly ``max_num_batched_tokens`` tokens replays a graph when it fits.
+    """
+    cap = min(max_num_batched_tokens, PD_PREFILL_CAPTURE_MAX_TOKENS)
+    sizes = [1, 2, 4, *range(8, 256, 8)]
+    sizes += range(256, _PD_PREFILL_FINE_GRID_MAX + 1, 16)
+    size = _PD_PREFILL_FINE_GRID_MAX * 2
+    while size <= PD_PREFILL_CAPTURE_MAX_TOKENS:
+        sizes.append(size)
+        size *= 2
+    return sorted({s for s in sizes if s <= cap} | {cap})
+
+
 # Smallest step (tokens, after CUDA-graph padding) whose token-shard MoE finishes with
 # the fused GEMM-AR (``KimiMoE._token_shard_gemm_ar``). Smaller steps keep the
 # separate all-reduce, which is faster there: on a TP8 prefill worker the fused path

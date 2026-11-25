@@ -599,13 +599,15 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         """Default the kv-cache dtype when the text backbone carries DSA:
         per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
         "fp8_ds_mla" otherwise. With a KV connector (P/D), start at most 2 KV
-        pulls per scheduling step."""
+        pulls per scheduling step, and on a P/D prefill worker default the CUDA-graph
+        capture sizes to prefill-sized steps (``_default_pd_prefill_capture_sizes``)."""
         scheduler_config = vllm_config.scheduler_config
         if (
             vllm_config.kv_transfer_config is not None
             and scheduler_config.max_async_kv_loads_per_step is None
         ):
             scheduler_config.max_async_kv_loads_per_step = 2
+        cls._default_pd_prefill_capture_sizes(vllm_config)
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.
@@ -635,6 +637,64 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             from vllm.models.kimi_k3.nvidia.dense_draft import configure_dense_draft
 
             configure_dense_draft(vllm_config.speculative_config, hf_text_config)
+
+    @staticmethod
+    def _default_pd_prefill_capture_sizes(vllm_config: "VllmConfig") -> None:
+        """Capture CUDA graphs up to min(max_num_batched_tokens, 8192) tokens on the
+        prefill worker of a P/D deployment (``pd_prefill_worker``: KV producer, not
+        the specialized decode). vLLM's default ceiling (<= 1024 tokens) is sized for
+        decode batches; prefill chunks are far larger. Decode instances (kv_consumer,
+        or kv_both on the latency-specialized decode) and non-P/D serving are left
+        alone.
+
+        Only a default: when either ``cudagraph_capture_sizes`` or
+        ``max_cudagraph_capture_size`` is set explicitly, the configured capture is
+        kept unchanged (a recipe that pins sizes must list the prefill sizes itself).
+        """
+        kv_transfer = vllm_config.kv_transfer_config
+        if kv_transfer is None or not kv_transfer.is_kv_producer:
+            return
+        if vllm_config.model_config.enforce_eager:
+            return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            return
+        from vllm.models.kimi_k3.nvidia.model import (
+            PD_PREFILL_CAPTURE_MAX_TOKENS,
+            pd_prefill_capture_sizes,
+            pd_prefill_worker,
+        )
+
+        if not pd_prefill_worker(vllm_config):
+            return
+        compilation_config = vllm_config.compilation_config
+        if (
+            compilation_config.cudagraph_capture_sizes is not None
+            or compilation_config.max_cudagraph_capture_size is not None
+        ):
+            logger.info(
+                "Kimi K3 P/D prefill worker: keeping the configured CUDA graph "
+                "capture (max_cudagraph_capture_size=%s, %s sizes); the prefill "
+                "default (up to %d tokens) applies only when neither is set.",
+                compilation_config.max_cudagraph_capture_size,
+                "no explicit"
+                if compilation_config.cudagraph_capture_sizes is None
+                else len(compilation_config.cudagraph_capture_sizes),
+                PD_PREFILL_CAPTURE_MAX_TOKENS,
+            )
+            return
+        sizes = pd_prefill_capture_sizes(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        compilation_config.cudagraph_capture_sizes = sizes
+        compilation_config.max_cudagraph_capture_size = sizes[-1]
+        logger.info(
+            "Kimi K3 P/D prefill worker: CUDA graph capture sizes up to %d tokens "
+            "(%d sizes).",
+            sizes[-1],
+            len(sizes),
+        )
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
