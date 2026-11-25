@@ -49,6 +49,7 @@ from ..common.primitives import (
     named_barrier,
     pack_fp8,
     pack_pair,
+    prefetch_bytes,
     redux,
     shared_address,
     situ,
@@ -61,6 +62,7 @@ from ..common.primitives import (
     unpack_bf16,
     view,
 )
+from ..common.primitives import prefetch_map as prefetch_tile
 from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
 from .experts import ExpertsKernel, claim, mx_block, swizzled
 
@@ -420,10 +422,18 @@ class RubinExpertsKernel(ExpertsKernel):
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
-        dies=(), static_groups=False, fast_exchange=False,
+        dies=(), static_groups=False, fast_exchange=False, warm=True,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
+        # warm (grid maps): before the routes are known, one thread per CTA prefetches
+        # into L2 one w13 box, one w2 box and 256 B of each scale tensor at its 1 / grid
+        # fraction of the layer's weights, so every 2 MiB page of them is translated
+        # (and its first lines cached) before the first weight stage. One GPU, L2
+        # flushed, route mailbox filled 40 us after launch, M8 (53 experts): first
+        # weight stage landed 1.70 -> 1.44 us after the routes, last CTA's epilogue
+        # -0.2 us. No effect on values.
+        self.warm = warm and grid_maps
         super().__init__(16, 8, experts, grid, publish, True, False, False, slots)
         if fast_exchange:
             from .experts_rubin64 import CENSUS_BYTES
@@ -1152,6 +1162,19 @@ class RubinExpertsKernel(ExpertsKernel):
         self.group_sync(eg)
 
     @cute.jit
+    def warm_pages(self, maps, w13_scales, w2_scales, cta):
+        """``warm``: this CTA's L2 prefetches (one thread; also the M64 kernel's)."""
+        rows13, rows2 = (self.experts * self.w13_rows, self.experts * 3584)
+        row = Int64(cta) * rows13 // self.grid // 128 * 128
+        prefetch_tile(maps[0], Int32(row), 0)
+        row = Int64(cta) * rows2 // self.grid // 128 * 128
+        prefetch_tile(maps[1], Int32(row), 0)
+        sizes = (self.w13_scale_bytes, self.w2_scale_bytes)
+        for scales, size in zip((w13_scales, w2_scales), sizes):
+            offset = Int64(cta) * (self.experts * size) // self.grid // 256 * 256
+            prefetch_bytes(scales.iterator + offset, 256)
+
+    @cute.jit
     def match_fc2(self, sm, workspace, experts, distinct):
         """The hidden loader warp (``dies``), during FC1: this CTA's arrival ticket on
         its SM's die (``ws_xflag`` words 2 / 3, armed to -1 like the pool counters and
@@ -1405,6 +1428,9 @@ class RubinExpertsKernel(ExpertsKernel):
             generations = view(workspace.iterator, ws_generation, Int32, self.slots)
         if cutlass.const_expr(self.lean_route):
             self.route_init(sm, counters, generations)
+        if cutlass.const_expr(self.warm):
+            if tid == 32:
+                self.warm_pages(maps, w13_scales, w2_scales, cta)
         source = ids
         if cutlass.const_expr(self.polled):
             source = view(workspace.iterator, self.ws_route, Int32, 129).iterator
