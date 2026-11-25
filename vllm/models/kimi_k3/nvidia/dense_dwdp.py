@@ -43,6 +43,15 @@ The vocabulary tables (embedding, LM head; ``shard_table``) are sharded the same
 but read in place: from ``install`` on, the other members' shards map those members'
 memory, as the embedding gathers few rows and the prefill LM head reads its weight
 once per step. Until then they map one shared load-time stand-in.
+
+Shared-expert selector (``configure_shared``; a P/D prefill worker under sequence
+parallelism, TP > 1, whose shared experts are replicated): the members are the EP
+ranks, and per decoder layer only its shared expert's storages are sharded (the
+other weights are TP-sharded, i.e. differ between members, or stay resident).
+Every module owning a selected parameter must be a replicated linear (``tp_size``
+1): any other raises, so a TP-sharded storage is never selected. A layer's copies
+start at the previous-but-one layer's MegaMoE launch (``moe_start``), under the
+MegaMoE kernel, instead of at its start, where the attention's SP all-gather runs.
 """
 
 from __future__ import annotations
@@ -65,6 +74,61 @@ logger = init_logger(__name__)
 DEPTH = 3  # staging slots: copies start two layers ahead
 MIN_BYTES = 1 << 20
 DEVICE_TYPE = "cuda"  # storages on other devices (host copies) are not moved
+
+# Shared-expert selector (configure_shared): decoder layer -> the module whose
+# storages are sharded (its replicated shared expert) or None; None = whole layers.
+_SELECT: Callable[[nn.Module], nn.Module | None] | None = None
+
+
+def configure_shared(select: Callable[[nn.Module], nn.Module | None] | None) -> None:
+    """Model init: shard only what ``select`` returns per decoder layer (its
+    replicated shared expert), or nothing extra (None). Exclusive with
+    ``ParallelConfig.dwdp`` (whole layers, DEP engines only)."""
+    global _SELECT
+    if select is not None and edwdp.dense_enabled():
+        raise ValueError(
+            "Shared-expert DWDP (TP > 1 SP prefill worker) and dwdp="
+            "'dense'/'experts' (DEP engines) are exclusive."
+        )
+    _SELECT = select
+
+
+def _enabled() -> bool:
+    return edwdp.dense_enabled() or _SELECT is not None
+
+
+def _root(layer: nn.Module, layer_idx: int) -> nn.Module | None:
+    """The module of decoder layer ``layer_idx`` whose storages are sharded: the
+    whole layer, or under the shared-expert selector its replicated shared expert
+    (None: nothing)."""
+    if _SELECT is None:
+        return layer
+    root = _SELECT(layer)
+    if root is not None:
+        _check_replicated(root, layer_idx)
+    return root
+
+
+def _check_replicated(root: nn.Module, layer_idx: int) -> None:
+    """Every module of ``root`` owning a parameter of at least ``MIN_BYTES`` (or not
+    yet materialized) is a replicated linear: byte-identical on every member, so
+    any member's shard of it is everyone's. A TP-sharded storage raises."""
+    from vllm.model_executor.layers.linear import LinearBase
+
+    for name, module in root.named_modules():
+        owned = [
+            p for p in module.parameters(recurse=False)
+            if p.is_meta or p.untyped_storage().nbytes() >= MIN_BYTES
+        ]  # fmt: skip
+        if owned and not (
+            isinstance(module, LinearBase) and getattr(module, "tp_size", None) == 1
+        ):
+            raise RuntimeError(
+                f"Shared-expert DWDP, layer {layer_idx}: {name or type(root).__name__} "
+                f"({type(module).__name__}, tp_size "
+                f"{getattr(module, 'tp_size', None)}) is not a replicated linear; "
+                "only weights identical on every EP rank can be sharded."
+            )
 
 
 class DenseDwdp:
@@ -107,7 +171,14 @@ class DenseDwdp:
             for idx, (blob, shard, _) in built_layers.items()
         }
         stops = _layer_stops(layers)
-        shared = _shared_storages(layers, stops)
+        # what each layer shards: itself, or its shared expert (shared-expert selector)
+        roots = [_root(layer, start + i) for i, layer in enumerate(layers)]
+        self.issue_at_moe = _SELECT is not None
+        self._ordinal: int | None = None
+        shared = _shared_storages(
+            [r for r in roots if r is not None],
+            [s for r, s in zip(roots, stops) if r is not None],
+        )
         skip = {b.untyped_storage().data_ptr() for b, _, _ in built_layers.values()}
         # Per layer, in order: its load window (module docstring), then its storages
         # that are not in its construction blob go to a load-time blob of the same
@@ -132,12 +203,13 @@ class DenseDwdp:
             _process_deferred(layer, stops[ordinal], dtype)
             prepare(layer)
             torch.cuda.synchronize(device)
-            if ordinal == 0:  # the first layer stays resident
+            root = roots[ordinal]
+            if ordinal == 0 or root is None:  # the first layer stays resident
                 continue
             if idx in built_layers:
-                r, d = _rehome(layer, built_layers[idx], stops[ordinal])
+                r, d = _rehome(root, built_layers[idx], stops[ordinal])
                 rehomed, dead = rehomed + r, dead + d
-            items, off = _plan_layer(layer, stops[ordinal], skip, shared)
+            items, off = _plan_layer(root, stops[ordinal], skip, shared)
             shard = _shard_bytes(items, off, n, chunk)
             if shard:
                 blobs[ordinal] = self._move(items, shard, n, me, device, ordinal)
@@ -171,11 +243,14 @@ class DenseDwdp:
         resident = sum(st.nbytes() for st in shared.values())
         free, total = torch.cuda.mem_get_info(device)
         logger.info(
-            "Dense DWDP: member %d/%d, %d layers (%d sharded at construction, "
+            "Dense DWDP%s: member %d/%d, %d layers (%d sharded at construction, "
             "%d with a load-time blob), %.2f GB/layer copied, %d replaced weight "
             "storages back in their construction shards, %.2f GiB of construction "
             "shards left unused, %.2f GiB of weight storages shared across layers "
             "resident; torch allocated %.2f GiB, device free %.2f / %.2f GiB",
+            " (shared-expert selector, copies at the MegaMoE launch)"
+            if self.issue_at_moe
+            else "",
             me,
             n,
             len(layers),
@@ -239,13 +314,27 @@ class DenseDwdp:
 
     def layer_start(self, layer_idx: int) -> None:
         """Before a decoder layer: wait for its shards, then copy those of the layer
-        ``depth - 1`` ahead (and, at the first layer, the ones in between)."""
+        ``depth - 1`` ahead (and, at the first layer, the ones in between). With
+        ``issue_at_moe`` those copies start at this layer's MegaMoE launch
+        (``moe_start``) instead; here only the next layer's, if the previous layer
+        launched no MegaMoE (a no-op otherwise: they are in flight)."""
         i = layer_idx - self.start
+        self._ordinal = i
         if i == 0:
             for j in range(1, DEPTH - 1):
                 self._fetch(j)
         self.copies[i].wait()
-        self._fetch(i + DEPTH - 1)
+        self._fetch(i + DEPTH - (2 if self.issue_at_moe and i else 1))
+
+    def moe_start(self) -> None:
+        """At the current layer's MegaMoE launch (main stream, before its stager):
+        copy the shards of the layer ``depth - 1`` ahead. Their slot was last read by
+        the previous layer, whose shared-expert side stream has joined the main
+        stream before this point; the copies run under the MegaMoE kernel, away from
+        the next layer's SP all-gather. A no-op without ``issue_at_moe``, outside a
+        forward, and when already in flight (sub-call launches)."""
+        if self.issue_at_moe and self._ordinal is not None:
+            self._fetch(self._ordinal + DEPTH - 1)
 
 
 def _peer_pairs(blob, shard: int, n: int, me: int, handles, key: str, device: int):
@@ -684,17 +773,20 @@ def shard_layer(layer: nn.Module, layer_idx: int) -> None:
     order): the first layer stays resident, the others' BF16 linear weights are
     sharded (``ParallelConfig.dwdp``)."""
     global _B
-    if not edwdp.dense_enabled():
+    if not _enabled():
         return
     if _B is None:
         _B = _Built()
     if _B.start is None:
         _B.start = layer_idx
         return
+    root = _root(layer, layer_idx)
+    if root is None:
+        return
     from .megamoe_rubin.experts import KimiK3MegaMoEExperts
 
     stop = {id(m) for m in layer.modules() if isinstance(m, KimiK3MegaMoEExperts)}
-    _B.shard(layer, layer_idx, stop)
+    _B.shard(root, layer_idx, stop)
 
 
 def shard_table(param: torch.Tensor) -> None:
@@ -722,11 +814,14 @@ def log_construction() -> None:
         pass
     free, total = torch.cuda.mem_get_info(_B.device)
     logger.info(
-        "Dense DWDP construction: member %d/%d, %d layers and %d vocabulary tables "
+        "Dense DWDP construction%s: member %d/%d, %d layers and %d vocabulary tables "
         "sharded, %.2f GiB fabric (home shards + staging slots + table stand-in), "
         "%.2f GiB dwdp_resident_linears weights resident until install; "
         "torch allocated %.2f / reserved %.2f GiB, cumem pool %s GiB, device free "
         "%.2f / %.2f GiB",
+        " (shared-expert selector: replicated shared experts only)"
+        if _SELECT is not None
+        else "",
         _B.me,
         _B.n,
         len(_B.layers),
@@ -754,7 +849,7 @@ def install(
     its load window and its storages are then sharded (the first stays
     resident)."""
     global _D
-    if not edwdp.dense_enabled():
+    if not _enabled():
         for layer in layers[start:end]:
             prepare(layer)
     elif _D is None:

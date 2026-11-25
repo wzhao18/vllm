@@ -285,6 +285,37 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
     return not (backend == "latency_specialized" and kv_transfer.is_kv_consumer)
 
 
+def shared_expert_dwdp(vllm_config: VllmConfig) -> bool:
+    """Whether the replicated shared experts are DWDP-sharded over the EP ranks
+    (dense_dwdp's shared-expert selector): a P/D prefill worker under sequence
+    parallelism on the Rubin MegaMoE, whose SP shared experts are replicated (byte
+    identical on every EP rank) and run beside the MegaMoE (``_shared_overlap``).
+    Each rank keeps 1/EP of their bytes and copies the rest per layer under the
+    MegaMoE kernel: same kernels, same bytes, same math. Not with the specialized
+    decode (its fused shared-expert views run outside the decoder-layer loop) or
+    ``ParallelConfig.dwdp`` (DEP engines)."""
+    parallel_config = vllm_config.parallel_config
+    extra = getattr(vllm_config, "additional_config", None)
+    backend = extra.get("decode_backend", "auto") if isinstance(extra, dict) else "auto"
+    return (
+        pd_prefill_worker(vllm_config)
+        and use_sequence_parallel(vllm_config)
+        and vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE
+        and backend == "auto"
+        and getattr(parallel_config, "dwdp", "none") == "none"
+        and not envs.VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT
+    )
+
+
+def shared_expert_dwdp_root(layer: nn.Module) -> nn.Module | None:
+    """dense_dwdp's shared-expert selector: the decoder layer's replicated SP shared
+    expert (the ``_shared_overlap`` MegaMoE layout), else None (nothing sharded)."""
+    moe = getattr(layer, "mlp", None)
+    if isinstance(moe, KimiMoE) and moe._shared_overlap:
+        return moe.shared_experts
+    return None
+
+
 def use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     """Whether the decoder runs sequence parallelism: each TP rank owns a 1/TP token
     shard between the attention blocks (o_proj GEMM-RS, SP all-gather before the
@@ -1186,6 +1217,9 @@ class KimiMoE(nn.Module):
     ) -> torch.Tensor:
         """MegaMoE routed experts; prefill workers split the batch into
         EP-uniform capacity sub-calls (specialized_prefill.moe)."""
+        dense = dense_dwdp.get()
+        if dense is not None:  # shared-expert DWDP: the copies two layers ahead
+            dense.moe_start()
         subcalls = self._prefill_subcalls
         if subcalls is None:
             return self.experts(hidden_states, topk_weights, topk_ids)
@@ -2101,6 +2135,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         parallel_config = vllm_config.parallel_config
         # DWDP layout (ParallelConfig.dwdp) before the MegaMoE experts are built.
         dense_dwdp.edwdp.configure(parallel_config)
+        # P/D prefill worker under SP: DWDP of the replicated shared experts only.
+        dense_dwdp.configure_shared(
+            shared_expert_dwdp_root if shared_expert_dwdp(vllm_config) else None
+        )
         self.use_sequence_parallel = use_sequence_parallel(vllm_config)
 
         self.vocab_size = config.vocab_size

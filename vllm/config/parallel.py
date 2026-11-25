@@ -465,7 +465,12 @@ class ParallelConfig:
       DEP8 engine that holds the full model on 8 GPUs.
     - "experts": "dense" plus expert DWDP across two engines with the same EP
       layout (e.g. two DEP4 engines of one 8-GPU prefill unit, EP4 x DWDP2);
-      they pair through ``dwdp_dir``. Incompatible with EPLB."""
+      they pair through ``dwdp_dir``. Incompatible with EPLB.
+    These modes shard every weight storage of a layer, so they need DEP (TP1: the
+    non-expert weights are identical on every EP rank). Independently of this
+    field, a TP > 1 P/D prefill worker under sequence parallelism shards only its
+    replicated shared experts the same way (Kimi K3 ``shared_expert_dwdp``: by
+    capability, no setting)."""
 
     dwdp_dir: str | None = None
     """``dwdp="experts"``: a directory shared by the two paired engines (fresh
@@ -1228,6 +1233,8 @@ class ParallelConfig:
                 " custom Executor subclass or its import path."
             )
         if self.dwdp != "none":
+            # Whole-layer DWDP: TP-sharded weights differ between EP ranks. (The
+            # shared-expert selector of TP > 1 prefill workers is not this field.)
             if self.tensor_parallel_size != 1 or self.data_parallel_size < 2:
                 raise ValueError(
                     f"dwdp={self.dwdp!r} needs a DEP engine (tensor_parallel_size=1, "

@@ -836,3 +836,218 @@ def test_expert_halves_match_whole_experts(fabric, monkeypatch, kind):
                 assert g_t.shape == w_t.shape and g_t.stride() == w_t.stride()
                 assert torch.equal(_bits(g_t.contiguous()), _bits(w_t.contiguous()))
             assert torch.equal(got.fc1_alpha, torch.ones(experts))
+
+
+# ---- shared-expert selector (TP > 1 SP prefill worker): replicated shared experts ----
+
+
+class _RLinear(_Linear):
+    """A replicated linear (``disable_tp``: tp_size 1)."""
+
+    tp_size = 1
+
+
+class _TpLinear(_Linear):
+    """A TP-sharded linear: each member holds a different slice."""
+
+    tp_size = 8
+
+
+class _SharedExpert(nn.Module):
+    """The SP shared expert: replicated MXFP8 gate_up / down (weight + E8M0 scale,
+    scales swizzled in place by the kernel's processing)."""
+
+    def __init__(self, linear=_RLinear):
+        super().__init__()
+        self.gate_up_proj = linear(256, 256, torch.float8_e4m3fn, _mxfp8, True)
+        self.down_proj = linear(128, 256, torch.float8_e4m3fn, _mxfp8, True)
+
+
+class _Moe(nn.Module):
+    def __init__(self, linear=_RLinear):
+        super().__init__()
+        self.shared_experts = _SharedExpert(linear)
+        self.gate = _RLinear(64, 64)  # replicated router: not selected
+        self.routed_expert_down_proj = _RLinear(64, 64)  # replicated: not selected
+
+
+class _SpLayer(nn.Module):
+    """A TP8 SP decoder layer: TP-sharded attention, a MoE with a replicated shared
+    expert, router and latent projection."""
+
+    def __init__(self, linear=_RLinear):
+        super().__init__()
+        self.attn = _TpLinear(128, 64, fn=_transpose)
+        self.mlp = _Moe(linear)
+
+
+def _select(layer):
+    return getattr(getattr(layer, "mlp", None), "shared_experts", None)
+
+
+@pytest.fixture
+def shared_fabric(fabric, monkeypatch):
+    """The fake fabric with the shared-expert selector on (no dwdp mode)."""
+    monkeypatch.setattr(dense_dwdp.edwdp, "dense_enabled", lambda: False)
+    monkeypatch.setattr(dense_dwdp, "_SELECT", _select)
+    return fabric
+
+
+def _shared_params(layer):
+    return {f"mlp.shared_experts.{n}": p
+            for n, p in layer.mlp.shared_experts.named_parameters()}  # fmt: skip
+
+
+def test_shared_selector_shards_only_the_shared_expert(shared_fabric):
+    """Under the shared-expert selector a member's construction blob holds exactly
+    the shared expert's storages (weights and scales); the TP-sharded attention and
+    the other replicated weights (router, latent projection) keep their own storage,
+    and no vocabulary table is sharded (they are TP-sharded under TP > 1)."""
+    layers, built = _build(me=1, cls=_SpLayer)
+    assert built.start == 10 and sorted(built.layers) == [11, 12]
+    blob, shard_bytes, regions = built.layers[11]
+    target = blob.untyped_storage().data_ptr()
+    shared = _shared_params(layers[1])
+    assert len(shared) == 4 and len(regions) == 4
+    for name, p in layers[1].named_parameters():
+        moved = p.untyped_storage().data_ptr() == target
+        assert moved == (name in shared), name
+    eligible = sum(dense_dwdp.aligned(p.nbytes) for p in shared.values())
+    assert shard_bytes == dense_dwdp.aligned(-(-eligible // N), CHUNK)
+    # the first layer stays resident
+    assert all(
+        p.untyped_storage().data_ptr() not in {b.untyped_storage().data_ptr()
+                                               for b, _, _ in built.layers.values()}
+        for p in layers[0].parameters()
+    )  # fmt: skip
+    table = nn.Parameter(torch.zeros(1000, 64, dtype=torch.bfloat16), False)
+    ptr = table.data_ptr()
+    dense_dwdp.shard_table(table)
+    assert table.data_ptr() == ptr and dense_dwdp._B is None
+    dense_dwdp._B = None
+
+
+def test_shared_selector_never_takes_tp_sharded_weights(shared_fabric):
+    """A selected module that owns a TP-sharded (non-identical) weight, or a
+    parameter outside a linear, raises at construction: never sharded silently."""
+    with pytest.raises(RuntimeError, match="not a replicated linear"):
+        _build(me=0, cls=lambda: _SpLayer(linear=_TpLinear))
+    dense_dwdp._B = None
+
+    class _Odd(_SpLayer):
+        def __init__(self):
+            super().__init__()
+            self.mlp.shared_experts.norm = nn.Parameter(torch.ones(1 << 20), False)
+
+    with pytest.raises(RuntimeError, match="not a replicated linear"):
+        _build(me=0, cls=_Odd)
+    dense_dwdp._B = None
+
+
+def test_shared_selector_exclusive_with_dwdp_modes(monkeypatch):
+    monkeypatch.setattr(dense_dwdp.edwdp, "dense_enabled", lambda: True)
+    with pytest.raises(ValueError, match="exclusive"):
+        dense_dwdp.configure_shared(_select)
+    dense_dwdp.configure_shared(None)
+    assert dense_dwdp._SELECT is None
+
+
+def test_shared_selector_load_windows_match_unsharded(shared_fabric):
+    """Every member processes each layer in its load window (scale swizzles on the
+    fetched whole shared expert); after a layer's fetch every parameter equals the
+    unsharded processing bitwise, the non-selected ones never moved, and the copies
+    start at the MegaMoE launch."""
+
+    def check(model, ref):
+        dwdp = model.dwdp
+        assert dwdp.issue_at_moe
+        blobs = {
+            b.untyped_storage().data_ptr() for b, _, _ in model.built.layers.values()
+        }
+        for i in range(1, len(model.layers)):
+            dwdp.copies[i].fetch(None, None)
+            got = dict(model.layers[i].named_parameters())
+            want = dict(ref.layers[i].named_parameters())
+            assert sorted(got) == sorted(want)
+            for name in want:
+                g, w = got[name], want[name]
+                assert g.shape == w.shape and g.stride() == w.stride(), name
+                assert torch.equal(_bits(g), _bits(w)), (i, name)
+                moved = g.untyped_storage().data_ptr() in blobs
+                assert moved == name.startswith("mlp.shared_experts."), (i, name)
+
+    _run_members(shared_fabric, 4, check, cls=_SpLayer, prepare=lambda layer: None)
+
+
+class _Sched:
+    """Copies that record when they are fetched / waited."""
+
+    log: list = []
+
+    def __init__(self, i):
+        self.i, self.in_flight = i, False
+
+    def fetch(self, streams, handles):
+        if not self.in_flight:
+            self.in_flight = True
+            _Sched.log.append(("fetch", self.i))
+
+    def wait(self):
+        if self.in_flight:
+            self.in_flight = False
+            _Sched.log.append(("wait", self.i))
+
+
+def _sched(issue_at_moe, layers=6):
+    d = object.__new__(dense_dwdp.DenseDwdp)
+    d.start, d.streams, d.handles = 0, None, None
+    d.copies = [_Sched(i) for i in range(layers)]
+    d.copies[0].fetch = lambda *a: None  # resident first layer: no copies
+    d.issue_at_moe, d._ordinal = issue_at_moe, None
+    return d
+
+
+@pytest.mark.parametrize("moe_layers", ["all", "none", "odd"])
+def test_shared_selector_issue_point(moe_layers):
+    """Shared-expert selector: layer i + 2's copies start at layer i's MegaMoE
+    launch (not at a layer start, where the SP all-gather runs), every layer waits
+    for its own before it starts, a slot (i % 3) is refilled only after the layer
+    that last read it (i - 3) has finished, and a layer whose predecessor launched
+    no MegaMoE still gets its copies (at its predecessor's start). Repeated
+    forwards and MegaMoE sub-calls fetch each layer once."""
+    for _ in range(2):  # a second forward starts from the same state
+        _Sched.log = []
+        d = _sched(issue_at_moe=True)
+        d.moe_start()  # outside a forward: nothing
+        assert _Sched.log == []
+        for i in range(6):
+            d.layer_start(i)
+            if moe_layers == "all" or (moe_layers == "odd" and i % 2):
+                _Sched.log.append(("moe", i))
+                d.moe_start()
+                d.moe_start()  # a second sub-call: no second copy
+            _Sched.log.append(("layer", i))
+        log = _Sched.log
+        assert sorted(i for kind, i in log if kind == "fetch") == [1, 2, 3, 4, 5]
+        for i in range(1, 6):
+            f, w = log.index(("fetch", i)), log.index(("wait", i))
+            assert f < w < log.index(("layer", i))
+            if i >= 3:
+                assert f > log.index(("layer", i - 3)), (i, log)  # slot reuse
+            if i >= 3 and ("moe", i - 2) in log:
+                assert log[f - 1] == ("moe", i - 2), (i, log)  # at the MegaMoE
+            elif i >= 3:  # no MegaMoE in layer i - 2: at layer i - 1's start
+                assert log[f - 1] == ("wait", i - 1), (i, log)
+
+
+def test_whole_layer_dwdp_issue_point_unchanged():
+    """dwdp="dense": copies start at the layer start, depth - 1 ahead; the MegaMoE
+    launch hook does nothing."""
+    _Sched.log = []
+    d = _sched(issue_at_moe=False)
+    for i in range(6):
+        d.layer_start(i)
+        d.moe_start()
+        _Sched.log.append(("layer", i))
+    assert _Sched.log[:3] == [("fetch", 1), ("fetch", 2), ("layer", 0)]
+    assert _Sched.log[3:6] == [("wait", 1), ("fetch", 3), ("layer", 1)]
