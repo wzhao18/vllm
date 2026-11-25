@@ -642,16 +642,16 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 k = sub0[stream + 1] - first
                 b = use % self.big
                 self.sync(full.iterator + b, use // self.big & 1, True)
-                for s in cutlass.range(k, unroll=1):
-                    values = self.take(tmem, empty, b, s, s == k - 1)
-                    if cutlass.const_expr(kk < 2):
+                if cutlass.const_expr(kk < 2):
+                    for s in cutlass.range(k, unroll=1):
+                        values = self.take(tmem, empty, b, s, s == k - 1)
                         if self.sub_partials(workspace, values, item, ranges, s):
                             tile = (first + s) * self.tiles + item % self.tiles
                             store = (sm, workspace, values, tile, parity)
                             self.store_hidden(*store, scalars[:3])
-                    else:
-                        unit, tile = (first + s, item % self.jobs)
-                        self.fc2(sm, workspace, output, values, unit, tile, ranges)
+                else:
+                    job = (first, k, item % self.jobs)
+                    self.fc2_slot(sm, workspace, output, tmem, empty, b, job, ranges)
             offset += count
         # The pool: this group's uses offset + m (m of its parity); pmeta[b]'s phase
         # counts the earlier pool uses of the slot (m // big).
@@ -669,12 +669,52 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 first = sub0[unit0]
                 k = sub0[unit0 + 1] - first
                 self.sync(full.iterator + slot, pool_use // self.big & 1, True)
-                for s in cutlass.range(k, unroll=1):
-                    values = self.take(tmem, empty, slot, s, s == k - 1)
-                    self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
+                job = (first, k, tile0)
+                self.fc2_slot(sm, workspace, output, tmem, empty, slot, job, ranges)
                 m += 2
         if cutlass.const_expr(self.publish):
             self.finalize(workspace, output, batch, scalars[3:], sm=sm)
+
+    @cute.jit
+    def fc2_slot(self, sm, workspace, output, tmem, empty, b, job, ranges):
+        """An FC2 job's k sub-units from big slot ``b``, two a pass: both sub-units'
+        16 columns in one TMEM load (one wait instead of two), then each sub-unit's
+        ``fc2`` in order (the same values, stores and addresses: bitwise)."""
+        first, k, tile = job
+        for s in cutlass.range(0, k, 2, unroll=1):
+            if s + 1 < k:
+                values = self.columns2(tmem, b, s)
+                if s + 2 == k:
+                    self.release(empty, b)
+                low = cute.make_rmem_tensor(self.width, Float32)
+                high = cute.make_rmem_tensor(self.width, Float32)
+                for t in cutlass.range_constexpr(self.width):
+                    low[t] = values[t]
+                    high[t] = values[self.width + t]
+                self.fc2(sm, workspace, output, low, first + s, tile, ranges)
+                self.fc2(sm, workspace, output, high, first + s + 1, tile, ranges)
+            else:
+                values = self.take(tmem, empty, b, s, True)
+                self.fc2(sm, workspace, output, values, first + s, tile, ranges)
+
+    @cute.jit
+    def release(self, empty, b):
+        """``take``'s slot release after the slot's last TMEM read."""
+        fence_tmem(before=True)
+        cute.arch.sync_warp()
+        if thread()[2] == 0:
+            cute.arch.mbarrier_arrive(empty.iterator + b)
+
+    @cute.jit
+    def columns2(self, tmem, b, s):
+        """Sub-units ``s`` and ``s + 1``'s 16 FP32 columns of big slot ``b`` (one load)."""
+        warp = thread()[1]
+        column = b * self.wide + 8 * s
+        raw = load_tmem(tmem + (Uint32(32 * (warp & 3)) << 16) + column, 16)
+        values = cute.make_rmem_tensor(2 * self.width, Float32)
+        for t in cutlass.range_constexpr(2 * self.width):
+            values[t] = raw[t]
+        return values
 
     @cute.jit
     def take(self, tmem, empty, b, s, last):
