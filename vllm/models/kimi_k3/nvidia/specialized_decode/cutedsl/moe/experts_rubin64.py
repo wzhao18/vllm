@@ -58,6 +58,7 @@ from .experts_rubin import (
     RubinExpertsKernel,
     census_add,
     die_words,
+    match_rank_popc,
     nth_set,
     require_below,
     sm_id,
@@ -136,9 +137,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False, warm=True,
+        dies=(), static_groups=False, warm=True, warp_match=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
+        # warp_match (``dies``): warp 0 ballots the four home-bit lists itself (seven
+        # rounds of 32 ranks) and matches them in registers (``match_warp``) instead
+        # of every warp's ``home_bits``, a CTA barrier and ``matched`` from shared
+        # memory (``RubinExpertsKernel.match_warp``'s M8 form).
+        self.warp_match = warp_match
         self.static_groups = static_groups
         # ``RubinExpertsKernel.warm``: an L2 prefetch per weight page before the wait.
         # One GPU, L2 flushed, launched 20 us before its predecessor's end, q4 verify
@@ -832,10 +838,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.arrive(sm, workspace, arrival)
         cute.arch.sync_threads()
         if cutlass.const_expr(len(self.dies) > 0):  # before warp 0 starts streaming
-            self.home_bits(sm, experts, scalars[0])
-            cute.arch.sync_threads()
-            if warp == 0:
-                self.matched(sm)
+            if cutlass.const_expr(self.warp_match):
+                if warp == 0:
+                    self.match_warp(sm, experts, scalars[0])
+            else:
+                self.home_bits(sm, experts, scalars[0])
+                cute.arch.sync_threads()
+                if warp == 0:
+                    self.matched(sm)
             cute.arch.sync_threads()
         if warp > 0:
             for pair in cutlass.range(tid - 32, batch * 16, threads - 32, unroll=1):
@@ -969,6 +979,46 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 ballot = cute.arch.vote_ballot_sync(dies[p])
                 if lane == 0:
                     bits[p * 12 + warp] = Uint32(ballot)
+
+    @cute.jit
+    def match_warp(self, sm, experts, units):
+        """``warp_match``: ``home_bits`` + ``matched`` by warp 0 alone: rank lane + 32 i
+        per round, the four lists' ballot words in registers (also stored for
+        ``pool_homed``), then each list's rank (``match_rank_popc``: ``matched``'s walk)
+        into misc 2904."""
+        lane = thread()[2]
+        info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
+        die, k = (info[0], info[3])
+        bits = view(sm.iterator, self.off_misc + 2704, Uint32, 48)
+        words: cutlass.Constexpr = (self.grid + 31) // 32
+        lists: list = [[], [], [], []]
+        for i in cutlass.range_constexpr(words):
+            rank = lane + 32 * i
+            ranges = self.rank_ranges(sm, units, rank)
+            dies = []
+            for kind in cutlass.range_constexpr(2):
+                for group in cutlass.range_constexpr(2):
+                    lo, hi = (ranges[group, 2 + 2 * kind], ranges[group, 3 + 2 * kind])
+                    mid = (lo + hi) // 2
+                    if cutlass.const_expr(kind == 0):
+                        tile = 3 * ranges[group, 0] + mid // 14
+                        row = experts[tile // 3] * self.w13_rows + tile % 3 * 128 + 64
+                        address = Int64(row) * 1792 + mid % 14 * 128
+                    else:
+                        row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
+                        address = Int64(row) * 128
+                    live = (rank < self.grid) & (lo < hi)
+                    dies.append(live & ((address >> 21 & 1) != 0))
+            for p in cutlass.range_constexpr(4):
+                ballot = Uint32(cute.arch.vote_ballot_sync(dies[p]))
+                lists[p].append(ballot)
+                if lane == 0:
+                    bits[p * 12 + i] = ballot
+        ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
+        for p in cutlass.range_constexpr(4):
+            rank = match_rank_popc(lists[p], self.grid, die, k)
+            if lane == 0:
+                ranks[p] = rank
 
     @cute.jit
     def matched(self, sm):
