@@ -265,10 +265,56 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
 
 
 def build_kernels(cfg: RubinMoeConfig) -> dict[bool, Any]:
-    """The session's kernel objects keyed by ``use_s2`` (always ``{False: kernel}``
-    since the FlashInfer a368c5f66 drop: one epilogue variant, VENDOR.md)."""
-    # FlashInfer a368c5f66: one epilogue variant (no S2), so one kernel per session.
-    return {False: build_kernel(cfg)}
+    """The session's kernel objects keyed by ``use_s2``: ``{False: kernel}`` (the
+    FlashInfer a368c5f66 drop has one epilogue variant, VENDOR.md), plus
+    ``True: narrow kernel`` when the bucket has one (``cfg.narrow``: the same variant
+    built with other tile knobs, sharing the session's workspace; checked by
+    :func:`narrow_local_offsets`)."""
+    kernels = {False: build_kernel(cfg)}
+    if cfg.narrow is not None:
+        kernels[True] = build_kernel(cfg.narrow_config())
+        narrow_local_offsets(kernels[False], kernels[True])
+    return kernels
+
+
+def narrow_local_offsets(wide, narrow) -> tuple[int, int]:
+    """``(wide, narrow)`` byte offsets of the two kernels' local workspaces in ONE
+    local buffer, so both kernels run over the same workspace (no second arena).
+
+    A space is laid out tail_reset span (zeroed by every launch's tail), then the
+    persistent kernel state (zero_on_first_allocate: call epochs, phase counters,
+    the host-written record addresses), then per-launch data (DeviceWorkspace.
+    finalize). Only the tail_reset span depends on the tile shape. Placing the
+    kernel with the shorter span at the length difference makes every persistent
+    and data region coincide, and its tail span lie inside the other's, which each
+    launch leaves zeroed. So the per-call protocol state (CallTail epoch + shared
+    done signals, software-sync phase + signals) is one state whichever kernel
+    runs. Raises unless the shared spaces are identical and the local spaces agree
+    past their tail spans."""
+    lw, ln = _workspace_layout(wide), _workspace_layout(narrow)
+    shared_w = next(x for x in lw if x[0] == "shared")
+    shared_n = next(x for x in ln if x[0] == "shared")
+    if shared_w != shared_n:
+        raise RuntimeError("narrow kernel: shared workspace layouts differ.")
+    ww, wn = wide._device_workspace, narrow._device_workspace
+    tail_w, tail_n = ww.tail_reset_bytes("local"), wn.tail_reset_bytes("local")
+
+    def past_tail(ws, tail):
+        return sorted(
+            (r.name, ws.offset(r.name) - tail, ws.nbytes(r.name), r.reset, str(r.dtype))
+            for r in ws.regions("local")
+            if r.reset != "tail_reset"
+        )
+
+    if (
+        past_tail(ww, tail_w) != past_tail(wn, tail_n)
+        or ww.total_bytes("local") - tail_w != wn.total_bytes("local") - tail_n
+    ):
+        raise RuntimeError("narrow kernel: local workspace state layouts differ.")
+    offsets = (max(tail_n - tail_w, 0), max(tail_w - tail_n, 0))
+    if any(o % 128 for o in offsets):
+        raise RuntimeError(f"narrow kernel: local offsets {offsets} not 128-aligned.")
+    return offsets
 
 
 def _workspace_layout(kernel) -> tuple:
@@ -358,6 +404,16 @@ class RubinMegaMoeSession:
             raise RuntimeError(f"kernel activation SF row {self.sf_cols} < hidden/vec.")
         workspace = self.kernel._device_workspace
         self.local_bytes = int(workspace.total_bytes("local"))
+        # One local buffer for both kernels of a narrow bucket (narrow_local_offsets).
+        self._local_offsets = (0, 0)
+        if True in self.kernels and False in self.kernels:
+            self._local_offsets = narrow_local_offsets(
+                self.kernels[False], self.kernels[True]
+            )
+            self.local_bytes = max(
+                off + int(k._device_workspace.total_bytes("local"))
+                for off, k in zip(self._local_offsets, (self.kernels[False], self.kernels[True]))
+            )
         self.shared_bytes = int(workspace.total_bytes("shared"))
         # (name, shape, dtype) carved from the arena in this order on every rank.
         self.symmetric_plan: list[tuple[str, tuple[int, ...], torch.dtype]] = [
@@ -398,16 +454,25 @@ class RubinMegaMoeSession:
         self.topk_idx = torch.full(
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device=self.device
         )
-        self.local_workspace = torch.zeros(
+        self._local_buffer = torch.zeros(
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
+        # The main kernel's view; a narrow kernel launches on its own view of the
+        # same buffer (same persistent state, narrow_local_offsets).
+        self.local_workspace = self._local_buffer[self._local_offsets[0] :]
+        self._narrow_local = self._local_buffer[self._local_offsets[1] :]
         self._write_spin_record_address()
         self._write_ep_balance_address()
         # Per-launch scratch of the refreshed inference kernel (src_gp; any content
         # at launch, nothing survives it). The caching allocator aligns to 512 B.
         self.tmp_buffer = (
             torch.empty(
-                (max(int(self.kernel.get_tmp_buffer_bytes()), 1),),
+                (
+                    max(
+                        [int(k.get_tmp_buffer_bytes()) for k in self.kernels.values()]
+                        + [1]
+                    ),
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -429,6 +494,7 @@ class RubinMegaMoeSession:
         if (
             self.topk_idx.data_ptr() % 16
             or self.local_workspace.data_ptr() % 128
+            or self._narrow_local.data_ptr() % 128
             or self.shared_workspace.data_ptr() % ALIGN
         ):
             raise RuntimeError("Rubin MegaMoE workspace alignment violated.")
@@ -504,8 +570,11 @@ class RubinMegaMoeSession:
             )
 
     def use_s2(self, ep_tokens: int | None) -> bool:
-        """The epilogue variant for a launch whose EP-uniform live tokens per rank are
-        ``ep_tokens`` (None: the capacity). Same answer on every EP rank."""
+        """The kernel for a launch whose EP-uniform live tokens per rank are
+        ``ep_tokens`` (None: the capacity): the narrow kernel (True) below the
+        bucket's narrow rows, else the main one. Same answer on every EP rank."""
+        if self.cfg.narrow is not None and True in self.kernels:
+            return ep_tokens is not None and ep_tokens < self.cfg.narrow[0]
         return next(iter(self.kernels))
 
     def prepare(
@@ -580,6 +649,8 @@ class RubinMegaMoeSession:
             kwargs.update(self._shared_kwargs(shared))
         if use_s2 is None:
             use_s2 = self.use_s2(None)
+        if use_s2 and self.cfg.narrow is not None:
+            kwargs["local_workspace"] = self._narrow_local_ptr()
         variant = (use_s2, rmsnorm is not None)
         if rmsnorm is not None and self.cfg.kernel_variant in DEDUP_VARIANTS:
             raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
@@ -601,6 +672,12 @@ class RubinMegaMoeSession:
                 _COMPILED[ckey] = compiled
             self.compiled[variant] = compiled
         return kwargs
+
+    def _narrow_local_ptr(self):
+        ptr = getattr(self, "_narrow_local_cute", None)
+        if ptr is None:
+            ptr = self._narrow_local_cute = _to_cute_ptr(self._narrow_local)
+        return ptr
 
     def _shared_kwargs(self, shared: "FusedSharedArgs") -> dict:
         """The fused shared expert's launch arguments (cached by pointers): the MXFP8
@@ -757,5 +834,6 @@ class RubinMegaMoeSession:
             setattr(self, name, None)
         self._shared_bound.clear()
         self.topk_idx = self.local_workspace = self.empty_output = None
+        self._local_buffer = self._narrow_local = self._narrow_local_cute = None
         self.tmp_buffer = None
         self.shared_output = None
