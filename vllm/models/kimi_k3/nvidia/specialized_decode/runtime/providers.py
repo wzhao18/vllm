@@ -30,6 +30,7 @@ from ..cutedsl.kda.head import (
 )
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
 from ..cutedsl.kda.prepared import PreparedKda
+from ..cutedsl.kda.sp import SpKdaCore
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.mla.dcp import PAIR_SENT, DcpBox, polled_output
 from ..cutedsl.mla.prepared import SWITCH, PreparedMla
@@ -620,6 +621,8 @@ class Attention:
             # SplitKTmemGemm64's CTAs are resident beside the preceding AttnRes
             self.before_carveout = MLA_BEFORE_CARVEOUT
         self.fold64: Any = None  # PreparedKdaInProj64 (KDA_FOLD64 verify rows)
+        # SpKdaCore: the KDA verify rows' record core under --use-replayssm
+        self.records_core: Any = None
         # Wide batches whose MLA runs PreparedMla (``mla.prepared.choose``); the
         # others run the stock MLA attention (seam S2, ``run_wide``).
         self.mla_wide: frozenset[int] = frozenset()
@@ -665,14 +668,28 @@ class Attention:
             mode = lambda b: (1 if b == 1 else 2 if b <= 8 else 0) if tp == 8 else 0
             policies = {b: (pitch, mode(b)) for b in runtime.tuned}
             q = runtime.q  # verify steps: B requests x q tokens
+            records = getattr(runtime, "records", "none")
+            if records != "none":
+                # RecoverSSM records (--use-replayssm): every verify row runs a record
+                # core (one checkpoint slot per request; the next verify folds the
+                # accepted tokens). The q-checkpoint verify kernels (PreparedKda
+                # verify keys, the fold64 / KdaHeadVerify / KdaHeadMulti heads) would
+                # write slots the records layout does not have: none is built.
+                rows = [b for b in runtime.batches if q > 1 and b % q == 0]
+                self.records_core = SpKdaCore(
+                    attention, rows, records=records, ctx=runtime.context
+                )
             shapes = (Shape(m, q) for m in runtime.wide)
             self.kda_stock = frozenset(
                 s.rows
                 for s in shapes
-                if kda_choose(s, runtime.context).path is Path.STOCK
+                if records == "none"
+                and kda_choose(s, runtime.context).path is Path.STOCK
             )
             kdasplit = [b for b in runtime.batches if b not in self.kda_stock]
             verify = [b // q for b in kdasplit if q > 1 and b % q == 0]
+            if records != "none":
+                verify = []
             policies.update({(b, q): (pitch, int(tp == 8)) for b in verify})
             fold = KDA_FOLD64 if runtime.bf16_state else KDA_FOLD64_FP32
             # (the fold's epilogue is a BF16 in-projection's: no MXFP8 layer folds)
@@ -726,6 +743,8 @@ class Attention:
             multi = [
                 b for b in runtime.batches if multi.get(b) and b % q == 0 and fits(b, q)
             ]
+            if records != "none":  # (verify rows: the record cores)
+                multi = []
             if batches or multi:
                 index = runtime.kda_heads
                 runtime.kda_heads += 1
@@ -752,7 +771,7 @@ class Attention:
                 verify = [
                     (b, runtime.q)
                     for b in batches
-                    if b == runtime.q == 8 and fits(b, runtime.q)
+                    if b == runtime.q == 8 and fits(b, runtime.q) and records == "none"
                 ]
                 verify += [(b, q) for b in multi]  # KdaHeadMulti
                 self.head = PreparedKdaHead(
@@ -876,6 +895,8 @@ class Attention:
     def prepare_layout(self, caches):
         if self.kind == "kda":
             self.core.prepare_caches(caches)
+            if self.records_core is not None:
+                self.records_core.prepare_caches(caches)
             if self.fold64 is not None:
                 self.fold64.prepare_caches(caches)
                 if self.fold64.tokens < 8:  # x's tensor maps, before any capture
@@ -993,7 +1014,11 @@ class Attention:
             self.run_dsa(projected, local, caches, metadata, slot_mapping, q)
         elif self.kind == "kda":
             self.prefetch.fork("attention_moe", self.layer.layer_idx, b)
-            if q > 1:  # uniform q-token verify rows
+            if q > 1 and self.records_core is not None:  # RecoverSSM records
+                self.records_core.run(
+                    projected, local, caches=caches, metadata=metadata
+                )
+            elif q > 1:  # uniform q-token verify rows
                 slots = metadata.spec_state_indices_tensor
                 accepted = metadata.num_accepted_tokens
                 operands = dict(prepared=prepared) if fold else {}
@@ -1055,6 +1080,8 @@ class Attention:
         attention = self.layer.self_attn
         if self.kind == "kda" and b in self.kda_stock:
             self.stock_kda(attention, projected, local)
+        elif self.kind == "kda" and self.records_core is not None:
+            self.records_core.run(projected, local, caches=caches, metadata=metadata)
         elif self.kind == "kda":
             slots = metadata.spec_state_indices_tensor
             accepted = metadata.num_accepted_tokens

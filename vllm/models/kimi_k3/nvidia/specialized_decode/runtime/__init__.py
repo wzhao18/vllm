@@ -33,7 +33,7 @@ class DecodeConfig:
     dp: int = 1
     # Expert-parallel ranks of the MoE (TP x DP under expert parallelism, else 1).
     ep: int = 1
-    # ReplaySSM / RecoverSSM records on the KDA layers (--use-replayssm; SP only).
+    # ReplaySSM / RecoverSSM records on the KDA layers (--use-replayssm).
     replayssm: bool = False
     # The SP topology's DSA-DP variant (``dsa_dp_topology``): TP4 attention groups at
     # DCP1 whose DSA layers run data-parallel inside the TP group (ops/dsa_dp.py).
@@ -205,7 +205,7 @@ def unsupported(vllm_config) -> str | None:
     # Kimi K3.1: sparse (DSA) MLA layers over the packed MLA and indexer caches,
     # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse.
     dsa = getattr(text, "dsa_config", None) is not None
-    # TP4 with expert parallelism and ReplaySSM records only as the SP topology
+    # TP4 with expert parallelism only as the SP topology
     # (``sp_unsupported`` narrows it to C512's decode role).
     sp = sp_topology(vllm_config)
     checks = (
@@ -258,23 +258,16 @@ def unsupported(vllm_config) -> str | None:
         # The KDA cores keep a BF16 or FP32 conv state (``--mamba-cache-dtype``; the
         # cores read and write it at its own dtype, the window holds the BF16
         # in-projection inputs either way) and an FP32 (Rubin: or BF16) recurrent
-        # state in place; no other cache dtypes, nor ReplaySSM / RecoverSSM records
-        # outside SP (the SP topology's KDA core writes the records).
+        # state in place; no other cache dtypes. ReplaySSM / RecoverSSM records
+        # (--use-replayssm) on every topology: the record cores (``kda.sp.SpKdaCore``)
+        # serve the SP step and the TP8 / TP16 verify rows; ``recoverssm.
+        # prepare_recoverssm`` refuses what they cannot run (BF16 state, conv bias).
         (
             kda_dtypes(vllm_config)
             not in [(c, s) for c in conv_dtypes() for s in states],
             "KDA cache dtypes other than a BF16 / FP32 conv state and an FP32 "
             "recurrent state (mamba cache dtype; a BF16 recurrent state on Rubin "
             "only)",
-        ),
-        (
-            (
-                vllm_config.cache_config.use_replayssm
-                or vllm_config.cache_config.use_kda_recoverssm
-            )
-            and not sp,
-            "ReplaySSM / RecoverSSM (--use-replayssm) outside TP4 sequence "
-            "parallelism (DCP4 or DSA-DP)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (

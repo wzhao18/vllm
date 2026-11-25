@@ -237,6 +237,7 @@ class SpecializedDecode:
     it; none of the TP8 / TP16 providers below is built."""
 
     sp = None  # the SP step (sp_attention.SpStep) under sequence parallelism
+    records = "none"  # RecoverSSM records mode of the TP8 / TP16 KDA verify rows
     strict_wide = False  # NQ-NOFALLBACK beyond the target topology (``__init__``)
 
     def __init__(self, backbone, config):
@@ -326,6 +327,16 @@ class SpecializedDecode:
         layers = backbone.layers[backbone.start_layer : backbone.end_layer]
         self.layers = layers = tuple(layers)
         self.kda_side, self.kda_heads = KdaSide(self.device), 0
+        # RecoverSSM records (--use-replayssm): "deferred", decided before any provider
+        # is built; the KDA verify rows then run the record cores (``kda.sp.SpKdaCore``:
+        # one checkpoint slot per request, the commit folded by the next verify)
+        # instead of the q-checkpoint verify kernels. ``bind_model_state`` binds the
+        # runner side.
+        self.records = "none"
+        if config.replayssm and q > 1:
+            from ..recoverssm import prepare_recoverssm
+
+            self.records = prepare_recoverssm(layers, self.context)
         # Batches whose captured step switches between two bodies (prepare_kv).
         self.switched: dict[int, int] = {}
         self.switch: GraphSwitch | None = None
@@ -752,7 +763,13 @@ class SpecializedDecode:
             )
         choices = {"embed": embed, "attn_res": attn_res}
         notes = {a.kind: inproj_note(a, b) for a in self.attention.values()}
-        if "kda" in kinds:
+        kda = next((a for a in self.attention.values() if a.kind == "kda"), None)
+        if kda is not None and kda.records_core is not None:
+            core = kda.records_core.choice(b)
+            choices["kda"] = Choice(
+                core.path, core.tactic, f"{notes['kda']} + {core.note}"
+            )
+        elif "kda" in kinds:
             core = kda_choose(Shape(b, q), self.context)
             choices["kda"] = Choice(core.path, note=f"{notes['kda']} + {core.note}")
         mla = next((a for a in self.attention.values() if a.kind == "mla"), None)
@@ -816,6 +833,8 @@ class SpecializedDecode:
                 note = "head"
             elif kda.fold64 is not None and q > 1 and b == 8 * q:  # as Attention.run
                 note = f"fold {b // q}x{q}"
+            elif kda.records_core is not None and q > 1:
+                note = kda.records_core.choice(b).note
             else:
                 capability = torch.cuda.get_device_capability(self.device)
                 kernel = verify_kernel(
@@ -1106,11 +1125,12 @@ class SpecializedDecode:
         return (out, aux_out) if aux_out else out
 
     def bind_model_state(self, state):
-        """The runner-state side of the SP step's deferred RecoverSSM (its KDA
-        cores fold the pending commit; ``recoverssm.bind_model_state``), called once
-        by the ``KimiK3ModelState`` that built this decode. No-op for the other
-        records modes and outside sequence parallelism."""
-        if self.sp is not None and self.sp.records == "deferred":
+        """The runner-state side of the deferred RecoverSSM (the SP step's or the
+        TP8 / TP16 verify rows' KDA record cores fold the pending commit;
+        ``recoverssm.bind_model_state``), called once by the ``KimiK3ModelState``
+        that built this decode. No-op for the other records modes."""
+        records = self.sp.records if self.sp is not None else self.records
+        if records == "deferred":
             from ..recoverssm import bind_model_state
 
             bind_model_state(state)
