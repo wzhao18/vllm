@@ -72,7 +72,12 @@ def tmem_ld32(taddr):
     """tcgen05.ld 32x32b.x32: 32 columns of this warp's 32 TMEM lanes."""
     regs = ",".join(f"${i}" for i in range(32))
     code = "tcgen05.ld.sync.aligned.32x32b.x32.b32 {" + regs + "}, [$32];"
-    return code, ",".join(["=f"] * 32) + ",r,~{memory}", (Int32(taddr),), (Float32,) * 32
+    return (
+        code,
+        ",".join(["=f"] * 32) + ",r,~{memory}",
+        (Int32(taddr),),
+        (Float32,) * 32,
+    )
 
 
 @asm()
@@ -159,9 +164,7 @@ class IndexerScoreFp4:
         vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma.thr_id.shape,))
         a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, fp4, STAGES)
         b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, fp4, 2)
-        sfa_layout = blockscaled_utils.make_smem_layout_sfa(
-            mma, self.tiler, 32, STAGES
-        )
+        sfa_layout = blockscaled_utils.make_smem_layout_sfa(mma, self.tiler, 32, STAGES)
         sfb_layout = blockscaled_utils.make_smem_layout_sfb(mma, self.tiler, 32, 2)
         sfa_one = cute.slice_(sfa_layout, (None, None, None, 0))
         sfb_one = cute.slice_(sfb_layout, (None, None, None, 0))
@@ -180,9 +183,7 @@ class IndexerScoreFp4:
         assert N + self.sfa_cols + self.sfb_cols <= TMEM_COLS
         # 64-byte K-major rows: the A stage is SW64 atoms of 8 rows, so each page
         # (64 keys) is one half of a stage.
-        atom = sm100_utils.make_smem_layout_atom(
-            tcgen05.SmemLayoutAtomKind.K_SW64, fp4
-        )
+        atom = sm100_utils.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW64, fp4)
         page_layout = cute.tile_to_shape(atom, (PAGE, DIM, 2 * STAGES), (0, 1, 2))
         tma_k, tma_k_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -240,7 +241,9 @@ class IndexerScoreFp4:
         return tiled, src, thr.partition_D(tc)
 
     @cute.jit
-    def tile_out(self, taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane):
+    def tile_out(
+        self, taddr, tok0, key, qs, w_a, sEnd, row0, out_base, acc_empty, lane
+    ):
         """One tile's logits of this thread's key for tokens tok0 .. tok0 + 3:
         stock's epilogue (see the module docstring); frees the accumulator once
         every load landed."""
@@ -269,7 +272,7 @@ class IndexerScoreFp4:
                     s1 = fma_bf16x2(relu_bf16x2(f[h + 6], f[h + 7]), w[3], s1)
                 pair_sum = add_bf16x2(s0, s1)
                 total = add_bf16x2(pair_sum, pair_sum >> Uint32(16))
-                if tok < Q:
+                if tok < Q:  # noqa: SIM102 (dynamic: no short-circuit and)
                     if key < sEnd[tok, qs]:
                         element = row0 + Int64(tok) * pitch + Int64(key)
                         store_b16(out_base + element * 2, total)
@@ -445,7 +448,7 @@ class IndexerScoreFp4:
         # insert (the last q keys of a request at most) cannot touch: cache pages
         # and block table are from earlier steps.
         pre = Int32(0)
-        if warp == PRODUCER:
+        if warp == PRODUCER:  # noqa: SIM102 (dynamic: no short-circuit and)
             if lo < hi:
                 req0, k00, nt0, _g, _r = _next_item(sStart, requests, lo, r_lo, hi)
                 page0 = table_entry(
@@ -544,7 +547,10 @@ class IndexerScoreFp4:
                     cute.group_modes(thr_mma.partition_B(gQ), 0, 3),
                 )
                 cute.copy(
-                    tma_q, tQgQ[(None, 0, 0, 0)], tQsQ[(None, qs)], tma_bar_ptr=q_full + qs
+                    tma_q,
+                    tQgQ[(None, 0, 0, 0)],
+                    tQsQ[(None, qs)],
+                    tma_bar_ptr=q_full + qs,
                 )
                 j += 1
                 for t in cutlass.range(skip, ntile, unroll=1):

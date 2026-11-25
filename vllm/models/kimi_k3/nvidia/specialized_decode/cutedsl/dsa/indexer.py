@@ -50,7 +50,6 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import fake, stream, to_cute
-from .index import fp4_query_views, is_fp4_cache
 from ..common.primitives import (
     asm,
     bits_float,
@@ -59,6 +58,7 @@ from ..common.primitives import (
     smem_words,
     store_shared_words,
 )
+from .index import fp4_query_views, is_fp4_cache
 
 PAGE = 64  # keys per indexer cache block
 DIM = 128
