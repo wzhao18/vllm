@@ -3144,12 +3144,15 @@ def _publish_units(items, t, device, ctas=None):
 
 @triton.jit
 def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
-                           slots: tl.constexpr, tile: tl.constexpr):
+                           slots: tl.constexpr, slots_pad: tl.constexpr,
+                           tile: tl.constexpr):
     """Per row and key lane: region copies 1.. appended after copy 0's slots, in copy
     order; a column that reaches ``slots`` keeps count ``slots`` (overflowed: the
-    select flags the row and the exact full path recomputes it)."""
+    select flags the row and the exact full path recomputes it). One program per
+    row moves a whole [slots, tile] copy at once (masked), no slot loop."""
     row = tl.program_id(0)
     lane = tl.arange(0, tile)
+    sl = tl.arange(0, slots_pad)[:, None]
     base = cand_ptr + row.to(tl.int64) * row_words
     total = tl.load(base + lane).to(tl.int32)
     ovf = total >= slots
@@ -3157,11 +3160,10 @@ def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.conste
         src = base + k * region_words
         c = tl.load(src + lane).to(tl.int32)
         ovf = ovf | (c >= slots) | (total + c >= slots)
-        # only the row's longest column of this copy (typically ~20 of 96 slots)
-        for s in range(0, tl.minimum(tl.max(c, axis=0), slots)):
-            m = (s < c) & (total + s < slots)
-            v = tl.load(src + (1 + s) * tile + lane, mask=m)
-            tl.store(base + (1 + total + s) * tile + lane, v, mask=m)
+        dst = total[None, :] + sl
+        m = (sl < c[None, :]) & (dst < slots)
+        v = tl.load(src + (1 + sl) * tile + lane[None, :], mask=m)
+        tl.store(base + (1 + dst) * tile + lane[None, :], v, mask=m)
         total = total + c
     tl.store(base + lane, tl.where(ovf, slots, total).to(tl.int32))
 
@@ -3183,7 +3185,8 @@ def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLI
           sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
           n_items=sp.n_pub_items)
     _concat_regions_kernel[(sp.t,)](
-        cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, num_warps=4
+        cand, (sp.t + 1) * REGION, REGION, split, SLOTS,
+        triton.next_power_of_2(SLOTS), TILE, num_warps=8,
     )
     return cand[: (sp.t + 1) * REGION]
 
