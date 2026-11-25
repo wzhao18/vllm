@@ -552,8 +552,9 @@ DCP_CORE_CASES = {
 
 @pytest.mark.parametrize("case", list(DCP_CORE_CASES))
 @pytest.mark.parametrize("kernel", ["trtllm", "prims_ts"])
+@pytest.mark.parametrize("partials", ["bf16", "proj"])
 def test_flashinfer_dcp_core_merges_to_full_attention(
-    default_vllm_config, dist_init, kernel, case
+    default_vllm_config, dist_init, kernel, case, partials
 ):
     """DCP on FlashInfer sparse (per-tensor FP8): each rank's dcp_core over its
     shard of a packed cache, its gathered 96-head query padded to 128 and the
@@ -561,7 +562,11 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     over the whole context. Request 0 lies on rank 0 only (empty shards: rows
     where some ranks own none of the top-k). The wide cases read the query from a
     widened box passed as ``box`` (rows above the 64-row box), q rows per request,
-    and de-interleave the global ids at interleave 896 over 16 ranks."""
+    and de-interleave the global ids at interleave 896 over 16 ranks.
+    ``partials`` "proj": the "proj" DcpValue drops a row by its per-row count (it
+    sends EMPTY_LSE and no value row), so trtllm-gen's empty-row fill is skipped and
+    the merge here masks the rows of count 0 the same way; "bf16": the fill gives
+    them LSE -inf (the BF16 DcpValue reads request lengths)."""
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -663,6 +668,9 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
             indexer=SimpleNamespace(
                 dcp_rank=rank, cp_kv_cache_interleave_size=interleave
             ),
+            dsa_box=SimpleNamespace(
+                mailbox=lambda batch: SimpleNamespace(format=partials)
+            ),
         )
         if cap > 64:
             # Wide rows read the widened box passed in, not the layer's own 64-row
@@ -679,6 +687,10 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         assert torch.equal(valid.view(-1).long(), owned.sum(1)), rank
         outs.append(row.view(rows, -1, 512)[:, :heads].float())
         lses.append(lse.view(rows, -1)[:, :heads].float())
+        if partials == "proj":  # DcpValue "proj": a row of count 0 sends EMPTY_LSE
+            empty = (valid.view(-1) == 0).view(-1, 1)
+            outs[-1] = outs[-1].masked_fill(empty.unsqueeze(-1), 0.0)
+            lses[-1] = lses[-1].masked_fill(empty, float("-inf"))
         if rank:
             assert torch.isinf(lses[-1][:q]).all(), "an empty shard must not count"
 
