@@ -912,9 +912,9 @@ def fused_fp4_inputs(contexts, q, seed, gap=GAP):
     )
 
 
-def deepgemm_fp4_logits(x, q, max_model_len):
+def deepgemm_fp4_logits(x, q, max_model_len, schedule=None):
     """Stock's MXFP4 paged logits (DeepGEMM SM100, the decode varlen form) of
-    ``fused_fp4_inputs``' rows."""
+    ``fused_fp4_inputs``' rows (``schedule``: its step metadata, else built)."""
     from vllm.model_executor.layers.sparse_attn_indexer import (
         kv_cache_as_quant_view,
     )
@@ -932,13 +932,17 @@ def deepgemm_fp4_logits(x, q, max_model_len):
     context_lens = x.ends.view(rows, 1).contiguous()
     indices = torch.arange(rows, dtype=torch.int32, device="cuda")
     table = x.table.repeat_interleave(q, 0).contiguous()
+    if schedule is None:
+        schedule = get_paged_mqa_logits_metadata(
+            context_lens, UNIT, get_num_sms(), indices
+        )
     return fp8_fp4_paged_mqa_logits(
         (packed.view(torch.int8).unsqueeze(1), q_sf.unsqueeze(1)),
         kv_cache_as_quant_view(x.index, 128, True),
         x.weights,
         context_lens,
         table,
-        get_paged_mqa_logits_metadata(context_lens, UNIT, get_num_sms(), indices),
+        schedule,
         max_model_len=max_model_len,
         indices=indices,
     )
