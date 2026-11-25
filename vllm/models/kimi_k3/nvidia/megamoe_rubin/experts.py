@@ -1177,8 +1177,15 @@ class KimiK3MegaMoEExperts(nn.Module):
                 )
             if not _dp_batches_uniform(dp_metadata):
                 return buckets[-1]
+        # P/D prefill workers' capped small bucket exists only for the side-stream
+        # shared-expert overlap, which never runs inside a stream capture
+        # (maybe_execute_in_parallel is serial under breakable graphs): captured steps
+        # take the full-grid bucket instead.
+        skip_capped = self.prefill_worker and torch.cuda.is_current_stream_capturing()
         for b in buckets:
             if num_tokens <= b.max_tokens:
+                if skip_capped and b.max_sm_count is not None and b is not buckets[-1]:
+                    continue
                 return b
         raise AssertionError("unreachable: the largest bucket holds max_num_tokens")
 

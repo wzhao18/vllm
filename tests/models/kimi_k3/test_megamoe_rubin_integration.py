@@ -411,6 +411,11 @@ def test_prefill_shared_overlap_caps_only_the_small_bucket(monkeypatch, world, t
     module.select_bucket = sel
     for n, capped in ((1, True), (cap, True), (cap + 1, False), (tokens, False)):
         assert X.KimiK3MegaMoEExperts.shared_overlap(module, n) is capped
+    # inside a stream capture (breakable graphs: no side-stream overlap) the full grid
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    for n in (1, cap, tokens):
+        assert sel(n) is big
+        assert X.KimiK3MegaMoEExperts.shared_overlap(module, n) is False
     with pytest.raises(ValueError):
         X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(
             SimpleNamespace(bucket=main, buckets=buckets, kernel_weights=None,
