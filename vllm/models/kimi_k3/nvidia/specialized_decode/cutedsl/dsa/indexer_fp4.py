@@ -274,6 +274,44 @@ class IndexerScoreFp4:
                         element = row0 + Int64(tok) * pitch + Int64(key)
                         store_b16(out_base + element * 2, total)
 
+    @cute.jit
+    def issue_tile(
+        self, t, it, my_page, blocks, kv_full, kv_empty, sSc, scales, tma_k, tKgK, tKsK
+    ):
+        """Tile ``t`` of an item (its pages two lanes of ``my_page``) into ring slot
+        ``it % STAGES``: the keys by TMA, the scale words by bulk copies."""
+        stage = it % STAGES
+        p0 = cute.arch.shuffle_sync(my_page, 2 * t)
+        p1 = cute.arch.shuffle_sync(my_page, 2 * t + 1)
+        # A partial last tile's second page may lie past the request's blocks:
+        # keep its (unused) reads in bounds.
+        p1 = cutlass.min(cutlass.max(p1, Int32(0)), blocks - 1)
+        cute.arch.mbarrier_wait(kv_empty + stage, ((it // STAGES) & 1) ^ 1)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                kv_full + stage, FP4_TILE_BYTES + TILE * 4
+            )
+            bulk_g2s(
+                sSc.iterator + stage * TILE,
+                scales.iterator + stride_pages(p0, scales),
+                kv_full + stage,
+                PAGE * 4,
+            )
+            bulk_g2s(
+                sSc.iterator + stage * TILE + PAGE,
+                scales.iterator + stride_pages(p1, scales),
+                kv_full + stage,
+                PAGE * 4,
+            )
+        cute.copy(
+            tma_k, tKgK[(None, 0, 0, p0)], tKsK[(None, 2 * stage)],
+            tma_bar_ptr=kv_full + stage,
+        )  # fmt: skip
+        cute.copy(
+            tma_k, tKgK[(None, 0, 0, p1)], tKsK[(None, 2 * stage + 1)],
+            tma_bar_ptr=kv_full + stage,
+        )  # fmt: skip
+
     @cute.kernel
     def kernel(
         self,
@@ -389,12 +427,42 @@ class IndexerScoreFp4:
             if lane == 0:
                 sStart[0] = Int32(0)
         cute.arch.sync_threads()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         total = sStart[requests]
         lo = Int32((Int64(total) * Int64(bid)) // Int64(self.ctas))
         hi = Int32((Int64(total) * Int64(bid + 1)) // Int64(self.ctas))
         r_lo = _first_request(sStart, requests, lo)
+        gK = cute.local_tile(mK, (PAGE, DIM), (None, None, None))
+        tKsK, tKgK = cpasync.tma_partition(
+            tma_k,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sPage, 0, 2),
+            cute.group_modes(gK, 0, 2),
+        )
+        max_page = table[2] - 1
+        blocks = scales.shape[0]
+        # Before the PDL wait: the first item's leading tiles that this step's key
+        # insert (the last q keys of a request at most) cannot touch: cache pages
+        # and block table are from earlier steps.
+        pre = Int32(0)
+        if warp == PRODUCER:
+            if lo < hi:
+                req0, k00, nt0, _g, _r = _next_item(sStart, requests, lo, r_lo, hi)
+                page0 = table_entry(
+                    table, req0, cutlass.min(k00 // PAGE + lane, max_page)
+                )
+                stable = row_ends[req0 * Q + Q - 1] - Q - k00
+                pre = cutlass.min(
+                    cutlass.min(nt0, Int32(STAGES)),
+                    cutlass.max(stable, Int32(0)) // Int32(TILE),
+                )
+                for t in cutlass.range(pre, unroll=1):
+                    self.issue_tile(
+                        t, t, page0, blocks, kv_full, kv_empty, sSc, scales,
+                        tma_k, tKgK, tKsK,
+                    )  # fmt: skip
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
 
         it = Int32(0)  # tiles issued / consumed by this role
         j = Int32(0)  # items issued / consumed by this role
@@ -402,16 +470,8 @@ class IndexerScoreFp4:
         r = r_lo
         if warp == PRODUCER:
             thr_mma = mma.get_slice(0)
-            gK = cute.local_tile(mK, (PAGE, DIM), (None, None, None))
-            tKsK, tKgK = cpasync.tma_partition(
-                tma_k,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sPage, 0, 2),
-                cute.group_modes(gK, 0, 2),
-            )
-            max_page = table[2] - 1
-            blocks = scales.shape[0]
+            it = pre
+            skip = pre  # the first item's tiles issued before the wait
             n_req = Int32(0)
             n_k0 = Int32(0)
             n_nt = Int32(0)
@@ -487,43 +547,13 @@ class IndexerScoreFp4:
                     tma_q, tQgQ[(None, 0, 0, 0)], tQsQ[(None, qs)], tma_bar_ptr=q_full + qs
                 )
                 j += 1
-                for t in cutlass.range(ntile, unroll=1):
-                    stage = it % STAGES
-                    p0 = cute.arch.shuffle_sync(my_page, 2 * t)
-                    p1 = cute.arch.shuffle_sync(my_page, 2 * t + 1)
-                    # A partial last tile's second page may lie past the request's
-                    # blocks: keep its (unused) reads in bounds.
-                    p1 = cutlass.min(cutlass.max(p1, Int32(0)), blocks - 1)
-                    cute.arch.mbarrier_wait(kv_empty + stage, ((it // STAGES) & 1) ^ 1)
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            kv_full + stage, FP4_TILE_BYTES + TILE * 4
-                        )
-                        bulk_g2s(
-                            sSc.iterator + stage * TILE,
-                            scales.iterator + stride_pages(p0, scales),
-                            kv_full + stage,
-                            PAGE * 4,
-                        )
-                        bulk_g2s(
-                            sSc.iterator + stage * TILE + PAGE,
-                            scales.iterator + stride_pages(p1, scales),
-                            kv_full + stage,
-                            PAGE * 4,
-                        )
-                    cute.copy(
-                        tma_k,
-                        tKgK[(None, 0, 0, p0)],
-                        tKsK[(None, 2 * stage)],
-                        tma_bar_ptr=kv_full + stage,
-                    )
-                    cute.copy(
-                        tma_k,
-                        tKgK[(None, 0, 0, p1)],
-                        tKsK[(None, 2 * stage + 1)],
-                        tma_bar_ptr=kv_full + stage,
-                    )
+                for t in cutlass.range(skip, ntile, unroll=1):
+                    self.issue_tile(
+                        t, it, my_page, blocks, kv_full, kv_empty, sSc, scales,
+                        tma_k, tKgK, tKsK,
+                    )  # fmt: skip
                     it += 1
+                skip = Int32(0)
                 has_item = n_nt > 0
         elif warp == MMA_WARP:
             tCrA = mma.make_fragment_A(sA)
