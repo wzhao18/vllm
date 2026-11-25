@@ -69,7 +69,14 @@ from .kernel import sigmoids
 from .recover import mul_rn, triton_rstd, triton_sigmoid, triton_silu
 from .window import check_conv_cache, conv_put, conv_tap
 
-__all__ = ["PREPARED_PITCH", "KdaInProj64", "KdaInProjQ", "PreparedKdaInProj64"]
+__all__ = [
+    "PREPARED_PITCH",
+    "KdaInProj64",
+    "KdaInProj80",
+    "KdaInProjQ",
+    "PreparedKdaInProj64",
+    "PreparedKdaInProj80",
+]
 
 OWNERS, SHARE, TOKENS = 4, 32, 8  # owner CTAs per tile, rows per owner, verify length
 # Registers per thread at most. The CTAs start early only where they fit beside the
@@ -79,6 +86,13 @@ OWNERS, SHARE, TOKENS = 4, 32, 8  # owner CTAs per tile, rows per owner, verify 
 # below (320 threads, 2 CTAs per SM) make ptxas target 96, without spills.
 REGISTERS = 96
 PREPARED_PITCH = 4 * 768 + 8  # FP32 words per token: q, k, v, gate, 6 betas, 2 pad
+
+
+@asm(Float32)
+def _ld_shared_bf16(address):
+    """The BF16 at shared address ``address``, as FP32 (exact)."""
+    code = "{ .reg .b16 h; ld.shared.b16 h, [$1]; cvt.f32.bf16 $0, h; }"
+    return code, "=f,r,~{memory}", (Int32(address),)
 
 
 @asm(Float32, pure=True)
@@ -525,6 +539,295 @@ class PreparedKdaInProj64:
         if self.tokens != TOKENS:
             maps += (cutlass.Int64(self.x_map(x).data_ptr()),)
         self.code(
+            self.view, matrix_view(x), y, *views, scale, *maps, stream(self.device)
+        )  # fmt: skip
+        return projected
+
+
+WIDTH80 = 20  # tokens per owner thread at N80 (80 token columns x 32 rows / 128)
+
+
+class KdaInProj80(KdaInProj64):
+    """``KdaInProj64`` at 72-80 verify rows (B9-B10 x q8): ``SplitKTmemGemm64`` with
+    one N tile of 80 token columns (``tactic`` (128, 80, split, x's slots); 13 A tiles
+    in tensor memory), then the same prologue (same operations, same order) per
+    channel. Each owner thread holds one channel of 20 tokens (warp g: tokens 20 g ..
+    20 g + 19), so a request (8 tokens) may straddle two warps: warp g's 8-aligned
+    base is 20 g - phase (phase 0 for even g, 4 for odd g); the requests whose first
+    token lies in [20 g, 20 g + 20) are the thread's own (prefetched taps, conv state
+    window written here: 3 for even g, 2 for odd g). Conv inputs of the other warp's
+    tokens (odd g: the 3 before 20 g; even g: a window's tokens past 20 g + 19) are
+    read back as BF16 from the owner's output tile (the published rows' transpose,
+    written before ``finish``'s barrier): the same BF16 values. Rows past the batch
+    (B9: tokens 72-79, x zero-filled by TMA) are computed but neither published nor
+    stored; requests past it read and write no conv state. q = 8 only."""
+
+    def __init__(self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168,
+                 stock=False):  # fmt: skip
+        super().__init__(
+            tactic=tactic, heads=heads, has_bias=has_bias, k=k, stock=stock
+        )
+        assert self.n == 80 and self.n * SHARE // 128 == WIDTH80
+
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, prepared: cute.Tensor,
+        conv_w: cute.Tensor, bias: cute.Tensor, conv_state: cute.Tensor,
+        slots: cute.Tensor, accepted: cute.Tensor, scale: Float32,
+        a_map: cutlass.Int64,
+    ):  # fmt: skip
+        self.norm_parts = _smem(Float32, OWNERS * 80, 16)
+        self.norm_bar = _smem(cutlass.Int64, 1, 8).iterator
+        tid, _, _ = cute.arch.thread_idx()
+        if tid == 0:
+            cute.arch.mbarrier_init(self.norm_bar, 1)
+        cute.arch.mbarrier_init_fence()
+        self.prefetch(tid, conv_w, bias, conv_state, slots, accepted)
+        out = (mC, prepared, conv_w, bias, conv_state, slots, accepted, scale)
+        self.body(mA, mB, mC, a_map, out)
+
+    @cute.jit
+    def prefetch(self, tid, conv_w, bias, conv_state, slots, accepted):
+        """As ``KdaInProj64.prefetch`` for the thread's own requests: k = 0, 1(, 2)
+        from ceil(20 g / 8) (3 for even g, 2 for odd g), those below the batch."""
+        dim: cutlass.Constexpr = self.dim
+        tap = cute.make_rmem_tensor((3, 3), BFloat16)
+        coeff = cute.make_rmem_tensor(5, Float32)
+        meta = cute.make_rmem_tensor((3, 3), Int32)  # offset, live, conv slot
+        for rq in cutlass.range_constexpr(3):
+            for j in cutlass.range_constexpr(3):
+                tap[rq, j] = BFloat16(0)
+                meta[rq, j] = Int32(0)
+        for i in cutlass.range_constexpr(5):
+            coeff[i] = Float32(0)
+        bidx, _, _ = cute.arch.block_idx()
+        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        row0 = bidx * 128 + rank * SHARE
+        section = row0 // dim
+        if (tid >= 128) & (rank < OWNERS) & (section < 3):
+            lane, g = (tid - 128) % SHARE, (tid - 128) // SHARE
+            channel = row0 % dim + lane
+            row = section * dim + channel
+            for i in cutlass.range_constexpr(4):
+                coeff[i] = Float32(conv_w[section, i, channel])
+            if cutlass.const_expr(self.has_bias):
+                coeff[4] = Float32(bias[row])
+            first = (WIDTH80 * g + 7) // 8
+            count = 3 - g % 2
+            requests = accepted.layout.shape[0]
+            for rq in cutlass.range_constexpr(3):
+                request = first + rq
+                if (rq < count) & (request < requests):
+                    offset = accepted[request] - 1
+                    live = Int32(slots[request, offset] > 0)
+                    meta[rq, 0] = offset
+                    meta[rq, 1] = live
+                    meta[rq, 2] = slots[request, 0] * live
+                    if live != 0:
+                        page = conv_state[Int64(meta[rq, 2]), None, None]
+                        for j in cutlass.range_constexpr(3):
+                            tap[rq, j] = conv_tap(page, row, offset + j)
+        self.pf_tap, self.pf_coeff, self.pf_meta = tap, coeff, meta
+
+    @cute.experimental.jit
+    def finish(
+        self, epi_tid: cutlass.Int32, totals: cute.Tensor, tile: Int32, out,
+        row0: cutlass.Int32, col0: cutlass.Int32, l_idx: cutlass.Int32,
+    ):  # fmt: skip
+        """The published BF16 rows (``SplitKTmemGemm64.finish``: the owner's tile
+        [80 tokens][32 rows] BF16 is complete after its barrier), then the prologue of
+        the thread's channel x 20 tokens (see the class docstring)."""
+        mC, prepared, conv_w, bias, conv_state, slots, accepted, scale = out
+        dim: cutlass.Constexpr = self.dim
+        width: cutlass.Constexpr = WIDTH80
+        if (row0 // dim == 4) & (row0 % dim < 128):  # F_A rows: polled (sentinel)
+            for t in cutlass.range_constexpr(width):
+                totals[t] = _canonical(totals[t])
+        SplitKTmemGemm64.finish(self, epi_tid, totals, tile, (mC,), row0, col0, l_idx)
+        lane, g = epi_tid % SHARE, epi_tid // SHARE
+        section = row0 // dim  # 0 Q, 1 K, 2 V, 3 output gate, 4 F_A / beta
+        channel = row0 % dim + lane
+        owner = row0 % 128 // SHARE
+        rows = prepared.layout.shape[0]
+        base = width * g  # the thread's first token
+        xb = cute.make_rmem_tensor(width, BFloat16)
+        for t in cutlass.range_constexpr(width):
+            xb[t] = BFloat16(totals[t])
+        if section < 3:
+            y = cute.make_rmem_tensor(width, Float32)
+            row = section * dim + channel
+            if g % 2 == 0:
+                self.conv80(y, xb, tile, lane, base, row, conv_state, 0)
+            else:
+                self.conv80(y, xb, tile, lane, base, row, conv_state, 4)
+            if cutlass.const_expr(self.stock):
+                for t in cutlass.range_constexpr(width):
+                    y[t] = triton_silu(y[t])
+            else:
+                act = sigmoids([y[t] for t in range(width)])
+                for t in cutlass.range_constexpr(width):
+                    y[t] = y[t] * act[t]
+            if section == 2:
+                for t in cutlass.range_constexpr(width):
+                    if base + t < rows:
+                        prepared[base + t, 2 * dim + channel] = y[t]
+            else:
+                self.normalize80(y, section, channel, owner, lane, g, prepared, scale)
+        elif section == 3:
+            act = self.sigmoids([Float32(xb[t]) for t in range(width)])
+            for t in cutlass.range_constexpr(width):
+                if base + t < rows:
+                    prepared[base + t, 3 * dim + channel] = act[t]
+        elif (channel >= 128) & (channel - 128 < self.heads):  # beta rows
+            act = self.sigmoids([Float32(xb[t]) for t in range(width)])
+            for t in cutlass.range_constexpr(width):
+                if base + t < rows:
+                    prepared[base + t, 4 * dim + channel - 128] = act[t]
+
+    @cute.jit
+    def conv80(self, y, xb, tile, lane, base, row, conv_state, phase):
+        """The 4-tap causal conv of the thread's 20 tokens (``KdaInProj64``'s FP32
+        fma chain from the bias) and its own requests' new conv windows; ``phase``
+        (trace-time): base - phase is 8-aligned. Local position p = t + phase: request
+        p // 8 (own requests from 1 when phase is 4), token p % 8."""
+        width: cutlass.Constexpr = WIDTH80
+        coeff = [self.pf_coeff[i] for i in range(4)]
+        start = self.pf_coeff[4]
+
+        def x_at(j):  # token base + j as BF16: own register or the owner's tile
+            if 0 <= j < width:
+                return xb[j]
+            return BFloat16(_ld_shared_bf16(tile + ((base + j) * SHARE + lane) * 2))
+
+        own = 0 if phase == 0 else 1  # local request index of prefetch slot 0
+        for j in cutlass.range_constexpr(width):
+            p = j + phase
+            rq, t = p // 8, p % 8
+            acc = start
+            for i in cutlass.range_constexpr(4):
+                w = t + i
+                if w < 3:  # (t < 3: an own request)
+                    term = self.pf_tap[rq - own, w]
+                else:
+                    term = x_at(j + i - 3)
+                acc = fma(Float32(term), coeff[i], acc)
+            y[j] = acc
+        for rq in cutlass.range_constexpr(own, 3):
+            slot = rq - own
+            live = self.pf_meta[slot, 1]
+            if live != 0:  # the conv state's new window
+                page = conv_state[Int64(self.pf_meta[slot, 2]), None, None]
+                first = 8 * rq - phase
+                window = (self.pf_tap[slot, 1], self.pf_tap[slot, 2])
+                window += tuple(x_at(first + t) for t in range(TOKENS))
+                for i, value in enumerate(window):
+                    conv_put(page, (row, i), value)
+
+    @cute.jit
+    def normalize80(self, y, section, channel, owner, lane, g, prepared, scale):
+        """``KdaInProj64.normalize`` over 80 tokens (20 per warp): per token the
+        head's L2 norm over its 4 owners' partials, ((r0 + r2) + (r1 + r3))."""
+        width: cutlass.Constexpr = WIDTH80
+        parts = cute.make_rmem_tensor(width, Float32)
+        for t in cutlass.range_constexpr(width):
+            parts[t] = warp_sum(y[t] * y[t])
+        mine = parts[0]
+        for t in cutlass.range_constexpr(1, width):  # lane t sends token 20 g + t
+            if lane == t:
+                mine = parts[t]
+        if (lane == 0) & (g == 0):
+            cute.arch.mbarrier_arrive_and_expect_tx(self.norm_bar, OWNERS * 80 * 4)
+        if lane < width:
+            slot = self.norm_parts.iterator + owner * 80 + width * g + lane
+            for peer in cutlass.range_constexpr(OWNERS):
+                push_float(slot, mine, self.norm_bar, peer)
+        wait(self.norm_bar)
+        rows = prepared.layout.shape[0]
+        for t in cutlass.range_constexpr(width):
+            token = width * g + t
+            r = [self.norm_parts[o * 80 + token] for o in range(OWNERS)]
+            n = (r[0] + r[2]) + (r[1] + r[3])
+            value = Float32(0)
+            if cutlass.const_expr(self.stock):
+                value = mul_rn(y[t], triton_rstd(n + 1.0e-6))
+                if section == 0:
+                    value = mul_rn(value, scale)
+            else:
+                factor = cute.math.rsqrt(n + 1.0e-6, fastmath=True)
+                if section == 0:
+                    factor = factor * scale
+                value = y[t] * factor
+            if token < rows:
+                prepared[token, section * self.dim + channel] = value
+
+
+@cache
+def compile_inproj80(tactic, heads, has_bias, specs, arch, stock=False):
+    """``KdaInProj80`` for ``tactic`` (128, 80, split, x's slots) and ``specs`` as
+    ``compile_inproj64``."""
+
+    def matrix(leading):
+        shape = tuple(cute.sym_int() for _ in range(3))
+        stride = (1, cute.sym_int(64), 0) if leading == 0 else (cute.sym_int(64), 1, 0)
+        return make_fake_tensor(cutlass.BFloat16, shape, stride, assumed_align=16)
+
+    kernel = KdaInProj80(
+        tactic=SplitKTactic(*tactic[:4]), heads=heads, has_bias=has_bias, stock=stock
+    )
+    tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
+    args = (matrix(1), matrix(1), matrix(0), *tensors, Float32(1.0), cutlass.Int64(0))
+    return cute.experimental.compile(
+        kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
+    )
+
+
+class PreparedKdaInProj80(PreparedKdaInProj64):
+    """``PreparedKdaInProj64`` at 9-10 requests x q8 (``KdaInProj80``, one compile
+    per request count): ``tactic`` the (128, 80, split, slots[, 13]) N80 tactic."""
+
+    def __init__(self, weight, core, tactic, requests=(9, 10)):
+        super().__init__(weight, core, tactic, tokens=TOKENS)
+        self.requests = tuple(requests)
+        self.codes: dict = {}
+
+    def prepare_caches(self, caches, requests=None):
+        core = self.core
+        check_conv_cache(caches[0], core.dim, core.conv_dim_first, "KdaInProj80")
+        meta = dict(device="meta")
+        stock = caches[1].dtype != torch.bfloat16
+        arch = architecture(self.device)
+        heads, bias = core.heads, core.has_bias
+        for count in self.requests:
+            rows = count * TOKENS
+            prepared = torch.empty(rows, PREPARED_PITCH, dtype=torch.float32, **meta)
+            slots = torch.empty((count, TOKENS), dtype=torch.int32, **meta)
+            accepted = torch.empty((count,), dtype=torch.int32, **meta)
+            tensors = self._tensors(prepared, caches, slots, accepted)
+            specs = tuple(map(layout, tensors))
+            with torch.accelerator.device_index(self.device.index):
+                code = compile_inproj80(self.tactic, heads, bias, specs, arch, stock)
+            _, function = resolve_kernel(code, self.device.index)
+            attr = _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS
+            (registers,) = _checked(_cuda.cuFuncGetAttribute(attr, function))
+            if registers > REGISTERS:
+                raise RuntimeError(
+                    f"KdaInProj80 uses {registers} registers per thread, over {REGISTERS}"
+                )
+            self.codes[count] = code
+        return self
+
+    def run(self, x, projected, prepared, *, caches, slots, accepted):
+        """x / ``projected`` [8 B, *], ``prepared`` [8 B, PREPARED_PITCH] FP32;
+        ``slots`` [>= B, 8], ``accepted`` [>= B]; B in ``requests``."""
+        count = x.shape[0] // TOKENS
+        if slots.stride() != (slots.shape[1], 1):
+            slots = slots.contiguous()
+        tensors = self._tensors(prepared, caches, slots[:count], accepted[:count])
+        views = [to_cute(t, 16) for t in tensors]
+        y = matrix_view(projected, output=True)
+        scale = self.core.scalars[1]
+        maps = (cutlass.Int64(self.map.data_ptr()),)
+        self.codes[count](
             self.view, matrix_view(x), y, *views, scale, *maps, stream(self.device)
         )  # fmt: skip
         return projected
