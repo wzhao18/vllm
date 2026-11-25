@@ -177,6 +177,26 @@ def st_global_u32(address, value):
     )
 
 
+@asm(Uint32)
+def match_any(value):
+    return "match.any.sync.b32 $0, $1, 0xffffffff;", "=r,r", (Uint32(value),)
+
+
+@asm(Uint32, pure=True)
+def popc(value):
+    return "popc.b32 $0, $1;", "=r,r", (Uint32(value),)
+
+
+@asm(Uint32, pure=True)
+def ctz(value):
+    """The index of the lowest set bit (value != 0)."""
+    return (
+        "{ .reg .b32 r; brev.b32 r, $1; bfind.shiftamt.u32 $0, r; }",
+        "=r,r",
+        (Uint32(value),),
+    )
+
+
 @asm()
 def st_global_v4_zero(address):
     code = "st.relaxed.gpu.global.v4.u32 [$0], {$1, $1, $1, $1};"
@@ -615,13 +635,21 @@ class IndexerScoreFp4:
                     if key < sEnd[tok, qs]:
                         element = row0 + Int64(tok) * pitch + Int64(key)
                         store_b16(out_base + element * 2, total)
-                        if cutlass.const_expr(self.topn > 0):
-                            # The row's 11-bit key histogram (rows of more keys
-                            # than the top-N only), for select_row.
-                            k16 = order16(total & Uint32(0xFFFF))
-                            if sEnd[tok, qs] > self.topn and k16 != Uint32(0):
-                                bin_ = Int64(hrow + tok) * BINS + Int64(k16 >> 5)
-                                red_add_u32(self.hist_base + bin_ * 4, 1)
+                    if cutlass.const_expr(self.topn > 0):
+                        # The row's 11-bit key histogram (rows of more keys than
+                        # the top-N only), for select_row: one add per distinct
+                        # bin of the warp (logits crowd a few bins).
+                        end = sEnd[tok, qs]
+                        k16 = order16(total & Uint32(0xFFFF))
+                        b = Uint32(0xFFFFFFFF)
+                        if key < end and k16 != Uint32(0):
+                            b = k16 >> Uint32(5)
+                        if end > self.topn:
+                            peers = match_any(b)
+                            first = Uint32(lane) == ctz(peers)
+                            if b != Uint32(0xFFFFFFFF) and first:
+                                at = Int64(hrow + tok) * BINS + Int64(b)
+                                red_add_u32(self.hist_base + at * 4, popc(peers))
 
     @cute.jit
     def issue_tile(
