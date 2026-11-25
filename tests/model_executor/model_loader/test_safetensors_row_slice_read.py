@@ -46,8 +46,12 @@ def _rows(rank: int):
     return read_rows
 
 
-def _read(path: str, read_rows=None) -> tuple[dict, _SafetensorsBulkReader]:
+def _read(
+    path: str, read_rows=None, coalesce: int | None = None
+) -> tuple[dict, _SafetensorsBulkReader]:
     reader = _SafetensorsBulkReader([path], None, read_rows)
+    if coalesce is not None:
+        reader.COALESCE_BYTES = coalesce
     try:
         return dict(reader.tensors(path)), reader
     finally:
@@ -62,11 +66,12 @@ def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
     return path, tensors
 
 
+@pytest.mark.parametrize("coalesce", [0, 1 << 20])
 @pytest.mark.parametrize("rank", range(TP))
-def test_declared_rows_are_the_file_bytes(checkpoint, rank):
+def test_declared_rows_are_the_file_bytes(checkpoint, rank, coalesce):
     path, ref = checkpoint
     full, _ = _read(path)
-    sliced, reader = _read(path, _rows(rank))
+    sliced, reader = _read(path, _rows(rank), coalesce)
     assert sliced.keys() == ref.keys()
     for name, t in ref.items():
         assert sliced[name].shape == t.shape and sliced[name].dtype == t.dtype
@@ -80,9 +85,10 @@ def test_declared_rows_are_the_file_bytes(checkpoint, rank):
         t.nbytes for n, t in ref.items() if ".w1." in n or ".w3." in n
     )
     assert reader.sliced_tensors == 12
-    # Only the whole pages around each rank's rows are read.
-    widened = 12 * 2 * mmap.PAGESIZE
-    assert reader.bytes_skipped >= sliced_bytes * (TP - 1) // TP - widened
+    if coalesce == 0:
+        # Only the whole pages around each rank's rows are read.
+        widened = 12 * 2 * mmap.PAGESIZE
+        assert reader.bytes_skipped >= sliced_bytes * (TP - 1) // TP - widened
 
 
 def test_rows_outside_the_declared_range_fault(checkpoint):
@@ -98,7 +104,7 @@ def test_rows_outside_the_declared_range_fault(checkpoint):
         )
         t = dict(r.tensors({path!r}))["layers.0.experts.0.w1.weight_packed"]
         print("inside", int(t[768:1536].sum()), flush=True)
-        print("outside", int(t[0].sum()), flush=True)
+        print("outside", int(t[100].sum()), flush=True)
         """
     )
     proc = subprocess.run(
@@ -111,11 +117,13 @@ def test_rows_outside_the_declared_range_fault(checkpoint):
 
 def test_empty_rows_read_nothing(checkpoint):
     path, ref = checkpoint
-    got, reader = _read(path, lambda n, s, d: (0, 0) if ".w3." in n else None)
+    got, reader = _read(path, lambda n, s, d: (0, 0) if ".w3." in n else None, 0)
     assert reader.sliced_tensors == 6
-    assert reader.bytes_skipped == sum(t.nbytes for n, t in ref.items() if ".w3." in n)
-    assert torch.equal(got["layers.0.experts.1.w1.weight_packed"],
-                       ref["layers.0.experts.1.w1.weight_packed"])
+    w3_bytes = sum(t.nbytes for n, t in ref.items() if ".w3." in n)
+    assert reader.bytes_skipped >= w3_bytes - 6 * 2 * mmap.PAGESIZE
+    for name, t in ref.items():
+        if ".w3." not in name:
+            assert torch.equal(got[name], t), name
 
 
 def test_rows_outside_the_tensor_raise(checkpoint):

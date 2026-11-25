@@ -1162,12 +1162,13 @@ def _mprotect_none(addr: int, length: int) -> None:
         raise OSError(err, f"mprotect({addr:#x}, {length}) failed")
 
 
-def _guarded_rows_buffer(
-    nbytes: int, lo: int, hi: int
-) -> tuple[torch.Tensor, int, int]:
-    """A *nbytes* host buffer (anonymous mmap, page-aligned) whose pages outside
-    [lo, hi) widened to page bounds are PROT_NONE; returns it with the widened
-    range, clamped to the buffer. Untouched pages cost no memory."""
+def _guarded_buffer(
+    nbytes: int, ranges: list[tuple[int, int]]
+) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    """A *nbytes* host buffer (anonymous private mmap, page-aligned) in which only
+    the pages covering *ranges* (sorted, disjoint byte ranges) are accessible; the
+    other pages are PROT_NONE. Returns it with *ranges* widened to whole pages,
+    clamped to the buffer and merged. Pages never written cost no memory."""
     import mmap
 
     page = mmap.PAGESIZE
@@ -1179,14 +1180,22 @@ def _guarded_rows_buffer(
     )
     buffer = torch.frombuffer(region, dtype=torch.uint8)[:nbytes]
     del region  # the tensor keeps the mapping alive; munmap when it is freed
-    lo_page = lo // page * page
-    hi_page = -(-hi // page) * page if hi > lo else lo_page
+    widened: list[tuple[int, int]] = []
+    for lo, hi in ranges:
+        if hi <= lo:
+            continue
+        lo, hi = lo // page * page, -(-hi // page) * page
+        if widened and lo <= widened[-1][1]:
+            widened[-1] = (widened[-1][0], max(widened[-1][1], hi))
+        else:
+            widened.append((lo, hi))
     base = buffer.data_ptr()
-    if lo_page > 0:
-        _mprotect_none(base, lo_page)
-    if hi_page < size:
-        _mprotect_none(base + hi_page, size - hi_page)
-    return buffer, lo_page, min(hi_page, nbytes)
+    pos = 0
+    for lo, hi in widened + [(size, size)]:
+        if lo > pos:
+            _mprotect_none(base + pos, lo - pos)
+        pos = hi
+    return buffer, [(lo, min(hi, nbytes)) for lo, hi in widened]
 
 
 class _SafetensorsBulkReader:
@@ -1210,12 +1219,13 @@ class _SafetensorsBulkReader:
     *read_rows* (from the model, see ``DefaultModelLoader.Source.read_rows``) maps
     a checkpoint tensor name, shape and dtype to the leading-dim rows
     ``(start, count)`` this rank's weight loader uses, or None for the whole
-    tensor. Such a tensor is
-    yielded with its full shape, but only those rows are read (widened to whole
-    pages inside the tensor); its other pages are mapped ``PROT_NONE``, so a loader
-    that touched rows outside the declared range would fault instead of reading
-    bytes that are not the file's. Without TP+EP (e.g. TP16 Kimi K3: every rank
-    reads every routed expert) this cuts the gate/up expert bytes per rank by TP.
+    tensor. Such a tensor is yielded with its full shape, but only those rows are
+    read: a group holding one gets a guarded buffer (``_guarded_buffer``) in which
+    only the needed byte ranges, merged across gaps up to ``COALESCE_BYTES`` and
+    widened to whole pages, are read; every other page is ``PROT_NONE``, so a
+    loader touching rows outside the declared range faults instead of reading
+    bytes that are not the file's. Without TP+EP (TP16 Kimi K3: every rank reads
+    every routed expert) this cuts the routed gate/up bytes per rank by TP.
     """
 
     GROUP_BYTES = 64 << 20
@@ -1223,9 +1233,8 @@ class _SafetensorsBulkReader:
     PIECE_BYTES = 32 << 20
     WINDOW_BYTES = 4 << 30
     NUM_THREADS = 16
-    # Window charge per row-sliced tensor (at least): bounds the number of live
-    # guarded mappings (each up to 3 VMAs) well below vm.max_map_count.
-    SLICED_MIN_CHARGE = 1 << 20
+    # Needed ranges of a row-sliced group closer than this are read as one.
+    COALESCE_BYTES = 1 << 20
 
     def __init__(
         self,
@@ -1242,7 +1251,8 @@ class _SafetensorsBulkReader:
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.NUM_THREADS, thread_name_prefix="st-read"
         )
-        # Pending groups in read order: (file, fd, group entries, buffer, futures).
+        # Pending groups in read order:
+        # (file, fd, group entries, buffer, pad, futures, window charge).
         self._queue: list[tuple] = []
         self._next_file = 0
         self._pending_groups: list[tuple[str, int, list]] = []
@@ -1256,28 +1266,28 @@ class _SafetensorsBulkReader:
         header.pop("__metadata__", None)
         return 8 + int(n), header
 
-    def _slice_bytes(
-        self, name: str, shape: list[int], dtype: torch.dtype, nbytes: int
+    def _needed(
+        self, name: str, shape: list[int], dtype: torch.dtype, start: int, end: int
     ) -> tuple[int, int] | None:
-        """Byte range [lo, hi) of the tensor holding the rows *read_rows* declares
-        for it, or None to read the whole tensor."""
-        if self._read_rows is None or not shape or nbytes == 0:
+        """File byte range [lo, hi) of the rows *read_rows* declares for a tensor
+        at [start, end), or None when the whole tensor is needed."""
+        if self._read_rows is None or not shape or end == start:
             return None
         rows = self._read_rows(name, list(shape), dtype)
         if rows is None:
             return None
-        start, count = rows
-        if not (0 <= start and 0 <= count and start + count <= shape[0]):
+        first, count = rows
+        if not (0 <= first and 0 <= count and first + count <= shape[0]):
             raise ValueError(
                 f"read_rows({name!r}, {shape}) = {rows} is outside the tensor"
             )
-        row_bytes = nbytes // shape[0]
-        return start * row_bytes, (start + count) * row_bytes
+        row_bytes = (end - start) // shape[0]
+        return start + first * row_bytes, start + (first + count) * row_bytes
 
     def _plan_file(self, path: str) -> list | None:
-        """Groups of (name, dtype, shape, start, end, slice) in file order, or None
-        if a tensor's dtype has no torch equivalent here (read that file through
-        mmap). A tensor with a row slice (``_slice_bytes``) is a group of its own."""
+        """Groups of (name, dtype, shape, start, end, needed) in file order, or
+        None if a tensor's dtype has no torch equivalent here (read that file
+        through mmap). *needed* is the row-sliced byte range or None (whole)."""
         base, header = self.parse_header(path)
         entries = []
         for name, info in header.items():
@@ -1287,20 +1297,15 @@ class _SafetensorsBulkReader:
             if dtype is None:
                 return None
             start, end = info["data_offsets"]
-            entries.append(
-                (
-                    name,
-                    dtype,
-                    info["shape"],
-                    base + start,
-                    base + end,
-                    self._slice_bytes(name, info["shape"], dtype, end - start),
-                )
-            )
+            start, end = base + start, base + end
+            needed = self._needed(name, info["shape"], dtype, start, end)
+            if needed is not None and start % dtype.itemsize:
+                needed = None  # yielded as an aligned copy of the whole tensor
+            entries.append((name, dtype, info["shape"], start, end, needed))
         entries.sort(key=lambda e: e[3])
         groups: list[list] = []
         for entry in entries:
-            if groups and entry[5] is None and groups[-1][0][5] is None:
+            if groups:
                 last = groups[-1]
                 if (
                     entry[3] - last[-1][4] <= self.GAP_BYTES
@@ -1311,6 +1316,20 @@ class _SafetensorsBulkReader:
             groups.append([entry])
         return groups
 
+    def _read_ranges(self, group: list) -> list[tuple[int, int]]:
+        """File byte ranges a row-sliced group reads: each tensor's needed range,
+        merged across gaps of at most COALESCE_BYTES."""
+        ranges: list[tuple[int, int]] = []
+        for _, _, _, s, e, needed in group:
+            lo, hi = needed if needed is not None else (s, e)
+            if hi <= lo:
+                continue
+            if ranges and lo - ranges[-1][1] <= self.COALESCE_BYTES:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+            else:
+                ranges.append((lo, hi))
+        return ranges
+
     def _read_piece(self, fd: int, view: memoryview, offset: int) -> None:
         done = 0
         while done < len(view):
@@ -1318,6 +1337,19 @@ class _SafetensorsBulkReader:
             if got <= 0:
                 raise OSError(f"short read at offset {offset + done}")
             done += got
+
+    def _submit_reads(
+        self, fd: int, view: memoryview, offset: int, length: int
+    ) -> list[concurrent.futures.Future]:
+        return [
+            self._pool.submit(
+                self._read_piece,
+                fd,
+                view[off : min(off + self.PIECE_BYTES, length)],
+                offset + off,
+            )
+            for off in range(0, length, self.PIECE_BYTES)
+        ]
 
     def _submit_more(self) -> None:
         while self._in_flight < self.WINDOW_BYTES:
@@ -1328,73 +1360,50 @@ class _SafetensorsBulkReader:
                 self._next_file += 1
                 groups = self._plan_file(path)
                 if groups is None:
-                    self._queue.append((path, None, None, None, None, 0))
+                    self._queue.append((path, None, None, None, 0, None, 0))
                     continue
                 fd = os.open(path, os.O_RDONLY)
                 if not groups:
-                    self._queue.append((path, fd, [], None, [], 0))
+                    self._queue.append((path, fd, [], None, 0, [], 0))
                     continue
                 self._pending_groups = [(path, fd, g) for g in groups]
                 # The last group of the file closes its fd once read.
             path, fd, group = self._pending_groups.pop(0)
             last = not self._pending_groups
-            if group[0][5] is not None:
-                buffer, futures, charge = self._submit_sliced(fd, group[0])
-                self._queue.append(
-                    (path, fd if last else -1, group, buffer, futures, charge)
-                )
-                self._in_flight += charge
-                continue
             start, end = group[0][3], group[-1][4]
             # Keep each tensor's file alignment (mod 64) so dtype views stay valid.
             pad = start % 64
-            buffer = torch.empty(pad + end - start, dtype=torch.uint8)
-            view = memoryview(buffer.numpy())[pad:]
-            futures = [
-                self._pool.submit(
-                    self._read_piece,
-                    fd,
-                    view[off : min(off + self.PIECE_BYTES, end - start)],
-                    start + off,
-                )
-                for off in range(0, end - start, self.PIECE_BYTES)
-            ]
+            if all(entry[5] is None for entry in group):
+                buffer = torch.empty(pad + end - start, dtype=torch.uint8)
+                view = memoryview(buffer.numpy())[pad:]
+                futures = self._submit_reads(fd, view, start, end - start)
+                charge = end - start
+            else:
+                ranges = [
+                    (pad + lo - start, pad + hi - start)
+                    for lo, hi in self._read_ranges(group)
+                ]
+                buffer, ranges = _guarded_buffer(pad + end - start, ranges)
+                view = memoryview(buffer.numpy())
+                futures = []
+                for lo, hi in ranges:
+                    futures += self._submit_reads(
+                        fd, view[lo:hi], start - pad + lo, hi - lo
+                    )
+                charge = sum(hi - lo for lo, hi in ranges)
+                self.bytes_skipped += end - start - charge
+                self.sliced_tensors += sum(entry[5] is not None for entry in group)
+            self.bytes_read += charge
             self._queue.append(
-                (path, fd if last else -1, group, buffer, futures, end - start)
+                (path, fd if last else -1, group, buffer, pad, futures, charge)
             )
-            self._in_flight += end - start
-            self.bytes_read += end - start
-
-    def _submit_sliced(
-        self, fd: int, entry: tuple
-    ) -> tuple[torch.Tensor, list, int]:
-        """Guarded full-size buffer of a row-sliced tensor and the reads of its
-        declared rows (widened to whole pages inside the tensor)."""
-        _, _, _, start, end, (lo, hi) = entry
-        nbytes = end - start
-        buffer, lo, hi = _guarded_rows_buffer(nbytes, lo, hi)
-        futures = []
-        if hi > lo:
-            view = memoryview(buffer.numpy())[lo:hi]
-            futures = [
-                self._pool.submit(
-                    self._read_piece,
-                    fd,
-                    view[off : min(off + self.PIECE_BYTES, hi - lo)],
-                    start + lo + off,
-                )
-                for off in range(0, hi - lo, self.PIECE_BYTES)
-            ]
-        self.bytes_read += hi - lo
-        self.bytes_skipped += nbytes - (hi - lo)
-        self.sliced_tensors += 1
-        return buffer, futures, max(hi - lo, self.SLICED_MIN_CHARGE)
+            self._in_flight += charge
 
     def tensors(self, path: str) -> Generator[tuple[str, torch.Tensor], None, None]:
         """The needed tensors of *path*, which must be the next file in order."""
         while True:
             self._submit_more()
-            file, fd, group, buffer, futures, charge = self._queue.pop(0)
+            file, fd, group, buffer, pad, futures, charge = self._queue.pop(0)
             assert file == path, (file, path)
             if group is None:  # dtype without a torch equivalent: mmap path
                 with safe_open(path, framework="pt") as f:
@@ -1404,14 +1413,8 @@ class _SafetensorsBulkReader:
                 return
             for future in futures:
                 future.result()
-            if group and group[0][5] is not None:
-                self._in_flight -= charge
-                name, dtype, shape = group[0][:3]
-                yield name, buffer.view(dtype).reshape(shape)
-                del buffer
-            elif group:
+            if group:
                 start = group[0][3]
-                pad = start % 64
                 self._in_flight -= charge
                 for name, dtype, shape, s, e, _ in group:
                     raw = buffer[pad + s - start : pad + e - start]
@@ -1426,8 +1429,8 @@ class _SafetensorsBulkReader:
     def close(self) -> None:
         if self._read_rows is not None:
             logger.info(
-                "Checkpoint bulk reads: %.2f GiB read, %.2f GiB of %d row-sliced "
-                "tensors skipped (rows other ranks load).",
+                "Checkpoint bulk reads: %.2f GiB read, %.2f GiB skipped "
+                "(%d row-sliced tensors: rows other ranks load).",
                 self.bytes_read / 1024**3,
                 self.bytes_skipped / 1024**3,
                 self.sliced_tensors,
