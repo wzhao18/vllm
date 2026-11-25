@@ -91,7 +91,6 @@ from ..common.primitives import (
     load_words,
     mma,
     multicast_words,
-    prefetch_bytes,
     store_relaxed,
     store_words,
     zeros,
@@ -517,16 +516,6 @@ class MarkovGreedy:
                             ready &= values[k] != Uint32(0)
                         if ready:
                             pending &= ~Uint32(1 << j)
-                            # The candidates' markov_w1 rows into L2 as their keys
-                            # land (each chunk by one CTA of the rank), so the
-                            # winner's row read after the poll hits L2.
-                            c = tid + j * THREADS
-                            if cutlass.const_expr(i + 1 < self.steps):  # noqa: SIM102
-                                if c % self.ctas == cta:
-                                    for h in cutlass.range_constexpr(2):
-                                        self.prefetch_row(
-                                            w1, values[2 * h], values[2 * h + 1]
-                                        )
                 sgn, sgt = spin_tick(
                     sgn, sgt, observed=pending,
                     target=0, rank=rank, size=self.tp
@@ -572,17 +561,6 @@ class MarkovGreedy:
                 previous = min(max(winners[group], Int32(0)), Int32(w1.shape[0] - 1))
         if (cta == 0) & (tid == 0):
             ordinal[0] = launch_ordinal + 1
-
-    @cute.jit
-    def prefetch_row(self, w1, lo, hi):
-        """L2 prefetch of the markov_w1 row of a key's token (words lo, hi)."""
-        key = (Uint64(hi) << 32) | Uint64(lo)
-        token = Int32(Uint32(0xFFFFFFFF) - Uint32(key & Uint64(0xFFFFFFFF)))
-        if cutlass.const_expr(self.sampled):
-            token = sampled_token(key)
-        token = min(max(token, Int32(0)), Int32(w1.shape[0] - 1))
-        row = w1.iterator + Int64(token) * self.markov_rank
-        prefetch_bytes(row, self.markov_rank * 2)
 
     @cute.jit
     def noise(self, noise, i, warp, temps, seeds_r, positions_r, rank, rows):
