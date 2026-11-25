@@ -253,6 +253,7 @@ _V_ROW = tl.constexpr(RECORD_V_ROW)
 _TAG_ROW = tl.constexpr(RECORD_TAG_ROW)
 _TAG_BITS = tl.constexpr(RECORD_TAG_BITS)
 _HEAD_BYTES = tl.constexpr(RECORD_HEAD_BYTES)
+_CHUNK = tl.constexpr(32)
 
 
 @triton.jit
@@ -262,19 +263,34 @@ def record_fold_head(state0, records, dst, pending):
     (``state0``) and the records (``records``: the head's rows of slot 1), stored to
     ``dst`` (fp32 pointers to each head's page). The token loop's two instructions per
     element in its order: S = S * decay_t, then S = fma(k_t, v_new_t, S); bit for bit
-    the stock checkpoint. ``dst`` may alias ``state0`` or ``records``: every load
-    precedes the barrier before the store."""
-    rows = tl.arange(0, 128)
-    offsets = rows[:, None] * 128 + rows[None, :]
-    state = tl.load(state0 + offsets)
-    for i in range(0, pending):
-        k = tl.load(records + i * 128 + rows)
-        decay = tl.load(records + (_DECAY_ROW + i) * 128 + rows)
-        v_new = tl.load(records + (_V_ROW + i) * 128 + rows)
-        state = state * decay[None, :]
-        state = tl.fma(k[None, :], v_new[:, None], state)
-    tl.debug_barrier()
-    tl.store(dst + offsets, state)
+    the stock checkpoint. In 32-row chunks (few registers: the align copies' early
+    exits keep their occupancy), the record rows' chunk (rows 0 .. 31) last, so
+    ``dst`` may alias ``state0`` or ``records``: every load of a chunk precedes the
+    barrier before its store, and no later chunk reads what it stores."""
+    rows = tl.arange(0, _CHUNK)
+    cols = tl.arange(0, 128)
+    for cc in tl.static_range(128 // _CHUNK):
+        r = (128 // _CHUNK - 1 - cc) * _CHUNK + rows
+        offsets = r[:, None] * 128 + cols[None, :]
+        state = tl.load(state0 + offsets)
+        for i in range(0, pending):
+            k = tl.load(records + i * 128 + cols)
+            decay = tl.load(records + (_DECAY_ROW + i) * 128 + cols)
+            v_new = tl.load(records + (_V_ROW + i) * 128 + r)
+            state = state * decay[None, :]
+            state = tl.fma(k[None, :], v_new[:, None], state)
+        tl.debug_barrier()
+        tl.store(dst + offsets, state)
+
+
+@triton.jit
+def record_copy_head(source, dst):
+    """One head's [128, 128] FP32 page, in record_fold_head's chunks."""
+    rows = tl.arange(0, _CHUNK)
+    cols = tl.arange(0, 128)
+    for c in tl.static_range(128 // _CHUNK):
+        offsets = (c * _CHUNK + rows)[:, None] * 128 + cols[None, :]
+        tl.store(dst + offsets, tl.load(source + offsets))
 
 
 @triton.jit
@@ -305,8 +321,6 @@ def _copy_record_state_block(
     slot0 = tl.load(block_table_base + src_col).to(tl.int64)
     slot1 = tl.load(block_table_base + src_col + 1).to(tl.int64)
     stock = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
-    rows = tl.arange(0, 128)
-    offsets = rows[:, None] * 128 + rows[None, :]
     for h in range(tile_idx, heads, TEMPORAL_TILES):
         head = h.to(tl.int64) * _HEAD_BYTES
         dst = (state_base_addr + dst_block * state_block_stride + head).to(
@@ -324,7 +338,7 @@ def _copy_record_state_block(
             source = (state_base_addr + stock * state_block_stride + head).to(
                 tl.pointer_type(tl.float32)
             )
-            tl.store(dst + offsets, tl.load(source + offsets))
+            record_copy_head(source, dst)
 
 
 @triton.jit
@@ -1554,15 +1568,11 @@ class MambaSpecDecodeGPUContext:
         )
 
     def record_kwargs(self) -> dict:
-        """The align kernels' record-format arguments: the per-state head counts and
-        eight warps (one head's FP32 [128, 128] page per fold), or none."""
+        """The align kernels' record-format arguments (the per-state head counts), or
+        none."""
         if self.state_record_heads is None:
             return {}
-        return dict(
-            state_record_heads_ptr=self.state_record_heads,
-            HAS_RECORDS=True,
-            num_warps=8,
-        )
+        return dict(state_record_heads_ptr=self.state_record_heads, HAS_RECORDS=True)
 
 
 @dataclasses.dataclass

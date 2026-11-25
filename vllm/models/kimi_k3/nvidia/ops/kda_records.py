@@ -23,7 +23,11 @@ way (``mamba_utils._copy_record_state_block``)."""
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.mamba_utils import record_fold_head, record_tagged
+from vllm.v1.worker.mamba_utils import (
+    record_copy_head,
+    record_fold_head,
+    record_tagged,
+)
 
 
 @triton.jit
@@ -52,10 +56,7 @@ def _materialize_kernel(
     if record_tagged(records):
         record_fold_head(state0, records, state0, accepted - 1)
     elif stock > 0:
-        rows = tl.arange(0, 128)
-        offsets = rows[:, None] * 128 + rows[None, :]
-        source = state + stock * stride_state_token + head
-        tl.store(state0 + offsets, tl.load(source + offsets))
+        record_copy_head(state + stock * stride_state_token + head, state0)
 
 
 def materialize(
@@ -81,5 +82,4 @@ def materialize(
         state.stride(0),
         state_indices.stride(0),
         H=heads,
-        num_warps=8,
     )

@@ -152,7 +152,7 @@ def test_align_copies_fold(records):
     want = stock[table[torch.arange(n), bias.long()].long()]
     meta, heads = align_meta(state)
     ptrs = torch.tensor([table.data_ptr()], dtype=torch.int64, device=DEVICE)
-    extra = dict(state_record_heads_ptr=heads, HAS_RECORDS=True, num_warps=8)
+    extra = dict(state_record_heads_ptr=heads, HAS_RECORDS=True)
     idx = torch.arange(n, dtype=torch.int32, device=DEVICE)
 
     pre = state.clone()
