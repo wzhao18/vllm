@@ -509,15 +509,15 @@ class PreparedDsa:
         stage = self.indexer_stage
         if scorer:
             if not fp4_unsupported:
-                # Logits only: DeepSelect + pack take the local top-N
-                # (IndexerLocalTopk, even publishing into the mailbox itself, is
-                # no faster: 1-node chain, L1 round 5 E1).
+                # EXPERIMENT E7: IndexerLocalTopk publishes the B' rows at every
+                # rows (aligned chain A/B per rows).
                 stage.fused = FusedIndexer(
                     self.indexer,
                     self.shapes,
                     self.device,
                     rows,
                     local_topk=stage.local_topk,
+                    packed=True,
                 )
         elif self.dcp_fused and not any(unsupported):
             stage.fused = FusedIndexer(
