@@ -106,6 +106,7 @@ from cutlass import Uint64  # noqa: E402
 
 _RAW: dict = {}
 _SITES: dict = {}
+_SIG: dict = {}
 ANCHOR_LOG2 = 16  # 65536 launches x 16 B (gridid-keyed)
 
 
@@ -179,7 +180,14 @@ if os.environ.get("STAMP_ANCHOR", "1") == "1":
 def dump_raw(out_path):
     """Raw buffers (accumulators zeroed after the copy) + the anchor site table."""
     torch.cuda.synchronize()
-    data = {f"{k[0]}:{k[1]}": b.cpu() for k, (b, _) in _RAW.items()}
+    data = {}
+    for k, (b, reset) in _RAW.items():
+        if not reset:  # rings: only when changed since the last dump (size)
+            sig = int(b.sum().item())
+            if _SIG.get(k) == sig:
+                continue
+            _SIG[k] = sig
+        data[f"{k[0]}:{k[1]}"] = b.cpu()
     torch.save(data, out_path)
     for b, reset in _RAW.values():
         if reset:
