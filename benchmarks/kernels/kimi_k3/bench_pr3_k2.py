@@ -41,7 +41,12 @@ def main():
     world = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     lr = int(os.environ["LOCAL_RANK"])
-    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
+    nnodes = max(1, world // torch.cuda.device_count())
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=world, nnodes=nnodes, node_rank=rank // (world // nnodes)
+        )
+    )
     with set_current_vllm_config(config):
         dev = torch.device("cuda", lr)
         torch.accelerator.set_device_index(dev)
