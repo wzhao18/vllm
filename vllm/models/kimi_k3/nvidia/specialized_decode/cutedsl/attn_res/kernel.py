@@ -38,9 +38,10 @@ from ..common.primitives import (
 
 @asm()
 def release_add_gpu(address):
-    """__threadfence + a gpu-scope release add of one (the CTA's stores, ordered by
-    the barrier before it, become visible to an acquire of the counter)."""
-    code = "fence.acq_rel.gpu; red.release.gpu.global.add.u32 [$0],1;"
+    """A gpu-scope release add of one: the CTA's stores, ordered before it by the
+    barrier (causality order is transitive through bar.sync), become visible to an
+    acquire of the counter."""
+    code = "red.release.gpu.global.add.u32 [$0],1;"
     return code, "l,~{memory}", (Int64(address),)
 
 
