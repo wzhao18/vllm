@@ -39,6 +39,10 @@ def main():
     parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--iters", type=int, default=60)
     parser.add_argument(
+        "--no-dies", action="store_true",
+        help="die-oblivious kernels on the placed weights (die-matching check)",
+    )  # fmt: skip
+    parser.add_argument(
         "--width", type=int, default=0,
         help="wide rows: stream width (8 / 16 / 32) instead of experts_runtime.WIDE's",
     )  # fmt: skip
@@ -87,7 +91,7 @@ def main():
         buffers = er.scratch(16, dev, rows=max(rows, 64))
         experts = er.PersistentExperts(
             *built["weights"], beta=t.BETA, linear_beta=t.LINEAR_BETA,
-            dies=built["dies"], q=4,
+            dies=() if args.no_dies else built["dies"], q=4,
         )  # fmt: skip
         out = torch.empty(rows * t.TOPK, t.H_LATENT, dtype=torch.bfloat16, device=dev)
         wide, rubin = None, False
