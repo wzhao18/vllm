@@ -77,6 +77,12 @@ class S0aExperts(RubinGroupedExpertsKernel):
         self.slab, self.census = (0, 0)  # set per call / layer while tracing
         self.off_drain = self.off_misc + 2936  # free misc bytes (2920-3200)
 
+    def set_layer(self, layer):
+        """Trace-time: this layer's trace slab and census half (kept off ``self``
+        stores in the loop body, which the DSL would carry as loop state)."""
+        self.slab = Int64(layer) * (self.grid * SLAB)
+        self.census = (layer & 1) * 8
+
     @cute.jit
     def stamp(self, slot: cutlass.Constexpr[int]):
         stamp_at(Int64(self.trace) + self.slab + Int64(thread()[3]) * SLAB, slot)
@@ -253,8 +259,7 @@ class S0aExperts(RubinGroupedExpertsKernel):
         tags = flags.iterator
         recv, peers, rslot = scalars[3:6]
         for layer in cutlass.range(self.layers, unroll=1):
-            self.slab = Int64(layer) * (self.grid * SLAB)
-            self.census = (layer & 1) * 8
+            self.set_layer(layer)  # a call: no attribute store inside the dynamic loop
             if layer > 0:  # every role ended the previous layer (drained): re-arm
                 if tid == 0:
                     self.barriers_init(sm)
