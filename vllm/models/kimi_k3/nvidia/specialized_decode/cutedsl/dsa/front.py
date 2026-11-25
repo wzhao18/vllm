@@ -15,7 +15,8 @@ K quarter (384 columns) in shared memory, bulk-loaded before the PDL wait. After
   row (a quarter of the rows each), which adds the four in order, rounds to BF16
   (the projection's output) and quantizes the head as DsaIndex does: FP8 with a
   power-of-two scale, folded into the BF16 head weight;
-- CTA head * 4 + part (< B) also inserts that row's indexer key (DsaIndex's code)."""
+- CTA head * 4 + part (< B) also inserts that row's indexer key (DsaIndex's code),
+  right after the PDL wait (under the x copy), not after its rows."""
 
 import cutlass
 import cutlass.cute as cute
@@ -138,6 +139,14 @@ class IndexFront:
         for c in range(tid, (RP - B) * CHUNKS, 256):  # the M tile's padding rows
             b, j = B + c // CHUNKS, c % CHUNKS
             store_shared_words(x.iterator + b * KS + j * 8, (Uint32(0),) * 4)
+        # The row's indexer key first: it reads only the packed row, so its
+        # dependent chain (slot, row, LayerNorm, quantize, store) runs under the
+        # x copy and the cluster rounds instead of after the head's rows (the key
+        # CTAs were the last to exit, which the scorer's PDL wait waits for).
+        token = head * CLUSTER + part
+        if (warp == 0) & (token < B):
+            key = projected, self.key, norm_w, norm_b, cache, slots, token, key_eps
+            insert_key(*key, self.mx, lane)
         wait(bar_x)
         self.mark(cta, 2, tid)
         cute.arch.cluster_wait()  # the peers' barriers are initialized
@@ -251,10 +260,6 @@ class IndexFront:
                     w_out[b, head] = BFloat16(wv * Float32(FP4_WEIGHT))
             else:
                 self.fp8_head(values, projected, q_out, w_out, b, head, lane)
-        token = head * CLUSTER + part
-        if (warp == 0) & (token < B):
-            key = projected, self.key, norm_w, norm_b, cache, slots, token, key_eps
-            insert_key(*key, self.mx, lane)
         if cutlass.const_expr(self.stamp_addr != 0):
             cute.arch.sync_threads()
         self.mark(cta, 6, tid)
