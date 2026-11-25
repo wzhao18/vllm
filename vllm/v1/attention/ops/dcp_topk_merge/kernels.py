@@ -552,6 +552,8 @@ _NUM_BINS = 1 << _RADIX_BITS
 # A rescue waits on peers' selects, which may run late (host stalls, a JIT
 # compile in eager mode); only a peer that never pushes (a bug) reaches this.
 _SPIN_TIMEOUT_NS = 600 * 10**9
+# Block-table entries the mailbox select keeps in shared memory (4 KiB).
+_TABLE_CACHE = 1024
 
 
 def _gid_bits(world_size: int) -> int:
@@ -598,12 +600,15 @@ def _make_radix_select(
     keys_per_thread: int,
     emit_ids: bool,
     block_size: int,
+    table_cache: int = 0,
 ) -> Any:
     """Top-``topk`` of the CTA's register keys ``(ord16 << gid_bits) | ~gid``
     (0 = empty) under (score desc, global id asc): writes the ids and/or this
     rank's owned physical rows for ``row`` and returns the thread's smallest
     selected ord16 (0x10000 when none). The select and the rescue share it, so
-    both emit bit-identical rows for the same candidate set."""
+    both emit bit-identical rows for the same candidate set. ``table_cache``:
+    the row's first block-table entries are in shared ``tab`` (the caller
+    loaded them before its poll), the rest are read from ``block_table``."""
     emit_rows = block_size > 0
     # One selected-key bit per register key, in 64-bit words.
     num_sel_words = -(-keys_per_thread // 64)
@@ -646,6 +651,7 @@ def _make_radix_select(
         valid_out: cute.Tensor,
         dcp_rank: Int32,
         stride_rows: Int32,
+        tab: cute.Tensor = None,
     ) -> Int32:
         # scalars: [committed, owned, threshold, take_all]
         sel_min = Int32(0x10000)
@@ -761,9 +767,17 @@ def _make_radix_select(
                     gid = Uint32(gid_mask) - Uint32(keys[i] & Uint64(gid_mask))
                     local = recast_val(gid // Uint32(world_size), Int32)
                     block = local // Int32(block_size)
-                    rows_out[row, pos] = block_table[
-                        req_id[row], block
-                    ] * stride_rows + (local - block * Int32(block_size))
+                    if cutlass.const_expr(table_cache > 0):
+                        entry = Int32(0)
+                        if block < Int32(table_cache):
+                            entry = tab[block]
+                        else:
+                            entry = block_table[req_id[row], block]
+                    else:
+                        entry = block_table[req_id[row], block]
+                    rows_out[row, pos] = entry * stride_rows + (
+                        local - block * Int32(block_size)
+                    )
                     pos += Int32(1)
             cute.arch.sync_threads()
             num_owned = scalars[1]
@@ -875,12 +889,15 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         box_words = _box_words(local_topk)
         row_chunks = world_size * box_words // 4
         polls = -(-row_chunks // tb_size)
+        # The mailbox select loads its row's block-table entries while it polls.
+        table_cache = _TABLE_CACHE if mailbox and block_size > 0 else 0
         radix_select = _make_radix_select(
             topk=topk,
             world_size=world_size,
             keys_per_thread=keys_per_thread,
             emit_ids=emit_ids,
             block_size=block_size,
+            table_cache=table_cache,
         )
         num_r1 = world_size * local_topk
         rescue_keys = num_r1 + num_slots * topk
@@ -891,6 +908,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             keys_per_thread=rescue_per_thread,
             emit_ids=emit_ids,
             block_size=block_size,
+            table_cache=table_cache,
         )
 
         @cute.jit
@@ -918,6 +936,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             peer_recv: Int64,
             peer_flags: Int64,
             max_rows: Int32,
+            tab: cute.Tensor,
         ):
             """DCPTopkRescueKernel's second round of a saturated ``row`` (its
             ``mask`` and ``tau16``), by the CTA that selected it: wait for the
@@ -1012,6 +1031,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 valid_out,
                 dcp_rank,
                 stride_rows,
+                tab,
             )
             cute.arch.sync_threads()
             if tid == Int32(0):
@@ -1031,6 +1051,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 cute.struct.MemRange[Int32, world_size * box_words if mailbox else 4],
                 16,
             ]
+            tab: cute.struct.Align[cute.struct.MemRange[Int32, max(table_cache, 4)], 16]
 
         @cute.jit
         def poll_row(
@@ -1271,6 +1292,14 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             prefix_ptr = storage.prefix.data_ptr()
 
             keys = cute.make_rmem_tensor((keys_per_thread,), Uint64)
+            tab = storage.tab.get_tensor(cute.make_layout((max(table_cache, 4),)))
+            if cutlass.const_expr(table_cache > 0):
+                # Step metadata (written before the step's kernels): the row's
+                # block-table entries, loaded while the mailbox fills.
+                req = req_id[row]
+                width = cutlass.min(Int32(block_table.shape[1]), Int32(table_cache))
+                for i in cutlass.range(tid, width, tb_size, unroll=1):
+                    tab[i] = block_table[req, i]
             if cutlass.const_expr(mailbox):
                 stage = storage.stage.get_tensor(
                     cute.make_layout((world_size * box_words,))
@@ -1351,6 +1380,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 valid_out,
                 dcp_rank,
                 stride_rows,
+                tab,
             )
 
             if cutlass.const_expr(exact):
@@ -1477,6 +1507,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         peer_recv,
                         peer_flags,
                         max_rows,
+                        tab,
                     )
 
         @cute.jit
