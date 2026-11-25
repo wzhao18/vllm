@@ -225,7 +225,6 @@ class KdaHeadVerify(KdaHeadWide):
             cute.arch.cluster_wait()
             if warp_idx == 0:
                 self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
-                l5diag.stamp(self.drow, 3, tid == 0)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")

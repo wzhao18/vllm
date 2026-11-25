@@ -1263,6 +1263,8 @@ class KdaHeadWide(KdaHead):
                 tcgen05.commit(bar_empty + stage, None, self.cta_group)
         for k in cutlass.range_constexpr(staged):  # A from tensor memory
             cute.arch.mbarrier_wait(b_full + k, 0)
+            if cutlass.const_expr(k == 0 and getattr(self, "drow", None) is not None):
+                l5diag.stamp(self.drow, 3, cute.arch.lane_idx() == 0)  # DIAG: x tile 0
             _fence_tcgen05()
             with cute.arch.elect_one():
                 for kb in cutlass.range_constexpr(k_blocks):
