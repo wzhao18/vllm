@@ -495,21 +495,41 @@ class OprojUmma(OprojProducer):
         stages: Constexpr = self.geometry(n)[2]
         # kind::f16 descriptor: FP32 D, BF16 A and B, both K-major, N, M = 64
         instruction: Constexpr = 1 << 4 | 1 << 7 | 1 << 10 | n >> 3 << 17 | 4 << 24
-        for kb in cutlass.range_constexpr(self.blocks):
-            s: Constexpr = kb % stages
-            wait(bars.iterator + s, kb // stages % 2)
-            if cutlass.const_expr(maddr is not None and kb == 0):
-                ds.stamp(maddr, 1)  # DIAG: K block 0 (W + x) landed
-            if cutlass.const_expr(maddr is not None and kb + 1 == self.blocks):
+        if cutlass.const_expr(stages == self.blocks):
+            # Every K block has its own stage (no ring reuse): wait for all of them,
+            # one proxy / TMEM fence, then the 4 x blocks MMAs back to back (same
+            # MMAs in the same order: bitwise identical). Per-block fences cost
+            # ~0.1 us each on the MMA warp's critical path (B-OA-3, 16 ranks).
+            for kb in cutlass.range_constexpr(self.blocks):
+                wait(bars.iterator + kb, 0)
+                if cutlass.const_expr(maddr is not None and kb == 0):
+                    ds.stamp(maddr, 1)  # DIAG: K block 0 (W + x) landed
+            if cutlass.const_expr(maddr is not None):
                 ds.stamp(maddr, 2)  # DIAG: last K block (all of x) landed
             cute.arch.fence_proxy("async.shared", space="cta")
             fence_tmem()
-            a = smem_desc(ring.iterator + s * stage, True)
-            b = smem_desc(ring.iterator + s * stage + 8192, True)
-            last: Constexpr = kb + 1 == self.blocks
-            release: Constexpr = last or kb + stages < self.blocks
-            barrier = bars.iterator + (2 * stages if last else stages + s)
-            mma_bf16_block(tmem, a, b, instruction, int(kb > 0), barrier, int(release))
+            for kb in cutlass.range_constexpr(self.blocks):
+                a = smem_desc(ring.iterator + kb * stage, True)
+                b = smem_desc(ring.iterator + kb * stage + 8192, True)
+                last: Constexpr = kb + 1 == self.blocks
+                barrier = bars.iterator + (2 * stages if last else stages + kb)
+                mma_bf16_block(tmem, a, b, instruction, int(kb > 0), barrier, int(last))
+        else:
+            for kb in cutlass.range_constexpr(self.blocks):
+                s: Constexpr = kb % stages
+                wait(bars.iterator + s, kb // stages % 2)
+                if cutlass.const_expr(maddr is not None and kb == 0):
+                    ds.stamp(maddr, 1)  # DIAG: K block 0 (W + x) landed
+                if cutlass.const_expr(maddr is not None and kb + 1 == self.blocks):
+                    ds.stamp(maddr, 2)  # DIAG: last K block (all of x) landed
+                cute.arch.fence_proxy("async.shared", space="cta")
+                fence_tmem()
+                a = smem_desc(ring.iterator + s * stage, True)
+                b = smem_desc(ring.iterator + s * stage + 8192, True)
+                last: Constexpr = kb + 1 == self.blocks
+                release: Constexpr = last or kb + stages < self.blocks
+                barrier = bars.iterator + (2 * stages if last else stages + s)
+                mma_bf16_block(tmem, a, b, instruction, int(kb > 0), barrier, int(release))
 
     @cute.jit
     def epilogue(self, args, ring, tmem, cta, n: Constexpr):
