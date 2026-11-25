@@ -293,6 +293,22 @@ def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
 TOKEN_SHARD_GEMM_AR_MIN_TOKENS = 288
 
 
+def megamoe_shared_overlap_role(vllm_config: VllmConfig) -> bool:
+    """Whether this role may run the sequence-parallel shared expert concurrently with
+    an SM-capped MegaMoE grid (``reserve_sms_for_shared_expert``, the decode SP
+    measurement behind RUBIN_SHARED_OVERLAP_MAX_SMS).
+
+    Not on P/D prefill workers: their chunks are compute-bound, and the capped grid
+    cost MegaMoE ~1.3x (TP8+DCP8 NVFP4 prefill, 4K tokens/GPU: 884 -> 1182 us per
+    layer, same bucket and knob record) while the shared expert hid only part of it.
+    They keep the full grid and run the shared expert beside the routing front
+    (``KimiMoE._prefill_shared_stream``), as the DEP prefill workers do; the shared
+    output enters the same up-projection epilogue, so the result is unchanged.
+    Decided by role, no switch; decode and unified serving keep the overlap.
+    """
+    return not pd_prefill_worker(vllm_config)
+
+
 def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
     """Whether the routed MoE runs on token shards over a replicated stream.
 
@@ -1089,14 +1105,10 @@ class KimiMoE(nn.Module):
         # collective) runs on a side stream concurrently with the MegaMoE launch,
         # whose persistent grid is capped to leave it SMs; joined before the
         # up-projection adds it. Same kernels and math, only concurrent.
-        # Not on P/D prefill workers: their chunks are compute-bound, the capped grid
-        # costs MegaMoE ~1.3x (TP8+DCP8 p4k: 884 -> 1182 us per layer) while the
-        # shared expert hides only part of it; they keep the full grid and run the
-        # shared expert beside the routing front (_prefill_shared_stream).
         self._shared_overlap = (
             self.use_mega_moe
             and use_sequence_parallel
-            and not pd_prefill_worker(vllm_config)
+            and megamoe_shared_overlap_role(vllm_config)
             and vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE
             and isinstance(self.shared_experts, KimiMLP)
             and not self.shared_experts.shard_sequence_parallel

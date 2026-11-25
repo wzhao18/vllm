@@ -119,3 +119,25 @@ def test_kda_segscan_role(kv_role, expected):
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
     assert kda_segscan.wanted(_config(kv_role)) is expected
+
+
+@pytest.mark.parametrize(
+    "kv_role,expected",
+    [
+        ("kv_both", False),  # P/D prefill worker: full MegaMoE grid, no SM cap
+        ("kv_producer", False),
+        ("kv_consumer", True),  # decode keeps the SM-capped shared-expert overlap
+        (None, True),  # unified serving: unchanged
+    ],
+)
+def test_megamoe_shared_overlap_role(kv_role, expected):
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import experts
+    from vllm.models.kimi_k3.nvidia.model import megamoe_shared_overlap_role
+
+    assert megamoe_shared_overlap_role(_config(kv_role)) is expected
+    # the decode cap itself is untouched
+    assert experts.RUBIN_SHARED_OVERLAP_MAX_SMS == 148
+    assert (
+        experts.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert.__defaults__[0]
+        == experts.RUBIN_SHARED_OVERLAP_MAX_SMS
+    )
