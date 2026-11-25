@@ -572,10 +572,13 @@ def test_dsa_core_rows_source():
         def merge_source(self, batch):
             return self.source
 
-        def merge_rows(self, *args, release=False):
+        def merge_rows(self, *args, release=False, join=None):
             # The core reads its rows after its PDL wait: the merge's rescue
-            # may release it early (FlashInfer's decode must not be).
+            # may release it early (FlashInfer's decode must not be). The
+            # query's join is made inside the merge (before its local select),
+            # not on the core's launch.
             assert release is True
+            assert join is JOIN
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
@@ -588,4 +591,7 @@ def test_dsa_core_rows_source():
     ):
         stage.source = step
         assert source.fits(64) is fits, step
+    JOIN = None
     assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
+    JOIN = object()  # (the fake reads it from this scope)
+    assert source.rows(None, None, None, None, 64, q=8, join=JOIN) == ("sel", "cnt")

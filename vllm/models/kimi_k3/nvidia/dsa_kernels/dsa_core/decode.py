@@ -144,11 +144,15 @@ class MergeRows:
         source, _ = self.stage.merge_source(batch)
         return source in ("merge", "exchange")
 
-    def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def rows(
+        self, *args, q: int = 1, join=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
         accepted. The core reads them after its PDL wait, so the merge's rescue
-        releases it early (``release``)."""
-        merged = self.stage.merge_rows(*args, q, release=True)
+        releases it early (``release``). ``join``: the query's join (its KV
+        insert), made inside the merge before its local select (``merge_rows``),
+        so that the core's only graph dependency is the rescue's PDL edge."""
+        merged = self.stage.merge_rows(*args, q, release=True, join=join)
         assert merged is not None, "merge_rows declined a step fits accepted"
         return merged
 
