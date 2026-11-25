@@ -201,6 +201,7 @@ class KdaVerifyLoop(KdaVerifyPacked):
                 elif thread < 128 + 32 * 8:
                     self.loop_gate(args, thread // 32 - 4, lane, head, token,
                                    shared_decay, own_gates)  # fmt: skip
+                    l5diag.stamp(drow, 13, (thread == 128) & (item_index == 0))
                     for p in cutlass.range_constexpr(pairs):
                         cute.arch.mbarrier_arrive(ready + p)
                 else:
@@ -214,6 +215,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
                         cute.arch.mbarrier_wait(ready + t // 2, phase)
                         if cutlass.const_expr(t == 0):
                             l5diag.stamp(drow, 4, (thread == 0) & (item_index == 0))
+                            l5diag.stamp(drow, 9, (thread == 128) & (item_index == 0))
+                            l5diag.stamp(drow, 11, (thread == 384) & (item_index == 0))
                     self.loop_token(history, t, group, j, row0, shared_q, shared_k,
                                     shared_decay, shared_v, shared_beta, shared_o,
                                     state, meta, item_index, head)  # fmt: skip
@@ -230,6 +233,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
                     position = (T - 1) * 128 + self.output_position(row)
                     shared_o[position] = self.round_out(owned)
                 l5diag.stamp(drow, 5, (thread == 0) & (item_index == 0))
+                l5diag.stamp(drow, 10, (thread == 128) & (item_index == 0))
+                l5diag.stamp(drow, 12, (thread == 384) & (item_index == 0))
                 cute.arch.sync_threads()
                 t, c, glane = thread // 64, thread % 64, thread % 32
                 if t < T:
@@ -521,6 +526,8 @@ class KdaVerifyLoopStock(KdaVerifyLoop):
                 shared_q[128 * t + thread] = mul_rn(mul_rn(qks[2 * jj], fq), scale)
                 shared_k[128 * t + thread] = mul_rn(qks[2 * jj + 1], fk)
             cute.arch.mbarrier_arrive(ready + p)
+            if cutlass.const_expr(p == 0 and getattr(self, "drow", None) is not None):
+                l5diag.stamp(self.drow, 14, thread == 0)  # DIAG: pair 0 done
         for s in cutlass.range_constexpr(3):  # the conv window
             window = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
             for i, value in enumerate(window):
