@@ -267,6 +267,47 @@ def build(batch, q, world, local_len, topk):
     )
 
 
+DBG = {}
+
+
+def patch_dsac_dbg(mp):
+    """DsaCore.run with its per-CTA timestamps (dsa_core.cu ``dbg``: [CTAs, 24] int64;
+    every layer overwrites them, so they hold the graph's last layer)."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import ops
+
+    run = ops.DsaCore.run
+
+    def run_dbg(self, q_box, sel, cnt, kv, **kw):
+        key = kw["rows"]
+        if key not in DBG:
+            DBG[key] = torch.zeros(key * 8 * 8, 24, dtype=torch.int64, device=sel.device)
+        kw["dbg"] = DBG[key]
+        return run(self, q_box, sel, cnt, kv, **kw)
+
+    mp.setattr(ops.DsaCore, "run", run_dbg)
+
+
+def dsac_phases(rows):
+    """Per-CTA phases of the last layer's DSA sparse core (us, mean / max over CTAs)."""
+    d = DBG.get(rows)
+    if d is None:
+        return None
+    d = d[d[:, 0] > 0].double()
+    if d.numel() == 0:
+        return None
+    t0 = d[:, 0:1]
+    names = {1: "q_polled", 5: "pdl_wait", 2: "slots", 3: "loop", 6: "pre_cluster",
+             7: "cluster_sync", 8: "lse", 9: "merged", 4: "end"}  # fmt: skip
+    out = {"ctas": int(d.shape[0]), "start_spread_us": float((t0.max() - t0.min()) / 1e3)}
+    for i, n in names.items():
+        col = d[:, i]
+        ok = col > 0
+        if ok.any():
+            rel = (col[ok] - d[ok, 0]) / 1e3
+            out[n] = [round(float(rel.mean()), 3), round(float(rel.max()), 3)]
+    return out
+
+
 def bench(case, args, rank):
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
@@ -330,6 +371,7 @@ def main():
     ap.add_argument("--prof", default="")
     ap.add_argument("--tag", default="chain")
     ap.add_argument("--out", default="")
+    ap.add_argument("--dsac-dbg", action="store_true")
     args = ap.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -337,6 +379,8 @@ def main():
 
     mp = pytest.MonkeyPatch()
     patch(mp, args.local * world + 4096, args.heads, args.topk)
+    if args.dsac_dbg:
+        patch_dsac_dbg(mp)
     n = init(world, rank, local_rank, args.topk)
     from vllm.distributed import get_dcp_group
 
@@ -351,7 +395,8 @@ def main():
         ).tolist()
         rec = dict(rows=rows, q=args.q, world=world, local_topk_n=n,
                    us_per_layer_max=max(all_us), us_per_layer=all_us,
-                   layers=args.layers, **case.info)  # fmt: skip
+                   layers=args.layers, dsac=dsac_phases(rows),
+                   **case.info)  # fmt: skip
         if rank == 0:
             print("REC " + json.dumps(rec), flush=True)
             res.append(rec)
