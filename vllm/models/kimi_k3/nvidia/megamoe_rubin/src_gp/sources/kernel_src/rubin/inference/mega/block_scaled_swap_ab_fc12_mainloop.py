@@ -1816,7 +1816,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         lane = cute.arch.lane_idx()
         for _ in cutlass.range(k_tile_count, unroll=1):
             stage_index = ab_pipeline_state.index
-            cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
+            import os as _os
+            if cutlass.const_expr("spin" in _os.environ.get("P8X", "")):
+                while not cute.arch.mbarrier_test_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase):
+                    pass
+            else:
+                cute.arch.mbarrier_wait(self.compact_sfa_mbarriers + stage_index, ab_pipeline_state.phase)
             stage = self.sfa_smem_tensor.iterator + stage_index * Int32(2 * compact_bytes)
             own = stage + Int32(compact_bytes) + lane * Int32(lane_bytes)
             leader = stage + lane * Int32(lane_bytes)
