@@ -843,8 +843,9 @@ def test_capture_output_store_with_sp_sharded_aux_rows():
     manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     manager.is_first_pp_rank = manager.is_last_pp_rank = True
     manager.max_num_reqs = 8
-    manager.dp_size = 1
-    manager.vllm_config = None
+    manager.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1)
+    )
 
     def aux_rows(n):
         return n // 8 if n >= 8192 else n
