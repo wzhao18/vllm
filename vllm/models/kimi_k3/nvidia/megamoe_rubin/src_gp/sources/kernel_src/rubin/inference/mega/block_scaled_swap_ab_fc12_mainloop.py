@@ -11,7 +11,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ......common.ptx_helpers import barrier_sync_unaligned
@@ -23,6 +23,7 @@ from .....helpers.cute_py_helpers import (
 )
 from .....helpers.dsl_helpers import spin_wait, tma_multicast_mask
 from .....helpers.iket_compat import iket
+from ......common import m1_stamps
 from .....helpers.smem_workspace import SmemWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import QuantKind
@@ -338,6 +339,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             2 if self.use_2cta_instrs else 1
         )
         self._pr2_sfb_tx = stage_one_regions[3].nbytes * (2 if self.use_2cta_instrs else 1)
+        self._pr2_sfa_tx = stage_one_regions[2].nbytes * (2 if self.use_2cta_instrs else 1)
         if self.heterogeneous_shared:
             shared_stage_one_regions = self._fit_shared_stage(stage_one_regions)
             shared_stage_operand_tma_bytes = (
@@ -987,7 +989,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_a = True
         a_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be") and expected_tx is None):
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be", "nowa") and expected_tx is None):
             # PR2 EXPERIMENT ONLY: each producer expects its own operand bytes (the stock even split assumes equal
             # A and B stage bytes); ws: an expert's 2nd+ token tile loads no weights (weight-stationary bytes).
             a_tx = Int32(self._pr2_a_tx)
@@ -995,9 +997,20 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 load_a = work_tile.tile_n_idx == Int32(0)
                 if not load_a:
                     a_tx = Int32(0)
+            if cutlass.const_expr(PR2_PROBE == "nowa"):
+                # PR2 EXPERIMENT ONLY: no weight data at all (first pass included); weight scales still loaded.
+                load_a = False
+                a_tx = Int32(self._pr2_sfa_tx)
+        m1w = getattr(self, "_m1a", None)
+        if cutlass.const_expr(m1w is not None):
+            m1w.vmin(m1_stamps.W_TMAA_FIRST, m1_stamps.clk())
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAA_ACQ)
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=a_tx)
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAA_ACQ)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
@@ -1020,6 +1033,18 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                   tma_desc_ptr=sfa_descriptor_ptr,
                   mcast_mask=multicast_mask,
               )
+            if cutlass.const_expr(PR2_PROBE == "nowa"):
+                cute.copy(
+                    sfa_atom,
+                    global_sfa_slice[(None, k_tile_idx)],
+                    partitioned_smem_sfa[(None, stage_index)],
+                    tma_bar_ptr=tma_barrier,
+                    tma_desc_ptr=sfa_descriptor_ptr,
+                    mcast_mask=multicast_mask,
+                )
+        if cutlass.const_expr(m1w is not None):
+            m1w.vmax(m1_stamps.W_TMAA_LAST, m1_stamps.clk())
+            m1w.add(m1_stamps.N_TMAA_TILES, 1)
         return ab_pipeline_state
 
     @cute.jit
@@ -1189,7 +1214,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 )
 
             iket.range_pop()
+            m1w = getattr(self, "_m1a", None)
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAA_SCHED)
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAA_SCHED)
 
         ab_pipeline.producer_tail(ab_pipeline_state)
 
@@ -1267,7 +1297,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         load_b = True
         b_tx = expected_tx
-        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be") and expected_tx is None):
+        if cutlass.const_expr(PR2_PROBE in ("breuse", "ws", "bws", "brsf", "bwsf", "mb", "mbe", "be", "nowa") and expected_tx is None):
             # PR2 EXPERIMENT ONLY: own operand bytes (see TMA-A); breuse: the odd pair M tile reuses the tokens.
             b_tx = Int32(self._pr2_b_tx)
             if cutlass.const_expr(PR2_PROBE in ("breuse", "bws", "brsf", "bwsf", "mb", "mbe", "be")):
@@ -1276,9 +1306,14 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                     b_tx = Int32(0)
                     if cutlass.const_expr(PR2_PROBE in ("brsf", "bwsf", "mb", "mbe", "be")):
                         b_tx = Int32(self._pr2_sfb_tx)  # token data skipped, token scales still loaded
+        m1w = getattr(self, "_m1b", None)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAB_ACQ)
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=b_tx)
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAB_ACQ)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
@@ -1303,6 +1338,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                   mcast_mask=sfb_multicast_mask,
               )
               cute.copy(sfb_issue_atom, global_sfb_slice[(None, k_tile_idx)], partitioned_smem_sfb[(None, stage_index)])
+        if cutlass.const_expr(m1w is not None):
+            m1w.vmax(m1_stamps.W_TMAB_LAST, m1_stamps.clk())
+            m1w.add(m1_stamps.N_TMAB_TILES, 1)
         return ab_pipeline_state
 
     @cute.jit
@@ -1337,7 +1375,13 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         if work_tile.phase == Int32(BlockPhase.Linear1):
             iket.range_push("tma_token_fc1")
             iket.range_push("tma_token_fc1_wait")
+            m1w = getattr(self, "_m1b", None)
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAB_FC1WAIT)
             kernel_extension.wait_for_input(work_tile)
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAB_FC1WAIT)
+                m1w.vmin(m1_stamps.W_TMAB_FIRST, m1_stamps.clk())
             iket.range_pop()
             ab_pipeline_state = self._issue_tma_b_tile(
                 *routed_kind,
@@ -1359,12 +1403,17 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             iket.range_push("tma_token_fc2")
             counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
             iket.range_push("tma_token_fc2_wait")
+            m1w = getattr(self, "_m1b", None)
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAB_FC2WAIT)
             spin_wait(
                 fc1_done_counter_pointer + counter_slot,
                 lambda value: value >= fc2_spin_threshold,
                 sleep_cycles=500,
                 peek_status=work_tile.peek_ready,
             )
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAB_FC2WAIT)
             iket.range_pop()
             ab_pipeline_state = self._issue_tma_b_tile(
                 *routed_kind,
@@ -1594,7 +1643,12 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 )
 
             iket.range_pop()
+            m1w = getattr(self, "_m1b", None)
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_TMAB_SCHED)
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_TMAB_SCHED)
 
         ab_pipeline.producer_tail(ab_pipeline_state)
 
@@ -1635,6 +1689,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 dtype=sf_dtype,
             )
             mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
+        m1w = getattr(self, "_m1m", None)
         use_n128_sfb_mapping = False
         if cutlass.const_expr(quant_kind == QuantKind.nvfp4 and self.cta_tile_n == 256):
             aligned_instruction_n = (work_tile.valid_tokens_in_cta_tile + Int32(15)) & Int32(-16)
@@ -1645,7 +1700,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+                if cutlass.const_expr(m1w is not None):
+                    m1w.begin(m1_stamps.C_MMA_ABWAIT)
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
+                if cutlass.const_expr(m1w is not None):
+                    m1w.end(m1_stamps.C_MMA_ABWAIT)
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
@@ -1714,7 +1773,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+                if cutlass.const_expr(m1w is not None):
+                    m1w.begin(m1_stamps.C_MMA_ABWAIT)
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
+                if cutlass.const_expr(m1w is not None):
+                    m1w.end(m1_stamps.C_MMA_ABWAIT)
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
@@ -1813,6 +1876,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         acc_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_accumulator_pipeline_stages
         )
+        m1w = getattr(self, "_m1m", None)
         work_tile = sched_consumer.consume_work()
         while work_tile.is_valid_tile:
             phase = work_tile.phase
@@ -1829,7 +1893,20 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             if self.is_leader_cta:
                 accumulator = accumulator_base[(None, None, accumulator_stage_index)]
                 accumulator = cute.tiled_divide(accumulator, accumulator.shape)
+                if cutlass.const_expr(m1w is not None):
+                    m1w.begin(m1_stamps.C_MMA_ACCWAIT)
                 acc_pipeline.producer_acquire(acc_producer_state)
+                if cutlass.const_expr(m1w is not None):
+                    m1w.end(m1_stamps.C_MMA_ACCWAIT)
+                    m1w.vmin(m1_stamps.W_MMA_FIRST, m1_stamps.clk())
+                    m1w.add(m1_stamps.N_MMA_TILES, 1)
+                    m1w.add(m1_stamps.N_KTILES, k_tile_count)
+                    m1w.add(m1_stamps.N_TOKENS, work_tile.valid_tokens_in_cta_tile)
+                    if phase == Int32(BlockPhase.Linear1):
+                        m1w.add(m1_stamps.N_FC1_TILES, 1)
+                        m1w.add(m1_stamps.N_TOKENS_FC1, work_tile.valid_tokens_in_cta_tile)
+                    if phase == Int32(BlockPhase.Linear2):
+                        m1w.add(m1_stamps.N_FC2_TILES, 1)
                 if cutlass.const_expr(self.heterogeneous_shared):
                     if self._is_shared_phase(phase):
                         ab_pipeline_state = self._mma_tile(
@@ -1874,9 +1951,15 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                         self.num_mma_instructions_per_ab_stage,
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
+                if cutlass.const_expr(m1w is not None):
+                    m1w.vmax(m1_stamps.W_MMA_LAST, m1_stamps.clk())
 
             acc_producer_state.advance()
+            if cutlass.const_expr(m1w is not None):
+                m1w.begin(m1_stamps.C_MMA_SCHED)
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(m1w is not None):
+                m1w.end(m1_stamps.C_MMA_SCHED)
         acc_pipeline.producer_tail(acc_producer_state)
 
 
