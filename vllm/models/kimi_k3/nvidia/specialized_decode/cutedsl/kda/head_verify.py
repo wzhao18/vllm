@@ -70,6 +70,8 @@ def fence_proxy_async_global():
     return "fence.proxy.async.global;", "~{memory}", ()
 
 
+# ``x_poll``: warps 0, 1 and 4-7 meet on this named barrier once x is complete
+X_BARRIER, X_THREADS = 6, 192
 KDA_CTAS = 8  # CTAs that run the recurrence (KdaSplit's B1 verify: cluster 8)
 ROWS = 128 // KDA_CTAS  # state rows per KDA CTA
 
@@ -345,8 +347,12 @@ class KdaHeadVerify(KdaHeadWide):
                     _store_zero(x_ready)
                     _store_zero(x_ready + 4)
             cute.arch.sync_warp()
-        wait(bar_x)
-        fence_proxy_async_global()
+            wait(bar_x)
+            fence_proxy_async_global()
+            named_barrier(X_BARRIER, X_THREADS, arrive=True)
+        else:  # blocked in bar.sync: no issue slots taken from the AttnRes beside it
+            named_barrier(X_BARRIER, X_THREADS)
+            fence_proxy_async_global()
 
     @cute.experimental.jit
     def x_resident_b(
@@ -387,7 +393,7 @@ class KdaHeadVerify(KdaHeadWide):
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % stages
             if k_tile == early:
-                wait(bar_x, scope="cta")
+                named_barrier(X_BARRIER, X_THREADS)
             cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
@@ -400,6 +406,8 @@ class KdaHeadVerify(KdaHeadWide):
                     _tma_load_evict_first(box, mbar, a_map, k, row0)
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
+        if early >= k_tile_count:  # (the barrier counts this warp once)
+            named_barrier(X_BARRIER, X_THREADS)
         self.drain(bar_empty, empty_phase, k_tile_count)
 
     @cute.jit
