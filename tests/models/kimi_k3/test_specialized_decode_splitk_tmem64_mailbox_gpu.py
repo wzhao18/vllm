@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3 specialized decode, ``SplitKTmemGemm64`` with separate reduce mailboxes
 (``separate``: the owners' FP32 mailboxes past the A / x slots, no cluster barrier
-between the MMAs and the DSMEM pushes) is bitwise the same kernel with the mailboxes in
-the A / x slots behind that barrier, at the decode tactics' 16 / 32 / 64 rows (N64,
-one N tile, partial last row tile) and over repeated calls; both within FP32
-accumulation noise of an FP64 reference. Also: which tactics take separate mailboxes
-(they must fit below the lone CTA's shared-memory request). One GPU, seconds."""
+between the MMAs and the DSMEM pushes): the MoE front kernels (``MoeFrontTmem64`` at
+16 / 32 / 64 rows, ``MoeFrontRows`` N64 at 128 rows; 8 owners) publish bitwise the
+same front box and h as the same kernels with the mailboxes in the A / x slots behind
+that barrier (2 GPUs: the front box is multicast memory); which tactics take separate
+mailboxes (only where they fit below the lone CTA's unchanged shared-memory request);
+the 4-owner projections keep the barrier form (FP64 bound, deterministic)."""
 
 import pytest
 import torch
@@ -57,22 +58,22 @@ def _run(weight, x, separate):
 
 @pytest.mark.parametrize("rows", [16, 32, 64])
 @pytest.mark.parametrize("n", [1024, 3040])
-def test_separate_mailboxes_bitwise(rows, n):
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.splitk_tmem64 import (  # noqa: E501
-        SplitKTmemGemm64,
-    )
+def test_projection_mailboxes_unchanged(rows, n):
+    """The 4-owner projections' mailboxes (32-row shares, 64 KB at N64) do not fit
+    beside the A / x slots: they keep the barrier form; still within FP32
+    accumulation noise of FP64 and deterministic over calls."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.splitk import (
         SplitKTactic,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.splitk_tmem64 import (  # noqa: E501
+        SplitKTmemGemm64,
+    )
 
-    assert SplitKTmemGemm64(tactic=SplitKTactic(*TACTIC[:4]), k=K).separate
+    assert not SplitKTmemGemm64(tactic=SplitKTactic(*TACTIC[:4]), k=K).separate
     gen = torch.Generator(device="cuda").manual_seed(1000 * rows + n)
     weight = (torch.randn(n, K, device="cuda", generator=gen) * 0.02).bfloat16()
     x = torch.randn(rows, K, device="cuda", generator=gen).bfloat16()
     got = _run(weight, x, separate=True)
-    ref = _run(weight, x, separate=False)
-    for a, b in zip(got, ref):
-        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
     assert torch.equal(got[0].view(torch.int16), got[2].view(torch.int16))
     exact = x.double() @ weight.double().T
     err = (got[0].double() - exact).abs().max() / exact.abs().max()
@@ -88,12 +89,15 @@ def test_separate_only_below_the_lone_request():
         SplitKTmemGemm64,
     )
 
-    for n, slots in ((64, 14), (128, 8)):
-        gemm = SplitKTmemGemm64(tactic=SplitKTactic(128, n, 8, slots), k=K)
-        assert gemm.smem_bytes == max(gemm.smem_bytes, ALONE_SMEM)
-        if gemm.separate:
-            assert gemm.smem_bytes == ALONE_SMEM  # the request is unchanged
-    lone = SplitKTmemGemm64(tactic=SplitKTactic(128, 64, 8, 14), k=K, alone=False)
+    # the MoE front's 8 owners (16-row shares): 32 KB of mailboxes at N64 fit below
+    # the lone request (separate), 64 KB at N128 do not
+    front = SplitKTmemGemm64(tactic=SplitKTactic(128, 64, 8, 14), k=K, owners=8)
+    assert front.separate and front.smem_bytes == ALONE_SMEM  # the request unchanged
+    wide = SplitKTmemGemm64(tactic=SplitKTactic(128, 128, 8, 8), k=K, owners=8)
+    assert not wide.separate
+    lone = SplitKTmemGemm64(
+        tactic=SplitKTactic(128, 64, 8, 14), k=K, owners=8, alone=False
+    )
     assert not lone.separate
 
 
