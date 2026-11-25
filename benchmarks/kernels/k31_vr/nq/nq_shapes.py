@@ -7,6 +7,9 @@ Contexts (b1/r2x/tools/make_shapes.py, plus the q8 c1/c8 group the audit asks fo
           q8_C64 (other q8 points) or q4_C48_C160_C256 (q4); B values without a vector take
           quantiles of the B=128 vector
   uNk     uniform N*1024 tokens (u192k)
+  uNkr    N*1024 + (i*q mod 64) tokens for request i (u132kr): rotates which DCP ranks hold each
+          request's new verify tokens and the shard's last partial page, as served (unaligned)
+          contexts do; under uNk every request puts both on DCP ranks 0..q-1
   mix     alternating 3K / 150K (rows with no local top-k entry on some ranks)
 
 --max-kv-tokens N (0 = off): a case whose contexts sum to more than N tokens has every context
@@ -55,6 +58,8 @@ for ctx in a.ctx.split(","):
         b = m // a.q
         if ctx == "agentx":
             lens = agentx(b)
+        elif ctx.startswith("u") and ctx.endswith("kr"):
+            lens = [int(ctx[1:-2]) * 1024 + (i * a.q) % 64 for i in range(b)]
         elif ctx.startswith("u") and ctx.endswith("k"):
             lens = [int(ctx[1:-1]) * 1024] * b
         elif ctx == "mix":
