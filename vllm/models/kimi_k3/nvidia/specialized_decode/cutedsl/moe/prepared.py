@@ -85,12 +85,6 @@ JOIN = {8: "9-16:0", 16: ""}
 # after the front) in a one-GPU MoE layer proxy (391 / 293 distinct experts),
 # outputs bitwise identical.
 RELEASE_EARLY_WIDE = "3-8:1,64:1"
-# Rubin-class TP16 batches whose shared expert (gate/up + SiTU, split-K down, RS push
-# kernel) runs whole on the side stream beside the front, routing and the experts'
-# launch, joined only before the tail, although the experts' grid spans every SM: the
-# experts no longer wait for the shared chain (B1: SiTU -> down ended ~1.8 us after
-# routing, then the experts launched).
-SHARED_TO_TAIL_WIDE = "8:1"
 
 
 class PreparedMoE:
@@ -138,8 +132,6 @@ class PreparedMoE:
         # gate/up half instead of after it.
         self.join = batch_table(JOIN[state.tp])
         self.sms = torch.cuda.get_device_properties(state.device).multi_processor_count
-        wide16 = self.sms > 152 and state.tp == 16
-        self.to_tail = batch_table(SHARED_TO_TAIL_WIDE if wide16 else "")
         for b, sms in front.split.items():  # the split's down CTAs take the SMs left
             experts.grids[b] = min(experts.grid_for(b), self.sms - sms)
         if self.sms > 152 and state.tp == 16:
@@ -173,7 +165,7 @@ class PreparedMoE:
         # The shared expert runs on the side stream beside the routed experts, or, when
         # the persistent expert grid spans every SM, beside the front only. Split: its
         # gate/up half beside the front, its down rows beside the experts.
-        before = self.experts.grid_for(b) >= self.sms and not self.to_tail.get(b)
+        before = self.experts.grid_for(b) >= self.sms
         if self.front.merged_batch(b):
             # One kernel publishes the routing logits and leaves h; the down rows then
             # run beside the experts.
