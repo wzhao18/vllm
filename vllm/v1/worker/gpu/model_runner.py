@@ -2217,7 +2217,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
-            # boundary reset is visible to the attention metadata.
+            # boundary reset is visible to the attention metadata. The copy
+            # itself is launched after pre_forward (launch_state_precopy): a
+            # same-step connector load writes its source block outside the CUDA
+            # streams and has landed only once pre_forward returns.
             self.model_state.preprocess_state(
                 input_batch,
                 block_tables,
@@ -2450,6 +2453,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
+            self.model_state.launch_state_precopy()
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -2473,6 +2477,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
+                self.model_state.launch_state_precopy()
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(
