@@ -27,6 +27,7 @@ from .experts import (
     fc2_pairs,
 )
 from .experts_rubin import (
+    HOME_RUN,
     ROUTE_IDS,
     ROUTE_WORDS,
     ImagePlanKernel,
@@ -334,7 +335,8 @@ PLACE_SAMPLES, PLACE_PASSES, PLACE_UNCLEAR = 8, 5, 1
 
 def place(routed):
     """Rubin TP16 with M64 experts (``RUBIN64``): re-home one MoE layer's routed w13
-    and w2 every 2 MiB alternately on die 0 / 1 (``dies.localized_like``: the same
+    and w2 in runs of ``2^HOME_RUN`` 2 MiB chunks alternately on die 0 / 1
+    (``experts_rubin.HOME_SHIFT``; ``dies.localized_like``: the same
     bytes and layout, so every reader sees the same values; the originals are
     released) and return the die of every SM for the experts kernels' die matching
     (``dies``: FC1 + FC2 at M64, FC2 at M8), or () (no trusted die map, other
@@ -359,9 +361,9 @@ def place(routed):
             "routed experts", wrong, scope="process",
         )  # fmt: skip
         return ()
-    placed = []
+    placed, run = ([], 1 << HOME_RUN)
     for weight in (routed.w13_weight, routed.w2_weight):
-        copy = dies.localized_like(weight.data, [0, 1])
+        copy = dies.localized_like(weight.data, [0] * run + [1] * run)
         chunks = -(-copy.numel() * copy.element_size() // dies.CHUNK)
         picks = {chunks * i // PLACE_SAMPLES for i in range(PLACE_SAMPLES)}
         sample = tuple(sorted(picks))
@@ -370,7 +372,7 @@ def place(routed):
         wrong, sms = sample, 4
         for attempt in range(PLACE_PASSES):
             homes = dies.chunk_homes(copy, wrong, sms)
-            wrong = tuple(c for c, home in zip(wrong, homes) if home != c % 2)
+            wrong = tuple(c for c, home in zip(wrong, homes) if home != c // run % 2)
             if not wrong:
                 break
             sms = 8 if attempt < 2 else 16
