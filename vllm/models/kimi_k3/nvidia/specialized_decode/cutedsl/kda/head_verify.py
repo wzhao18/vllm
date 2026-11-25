@@ -37,6 +37,8 @@ from vllm.models.kimi_k3.nvidia.k31_spin_guard import spin_start, spin_tick
 from ..attn_res.kernel import BESIDE_SMEM
 from ..common.primitives import (
     asm,
+    sleep_ns,
+    try_wait,
     at,
     float_bits,
     fma,
@@ -339,6 +341,7 @@ class KdaHeadVerify(KdaHeadWide):
                 seen = Int32(_acquire_load(x_ready))
                 sgn, sgt = spin_start()
                 while seen < x_target:
+                    sleep_ns(64)  # (backoff: the AttnRes's own loads share the L2)
                     seen = Int32(_acquire_load(x_ready))
                     sgn, sgt = spin_tick(sgn, sgt, observed=seen, target=0)
                 for peer in cutlass.range_constexpr(CLUSTER):
@@ -347,7 +350,10 @@ class KdaHeadVerify(KdaHeadWide):
                     _store_zero(x_ready)
                     _store_zero(x_ready + 4)
             cute.arch.sync_warp()
-            wait(bar_x)
+            ready = try_wait(bar_x)
+            while ready == 0:
+                sleep_ns(64)  # (a parked warp beside the AttnRes's CTA)
+                ready = try_wait(bar_x)
             fence_proxy_async_global()
             named_barrier(X_BARRIER, X_THREADS, arrive=True)
         else:  # blocked in bar.sync: no issue slots taken from the AttnRes beside it
