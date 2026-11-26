@@ -16,7 +16,9 @@ An FP32 state's pair runs the stock-math ``KdaSplitStock`` (q = 1 and verify; ch
 against the stock layer in ``test_specialized_decode_kda_loop_gpu.py`` /
 ``test_specialized_decode_kda_stock_gpu.py``) and the FP32 heads compute its math
 (``KdaHead.stock``), so they match it bit for bit too; the BF16 heads and pair keep
-KdaSplit's math.
+KdaSplit's math. Exception: the FP32 record heads (q8: B1 verify, 2 x q8 multi) run
+the token loop at 16 lanes per row, an FP32 reassociation of the pair's row dots:
+checked with the stock test's tolerances (``assert_reassociated``).
 
 One GPU; a few minutes of CuTe compiles on a cold cache."""
 
@@ -104,6 +106,27 @@ def assert_bitwise(name, got, want):
         f"{name}: {int(diff.sum())} of {diff.numel()} elements differ, max |diff| "
         f"{(got.float() - want.float()).abs().max().item():.3e}"
     )
+
+
+def relative_error(got, want):
+    got, want = got.double(), want.double()
+    return ((got - want).norm() / want.norm().clamp_min(1e-30)).item()
+
+
+def assert_reassociated(got, got_caches, want, want_caches, slot_index):
+    """The record heads' token loop (``HeadRecords.LOOP_LANES`` 16) sums each row dot
+    in another FP32 order than the pair's 8-lane KdaSplit: the accepted states within
+    FP32 reassociation (relerr 2e-7, the stock test's bar), the outputs within
+    relerr 2e-4 and at most 1 / 4000 one rounding apart, the conv window bitwise."""
+    state_error = relative_error(
+        accepted_states(got_caches[1], slot_index),
+        accepted_states(want_caches[1], slot_index),
+    )
+    assert state_error < 2e-7, state_error
+    off = (bits(got) != bits(want)).sum().item()
+    assert off <= max(4, got.numel() // 4000), f"{off} of {got.numel()} differ"
+    assert relative_error(got, want) < 2e-4
+    assert_bitwise("conv state", got_caches[0], want_caches[0])
 
 
 def spec_inputs(requests, tokens, slots, seed=2):
@@ -204,6 +227,9 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
     side.join()
     torch.cuda.synchronize()
 
+    if q == 8 and state_dtype == torch.float32:  # the record heads (16-lane loop)
+        assert_reassociated(got, got_caches, want, want_caches, slot_index)
+        return
     assert_bitwise("output", got, want)
     if q > 1 and state_dtype == torch.float32:
         # both record forms (the FP32 deferred-verify protocol): the raw slots bit for

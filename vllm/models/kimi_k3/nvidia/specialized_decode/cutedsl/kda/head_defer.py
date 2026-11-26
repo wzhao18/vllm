@@ -97,7 +97,7 @@ class HeadRecords:
         vk = self.vkda
         dots = [vk.row_dot(history, qr, p) for p in range(vk.passes)]
         for shift in reversed(range(vk.lanes_per_row.bit_length() - 1)):
-            for p in range(vk.passes):
+            for p in cutlass.range_constexpr(vk.passes):
                 dots[p] += cute.arch.shuffle_sync_bfly(dots[p], 1 << shift)
         return dots
 
@@ -132,7 +132,7 @@ class HeadRecords:
                     history[p, j, e] *= ops[2, j, e]
         dot_k = [vk.row_dot(history, kr, p) for p in range(P)]
         for shift in reversed(range(vk.lanes_per_row.bit_length() - 1)):
-            for p in range(P):
+            for p in cutlass.range_constexpr(P):
                 dot_k[p] += cute.arch.shuffle_sync_bfly(dot_k[p], 1 << shift)
                 dot_q[p] += cute.arch.shuffle_sync_bfly(dot_q[p], 1 << shift)
         v_new = [(v_rows[p] - dot_k[p]) * beta for p in range(P)]
