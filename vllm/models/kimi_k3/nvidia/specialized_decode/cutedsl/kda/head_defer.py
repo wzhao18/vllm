@@ -529,6 +529,13 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         super().__init__(*args, **kwargs)
         assert self.tokens == KDA_CTAS, "KdaHeadMultiDefer: q8 (one token per KDA CTA)"
 
+    # Where the four main warps fold the pending records relative to their share of
+    # x's K tiles (``resident_b``, B_ISSUERS - 1 of the 5 issuers): 0 = before the PDL
+    # wait (the MMA's x tiles 1 .. 4 mod 5 wait for the fold), 1 = the whole fold after
+    # the x issue (under the in-projection MMA), 2 = record staging + state loads
+    # before the wait, the fold arithmetic after the x issue.
+    fold_mode = 2
+
     @cute.experimental.kernel
     def kernel(
         self, mA: cute.Tensor, mB: cute.Tensor, a_map: cutlass.Int64,
@@ -648,12 +655,15 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             kt = tid - 128
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset, request, block)
-            early = self.multi_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            staging = (shared_q, shared_k)
+            early = self.multi_early(kt, tensors, coords, slots, staging)
             cute.arch.cluster_wait()
             # the other B_ISSUERS - 1 warps of x's tiles
             b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
             self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+            if cutlass.const_expr(self.fold_mode != 0):  # under the in-proj MMA
+                self.late_fold(kt, early, tensors, coords, slots, staging)
             self.push_tokens(
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
@@ -709,10 +719,17 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             values = self.vkda.load_state(pointer)
             for e in cutlass.range_constexpr(4):
                 history[0, j, e] = values[e]
-        if (slot > 0) & (pending > 0):  # the fold (pre-wait)
-            record_page = state[Int64(records), None, None, None]
-            self.head_fold(history, record_page, head, pending, value_base, group,
-                           group_lane, kt, staging)  # fmt: skip
+        if cutlass.const_expr(self.fold_mode == 0):
+            if (slot > 0) & (pending > 0):  # the fold (pre-wait)
+                record_page = state[Int64(records), None, None, None]
+                self.head_fold(history, record_page, head, pending, value_base, group,
+                               group_lane, kt, staging)  # fmt: skip
+        vs = zeros(7, Float32)
+        if cutlass.const_expr(self.fold_mode == 2):  # stage now, fold after the x issue
+            if (slot > 0) & (pending > 0):
+                record_page = state[Int64(records), None, None, None]
+                self.fold_stage(vs, record_page, head, pending, value_base, group, kt,
+                                staging)  # fmt: skip
         taps = zeros((3, 3), BFloat16)
         coeff = zeros((3, 4), conv_w.element_type)
         accum = zeros(3 * self.tokens, Float32)
@@ -732,7 +749,65 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                         accum[s] = bias[s * dim + channel]
                         for t in cutlass.range_constexpr(1, self.tokens):
                             accum[3 * t + s] = accum[s]
-        return history, taps, coeff, accum, norm_w[kt]
+        return history, taps, coeff, accum, norm_w[kt], vs
+
+    @cute.jit
+    def fold_stage(self, vs, record_page, head, pending, value_base, group, kt, staging):
+        """``head_fold``'s loads: the pending k / decay record rows cp.async-staged into
+        ``staging`` (committed, not waited) and the row's corrections into ``vs``."""
+        stage_k, stage_d = staging
+        row = value_base + group % ROWS
+        for which in cutlass.range_constexpr(2):  # k rows 0 .., decay rows 8 ..
+            target = (stage_k, stage_d)[which]
+            for c in cutlass.range_constexpr(2):
+                index = kt + 128 * c
+                if index < 7 * 32:
+                    r, column = index // 32, 4 * (index % 32)
+                    if r < pending:
+                        source = at(record_page, head, DECAY_ROW * which + r, column)
+                        copy_g2s(target.iterator + r * 128 + column, source)
+        cute.arch.cp_async_commit_group()
+        for i in cutlass.range_constexpr(7):
+            vs[i] = record_page[head, V_ROW + i, row]
+
+    @cute.jit
+    def late_fold(self, kt, early, tensors, coords, slots, staging):
+        """The fold after this warp's x tiles are issued (``fold_mode`` 1 / 2): the
+        same instructions in the same order as ``head_fold``."""
+        history, vs = early[0], early[5]
+        state = tensors[3]
+        head, _, _, offset, request, block = coords
+        slot, records = slots[request, 0], slots[request, 1]
+        pending = offset
+        if (offset < 0) | (records <= 0):
+            pending = Int32(0)
+        group, group_lane = kt // self.vkda.lanes_per_row, kt % self.vkda.lanes_per_row
+        value_base = block * ROWS
+        if (slot > 0) & (pending > 0):
+            if cutlass.const_expr(self.fold_mode == 1):
+                record_page = state[Int64(records), None, None, None]
+                self.head_fold(history, record_page, head, pending, value_base, group,
+                               group_lane, kt, staging)  # fmt: skip
+            else:
+                vk = self.vkda
+                stage_k, stage_d = staging
+                cute.arch.cp_async_wait_group(0)
+                named_barrier(4, 128)  # every thread's staged chunks
+                for i in cutlass.range_constexpr(7):
+                    if i < pending:
+                        for j in cutlass.range_constexpr(vk.chunks):
+                            column = 4 * (group_lane + vk.lanes_per_row * j)
+                            d4 = load_f32x4(stage_d.iterator + i * 128 + column, shared=True)
+                            for e in cutlass.range_constexpr(4):
+                                history[0, j, e] *= d4[e]
+                        for j in cutlass.range_constexpr(vk.chunks):
+                            column = 4 * (group_lane + vk.lanes_per_row * j)
+                            k4 = load_f32x4(stage_k.iterator + i * 128 + column, shared=True)
+                            for e in cutlass.range_constexpr(4):
+                                history[0, j, e] = fma(
+                                    k4[e], vs[i], history[0, j, e], ftz=vk.fast_math
+                                )
+                named_barrier(4, 128)  # the staging buffers read before anyone reuses them
 
 
     @cute.jit
@@ -744,7 +819,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         ``block``; at q < 8 ``owned_norm`` runs it)."""
         T: cutlass.Constexpr = self.tokens
         dim = self.dim
-        history, taps, coeff, accum, nw = early
+        history, taps, coeff, accum, nw = early[:5]
         raw_qk, raw_v, mine, bar_hop = raws
         shared_q, shared_k, shared_decay, shared_v, shared_o, reductions = rows[:6]
         local_o, slot_rows = rows[6:]
