@@ -32,7 +32,7 @@ from ..common.primitives import (
     zeros,
 )
 from . import head_multi, head_verify
-from .head import CLUSTER, INPUT_BYTES, SECTIONS
+from .head import CLUSTER, INPUT_BYTES, SECTIONS, WEIGHT_WARP2
 from .head_multi import TOKEN_INPUTS
 from .head_verify import _smem, cute_ext, sm100_utils, utils
 from .head_multi import KdaHeadMulti
@@ -226,10 +226,11 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
         tiles = (split_rank * k_tile_count, k_tile_count)
         offset = accepted[0] - 1
         slot = slots[0, offset]
-        if warp_idx < 3:
+        if warp_idx < 3 or warp_idx == WEIGHT_WARP2:
             cute.arch.cluster_wait()
-            if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            if warp_idx == 0 or warp_idx == WEIGHT_WARP2:
+                issuer = warp_idx // WEIGHT_WARP2
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles, issuer)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -630,10 +631,11 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         tiles = (split_rank * k_tile_count, k_tile_count)
         offset = accepted[request] - 1
         slot = slots[request, offset]
-        if warp_idx < 3:
+        if warp_idx < 3 or warp_idx == WEIGHT_WARP2:
             cute.arch.cluster_wait()
-            if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            if warp_idx == 0 or warp_idx == WEIGHT_WARP2:
+                issuer = warp_idx // WEIGHT_WARP2
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles, issuer)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")

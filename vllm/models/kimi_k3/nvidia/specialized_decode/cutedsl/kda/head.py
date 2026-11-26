@@ -87,6 +87,10 @@ CLUSTER = 16  # 8 M tiles x split-K 2 = 8 tokens x 2 value partitions
 # KdaHeadWide: warps issuing x's K tiles after the PDL wait (warp 1 and the four main
 # warps; ``resident_b``)
 B_ISSUERS = 5
+# KdaHeadWide family: warps requesting the weight (A) tiles (``weight_warp``): warp 0
+# and, with 2, an extra warp WEIGHT_WARP2 after the eight role warps.
+WEIGHT_ISSUERS = 2
+WEIGHT_WARP2 = 8
 # ``polled_out``: the sentinel of every BF16 element of a KDA layer's polled output (a
 # NaN the canonical output store never writes: BF16 NaN results are stored as 0x7FFF).
 OUT_SENT = 0xFFFF
@@ -1001,6 +1005,9 @@ class KdaHeadWide(KdaHead):
     path); a counter pair must then not be reused before a graph boundary (the model
     has one pair per layer)."""
 
+    # warps requesting the weight tiles (``weight_warp``; the second is WEIGHT_WARP2)
+    weight_issuers = WEIGHT_ISSUERS
+
     def __init__(
         self, heads, *, stages=12, cta_k=64, tmem_tiles=0, early_loads=None,
         bf16_state=True, has_bias=False, hidden=7168,
@@ -1012,6 +1019,7 @@ class KdaHeadWide(KdaHead):
         self.k_tiles, self.tmem_tiles = hidden // cta_k // SECTIONS, tmem_tiles
         # A tiles the weight warp issues before the PDL wait (None: as the ring allows)
         self.early_loads = early_loads
+        self.set_weight_issuers()
         assert 8 + tmem_tiles * cta_k // 2 <= 512 and tmem_tiles <= self.k_tiles
         # Only the shared memory the kernel uses (+ alignment slack): a CTA then fits
         # beside a small-smem CTA (the AttnRes at carve-out 100) on one SM.
@@ -1024,24 +1032,39 @@ class KdaHeadWide(KdaHead):
         self.smem_bytes = (used + 2560 + 1023) // 1024 * 1024
         assert self.smem_bytes <= BESIDE_SMEM  # beside an AttnRes CTA
 
+    def set_weight_issuers(self):
+        """The eight role warps plus the extra weight issuers (after any
+        ``SplitKGemm.__init__``, which sets 256 threads)."""
+        assert self.weight_issuers in (1, 2)
+        self.threads_per_cta = 32 * (8 + self.weight_issuers - 1)
+
     @cute.experimental.jit
     def weight_warp(
         self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
         row0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
+        issuer: cutlass.Int32,
     ):  # fmt: skip
         """``KdaHead.weight_warp``; with ``early_loads``, tiles from that index on
-        are issued only after the PDL wait (the predecessor has completed)."""
-        stages = self.num_ab_stage
+        are issued only after the PDL wait (the predecessor has completed).
+
+        ``weight_issuers`` warps share the ring: issuer i requests K tiles i, i +
+        weight_issuers, ... (one TMA issuing thread streams a 16 KiB stage per
+        ~0.25 us, so one issuer bounds the weight stream from CTA entry; hwdb INDEX
+        53b). Each tile waits for its own stage's previous use (phase from the tile
+        index); an issuer's previous tile k - weight_issuers waited for tile k -
+        weight_issuers - stages, and the MMA warp frees stages in K order, so the
+        parity wait cannot pass a stage two uses early. Issuer 0 drains."""
+        stages, issuers = self.num_ab_stage, self.weight_issuers
         stage_bytes = cute.size_in_bytes(
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         early = self.k_tiles if self.early_loads is None else self.early_loads
         _acquire_tensor_map(a_map)
-        empty_phase = cutlass.Int32(1)
-        for k_tile in cutlass.range(k_tile_count, unroll=1):
+        for k_tile in cutlass.range(issuer, k_tile_count, issuers, unroll=1):
             stage = k_tile % stages
-            if k_tile == early:
+            if k_tile >= early and k_tile < early + issuers:  # this issuer's first
                 cute.arch.griddepcontrol_wait()
+            empty_phase = (k_tile // stages) % 2 ^ 1
             cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
@@ -1052,9 +1075,8 @@ class KdaHeadWide(KdaHead):
                     box, mbar = tile + atom * self.cta_m * ATOM_K, bar_full + stage
                     k = k0 + atom * ATOM_K
                     _tma_load_evict_first(box, mbar, a_map, k, row0)
-            if stage == stages - 1:
-                empty_phase = empty_phase ^ 1
-        self.drain(bar_empty, empty_phase, k_tile_count)
+        if issuer == 0:
+            self.drain(bar_empty, (k_tile_count // stages) % 2 ^ 1, k_tile_count)
 
     @cute.experimental.kernel
     def kernel(
@@ -1133,10 +1155,11 @@ class KdaHeadWide(KdaHead):
         k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
         tiles = (split_rank * k_tile_count, k_tile_count)
         slot = slots[token]
-        if warp_idx < 3:
+        if warp_idx < 3 or warp_idx == WEIGHT_WARP2:
             cute.arch.cluster_wait()
-            if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            if warp_idx == 0 or warp_idx == WEIGHT_WARP2:
+                issuer = warp_idx // WEIGHT_WARP2
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles, issuer)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")

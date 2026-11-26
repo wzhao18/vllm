@@ -51,6 +51,7 @@ from .head import (
     CLUSTER,
     INPUT_BYTES,
     SECTIONS,
+    WEIGHT_WARP2,
     KdaHeadWide,
     load_bf16x4,
     store_bf16_canonical,
@@ -215,10 +216,11 @@ class KdaHeadVerify(KdaHeadWide):
         tiles = (split_rank * k_tile_count, k_tile_count)
         offset = accepted[0] - 1
         slot = slots[0, offset]
-        if warp_idx < 3:
+        if warp_idx < 3 or warp_idx == WEIGHT_WARP2:
             cute.arch.cluster_wait()
-            if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+            if warp_idx == 0 or warp_idx == WEIGHT_WARP2:
+                issuer = warp_idx // WEIGHT_WARP2
+                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles, issuer)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
