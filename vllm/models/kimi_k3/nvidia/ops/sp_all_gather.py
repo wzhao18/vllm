@@ -414,24 +414,43 @@ class AgPending:
         self.ctr_ptr = gather.flags.data_ptr() + 4 * 64
         self.done = False
 
-    def _push(self, pdl: bool) -> None:
+    def _push(self, pdl: bool, side: bool = False) -> None:
         if self.done:
             raise RuntimeError("SP all-gather: pending gather pushed twice")
         self.done = True
         g = self.gather
+        if side:
+            if not hasattr(g, "_side"):
+                g._side = torch.cuda.Stream()
+            cur = torch.cuda.current_stream()
+            g._side.wait_event(self._ev)
+            with torch.cuda.stream(g._side):
+                self._launch(g, False)
+            cur.wait_stream(g._side)
+            if g.pending is self:
+                g.pending = None
+            return
+        self._launch(g, pdl)
+        if g.pending is self:
+            g.pending = None
+
+    def _launch(self, g, pdl: bool) -> None:
         _ag_module().sp_ag_push(
             g.storage.data_ptr() + self.slot * g.slot_numel * g.storage.element_size(),
             g.peer_ptrs[self.slot], g.peer_flags, g.rank, g.world, self.rows, self.hidden,
             g.world * g.max_rows * self.hidden, self.cl_rows, _AG_CHUNK,
             g.idle_sms, pdl, _AG_SPIN_NS,
         )  # fmt: skip
-        if g.pending is self:
-            g.pending = None
 
     def launch_pushers(self) -> None:
-        """Launch the pusher grid as the PDL secondary of the kernel just
-        launched on this stream (the fused GEMM)."""
-        self._push(True)
+        """DIAG (never merge): pushers on a side stream, released by an event
+        recorded before the GEMM (no PDL edge)."""
+        self._push(False, side=True)
+
+    def arm(self) -> None:
+        """DIAG: record the release event before the GEMM launch."""
+        self._ev = torch.cuda.Event()
+        self._ev.record()
 
     def complete(self) -> None:
         """Make the gathered tensor whole on this stream (non-fused consumer)."""
@@ -584,6 +603,7 @@ class SymmSpAllGather:
         if pending.ncl > _AG_FLAG_WORDS - 64:
             raise ValueError(f"SP overlapped all-gather: {pending.ncl} tiles")
         self._arrive(reset=pending.ncl)
+        pending.arm()
         self.pending = pending
         self.last_overlapped = True
         out = raw[start : start + self.world * rows * hidden]
