@@ -81,8 +81,11 @@ def wait_rows(ctr: Int64, cl_idx: Int32, target: Int32, lo: Int32, hi: Int32):
                 _nanosleep()
                 if globaltimer_ns() - t0 > Uint64(SPIN_LIMIT_NS):
                     cute.printf(
-                        "K31_SPIN_TIMEOUT kernel=sp_ag_gemm tile={} target={} count={}",
+                        "K31_SPIN_TIMEOUT kernel=sp_ag_gemm tile={} target={} count={} arrival={} pushers_started={} pushers_past_first_wait={}",
                         cl_idx, target, v,
+                        _ld_acquire_sys_u32(ctr - Int64(256)),
+                        _ld_acquire_sys_u32(ctr - Int64(252)),
+                        _ld_acquire_sys_u32(ctr - Int64(248)),
                     )
                     _trap()
                 v = _ld_acquire_sys_u32(addr)

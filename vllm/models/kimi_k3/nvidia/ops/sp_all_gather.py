@@ -223,6 +223,8 @@ __global__ void __launch_bounds__(32, 1) sp_ag_push_kernel(
   // This gather's arrival count (raised by this rank's arrive kernel, which
   // precedes the GEMM on the stream): a peer at >= it reached this gather.
   const uint32_t arrive_target = ag_ld_acq((uint64_t)peer_flags[rank]);
+  // diagnostics: pusher CTAs started (word 1), CTAs past their arrival waits (word 2)
+  atomicAdd((unsigned*)((uint64_t)peer_flags[rank] + 4), 1u);
   for (int i = 0; i < NS; ++i) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(ag_sa(&bar[i])));
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   const int G = gridDim.x, g = blockIdx.x;
@@ -272,6 +274,7 @@ __global__ void __launch_bounds__(32, 1) sp_ag_push_kernel(
                  :: "r"(ag_sa(smem + (size_t)s * chunk)), "l"(src), "r"(nb), "r"(ag_sa(&bar[s])) : "memory");
   };
   for (int64_t k = 0; k < NS - 1 && k < n; ++k) issue(k);
+  atomicAdd((unsigned*)((uint64_t)peer_flags[rank] + 8), 1u);
   for (int64_t k = 0; k < n; ++k) {
     const int s = (int)(k % NS);
     const uint32_t a = ag_sa(&bar[s]), p = (ph >> s) & 1u;
