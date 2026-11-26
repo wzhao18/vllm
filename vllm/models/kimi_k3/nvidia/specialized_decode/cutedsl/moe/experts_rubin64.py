@@ -17,6 +17,8 @@ late would otherwise set the end. Published modes stage
 each lane's own BF16 half of the FC2 rows (no shuffles or branches), so the epilogue
 keeps up with the MMAs."""
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64, Uint8, Uint32, Uint64
@@ -156,6 +158,20 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         dies=(), static_groups=False, paired=False,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
+        # RING-1 DIAG (not for merge): K31RING1_MODE on the grouped kernel only.
+        # A dev / A8 8 slots / P paired 8 / Q paired 8 + one MMA full wait per pair
+        # (K512-equivalent gating) / F MMA reads a FIXED slot 0 (timing only, wrong
+        # numbers) / QF both.
+        mode = "A"
+        if type(self) is RubinGroupedExpertsKernel:
+            mode = os.environ.get("K31RING1_MODE", "A")
+        self.single = mode in ("Q", "QF")
+        self.fixed = mode in ("F", "QF")
+        if mode in ("A8", "P", "Q", "QF"):
+            stages = 8
+        if mode in ("P", "Q", "QF"):
+            paired = True
+        self.ring1_mode = mode
         # paired: two consecutive 16 KiB slots share one full / empty barrier (pair
         # ``slot // 2``): one ~0.25 us barrier-stage round per 32 KiB of weights
         # instead of per 16 KiB (hwdb INDEX 39 / 42: the per-issuer cost is per
@@ -243,6 +259,23 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     def stamp(self, slot: cutlass.Constexpr[int]):
         if cutlass.const_expr(self.trace != 0):
             stamp_at(Int64(self.trace) + Int64(thread()[3]) * 512, slot)
+
+    @cute.jit
+    def full_wait(self, full, slot, phase):
+        """The MMA warp's full wait for ``slot`` (``single``: only a pair's first slot
+        waits; the pair barrier completes once both slots landed)."""
+        if cutlass.const_expr(self.single):
+            if slot % 2 == 0:
+                self.sync(full.iterator + self.pb(slot), phase, True)
+        else:
+            self.sync(full.iterator + self.pb(slot), phase, True)
+
+    @cute.jit
+    def ms(self, slot):
+        """The slot the MMAs read (``fixed``: always 0)."""
+        if cutlass.const_expr(self.fixed):
+            return Int32(0)
+        return slot
 
     @cute.jit
     def pb(self, slot):
@@ -566,8 +599,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ks = lo % 14
             for s in cutlass.range(lo, hi, unroll=1):
                 slot = count % stages
-                self.sync(full.iterator + self.pb(slot), count // stages & 1, True)
-                weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
+                self.full_wait(full, slot, count // stages & 1)
+                m = self.ms(slot)
+                weights = (tmem + 128 + m * 8, asf0 + m * 64)
                 released = shared_address(empty.iterator + self.pb(slot))
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
                 if first:
@@ -578,9 +612,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if last:
                     completion = shared_address(accfull.iterator + acc)
                 stage16(
-                    (tmem + acc * 8, a0 + slot * slot16, x0 + slot * 128),
+                    (tmem + acc * 8, a0 + m * slot16, x0 + m * 128),
                     weights,
-                    (tmem + 256 + slot * 8, xsf0 + slot * 16, Uint32(1)),
+                    (tmem + 256 + m * 8, xsf0 + m * 16, Uint32(1)),
                     (Uint32(not first), released),
                     completion,
                     kind="fc1",
@@ -607,13 +641,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         for g in cutlass.range_constexpr(2):
             end = ranges[g, 5] - (zone if g == 1 else 0)
             for j in cutlass.range(ranges[g, 4], end, unroll=1):
-                self.sync(full.iterator + self.pb(state[0]), state[1], True)
+                self.full_wait(full, state[0], state[1])
                 state = self.fc2_mma(state, mma, j // self.jobs)
         accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
         pmeta = view(sm.iterator, self.off_misc + self.bar_pmeta, Uint64, 16)
         ended = False
         while not ended:
-            self.sync(full.iterator + self.pb(state[0]), state[1], True)
+            self.full_wait(full, state[0], state[1])
             kind, a, b = (meta[4 * state[0] + i] for i in range(3))
             if kind != 1:  # the end marker
                 ended = True
@@ -643,7 +677,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         tmem, a0, asf0, h0, hsf0, bars = mma
         full, empty, accempty, accfull, hfull, hempty = bars
         lane, stages = (thread()[2], self.stages)
-        weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
+        m = self.ms(slot)
+        weights = (tmem + 128 + m * 8, asf0 + m * 64)
         released = shared_address(empty.iterator + self.pb(slot))
         copy_scales, release = (Uint32(0), Uint32(0))
         if unit != current:
@@ -671,7 +706,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.acquire(accempty, acc, uses)
         slot16 = self.slot_bytes // 16
         stage16(
-            (tmem + acc * 8, a0 + slot * slot16, hd),
+            (tmem + acc * 8, a0 + m * slot16, hd),
             weights,
             (sfbc, hs, copy_scales),
             (release, released),
