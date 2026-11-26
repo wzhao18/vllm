@@ -219,6 +219,10 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        if os.environ.get("M1_STAMPS_DIR"):  # M1 EXPERIMENT ONLY
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import m1_dump
+
+            m1_dump.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:
