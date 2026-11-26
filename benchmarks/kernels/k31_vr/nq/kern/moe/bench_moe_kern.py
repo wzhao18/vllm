@@ -1078,7 +1078,7 @@ def section_dist(args):
     res = Results(args.out, args.section, tag, rank=d.rank)
     dog = Watchdog(args.case_timeout)
     fn = {"front": _front_impl, "layer": _front_impl, "tail": _tail_impl,
-          "oproj": _oproj_impl}[args.section]  # fmt: skip
+          "oproj": _oproj_impl, "osmall": _osmall_impl}[args.section]  # fmt: skip
     log(f"rank {d.rank}/{d.world} {args.section}: {d.world} real + "
         f"{TP - d.world} emulated ranks")  # fmt: skip
     try:
@@ -1652,6 +1652,169 @@ def _oproj_impl(args, d, res, dog):
             run_case(d, res, dog, f"spec:{name}:M{rows}", spec_case)
 
 
+
+# --------------------------------------------------------------------------------------
+# Section: osmall (the <= 64-row o-projection pair through PreparedOproj's dispatch)
+
+OSMALL_VARIANTS = {
+    # name: (rows it applies to, prepared-module table overrides)
+    "prod": (None, {}),
+    # 9-16 rows as two-shot (RS to column owners + multicast gather) with the
+    # producer-reduce / resident ring / x multicast 2 / batched-poll forms of 17-64
+    "twoshot16": ((16,), dict(
+        TWOSHOT={8: "33-64:1", 16: "9-64:1"},
+        PRODUCER_REDUCE={16: "9-64:1"},
+        RESIDENT_RING={16: "9-64:1"},
+        X_MULTICAST={16: "9-16:2,17-64:4"},
+        TWOSHOT_BATCHED={8: "33-64:1", 16: "9-64:1"},
+        CONSUMER_CARVEOUT={8: "32:100,64:100", 16: "16:100,32:100,64:100"},
+    )),
+    "twoshot16-nocarve": ((16,), dict(
+        TWOSHOT={8: "33-64:1", 16: "9-64:1"},
+        PRODUCER_REDUCE={16: "9-64:1"},
+        RESIDENT_RING={16: "9-64:1"},
+        X_MULTICAST={16: "9-16:2,17-64:4"},
+        TWOSHOT_BATCHED={8: "33-64:1", 16: "9-64:1"},
+    )),
+    "twoshot16-b": ((16,), dict(
+        TWOSHOT={8: "33-64:1", 16: "9-64:1"},
+        PRODUCER_REDUCE={16: "9-64:1"},
+        RESIDENT_RING={16: "9-64:1"},
+        X_MULTICAST={16: "9-16:2,17-64:4"},
+        TWOSHOT_BATCHED={8: "33-64:1", 16: "9-64:1"},
+        CONSUMER_CARVEOUT={8: "32:100,64:100", 16: "16:100,32:100,64:100"},
+    )),
+    "twoshot16-xmc1": ((16,), dict(
+        TWOSHOT={8: "33-64:1", 16: "9-64:1"},
+        PRODUCER_REDUCE={16: "9-64:1"},
+        RESIDENT_RING={16: "9-64:1"},
+        X_MULTICAST={16: "17-64:4"},
+        TWOSHOT_BATCHED={8: "33-64:1", 16: "9-64:1"},
+        CONSUMER_CARVEOUT={8: "32:100,64:100", 16: "16:100,32:100,64:100"},
+    )),
+    "chunk80": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80,128:80,192-256:96"})),
+    "chunk96": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80,128:96,192-256:96"})),
+    "chunk64": ((128, 256), dict(WIDE_CHUNK={16: "65-80:80"})),
+    "xmc2": ((32, 64), dict(X_MULTICAST={16: "17-64:2"})),
+    "noxmc": ((32, 64), dict(X_MULTICAST={16: "17-64:1"})),
+    "pcarve100": ((32, 64), dict(PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "xmc2-pcarve100": ((32, 64), dict(
+        X_MULTICAST={16: "17-64:2"},
+        PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "noxmc-pcarve100": ((32, 64), dict(
+        X_MULTICAST={16: "17-64:1"},
+        PRODUCER_CARVEOUT={8: "9-40:80", 16: "9-64:100"})),
+    "prod2": (None, {}),  # production again (order / drift check)
+}
+
+
+def _osmall_impl(args, d, res, dog):
+    import types
+
+    import torch
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.twoshot import (
+        TwoShot,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import (
+        prepared as op,
+    )
+
+    dev, world, rank = d.device, d.world, d.rank
+    rows_all = parse_rows(args.rows, (16, 32, 64))
+    k, nb, eps, cap = 96 * 128 // TP, 4, 1e-6, 64
+    gen = torch.Generator(device=dev).manual_seed(500 + rank)
+
+    def rnd(*shape, scale=1.0):
+        return (torch.randn(*shape, generator=gen, device=dev) * scale).bfloat16()
+
+    def norm(w):
+        return types.SimpleNamespace(weight=w, variance_epsilon=eps)
+
+    weight = rnd(H, k, scale=k**-0.5)
+    decoders = [
+        types.SimpleNamespace(
+            self_attn=types.SimpleNamespace(o_proj=types.SimpleNamespace(weight=weight)),
+            mlp_res_norm=norm((1 + 0.1 * rnd(H)).bfloat16()),
+            mlp_res_proj=types.SimpleNamespace(weight=rnd(1, H, scale=H**-0.5)),
+            post_attention_layernorm=norm((1 + 0.1 * rnd(H)).bfloat16()),
+            layer_idx=i, prev_valid_blocks=nb, is_block_write_layer=False,
+        )
+        for i in range(2)
+    ]  # fmt: skip
+    mailbox = op.OprojMailbox(d.group, dev, TP, rank)
+    box = TwoShot(d.group, dev, TP, rank, H, cap, parities=2)
+    patch_twoshot(box, world, dev)
+    wcap = max([cap, *rows_all])
+    wcap = -(-wcap // 128) * 128
+    if wcap > cap:  # wide rows: the rows box PreparedOproj takes, emulated owners
+        patch_twoshot(box.rows_box(wcap), world, dev)
+    x_buffer = rnd(wcap, k)
+    prefix0, blocks = rnd(wcap, H), rnd(wcap, 8, H)
+    out = torch.empty(wcap, H, dtype=torch.bfloat16, device=dev)
+    width = H // TP
+    mb_pat = rnd(TP - world, cap, H, scale=0.05)
+    recv_pat = rnd(TP - world, wcap, width, scale=0.05)
+    gather_pat = rnd(wcap, H - width * world, scale=0.05)
+    names = [v for v in (args.variants.split(",") if args.variants else OSMALL_VARIANTS)]
+    for rows in rows_all:
+        b = rows
+        x = x_buffer[:b]
+        prefix = prefix0[:b].clone()
+        for name in names:
+            applies, tables = OSMALL_VARIANTS[name]
+            if applies is not None and b not in applies:
+                continue
+
+            def case(name=name, tables=tables):
+                with patched(op, **tables):
+                    preps = [
+                        op.PreparedOproj(dec, mailbox, [b], False, None, box,
+                                         x_buffer=x_buffer)
+                        for dec in decoders
+                    ]  # fmt: skip
+                wide = b in preps[0].wide
+                twoshot = wide or b in preps[0].twoshots
+                tbox = box.rows_box(wcap) if wide else box
+
+                def fill(parity):
+                    if twoshot:
+                        tbox.recv[parity, world:, :b].copy_(recv_pat[:, :b])
+                        tbox.gather[parity, 0, :b, width * world :].copy_(
+                            gather_pat[:b])
+                    else:
+                        mailbox.buffer[parity, world:, :b].copy_(mb_pat[:, :b])
+
+                def fills():
+                    for i in range(args.layers):
+                        fill(i % 2)
+
+                def chain():
+                    for i in range(args.layers):
+                        fill(i % 2)
+                        preps[i % 2].run(x, prefix, blocks[:b], out[:b])
+
+                us_f, _ = time_region(fills, dist=d, samples=args.samples)
+                us_c, how = time_region(chain, prefill=None, dist=d,
+                                        samples=args.samples)  # fmt: skip
+                per = (us_c - us_f) / args.layers
+                form = "wide" if wide else "two-shot" if twoshot else "one-shot"
+                res.add(dict(case="oproj-small", rows=rows, variant=name,
+                             prod="1" if name == "prod" else "0", spec_us=per,
+                             tactic=f"{form} {how} layers {args.layers} "
+                             f"chain {us_c:.2f} fills {us_f:.2f} "
+                             f"(world {world}+{TP - world} emulated)",
+                             note=str(tables)))  # fmt: skip
+                torch.cuda.synchronize()
+                import hashlib
+                digest = hashlib.sha1(
+                    out[:b].view(torch.int16).cpu().numpy().tobytes()).hexdigest()[:12]
+                if rank == 0:
+                    log(f"OSMALL rows {rows} {name}: {per:.3f} us/pair ({form}; chain "
+                        f"{us_c:.2f} fills {us_f:.2f}) out {digest}")
+
+            run_case(d, res, dog, f"osmall:{name}:M{rows}", case)
+
 # --------------------------------------------------------------------------------------
 # Self-test (pure python)
 
@@ -1704,7 +1867,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("section", choices=("experts", "attnres", "front", "layer", "tail",
-                                       "oproj", "summary", "selftest"))  # fmt: skip
+                                       "oproj", "osmall", "summary",
+                                       "selftest"))  # fmt: skip
+    p.add_argument("--layers", type=int, default=16, help="osmall: pairs per graph")
+    p.add_argument("--variants", default="", help="osmall: comma list (default all)")
     p.add_argument("--out", default="out")
     p.add_argument("--rows", default="", help="e.g. 72,128,1024 or 128-2048 (step 64)")
     p.add_argument("--q", default="4", help="front/layer: verify length (rows divisible by q)")
