@@ -680,6 +680,10 @@ class PreparedDsa:
         impl._prepare_mqa_kernel(self.layer, self.device)
         scales = impl.bmm1_scale, impl.bmm2_scale
         if mic is not None:
+            logger.info_once(
+                "Kimi K3.1 DSA sparse core: the #63 top-k merge in the core",
+                scope="global",
+            )
             args = box.q[p], kv, mic, scales, box, self.heads, p, batch
             self.dsac.run_mic(variant, *args, lse_wide=spread)
             return

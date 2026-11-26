@@ -2886,6 +2886,29 @@ def _publish_round1(
     return mailbox.gathered[:, :num_rows]
 
 
+def dcp_topk_merge_publish(
+    *,
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    local_topk: int,
+    topk: int,
+    max_local_len: int | None = None,
+) -> torch.Tensor:
+    """Round 1 of the exact merge only: this rank's local top-N of ``logits``
+    (DeepSelect + the pack kernel) multicast into the round-1 mailbox, for a
+    consumer that selects from the mailbox itself (the DSA sparse core's merge in
+    core, DsaCore.run_mic) instead of DCPTopkSelectKernel. Returns the bounded
+    logits (the second round's input: they must stay unmodified until that
+    consumer returns, in stream order). Collective as ``dcp_topk_merge_rows``."""
+    logits = _bound_logits(logits, max_local_len)
+    mailbox = _mailbox_for(topk, local_topk)
+    if mailbox is None:
+        raise ValueError("dcp_topk_merge_publish needs the round-1 mailbox")
+    exact = _exact_args_for(topk, local_topk, logits, row_ends)
+    _publish_round1(mailbox, logits, row_ends, local_topk, exact=exact)
+    return logits
+
+
 def _exact_args_for(
     topk: int,
     local_topk: int,

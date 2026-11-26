@@ -121,7 +121,10 @@ def _check(group, ws, n) -> None:
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer_stage import (  # noqa: E501
         MicInputs,
     )
-    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge_publish,
+        dcp_topk_merge_rows,
+    )
 
     world, rank = group.world_size, group.rank_in_group
     box = ws.mailbox
@@ -168,13 +171,16 @@ def _check(group, ws, n) -> None:
                 rows=rows, splits=splits, split_min=split_min, heads_per_cta=heads,
             )  # fmt: skip
 
-            def arm_a():
-                packed = _publish(box, local, local_end, n, world)
+            def arm_a(pub):
+                packed = None
+                if pub == "fused":
+                    packed = _publish(box, local, local_end, n, world)
                 dcp_topk_merge_rows(
-                    logits=local, row_ends=local_end, packed=packed, published=True,
-                    release=True, local_topk=n, topk=TOPK, req_id=req_id,
-                    block_table=table, block_size=_BLOCK, stride_rows=_BLOCK,
-                    dcp_rank=rank, rows_out=rows_a, valid_out=valid_a,
+                    logits=local, row_ends=local_end, packed=packed,
+                    published=packed is not None, release=True, local_topk=n,
+                    topk=TOPK, req_id=req_id, block_table=table, block_size=_BLOCK,
+                    stride_rows=_BLOCK, dcp_rank=rank, rows_out=rows_a,
+                    valid_out=valid_a,
                 )  # fmt: skip
                 core.run(q_box, rows_a, valid_a, kv, **common)
 
@@ -184,52 +190,58 @@ def _check(group, ws, n) -> None:
                 rows=rows_b, valid=valid_b, topk=TOPK, local_topk=n,
             )  # fmt: skip
 
-            def arm_b():
-                _publish(box, local, local_end, n, world)
+            def arm_b(pub):
+                if pub == "fused":  # the fused indexer's own publish
+                    _publish(box, local, local_end, n, world)
+                else:  # DeepGEMM-logits steps: DeepSelect + the merge's pack kernel
+                    dcp_topk_merge_publish(
+                        logits=local, row_ends=local_end, local_topk=n, topk=TOPK
+                    )
                 core.run_mic(q_box, kv, mic, **common)
 
-            what = f"{name}/rows {rows}"
-            boxes.arm()
-            arm_a()
-            torch.accelerator.synchronize()
-            core.check()
-            want = boxes.snap()
-            masks = ((ws.sat_word[:rows] >> 16) & 0xFFFF).tolist()
-            if sat:
-                assert any(masks), f"{what}: no saturated row"
-            # eager, both mailbox parities
-            for rep in range(2):
+            # each round-1 publisher against the select of the same publisher
+            for pub in ("fused", "pack"):
+                what = f"{name}/rows {rows}/{pub}"
                 boxes.arm()
-                rows_b.fill_(-1)
-                valid_b.fill_(-7)
-                arm_b()
+                arm_a(pub)
                 torch.accelerator.synchronize()
                 core.check()
-                assert torch.equal(valid_b, valid_a), f"{what}/{rep}: counts"
-                assert torch.equal(rows_b.sort(1).values, rows_a.sort(1).values), (
-                    f"{what}/{rep}: row sets"
-                )
-                assert torch.equal(rows_b, rows_a), f"{what}/{rep}: row order"
-                got = boxes.snap()
-                for i, (x, y) in enumerate(zip(got, want)):
-                    assert torch.equal(x, y), f"{what}/{rep}: box {i}"
-            # CUDA graph: publish + core captured, replayed
-            group.barrier()
-            torch.accelerator.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                arm_b()
-            for rep in range(3):
-                boxes.arm()
-                rows_b.fill_(-1)
-                graph.replay()
+                want = boxes.snap()
+                masks = ((ws.sat_word[:rows] >> 16) & 0xFFFF).tolist()
+                if sat:
+                    assert any(masks), f"{what}: no saturated row"
+                for rep in range(2):  # eager, both mailbox parities
+                    boxes.arm()
+                    rows_b.fill_(-1)
+                    valid_b.fill_(-7)
+                    arm_b(pub)
+                    torch.accelerator.synchronize()
+                    core.check()
+                    assert torch.equal(valid_b, valid_a), f"{what}/{rep}: counts"
+                    assert torch.equal(
+                        rows_b.sort(1).values, rows_a.sort(1).values
+                    ), f"{what}/{rep}: row sets"
+                    assert torch.equal(rows_b, rows_a), f"{what}/{rep}: row order"
+                    got = boxes.snap()
+                    for i, (x, y) in enumerate(zip(got, want)):
+                        assert torch.equal(x, y), f"{what}/{rep}: box {i}"
+                # CUDA graph: publish + core captured, replayed
+                group.barrier()
                 torch.accelerator.synchronize()
-                core.check()
-                assert torch.equal(rows_b, rows_a), f"{what}/graph {rep}: rows"
-                got = boxes.snap()
-                for i, (x, y) in enumerate(zip(got, want)):
-                    assert torch.equal(x, y), f"{what}/graph {rep}: box {i}"
-            del graph
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    arm_b(pub)
+                for rep in range(3):
+                    boxes.arm()
+                    rows_b.fill_(-1)
+                    graph.replay()
+                    torch.accelerator.synchronize()
+                    core.check()
+                    assert torch.equal(rows_b, rows_a), f"{what}/graph {rep}: rows"
+                    got = boxes.snap()
+                    for i, (x, y) in enumerate(zip(got, want)):
+                        assert torch.equal(x, y), f"{what}/graph {rep}: box {i}"
+                del graph
             group.barrier()
             torch.accelerator.synchronize()
             assert bool((box.box == -1).all()), f"{what}: a mailbox slot is armed"

@@ -287,44 +287,69 @@ class IndexerStage:
     def merge_in_core(
         self, q_fp8, head_w, metadata, stride_rows, batch, q=1, after_logits=None
     ):
-        """The #63 merge inside the DSA sparse core (DsaCore.run_mic) on a step whose
-        rows the fused DCP indexer publishes into the merge's round-1 mailbox itself
-        (the "merge" source, every row a decode row, ``packs`` and the mailbox; the same
-        on every rank): runs that indexer (scorer + local top-N + publish) and returns
-        the core's merge inputs (``MicInputs``) instead of selecting; None on any other
-        step (the caller then runs ``merge_rows``). ``after_logits``: as merge_rows'."""
+        """The #63 merge inside the DSA sparse core (DsaCore.run_mic) on a step the
+        merge serves (the "merge" source, every row a decode row, the round-1
+        mailbox; the same on every rank): scores the rows and publishes round 1 (the
+        fused DCP indexer's own publish where it packs, else DeepGEMM logits +
+        DeepSelect + the merge's pack kernel), and returns the core's merge inputs
+        (``MicInputs``) instead of running the select; None on any other step (the
+        caller then runs ``merge_rows``). ``after_logits``: as merge_rows'."""
         from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.indexer_topk import (
+            SparseIndexerTopk,
+            is_deep_select_supported,
+        )
+        from vllm.utils.math_utils import cdiv
         from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+            dcp_topk_merge_publish,
             get_dcp_topk_rescue_workspace,
         )
 
         if self.dcp_ids is not None:  # (tests: the global ids need the select)
             return None
         source, rows = self.merge_source(batch)
-        fused = self.fused
-        if source != "merge" or rows != batch or fused is None:
-            return None
-        indexer = self.indexer
-        decode = get_forward_context().attn_metadata[indexer.k_cache.prefix].decode
-        if (
-            decode.seq_lens.numel() != rows
-            or (batch, q) not in fused.kernels
-            or not fused.publishes(rows)
-        ):
+        if source != "merge" or rows != batch:
             return None
         ws = get_dcp_topk_rescue_workspace(self.topk, self.local_topk)
         if ws is None or ws.mailbox is None:
             return None
-        # The logits stay valid until the core returns (stream order): a saturated
-        # rank re-reads its row in the merge's second round.
-        packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
-        assert packed is not None
-        if after_logits is not None:
-            after_logits()
+        indexer, n = self.indexer, self.local_topk
+        decode = get_forward_context().attn_metadata[indexer.k_cache.prefix].decode
+        fused = self.fused
+        if (
+            fused is not None
+            and decode.seq_lens.numel() == rows
+            and (batch, q) in fused.kernels
+            and fused.publishes(rows)
+        ):
+            # The logits stay valid until the core returns (stream order): a
+            # saturated rank re-reads its row in the merge's second round.
+            packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
+            assert packed is not None
+            if after_logits is not None:
+                after_logits()
+            logits, ends = logits[:rows], ends[:rows]
+        else:
+            logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+            if after_logits is not None:
+                after_logits()
+            assert logits.dtype == torch.bfloat16 and is_deep_select_supported(
+                logits, n
+            )
+            reqs = decode.decode_lens.shape[0]
+            seq_lens = decode.seq_lens[:reqs]
+            ends = SparseIndexerTopk._row_ends(seq_lens, rows // reqs, rows)
+            logits = dcp_topk_merge_publish(
+                logits=logits,
+                row_ends=ends,
+                local_topk=n,
+                topk=self.topk,
+                max_local_len=cdiv(self.max_model_len, indexer.dcp_world_size),
+            )
         return MicInputs(
             ws=ws,
-            logits=logits[:rows],
-            row_ends=ends[:rows],
+            logits=logits,
+            row_ends=ends,
             req_id=metadata.req_id_per_token,
             block_table=metadata.block_table,
             block_size=metadata.block_size,
@@ -332,7 +357,7 @@ class IndexerStage:
             rows=self.dcp_rows[:batch],
             valid=self.dcp_valid[:batch],
             topk=self.topk,
-            local_topk=self.local_topk,
+            local_topk=n,
         )
 
     def decode_logits(self, q_fp8, head_w, decode, rows, batch):
