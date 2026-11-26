@@ -2531,9 +2531,7 @@ class TokenCommDedup(KernelComponent):
             round_expert = Int32(expert_round * 32) + lane_idx
             if round_expert < Int32(self.experts_per_rank):
                 lane_tiles = lane_tiles + (owned_sizes[round_expert] + slot_tokens - Int32(1)) // slot_tokens
-        for step_log in cutlass.range_constexpr(5):
-            lane_tiles = lane_tiles + Int32(cute.arch.shuffle_sync_bfly(lane_tiles, offset=1 << step_log))
-        total_slots = lane_tiles
+        total_slots = self._warp_sum(lane_tiles)
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
 
@@ -2618,6 +2616,18 @@ class TokenCommDedup(KernelComponent):
         iket.range_pop()
         if cutlass.const_expr(m1w is not None):
             m1w.st(m1_stamps.W_TB_END, m1_stamps.gtime())
+
+    @cute.jit
+    def _warp_sum(self, value: Int32) -> Int32:
+        """Sum of ``value`` over the warp, broadcast to every lane (inclusive scan by shuffle-up, then lane 31)."""
+        lane_idx = self._lane_idx
+        inclusive = value
+        for step_log in cutlass.range_constexpr(5):
+            step = Int32(1 << step_log)
+            previous = Int32(cute.arch.shuffle_sync(inclusive, lane_idx - step))
+            if lane_idx >= step:
+                inclusive = inclusive + previous
+        return Int32(cute.arch.shuffle_sync(inclusive, Int32(31)))
 
     @cute.jit
     def _advance_slot_prefix(
@@ -2723,8 +2733,7 @@ class TokenCommDedup(KernelComponent):
                 round_expert = Int32(expert_round * 32) + lane_idx
                 if round_expert < copy_expert:
                     earlier_tiles = earlier_tiles + (owned_sizes[round_expert] + slot_tokens - Int32(1)) // slot_tokens
-            for step_log in cutlass.range_constexpr(5):
-                earlier_tiles = earlier_tiles + Int32(cute.arch.shuffle_sync_bfly(earlier_tiles, offset=1 << step_log))
+            earlier_tiles = self._warp_sum(earlier_tiles)
             if lane_idx == copy_idx:
                 lane_slot = earlier_tiles + lane_offset // slot_tokens
         wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
