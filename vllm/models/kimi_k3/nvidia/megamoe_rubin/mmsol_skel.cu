@@ -14,7 +14,11 @@
 #include "mmsol_core.cuh"
 #include <cuda_bf16.h>
 #ifndef MMSOL_ABL
-#define MMSOL_ABL 0  // solo ablations only: 1 = one SF cp per group (prices the tcgen05.cp share of the stage)
+#define MMSOL_ABL 0
+#endif
+#define MMSOL_NOTOK (MMSOL_ABL == 2 || MMSOL_ABL == 12 || MMSOL_ABL == 14)
+#define MMSOL_NOW (MMSOL_ABL == 3 || MMSOL_ABL == 13 || MMSOL_ABL == 14)
+#ifndef MMSOL_ABL  // solo ablations only: 1 = one SF cp per group (prices the tcgen05.cp share of the stage)
 #endif
 
 using namespace mm;
@@ -22,12 +26,13 @@ using namespace mm;
 namespace sk {
 constexpr int NT = 512;                       // 16 warps
 constexpr int AS = MMSOL_ABL == 11 ? 4 : 8, BS = MMSOL_ABL == 10 ? 3 : 5;  // ring slots (ABL 10/11: depth law)
-constexpr int A_DATA = 16384, A_SF = 2048, A_SLOT = A_DATA + A_SF;          // 18 KiB
-constexpr int B_DATA = 152 * 128, B_SF = 12 * 512, B_SLOT = B_DATA + B_SF;  // 25 KiB
+// smem: SF rings LOW (tcgen05.cp descriptors must stay < 256 KiB), staging, then the data rings (15-bit UMMA desc)
+constexpr int A_DATA = 16384, A_SF = 2048, A_SLOT = A_DATA;                  // 16 KiB data + 2 KiB SF ring slot
+constexpr int B_DATA = 152 * 128, B_SF = 12 * 512, B_SLOT = B_DATA;          // 19 KiB data + 6 KiB SF ring slot
 constexpr int STG = 16384;                    // epilogue staging buffer (x2)
 constexpr int DST = 8192;                     // dispatch staging (2 x 4 KiB)
 constexpr int TR = 8;                         // tile ring depth
-constexpr int SMEM = AS * A_SLOT + BS * B_SLOT + 2 * STG + DST + 1024;       // + alignment
+constexpr int SMEM = AS * (A_SLOT + A_SF) + BS * (B_SLOT + B_SF) + 2 * STG + DST + 1024;       // + alignment
 constexpr int E = 112;
 enum { K_SEGU = 0, K_FC1 = 1, K_FC2 = 2, K_SEDN = 3, K_END = 7 };
 // counter page (uint32 words, local rank unless noted)
@@ -129,6 +134,109 @@ MMD uint32_t pack_bf16(float lo, float hi) {
   uint32_t r; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r;
 }
 MMD float silu(float x) { return __fdividef(x, 1.f + __expf(-x)); }  // 2 MUFU
+
+// ---------------- tight MMA-warp stage loops (compile-time shapes; no runtime branches between tcgen05 ops) ----------------
+struct Ring { uint32_t slot, ph; };
+template <int R> MMD void adv(Ring& r) { if (++r.slot == R) { r.slot = 0; r.ph ^= 1u; } }
+struct MmaCtx { uint32_t tb; uint64_t dA0, dB0, sfA0, sfB0, sfSE0; uint32_t afull, aempty, bfull, bempty, res; };
+__device__ __noinline__ void wait_slow(uint32_t b, uint32_t ph, int what) {
+  const uint64_t t0 = now_ns();
+  while (!try_w(b, ph))
+    if (now_ns() - t0 > 20000000000ull) { printf("K31_SPIN_TIMEOUT kernel=mmsol_skel mma what=%d block=%d\n", what, blockIdx.x); __trap(); }
+}
+MMD void wait_fast(uint32_t b, uint32_t ph, int what) { if (!try_w(b, ph)) wait_slow(b, ph, what); }
+// one routed K256 stage: 16 SF cps (SFA 4, SFB(a) 8, SFB(b) 4), a = 2 x N208, b = 2 x N96, commits to both ring empties
+template <bool FIRST>
+MMD void routed_stage(const MmaCtx& c, Ring& ar, Ring& br, uint32_t acc_a, uint32_t b_ph) {
+  wait_fast(c.afull + 8 * ar.slot, ar.ph, 70);
+  wait_fast(c.bfull + 8 * br.slot, br.ph, 71);
+  tc_fence_after();
+  const uint64_t da = c.dA0 + (uint64_t)ar.slot * (A_SLOT >> 4), db = c.dB0 + (uint64_t)br.slot * (B_SLOT >> 4);
+  const uint64_t sa_ = c.sfA0 + (uint64_t)ar.slot * (A_SF >> 4), sb_ = c.sfB0 + (uint64_t)br.slot * (B_SF >> 4);
+  constexpr uint32_t ida = (1u << 3) | (1u << 7) | (1u << 10) | ((uint32_t)(NA >> 3) << 17) | ((256u >> 4) << 24);
+  constexpr uint32_t idb = (1u << 3) | (1u << 7) | (1u << 10) | ((uint32_t)(NB >> 3) << 17) | ((256u >> 4) << 24);
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) sf_cp(c.tb + COL_SFA + 4 * j, sa_ + 32 * j);
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) sf_cp(c.tb + COL_SFBA + 4 * j, sb_ + 32 * j);
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) sf_cp(c.tb + COL_SFBB + 4 * j, sb_ + 256 + 32 * j);
+  mma_nvf4(c.tb + acc_a, da, db, ida, c.tb + COL_SFA, c.tb + COL_SFBA, FIRST ? 0u : 1u);
+  mma_nvf4(c.tb + acc_a, da + 4, db + 4, ida, c.tb + COL_SFA + 8, c.tb + COL_SFBA + 16, 1u);
+  if (FIRST && b_ph < 2) wait_fast(c.res + 16, b_ph, 62);  // b turnaround: only the stage-0 a-MMAs overlap it
+  mma_nvf4(c.tb + COL_B, da, db + 832, idb, c.tb + COL_SFA, c.tb + COL_SFBB, FIRST ? 0u : 1u);
+  mma_nvf4(c.tb + COL_B, da + 4, db + 836, idb, c.tb + COL_SFA + 8, c.tb + COL_SFBB + 8, 1u);
+  commit_mc(c.aempty + 8 * ar.slot, 3); commit_mc(c.bempty + 8 * br.slot, 3);
+  adv<AS>(ar); adv<BS>(br);
+}
+template <int S>
+MMD void mma_routed(const MmaCtx& c, Ring& ar, Ring& br, uint32_t acc_a, uint32_t b_ph, uint64_t* tt) {
+  tt[0] = now_ns();
+  routed_stage<true>(c, ar, br, acc_a, b_ph);
+  tt[1] = now_ns(); const uint64_t c1 = clk64();
+  #pragma unroll 1
+  for (int s = 1; s < S - 1; ++s) routed_stage<false>(c, ar, br, acc_a, 0);
+  tt[2] = now_ns(); tt[3] = clk64() - c1;
+  routed_stage<false>(c, ar, br, acc_a, 0);
+}
+// SE stage (MXFP8 K128 = 2 x K64): weights (A ring) are the MMA B operand, tokens (B ring, NB2 slots) the A operand
+template <bool FIRST, int NB2>
+MMD void se_stage(const MmaCtx& c, Ring& ar, Ring& br) {
+  wait_fast(c.afull + 8 * ar.slot, ar.ph, 73);
+  const uint32_t b0 = br.slot, p0 = br.ph;
+  wait_fast(c.bfull + 8 * b0, p0, 74);
+  Ring b1r = br; adv<BS>(b1r);
+  if (NB2 == 2) wait_fast(c.bfull + 8 * b1r.slot, b1r.ph, 75);
+  tc_fence_after();
+  constexpr uint32_t id = (1u << 23) | ((uint32_t)(256 >> 3) << 17) | ((256u >> 4) << 24) | (1u << 31);
+  const uint64_t dw = c.dA0 + (uint64_t)ar.slot * (A_SLOT >> 4);
+  const uint64_t dt0 = c.dB0 + (uint64_t)b0 * (B_SLOT >> 4), dt1 = c.dB0 + (uint64_t)b1r.slot * (B_SLOT >> 4);
+  const uint64_t sw = c.sfA0 + (uint64_t)ar.slot * (A_SF >> 4);
+  sf_cp(c.tb + COL_SE_SFB, sw); sf_cp(c.tb + COL_SE_SFB + 4, sw + 32);
+  sf_cp(c.tb + COL_SE_SFA, c.sfB0 + (uint64_t)b0 * (B_SF >> 4));
+  if (NB2 == 2) sf_cp(c.tb + COL_SE_SFA + 4, c.sfB0 + (uint64_t)b1r.slot * (B_SF >> 4));
+  #pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    mma_mx8(c.tb + COL_SE0, dt0 + 4 * i, dw + 4 * i, id, c.tb + COL_SE_SFA, c.tb + COL_SE_SFB, (FIRST && i == 0) ? 0u : 1u);
+    if (NB2 == 2) mma_mx8(c.tb + COL_SE1, dt1 + 4 * i, dw + 4 * i, id, c.tb + COL_SE_SFA + 4, c.tb + COL_SE_SFB, (FIRST && i == 0) ? 0u : 1u);
+  }
+  commit_mc(c.aempty + 8 * ar.slot, 3); commit_mc(c.bempty + 8 * b0, 3);
+  if (NB2 == 2) commit_mc(c.bempty + 8 * b1r.slot, 3);
+  adv<AS>(ar); adv<BS>(br); if (NB2 == 2) adv<BS>(br);
+}
+template <int S, int NB2>
+MMD void mma_se(const MmaCtx& c, Ring& ar, Ring& br, uint64_t* tt) {
+  tt[0] = now_ns();
+  se_stage<true, NB2>(c, ar, br);
+  tt[1] = now_ns(); const uint64_t c1 = clk64();
+  #pragma unroll 1
+  for (int s = 1; s < S - 1; ++s) se_stage<false, NB2>(c, ar, br);
+  tt[2] = now_ns(); tt[3] = clk64() - c1;
+  se_stage<false, NB2>(c, ar, br);
+}
+
+struct IssueTile { const CUtensorMap* dm; const CUtensorMap* sm; int drow, dbytes, sbox, sbytes, srow, sstep, bbrow; };
+// lean per-slot TMA issue: the issuer owns slots with (cnt & 1) == par; NB B-ring slots per stage (SE gate_up: 2)
+template <int R, int NB>
+MMD void issue_loop(uint32_t& cnt, int par, int S, bool leader, uint32_t ebytes, uint32_t emp0, uint32_t full0, uint32_t lead0,
+                    uint8_t* dring, int dslot, uint8_t* sring, int sslot, const IssueTile& t) {
+  uint32_t slot = cnt % R, ph = (cnt / R) & 1, round_nz = cnt >= (uint32_t)R;
+  #pragma unroll 1
+  for (int j = 0; j < S * NB; ++j) {
+    if ((int)(cnt & 1) == par) {
+      if (round_nz) wait_fast(emp0 + 8 * slot, ph ^ 1u, 40);
+      if (MMSOL_ABL == 15) { if (leader) bar_arrive(full0 + 8 * slot); }  // ablation: ring without any TMA
+      else {
+      if (leader) bar_expect(full0 + 8 * slot, ebytes);
+      const int s = NB == 1 ? j : j >> 1, bb = NB == 1 ? 0 : (j & 1);
+      if (t.dm) tma2d_cg2(sa(dring + slot * dslot), t.dm, s * 128, t.drow + bb * t.bbrow, lead0 + 8 * slot);
+      tma2d_cg2(sa(sring + slot * sslot), t.sm, 0, t.srow + j * t.sstep, lead0 + 8 * slot);
+      }
+    }
+    ++cnt;
+    if (++slot == (uint32_t)R) { slot = 0; ph ^= 1u; round_nz = 1; }
+  }
+}
 }  // namespace sk
 
 using namespace sk;
@@ -140,10 +248,12 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NT, 1) mmsol_skel_ke
   __shared__ __align__(16) int4 tring[TR];
   __shared__ uint32_t tmem_base;
   uint8_t* base = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
-  uint8_t* aring = base;
-  uint8_t* bring = aring + AS * A_SLOT;
-  uint8_t* stg = bring + BS * B_SLOT;
+  uint8_t* sfa_ring = base;
+  uint8_t* sfb_ring = sfa_ring + AS * A_SF;
+  uint8_t* stg = sfb_ring + BS * B_SF;
   uint8_t* dstg = stg + 2 * STG;
+  uint8_t* aring = (uint8_t*)(((uintptr_t)(dstg + DST) + 1023) & ~(uintptr_t)1023);
+  uint8_t* bring = aring + AS * A_SLOT;
   const uint32_t cr = cta_rank();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, G = gridDim.x, g = blockIdx.x;
   const uint64_t LIM = a.limit;
@@ -236,10 +346,12 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NT, 1) mmsol_skel_ke
       st[2] = (int64_t)now_ns(); atomicAdd((unsigned long long*)&st[8], (unsigned long long)pushed);
     }
   } else if (warp < 4) {
-    // ================= TMA issuers: W0/W1 A ring (alternate stages), W2/W3 B ring (alternate slots) =================
+    // ================= TMA issuers: W0/W1 A ring, W2/W3 B ring (alternate slots); per-tile setup, lean per-slot loop ======
     if (lane == 0) {
       const bool isA = warp < 2; const int par = warp & 1;
-      uint32_t cnt = 0;  // ring position counter (A: stages; B: slots)
+      const uint32_t emp0 = sa(isA ? aempty : bempty), full0 = sa(isA ? afull : bfull), lead0 = mapa(full0, 0);
+      uint8_t* dring = isA ? aring : bring; uint8_t* sring = isA ? sfa_ring : sfb_ring;
+      uint32_t cnt = 0;
       for (int k = 0;; ++k) {
         const int ts = k % TR;
         bwait_cl(sa(&tfull[ts]), (k / TR) & 1, LIM, 30 + warp);
@@ -247,55 +359,55 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NT, 1) mmsol_skel_ke
         bar_arrive_cluster(mapa(sa(&tempty[ts]), 0));
         const int kind = v.x & 7, e = v.y, u = v.z, m = v.w;
         if (kind == K_END) break;
-        const int S = nstages(kind), nb = isA ? 1 : bslots(kind);
-        for (int s = 0; s < S; ++s)
-          for (int bb = 0; bb < nb; ++bb, ++cnt) {
-            if ((int)(cnt & 1) != par) continue;
-            const int R = isA ? AS : BS;
-            const int slot = cnt % R; const uint32_t round = cnt / R;
-            if (round > 0) bwait(sa(&(isA ? aempty : bempty)[slot]), (round - 1) & 1, LIM, 40 + warp);
-            uint64_t* fb = isA ? &afull[slot] : &bfull[slot];
-            const uint32_t lb = mapa(sa(fb), 0);
-            uint8_t* sl = isA ? aring + slot * A_SLOT : bring + slot * B_SLOT;
-            if (isA) {
-              if (kind == K_FC1 || kind == K_FC2) {
-                const int rowsW = (kind == K_FC1 ? 6144 : 3584);
-                if (cr == 0) bar_expect(sa(fb), 2 * ((MMSOL_ABL == 3 ? 0 : A_DATA) + A_SF));
-                if (MMSOL_ABL != 3) tma2d_cg2(sa(sl), kind == K_FC1 ? &a.tmW1 : &a.tmW2, s * 128, e * rowsW + m * 256 + cr * 128, lb);
-                tma2d_cg2(sa(sl + A_DATA), &a.tmSFW, 0, clampi((((e * 24 + m) * 2 + cr) * 14 + s) * 4 + (kind == K_FC2) * 7777, a.rows_sfw, 4), lb);
-              } else {  // SE weights: N128 half x K128 FP8 (16 KiB) + SFB (N256 x 4 UE8M0 = 2 chunks)
-                if (cr == 0) bar_expect(sa(fb), 2 * (A_DATA + 1024));
-                tma2d_cg2(sa(sl), kind == K_SEGU ? &a.tmSEW1 : &a.tmSEW2, s * 128, m * 256 + cr * 128, lb);
-                tma2d_cg2(sa(sl + A_DATA), &a.tmSFSE2, 0, clampi((m * 56 + s) * 2 + (kind == K_SEDN) * 5555, a.rows_sesf, 2), lb);
-              }
-            } else {
-              if (kind == K_FC1 || kind == K_FC2) {
-                if (cr == 0) bar_expect(sa(fb), 2 * (MMSOL_ABL == 2 ? B_SF : B_SLOT));
-                const int rb = ((e * a.n_u + u) * 304 + cr * 152);
-                if (MMSOL_ABL == 2) {}
-                else if (kind == K_FC1) tma2d_cg2(sa(sl), &a.tmX1, s * 128, clampi(rb, a.rows_x1, 152), lb);
-                else tma2d_cg2(sa(sl), &a.tmX2, s * 128, clampi(rb, a.rows_x2, 152), lb);
-                tma2d_cg2(sa(sl + B_DATA), &a.tmSFX, 0, clampi(((e * a.n_u + u) * 14 + s) * 12 + (kind == K_FC2) * 3333, a.rows_sfx, 12), lb);
-              } else {  // SE tokens: M128 per CTA x K128 FP8 (16 KiB) + SFA (1 chunk)
-                if (cr == 0) bar_expect(sa(fb), 2 * (A_DATA + 512));
-                const int row = (kind == K_SEGU ? e * 512 + bb * 256 : e * 256) + cr * 128;
-                if (kind == K_SEGU) tma2d_cg2(sa(sl), &a.tmSEX1, s * 128, clampi(row, a.rows_sex1, 128), lb);
-                else tma2d_cg2(sa(sl), &a.tmSEX2, s * 128, clampi(row, a.rows_sex2, 128), lb);
-                tma2d_cg2(sa(sl + A_DATA), &a.tmSFSE1, 0, clampi((row / 128) * 56 + s + (kind == K_SEDN) * 999, a.rows_sesf, 1), lb);
-              }
-            }
+        IssueTile t;
+        const bool routed = kind == K_FC1 || kind == K_FC2;
+        const int S = nstages(kind);
+        if (isA) {
+          if (routed) {
+            t.dm = MMSOL_NOW ? nullptr : (kind == K_FC1 ? &a.tmW1 : &a.tmW2);
+            t.drow = e * (kind == K_FC1 ? 6144 : 3584) + m * 256 + (int)cr * 128; t.dbytes = MMSOL_NOW ? 0 : A_DATA;
+            t.sm = &a.tmSFW; t.sbox = 4; t.sbytes = A_SF;
+            t.srow = clampi((((e * 24 + m) * 2 + (int)cr) * 14) * 4 + (kind == K_FC2) * 7777, a.rows_sfw - S * 4, 4);
+          } else {
+            t.dm = kind == K_SEGU ? &a.tmSEW1 : &a.tmSEW2; t.drow = m * 256 + (int)cr * 128; t.dbytes = A_DATA;
+            t.sm = &a.tmSFSE2; t.sbox = 2; t.sbytes = 1024;
+            t.srow = clampi(m * 56 * 2 + (kind == K_SEDN) * 5555, a.rows_sesf - S * 2, 2);
           }
+          t.bbrow = 0;
+        } else {
+          if (routed) {
+            const int rb = (e * a.n_u + u) * 304 + (int)cr * 152;
+            t.dm = MMSOL_NOTOK ? nullptr : (kind == K_FC1 ? &a.tmX1 : &a.tmX2);
+            t.drow = clampi(rb, kind == K_FC1 ? a.rows_x1 : a.rows_x2, 152); t.dbytes = MMSOL_NOTOK ? 0 : B_SLOT;
+            t.sm = &a.tmSFX; t.sbox = 12; t.sbytes = B_SF;
+            t.srow = clampi(((e * a.n_u + u) * 14) * 12 + (kind == K_FC2) * 3333, a.rows_sfx - S * 12, 12);
+            t.bbrow = 0;
+          } else {
+            const int row = (kind == K_SEGU ? e * 512 : e * 256) + (int)cr * 128;
+            t.dm = kind == K_SEGU ? &a.tmSEX1 : &a.tmSEX2;
+            t.drow = clampi(row, kind == K_SEGU ? a.rows_sex1 - 256 : a.rows_sex2, 128); t.dbytes = A_DATA;
+            t.sm = &a.tmSFSE1; t.sbox = 1; t.sbytes = 512;
+            t.srow = clampi((row / 128) * 56 + (kind == K_SEDN) * 999, a.rows_sesf - 2 * S, 1);
+            t.bbrow = 256;
+          }
+        }
+        t.sstep = t.sbox;
+        const uint32_t ebytes = 2u * (uint32_t)(t.dbytes + t.sbytes);
+        if (isA) issue_loop<AS, 1>(cnt, par, S, cr == 0, ebytes, emp0, full0, lead0, dring, A_SLOT, sring, A_SF, t);
+        else if (kind == K_SEGU) issue_loop<BS, 2>(cnt, par, S, cr == 0, ebytes, emp0, full0, lead0, dring, B_SLOT, sring, B_SF, t);
+        else issue_loop<BS, 1>(cnt, par, S, cr == 0, ebytes, emp0, full0, lead0, dring, B_SLOT, sring, B_SF, t);
       }
     }
   } else if (warp == 4) {
-    // ================= MMA issuer (leader CTA, warp-uniform) =================
+    // ================= MMA issuer (leader CTA): compile-time-specialized elect.sync stage loops (sec 4.4 law) =========
     if (cr == 0) {
-      uint32_t acnt = 0, bcnt = 0, ntile = 0, ra = 0;  // ra: routed tile count (a-buffer parity)
-      uint32_t ruse[3] = {0, 0, 0};
-      const uint32_t ida = idesc_nvf4(NA), idb = idesc_nvf4(NB), idse = idesc_mx8(256);
+      Ring ar{0, 0}, br{0, 0};
+      uint32_t ntile = 0, ra = 0, ruse0 = 0, ruse1 = 0, ruse2 = 0;
       int64_t* ts = a.tstamps + ((int64_t)((a.epoch - 1) % RING) * G + g) * 128;
       int nts = 0;
       if (lane == 0) for (int i = 0; i < 128; ++i) ts[i] = 0;
+      const MmaCtx c{tb, desc_sw128(sa(aring)), desc_sw128(sa(bring)), desc_sf(sa(sfa_ring)), desc_sf(sa(sfb_ring)),
+                     desc_sf(sa(sfb_ring)), sa(afull), sa(aempty), sa(bfull), sa(bempty), sa(resempty)};
       for (int k = 0;; ++k) {
         const int tsl = k % TR;
         bwait_cl(sa(&tfull[tsl]), (k / TR) & 1, LIM, 50);
@@ -304,59 +416,33 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NT, 1) mmsol_skel_ke
         if (lane == 0) bar_arrive(sa(&tempty[tsl]));
         const int kind = v.x & 7;
         if (kind == K_END) break;
-        const int S = nstages(kind);
-        // accumulator resources: routed tile -> a[ra%2] + b; SE tile -> all three
-        auto acquire = [&](int r) { if (ruse[r] > 0) bwait(sa(&resempty[r]), (ruse[r] - 1) & 1, LIM, 60 + r); ++ruse[r]; };
-        const bool routed = (kind == K_FC1 || kind == K_FC2);
-        const int abuf = ra & 1;
-        if (routed) acquire(abuf); else { acquire(0); acquire(1); acquire(2); }
         const bool samp = (ntile % 8) == 0 && nts < 15;
-        uint64_t t_first = 0, c_first = 0;
-        for (int s = 0; s < S; ++s) {
-          const int as_ = acnt % AS; bwait(sa(&afull[as_]), (acnt / AS) & 1, LIM, 70);
-          const int bs0 = bcnt % BS; bwait(sa(&bfull[bs0]), (bcnt / BS) & 1, LIM, 71);
-          int bs1 = 0;
-          if (kind == K_SEGU) { bs1 = (bcnt + 1) % BS; bwait(sa(&bfull[bs1]), ((bcnt + 1) / BS) & 1, LIM, 72); }
-          tc_fence_after();
-          if (s == 0 && st[3] == 0 && lane == 0) st[3] = (int64_t)now_ns();
-          if (samp && s == 1) { t_first = now_ns(); c_first = clk64(); }  // stage 1 .. S-1: excludes the b turnaround
-          uint8_t* A = aring + as_ * A_SLOT; uint8_t* B = bring + bs0 * B_SLOT;
-          if (routed) {
-            const int ncp = MMSOL_ABL == 1 ? 1 : (MMSOL_ABL == 6 || (MMSOL_ABL == 8 && s > 0)) ? 0 : 4;
-            const uint32_t sfo = (MMSOL_ABL == 9 && (s & 1)) ? (uint32_t)(352 - COL_SFA) : 0u;  // image 2 offset
-            for (int j = 0; j < ncp; ++j) sf_cp(tb + sfo + COL_SFA + 4 * j, desc_sf(sa(A + A_DATA) + 512 * j));
-            for (int j = 0; j < 2 * ncp; ++j) sf_cp(tb + sfo + COL_SFBA + 4 * j, desc_sf(sa(B + B_DATA) + 512 * j));
-            for (int j = 0; j < ncp; ++j) sf_cp(tb + sfo + COL_SFBB + 4 * j, desc_sf(sa(B + B_DATA) + 4096 + 512 * j));
-            const uint64_t da = desc_sw128(sa(A)), dba = desc_sw128(sa(B)), dbb = desc_sw128(sa(B) + 104 * 128);
-            const uint32_t acc_a = tb + (abuf ? COL_A1 : COL_A0);
-            for (int i = 0; i < 2 && MMSOL_ABL != 7; ++i)
-              mma_nvf4(acc_a, da + 4 * i, dba + 4 * i, ida, tb + sfo + COL_SFA + 8 * i, tb + sfo + COL_SFBA + 16 * i, (s > 0 || i > 0));
-            if (s == 0) acquire(2);  // b turnaround: previous tile's b drained (only the stage-0 a-MMAs overlap it)
-            for (int i = 0; i < 2 && MMSOL_ABL != 7; ++i)
-              mma_nvf4(tb + COL_B, da + 4 * i, dbb + 4 * i, idb, tb + sfo + COL_SFA + 8 * i, tb + sfo + COL_SFBB + 8 * i, (s > 0 || i > 0));
-          } else {
-            uint8_t* B1 = bring + bs1 * B_SLOT;
-            sf_cp(tb + COL_SE_SFB, desc_sf(sa(A + A_DATA))); sf_cp(tb + COL_SE_SFB + 4, desc_sf(sa(A + A_DATA) + 512));
-            sf_cp(tb + COL_SE_SFA, desc_sf(sa(B + A_DATA)));
-            if (kind == K_SEGU) sf_cp(tb + COL_SE_SFA + 4, desc_sf(sa(B1 + A_DATA)));
-            const uint64_t dw = desc_sw128(sa(A)), dt0 = desc_sw128(sa(B)), dt1 = desc_sw128(sa(B1));
-            for (int i = 0; i < 2; ++i) {
-              mma_mx8(tb + COL_SE0, dt0 + 4 * i, dw + 4 * i, idse, tb + COL_SE_SFA, tb + COL_SE_SFB, (s > 0 || i > 0));
-              if (kind == K_SEGU)
-                mma_mx8(tb + COL_SE1, dt1 + 4 * i, dw + 4 * i, idse, tb + COL_SE_SFA + 4, tb + COL_SE_SFB, (s > 0 || i > 0));
-            }
-          }
-          commit_mc(sa(&aempty[as_]), 3); commit_mc(sa(&bempty[bs0]), 3);
-          if (kind == K_SEGU) commit_mc(sa(&bempty[bs1]), 3);
-          ++acnt; bcnt += bslots(kind);
-          if (samp && s == S - 1 && lane == 0) {
-            ts[nts * 4 + 0] = kind | ((S - 1) << 8); ts[nts * 4 + 1] = (int64_t)(now_ns() - t_first);
-            ts[nts * 4 + 2] = (int64_t)(clk64() - c_first); ts[nts * 4 + 3] = v.x >> 3; ++nts;
+        uint64_t tt[4];
+        if (kind == K_FC1 || kind == K_FC2) {
+          const uint32_t abuf = ra & 1;
+          if (abuf) { if (ruse1) wait_fast(c.res + 8, (ruse1 - 1) & 1, 61); ++ruse1; }
+          else { if (ruse0) wait_fast(c.res, (ruse0 - 1) & 1, 60); ++ruse0; }
+          const uint32_t b_ph = ruse2 ? ((ruse2 - 1) & 1) : 2u; ++ruse2;
+          if (kind == K_FC1) mma_routed<14>(c, ar, br, abuf ? COL_A1 : COL_A0, b_ph, tt);
+          else mma_routed<12>(c, ar, br, abuf ? COL_A1 : COL_A0, b_ph, tt);
+          ++ra;
+        } else {
+          if (ruse0) wait_fast(c.res, (ruse0 - 1) & 1, 60); ++ruse0;
+          if (ruse1) wait_fast(c.res + 8, (ruse1 - 1) & 1, 61); ++ruse1;
+          if (ruse2) wait_fast(c.res + 16, (ruse2 - 1) & 1, 62); ++ruse2;
+          if (kind == K_SEGU) mma_se<56, 2>(c, ar, br, tt); else mma_se<48, 1>(c, ar, br, tt);
+        }
+        if (st[3] == 0 && lane == 0) st[3] = (int64_t)tt[0];
+        commit_mc(sa(&accfull[ntile & 1]), 3);
+        if (lane == 0) {
+          st[4] = (int64_t)now_ns();
+          if (samp) {
+            const int S = nstages(kind);
+            ts[nts * 4 + 0] = kind | ((S - 2) << 8); ts[nts * 4 + 1] = (int64_t)(tt[2] - tt[1]);
+            ts[nts * 4 + 2] = (int64_t)(tt[3]); ts[nts * 4 + 3] = v.x >> 3; ++nts;
           }
         }
-        commit_mc(sa(&accfull[ntile & 1]), 3);
-        if (lane == 0) st[4] = (int64_t)now_ns();
-        ++ntile; if (routed) ++ra;
+        ++ntile;
       }
     }
   } else {

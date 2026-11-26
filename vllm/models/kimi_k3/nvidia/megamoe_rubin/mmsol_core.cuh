@@ -77,7 +77,7 @@ template <int N> MMD void bulk_wait() { asm volatile("cp.async.bulk.wait_group %
 // ---------------- smem descriptors ----------------
 // K-major SWIZZLE_128B operand (rows of 128 B, 8-row atoms 1024 B apart): LBO 16 B (ignored), SBO 1024 B, version 1.
 MMD uint64_t desc_sw128(uint32_t saddr) {
-  return (uint64_t)((saddr >> 4) & 0x3FFF) | ((uint64_t)1 << 16) | ((uint64_t)64 << 32) | ((uint64_t)1 << 46) |
+  return (uint64_t)((saddr >> 4) & 0x7FFF) | ((uint64_t)1 << 16) | ((uint64_t)64 << 32)  /* 15-bit addr (>256 KiB) */ | ((uint64_t)1 << 46) |
          ((uint64_t)2 << 61);
 }
 // tcgen05.cp 32x128b source: one 512 B chunk = 32 rows x 16 B, no swizzle (core matrices 8 x 16 B, 128 B apart).
