@@ -12,6 +12,7 @@ import torch
 from cutlass import Int32, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
+from ..common import routediag as rd  # DIAG (never merge)
 from ..common.host import fake, prepare_shared_carveout, stream, to_cute
 from ..common.mailbox import poll, rearm
 from ..common.policy import batch_table
@@ -108,29 +109,34 @@ class RouteSitu:
         token, role = cta % self.batch, cta // self.batch
         if c.const_expr(self.halves):  # CTAs [B, 3B): the two copy halves of each token
             role = Int32(cta >= self.batch)
+        dbase, dctr = rd.buffer("route" + "".join(r[0] for r in self.roles), self.batch)
+        daddr = rd.begin(dbase, dctr, cta, tid == 0)  # DIAG slot 0 entry, 6 smid
         if c.const_expr(self.early == "front"):
             # Release the experts once this rank's front GEMM has completed: their
             # launch then never overlaps it (they still wait for this kernel's end).
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
+            rd.stamp(daddr, 1)  # DIAG: entry wait returned (front completed)
         elif c.const_expr(self.early):
             cute.arch.griddepcontrol_launch_dependents()
         for r in c.range_constexpr(len(self.roles)):
             if role == r:
                 if c.const_expr(self.roles[r] == "route"):
                     work = (logits, bias, ids, weights, scale, token, tid, mailbox)
-                    self.route(*work, signal)
+                    self.route(*work, signal, daddr)
                 elif c.const_expr(self.roles[r] == "copy"):
                     # Lamport: no dependency wait; the sentinel poll is the barrier.
                     if c.const_expr(self.halves):
                         if tid < 224:  # whole warps: the image's block shuffles
                             self.copy_half(mailbox, latent, token, tid, plan)
+                        rd.stamp(daddr, 2)  # DIAG: tid 0's latent chunk landed + written
                         if c.const_expr(self.signal):
                             # The CTA's image part, then its count (release), then
                             # the mailbox re-arm (not ahead of the count's release).
                             cute.arch.sync_threads()
                             if tid == 0:
                                 count_image(signal.iterator + 128)
+                            rd.stamp(daddr, 3)  # DIAG: image part counted
                             if tid < 224:
                                 rearm(self.copy_cell(mailbox, token, tid))
                     else:
@@ -156,6 +162,7 @@ class RouteSitu:
         # Late release: the persistent experts must not take SMs from the down GEMM.
         if c.const_expr(not self.early):
             cute.arch.griddepcontrol_launch_dependents()
+        rd.stamp(daddr, 7)  # DIAG: exit
 
     @cute.jit
     def select(self, key, threshold, buffers, signal=None, token=None):
@@ -302,7 +309,8 @@ class RouteSitu:
 
     @cute.jit
     def route(
-        self, logits, bias, ids, weights, scale, token, tid, mailbox, signal=None
+        self, logits, bias, ids, weights, scale, token, tid, mailbox, signal=None,
+        daddr=None,
     ):
         """Exact top16 by threads [0, 256): candidates at or above the 16th largest
         lane-group maximum are compacted and ranked by an unrolled 64-way compare."""
@@ -361,6 +369,7 @@ class RouteSitu:
             if tid == 0:
                 found[0] = Int32(0)
         cute.arch.sync_threads()
+        rd.stamp(daddr, 2)  # DIAG: every logit polled + keyed (CTA barrier)
         if warp == 0:
             group = km[0, lane]
             for w in c.range_constexpr(1, 8):
@@ -374,11 +383,14 @@ class RouteSitu:
             if lane == 0:
                 cutoff[0] = low
         cute.arch.sync_threads()
+        rd.stamp(daddr, 3)  # DIAG: cutoff
         if c.const_expr(self.lean):
             dense = view(cand.iterator, 0, Uint64, (1024,))
             buffers = (dense, sig, chosen, picked, found)
             self.select(key, cutoff[0], buffers, signal, token)
+            rd.stamp(daddr, 4)  # DIAG: select done (early ids stored)
             self.publish(chosen, picked, ids, weights, scale, token, signal)
+            rd.stamp(daddr, 5)  # DIAG: tid 0's publish stores issued
             return
         threshold, offset = cutoff[0], Int32(0)
         for i in c.range_constexpr(4):
