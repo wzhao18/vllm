@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Int32
+from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
@@ -30,6 +30,8 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
     SplitKTactic,
     _store_shared_remote_v4,
 )
+
+from ..common.primitives import asm
 
 CTA_K, ATOM_K = 128, 64  # K per tile; K per 128-byte swizzle atom (one A box)
 
@@ -67,6 +69,13 @@ def _wait_cluster(mbar, phase, *, loc=None, ip=None):
     code += "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1, "
     code += "10000000; @P1 bra.uni DONE; bra.uni LAB_WAIT; DONE: }"
     _asm(code, "r,r", [mbar.toint().ir_value(), phase.ir_value()], loc, ip)
+
+
+@asm((Float32,) * 4)
+def _load_shared_f32x4(address):
+    """Four FP32 words from shared ``address`` (16-byte aligned)."""
+    code = "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];"
+    return code, "=f,=f,=f,=f,r,~{memory}", (Int32(address),)
 
 
 @dsl_user_op
@@ -393,20 +402,30 @@ class SplitKGemm:
         if cutlass.const_expr(self.split_k > 1):
             vpt = cutlass.const_expr(cute.size(rmem_layout))  # values per thread
             vpp = cutlass.const_expr(self.epilog_threads * vpt)  # values per peer
+            # Mailbox [peer][quad][thread][4]: a peer's quad i of thread t at
+            # (i / 4) x threads x 4 + 4 t, so the owner's 16-byte loads of one quad
+            # are consecutive over the warp (a [thread][values] layout puts every
+            # lane of a warp on one bank: 32-way conflicts, ~0.5 us at 64 x 64).
+            # Same adds in the same order.
+            quad = cutlass.const_expr(self.epilog_threads * 4)  # values per quad row
             if split_rank != OWNER_RANK:
                 for i in cutlass.range_constexpr(0, vpt, 4):
                     words = (rAcc[i], rAcc[i + 1], rAcc[i + 2], rAcc[i + 3])
                     slot = mailbox.iterator + (split_rank - Int32(1)) * vpp
-                    slot = slot + epi_tid * vpt + i
+                    slot = slot + (i // 4) * quad + epi_tid * 4
                     _store_shared_remote_v4(*words, slot, bar_reduce, Int32(OWNER_RANK))
             else:
                 if epi_tid == 0:
                     expected = self.expected_transaction_bytes
                     cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
                 _wait_cluster(bar_reduce, Int32(0))
+                base = Int32(mailbox.iterator.toint()) + epi_tid * 16
                 for peer in cutlass.range_constexpr(self.split_k - 1):
-                    for i in cutlass.range_constexpr(vpt):
-                        rAcc[i] = rAcc[i] + mailbox[peer * vpp + epi_tid * vpt + i]
+                    for i in cutlass.range_constexpr(0, vpt, 4):
+                        offset = (peer * vpp + (i // 4) * quad) * 4
+                        values = _load_shared_f32x4(base + offset)
+                        for e in cutlass.range_constexpr(4):
+                            rAcc[i + e] = rAcc[i + e] + values[e]
 
         if split_rank == OWNER_RANK:
             rD.store(rAcc.load().to(c_dtype))
