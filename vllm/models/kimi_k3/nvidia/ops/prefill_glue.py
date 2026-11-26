@@ -314,15 +314,14 @@ __global__ void __launch_bounds__(WARPS * 32)
 // ---------------------------------------------------------------------------
 
 template <int NW, int VPT>
-__global__ void __launch_bounds__(128)
-    rms_norm_rows_kernel(uint16_t* __restrict__ out,
-                         const uint16_t* __restrict__ input,
-                         int64_t in_stride, const uint16_t* __restrict__ weight,
-                         float epsilon, int32_t num_tokens,
-                         int32_t hidden_size) {
+__device__ __forceinline__ void rms_norm_rows_body(
+    int32_t const blk, uint16_t* __restrict__ out,
+    const uint16_t* __restrict__ input, int64_t in_stride,
+    const uint16_t* __restrict__ weight, float epsilon, int32_t num_tokens,
+    int32_t hidden_size) {
   constexpr int B = NW * 32;  // stock block size
   int32_t const lane = threadIdx.x & 31;
-  int32_t const row = blockIdx.x * 4 + (threadIdx.x >> 5);
+  int32_t const row = blk * 4 + (threadIdx.x >> 5);
   if (row >= num_tokens) return;  // warp-uniform
   int32_t const num_vec = hidden_size / 8;
   const uint4* v_in =
@@ -387,6 +386,37 @@ __global__ void __launch_bounds__(128)
         v_out[i] = o;
       }
     }
+  }
+}
+
+template <int NW, int VPT>
+__global__ void __launch_bounds__(128)
+    rms_norm_rows_kernel(uint16_t* __restrict__ out,
+                         const uint16_t* __restrict__ input,
+                         int64_t in_stride, const uint16_t* __restrict__ weight,
+                         float epsilon, int32_t num_tokens,
+                         int32_t hidden_size) {
+  rms_norm_rows_body<NW, VPT>(blockIdx.x, out, input, in_stride, weight,
+                              epsilon, num_tokens, hidden_size);
+}
+
+// Two independent row norms in one launch (the DSA q_a and kv_a norms of the
+// same rows): CTAs [0, blocks1) replay rms_norm_rows_kernel<NW1, VPT1> on the
+// first problem, the rest rms_norm_rows_kernel<NW2, VPT2> on the second. Same
+// per-row code, so each output is bitwise the separate launch's.
+template <int NW1, int VPT1, int NW2, int VPT2>
+__global__ void __launch_bounds__(128) rms_norm_rows_pair_kernel(
+    uint16_t* __restrict__ out1, const uint16_t* __restrict__ in1,
+    int64_t in1_stride, const uint16_t* __restrict__ w1, int32_t n1,
+    int32_t h1, uint16_t* __restrict__ out2, const uint16_t* __restrict__ in2,
+    int64_t in2_stride, const uint16_t* __restrict__ w2, int32_t n2,
+    int32_t h2, float epsilon, int32_t blocks1) {
+  if ((int32_t)blockIdx.x < blocks1) {
+    rms_norm_rows_body<NW1, VPT1>(blockIdx.x, out1, in1, in1_stride, w1,
+                                  epsilon, n1, h1);
+  } else {
+    rms_norm_rows_body<NW2, VPT2>((int32_t)blockIdx.x - blocks1, out2, in2,
+                                  in2_stride, w2, epsilon, n2, h2);
   }
 }
 
@@ -1004,6 +1034,49 @@ void rms_norm_rows(torch::Tensor& out, const torch::Tensor& input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// rms_norm_rows of two 2-D inputs in one launch; returns false (nothing
+// launched) when the pair is not the instantiated (6, 1) + (2, 1) warp-per-row
+// form (q_lora 1536 + kv_lora 512 at >= 256 rows), so the caller launches the
+// two norms separately.
+bool rms_norm_rows_pair(torch::Tensor& out1, const torch::Tensor& in1,
+                        const torch::Tensor& w1, int64_t block1,
+                        torch::Tensor& out2, const torch::Tensor& in2,
+                        const torch::Tensor& w2, int64_t block2,
+                        double epsilon) {
+  auto ok = [](const torch::Tensor& o, const torch::Tensor& x,
+               const torch::Tensor& w) {
+    return x.scalar_type() == at::kBFloat16 && o.scalar_type() == at::kBFloat16 &&
+           w.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.stride(1) == 1 &&
+           o.is_contiguous() && w.is_contiguous() && w.dim() == 1 &&
+           x.size(1) % 8 == 0 && w.numel() == x.size(1) &&
+           o.numel() == x.numel() && x.stride(0) % 8 == 0 &&
+           reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(o.data_ptr()) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0;
+  };
+  if (!ok(out1, in1, w1) || !ok(out2, in2, w2)) return false;
+  // The stock block sizes this pair replays: hidden 1536 -> 192 threads (6
+  // warps, 1 vector each), hidden 512 -> 64 threads (2 warps, 1 vector each).
+  if (block1 != 192 || in1.size(1) != 1536 || block2 != 64 || in2.size(1) != 512)
+    return false;
+  const int64_t n1 = in1.size(0), n2 = in2.size(0);
+  if (n1 == 0 || n2 == 0 || (n1 + 3) / 4 + (n2 + 3) / 4 >= (int64_t{1} << 31))
+    return false;
+  const int32_t blocks1 = (int32_t)((n1 + 3) / 4);
+  const dim3 grid((unsigned)(blocks1 + (n2 + 3) / 4)), block(128);
+  rms_norm_rows_pair_kernel<6, 1, 2, 1>
+      <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<uint16_t*>(out1.data_ptr()),
+          reinterpret_cast<const uint16_t*>(in1.data_ptr()), in1.stride(0),
+          reinterpret_cast<const uint16_t*>(w1.data_ptr()), (int32_t)n1,
+          (int32_t)in1.size(1), reinterpret_cast<uint16_t*>(out2.data_ptr()),
+          reinterpret_cast<const uint16_t*>(in2.data_ptr()), in2.stride(0),
+          reinterpret_cast<const uint16_t*>(w2.data_ptr()), (int32_t)n2,
+          (int32_t)in2.size(1), (float)epsilon, blocks1);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return true;
+}
+
 void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
                       const torch::Tensor& gate) {
   TORCH_CHECK(attn.scalar_type() == at::kBFloat16 &&
@@ -1182,6 +1255,11 @@ void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
 void rms_norm_rows(torch::Tensor& out, const torch::Tensor& input,
                    const torch::Tensor& weight, double epsilon,
                    int64_t block_size);
+bool rms_norm_rows_pair(torch::Tensor& out1, const torch::Tensor& in1,
+                        const torch::Tensor& w1, int64_t block1,
+                        torch::Tensor& out2, const torch::Tensor& in2,
+                        const torch::Tensor& w2, int64_t block2,
+                        double epsilon);
 void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
                       const torch::Tensor& gate);
 void scatter_rows(torch::Tensor& dst, const torch::Tensor& index,
@@ -1226,6 +1304,7 @@ def _module():
                 functions=[
                     "router_topk",
                     "rms_norm_rows",
+                    "rms_norm_rows_pair",
                     "gate_sigmoid_mul",
                     "scatter_rows",
                     "rope_store_kv",
@@ -1361,6 +1440,32 @@ def rms_norm(
     block = stock_rms_norm_block_size(x.numel() // x.shape[-1], x.shape[-1])
     _module().rms_norm_rows(out, x, weight, float(eps), block)
     return out
+
+
+def rms_norm_pair(
+    x: torch.Tensor,
+    wx: torch.Tensor,
+    y: torch.Tensor,
+    wy: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """:func:`rms_norm` of ``x`` and of ``y`` (same eps) in one launch, bitwise
+    the two separate calls; None (nothing launched) for a pair of shapes the
+    pair kernel does not instantiate. The caller checks :func:`use_rms_norm`
+    for both."""
+    bx = stock_rms_norm_block_size(x.numel() // x.shape[-1], x.shape[-1])
+    by = stock_rms_norm_block_size(y.numel() // y.shape[-1], y.shape[-1])
+    if not (
+        x.dim() == 2
+        and y.dim() == 2
+        and (x.shape[-1], bx, y.shape[-1], by) == (1536, 192, 512, 64)
+    ):
+        return None
+    out_x = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    out_y = torch.empty(y.shape, dtype=y.dtype, device=y.device)
+    if not _module().rms_norm_rows_pair(out_x, x, wx, bx, out_y, y, wy, by, float(eps)):
+        return None
+    return out_x, out_y
 
 
 def use_gate_sigmoid_mul(attn: torch.Tensor, gate: torch.Tensor) -> bool:
@@ -1587,20 +1692,41 @@ class KimiRowsRMSNorm(RMSNorm):
         super().__init__(hidden_size, eps=eps)
         warmup()  # build / load the JIT extension at model init, not mid-step
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        if (
-            residual is None
-            and self.has_weight
+    def _rows_kernel(self, x: torch.Tensor) -> bool:
+        if not (
+            self.has_weight
             and self.variance_size_override is None
             and use_rms_norm(x, self.weight.data)
         ):
-            from vllm import ir
+            return False
+        from vllm import ir
 
-            if (
-                ir.ops.rms_norm.dispatch(
-                    x, self.weight.data, self.variance_epsilon, None
-                ).provider
-                == "vllm_c"
-            ):
-                return rms_norm(x, self.weight.data, self.variance_epsilon)
+        return (
+            ir.ops.rms_norm.dispatch(
+                x, self.weight.data, self.variance_epsilon, None
+            ).provider
+            == "vllm_c"
+        )
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        if residual is None and self._rows_kernel(x):
+            return rms_norm(x, self.weight.data, self.variance_epsilon)
         return super().forward(x, residual)
+
+    def forward_pair(
+        self, x: torch.Tensor, other: "KimiRowsRMSNorm", y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """``(self(x), other(y))`` in one launch where both run the rows
+        kernel with the instantiated pair of stock block shapes (the DSA q_a /
+        kv_a norms): bitwise the two separate calls. None (nothing launched)
+        otherwise; the caller then runs the two norms itself."""
+        if not (
+            isinstance(other, KimiRowsRMSNorm)
+            and self.variance_epsilon == other.variance_epsilon
+            and self._rows_kernel(x)
+            and other._rows_kernel(y)
+        ):
+            return None
+        return rms_norm_pair(
+            x, self.weight.data, y, other.weight.data, self.variance_epsilon
+        )

@@ -176,6 +176,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        kv_c_normed = None
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -195,7 +196,22 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             q_proj_layer = self.q_b_proj
             if not self.fuse_qkv_rmsnorm:
-                q_c = self.q_a_layernorm(q_c)
+                # Norm modules with a two-norm launch (Kimi K3 prefill rows
+                # kernel) normalize q_c and kv_c in one launch, bitwise.
+                pair = getattr(self.q_a_layernorm, "forward_pair", None)
+                normed = (
+                    pair(
+                        q_c,
+                        self.kv_a_layernorm,
+                        kv_lora[..., : self.kv_lora_rank],
+                    )
+                    if pair is not None
+                    else None
+                )
+                if normed is not None:
+                    q_c, kv_c_normed = normed
+                else:
+                    q_c = self.q_a_layernorm(q_c)
             q_proj_input = q_c
         else:
             assert self.kv_a_proj_with_mqa is not None, (
@@ -221,7 +237,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.q_a_layernorm.variance_epsilon,
             )
             q_c = q_proj_input
-        else:
+        elif kv_c_normed is None:
             kv_c_normed = self.kv_a_layernorm(kv_c)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)

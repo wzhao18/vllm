@@ -340,3 +340,50 @@ def test_ctx_kv_insert_matches_per_layer(pg, rows, block_size):
     for i in range(layers):
         if refs[i] is not None:
             assert torch.equal(_bits(outs[i]), _bits(refs[i])), f"layer {i}"
+
+
+@pytest.mark.parametrize("rows", [2048, 16384, 6157])
+def test_rms_norm_pair_matches_vllm_c(pg, rows):
+    """The DSA q_a (1536) and kv_a (512) norms of one fused_qkv_a output in one
+    launch (KimiRowsRMSNorm.forward_pair): each bitwise the stock kernel."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(rows)
+    qkv = torch.randn(rows, 1536 + 512 + 64, device="cuda", dtype=torch.bfloat16) * 3
+    qkv[0] = 0
+    qkv[1, :8] = 3.0e38
+    qkv[2, 1536 : 1536 + 8] = 3.0e38
+    q_c, kv_c = qkv[:, :1536], qkv[:, 1536 : 1536 + 512]
+    wq = (torch.rand(1536, device="cuda") + 0.5).to(torch.bfloat16)
+    wkv = (torch.rand(512, device="cuda") + 0.5).to(torch.bfloat16)
+    assert pg.use_rms_norm(q_c, wq) and pg.use_rms_norm(kv_c, wkv)
+    got = pg.rms_norm_pair(q_c, wq, kv_c, wkv, 1e-6)
+    assert got is not None
+    for out, x, w in zip(got, (q_c, kv_c), (wq, wkv)):
+        ref = torch.empty(x.shape, dtype=x.dtype, device="cuda")
+        ops.rms_norm(ref, x, w, 1e-6)
+        assert torch.equal(_bits(out), _bits(ref))
+    # Shapes without an instantiated pair launch nothing (caller runs both).
+    assert pg.rms_norm_pair(kv_c, wkv, q_c, wq, 1e-6) is None
+
+
+def test_rows_rms_norm_module_pair(pg):
+    """KimiRowsRMSNorm.forward_pair == the two module calls, bitwise; None
+    for a mismatched eps."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    torch.manual_seed(5)
+    qkv = torch.randn(4096, 2112, device="cuda", dtype=torch.bfloat16)
+    q_c, kv_c = qkv[:, :1536], qkv[:, 1536:2048]
+    with set_current_vllm_config(VllmConfig()):
+        qn = pg.KimiRowsRMSNorm(1536, eps=1e-6).cuda().to(torch.bfloat16)
+        kvn = pg.KimiRowsRMSNorm(512, eps=1e-6).cuda().to(torch.bfloat16)
+        for n in (qn, kvn):
+            with torch.no_grad():
+                n.weight.copy_(torch.rand_like(n.weight) + 0.5)
+        got = qn.forward_pair(q_c, kvn, kv_c)
+        assert got is not None
+        assert torch.equal(_bits(got[0]), _bits(qn(q_c)))
+        assert torch.equal(_bits(got[1]), _bits(kvn(kv_c)))
+        kvn.variance_epsilon = 1e-5
+        assert qn.forward_pair(q_c, kvn, kv_c) is None
