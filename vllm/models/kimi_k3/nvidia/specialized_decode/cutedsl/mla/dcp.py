@@ -1079,6 +1079,9 @@ class DcpValue:
         smem = cutlass.utils.SmemAllocator()
         latent = alloc(smem, BFloat16, (16, 544), 128)
         scales = alloc(smem, Float32, (16, D))
+        stage = None
+        if cutlass.const_expr(self.spread and self.merge_rows == 1):
+            stage = alloc(smem, Uint32, (D, 64, 4), 128)  # [source, chunk, word]
         tid, _, _ = cute.arch.thread_idx()
         head, tile, pusher = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
@@ -1109,6 +1112,14 @@ class DcpValue:
                     load_words(at(w_uv, head, 32 * c + 8 * quarter, v), count=4)
                     for c in range(16)
                 ]
+        elif cutlass.const_expr(self.spread and self.merge_rows == 1):
+            # one-row spread CTAs: the W_UV fragments before the PDL wait (hidden
+            # under the predecessor, as the per-head merge's), the 16 sources'
+            # chunks polled by 4 thread groups at once into ``stage``
+            wb = [
+                load_words(at(w_uv, head, 32 * c + 8 * quarter, v), count=4)
+                for c in range(16)
+            ]
         elif cutlass.const_expr(self.spread):
             pass  # every CTA merges: merge_spread loads its W_UV fragments
         elif cutlass.const_expr(self.lean):  # push-only CTAs skip W_UV
@@ -1197,7 +1208,7 @@ class DcpValue:
         if cutlass.const_expr(self.tile_stride > 0 and self.spread):  # above one wave
             for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
                 if 16 * y + R * pusher < self.batch:
-                    self.merge_spread(args, latent, scales, tid, y)
+                    self.merge_spread(args, latent, scales, tid, y, wb, stage)
                     self.rearm_rows(mailbox, 16 * y + R * pusher, R, head, tid)
         elif cutlass.const_expr(self.tile_stride > 0):  # the per-head merge, strided
             if pusher == 0:
@@ -1206,7 +1217,7 @@ class DcpValue:
                     self.rearm_rows(mailbox, 16 * y, 16, head, tid)
         elif self.merges(pusher):
             if cutlass.const_expr(self.spread):
-                self.merge_spread(args, latent, scales, tid)
+                self.merge_spread(args, latent, scales, tid, None, wb, stage)
                 self.rearm_rows(mailbox, 16 * tile + R * pusher, R, head, tid)
             elif cutlass.const_expr(self.wide):
                 self.merge_row(args, latent, scales, wb, tid, bar)
@@ -1657,7 +1668,7 @@ class DcpValue:
                 store_words(at(output, t, col), (bf16x2(lo, hi),))
 
     @cute.jit
-    def merge_spread(self, args, latent, scales, tid, row_tile=None):
+    def merge_spread(self, args, latent, scales, tid, row_tile=None, wb=None, stage=None):
         """spread: CTA z of (head, row tile y) merges rows 16 y + R z + r (r < R) into
         rows r of its latent tile, then warp w projects output tile w of them: the
         weights, sums and per-tile MMAs of merge() (MMA rows are independent, so the
@@ -1689,10 +1700,13 @@ class DcpValue:
                 word = load_words(at(gate, t0 + group + 8, col), count=1, mutable=True)
                 gates8 = unpack_bf16(word[0])
                 alive8 = totals[(t0 + group + 8) // self.q]
-        if (warp < R) & (t0 + warp < B):  # warp r: the source weights of row t0 + r
+        lw = warp  # the warp polling row lw's LSEs (one-row CTAs: the last warp)
+        if cutlass.const_expr(R == 1):
+            lw = warp - 15
+        if (lw >= 0) & (lw < R) & (t0 + lw < B):  # the source weights of row t0 + lw
             lse = Float32(EMPTY_LSE)
             if lane < D:  # the row's sources share one line
-                source = lbox.iterator + ((t0 + warp) * self.heads + head) * D + lane
+                source = lbox.iterator + ((t0 + lw) * self.heads + head) * D + lane
                 word = load_volatile(source)[0]
                 sgn, sgt = spin_start()
                 while word == Uint32(LSE_SENT):
@@ -1711,10 +1725,13 @@ class DcpValue:
             if total > 0:
                 scale = weight / total
             if lane < D:
-                scales[warp, lane] = scale
-        cute.arch.sync_threads()
+                scales[lw, lane] = scale
+        if cutlass.const_expr(R == 1):
+            self.stage_row(args, stage, t0, tid)
+        else:
+            cute.arch.sync_threads()
         chunk = tid % 64  # 16 B chunk of row t0 + r
-        for h in cutlass.range_constexpr((R + 7) // 8):  # r = tid // 64 (+ 8: R = 16)
+        for h in cutlass.range_constexpr((R + 7) // 8 * (R > 1)):  # r = tid // 64 (+ 8: R = 16)
             r = tid // 64 if h == 0 else tid // 64 + 8
             if (r < R) & (t0 + r < B):
                 merged = zeros(8, Float32)
@@ -1737,10 +1754,28 @@ class DcpValue:
                     for e in range(4)
                 )
                 store_shared_words(latent.iterator + r * 544 + 8 * chunk, pairs)
-        wb = [  # loaded after the polls: not live across them (no spills)
-            load_words(at(args[8], head, 32 * c + 8 * quarter, v), count=4)
-            for c in range(16)
-        ]
+        if cutlass.const_expr(R == 1):
+            if (tid < 64) & (t0 < B):  # row t0, sources in order (merge()'s sums)
+                merged = zeros(8, Float32)
+                for s in cutlass.range_constexpr(D):
+                    words = load_words(
+                        stage.iterator + (s * 64 + chunk) * 4, count=4, shared=True
+                    )
+                    w = scales[0, s]
+                    for e in cutlass.range_constexpr(4):
+                        lo, hi = unpack_bf16(words[e])
+                        merged[2 * e] += w * lo
+                        merged[2 * e + 1] += w * hi
+                pairs = tuple(
+                    pack_pair(merged[2 * e], merged[2 * e + 1], policy=None)
+                    for e in range(4)
+                )
+                store_shared_words(latent.iterator + 8 * chunk, pairs)
+        else:
+            wb = [  # loaded after the polls: not live across them (no spills)
+                load_words(at(args[8], head, 32 * c + 8 * quarter, v), count=4)
+                for c in range(16)
+            ]
         cute.arch.sync_threads()
         parts = zeros((2, 4), Float32)  # two accumulation chains; rows >= R unused
         for c in cutlass.range_constexpr(16):
@@ -1775,6 +1810,31 @@ class DcpValue:
                         for e in range(2)
                     )
                 store_words(at(output, t0 + group + 8, col), (bf16x2(lo, hi),))
+
+    @cute.jit
+    def stage_row(self, args, stage, t0, tid):
+        """One-row spread CTAs: thread group g = tid // 64 < 4 polls sources 4 g ..
+        4 g + 3 of row ``t0``'s 16 B chunk tid % 64 (every source in one round trip,
+        beside the last warp's LSE poll), re-arms them and stages the words in shared
+        memory for the ordered sum; ends with the CTA barrier."""
+        box, D = args[3], self.size
+        head, _, _ = cute.arch.block_idx()
+        g, chunk = tid // 64, tid % 64
+        per: cutlass.Constexpr = (D + 3) // 4
+        if (g < 4) & (t0 < self.batch):
+            sources = [
+                at(box, cutlass.min(per * g + i, D - 1), t0, head, 8 * chunk)
+                for i in range(per)
+            ]
+            raw = self.poll_rows(sources)
+            for i in cutlass.range_constexpr(per):
+                if per * g + i < D:
+                    store_words(sources[i], (Uint32(PAIR_SENT),) * 4)
+                    store_shared_words(
+                        stage.iterator + ((per * g + i) * 64 + chunk) * 4,
+                        tuple(raw[i, j] for j in range(4)),
+                    )
+        cute.arch.sync_threads()
 
     @cute.jit
     def poll_rows(self, sources):
