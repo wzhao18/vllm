@@ -35,6 +35,7 @@ from vllm.model_executor.layers.fused_moe import deep_gemm_mega_moe as dg
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia.megamoe_rubin import config as C
 from vllm.models.kimi_k3.nvidia.megamoe_rubin import experts as X
+from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as S
 from vllm.models.kimi_k3.nvidia.megamoe_rubin import weights as W
 
 # Kimi K3.1 routed MoE: 896 experts, latent hidden 3584, intermediate 3072, top-16.
@@ -1149,6 +1150,135 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
     assert tuple(emulated[0].knobs.schedule_policy)[0] == "decode"
     native, _ = X.select_rubin_buckets(problem, 4, 2048, prefill_worker=False)
     assert native != ep32
+
+
+def test_ep8_prefill_worker_dedup_bucket_picks_tile_n_per_launch():
+    """EP8 P/D prefill (dedup bucket): ONE bucket (one arena carve) whose main kernel
+    runs N256 tiles and whose narrow kernel runs the capacity's N128 record below
+    RUBIN_PREFILL_WIDE_N_MIN_TOKENS; both configs admitted. Decode servers, other EP
+    sizes and non-dedup prefill buckets keep their buckets."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    main, _ = X.select_rubin_bucket(problem, 8, 8192)
+    (bucket,), notes = X.select_rubin_buckets(problem, 8, 8192, prefill_worker=True)
+    assert bucket.max_tokens == 8192 and bucket.variant == X.RUBIN_DEDUP_VARIANT
+    assert bucket.knobs == X.RUBIN_PREFILL_WIDE_N_KNOBS
+    assert bucket.knobs.mma_tiler_mnk == (256, 256, 256)
+    assert bucket.narrow == (
+        X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS, X._prefill_dedup(main).knobs
+    )
+    assert bucket.narrow[1].mma_tiler_mnk == (256, 128, 256)
+    assert any("N256 tiles" in n for n in notes)
+    cfg = C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=8)
+    narrow = cfg.narrow_config()
+    assert narrow.mma_tiler_mnk == (256, 128, 256) and narrow.narrow is None
+    assert narrow.max_tokens_per_rank == cfg.max_tokens_per_rank
+    assert narrow.fallback_cluster_shape_mn == tuple(main.knobs.fallback_cluster_shape_mn)
+    capped = C.RubinMoeConfig.make(
+        problem, dataclasses.replace(bucket, max_sm_count=148), rank=0, world_size=8
+    )
+    assert capped.narrow_config().fallback_cluster_shape_mn is None
+    # the wide knobs are the EP8 i2048 phase-interleaved record (dedup token back)
+    rec, _, _ = C.resolve_knobs(
+        C.SHIPPED_KNOBS, problem=problem, variant="inference", world_size=8,
+        max_tokens=2048,
+    )  # fmt: skip
+    assert X.RUBIN_PREFILL_WIDE_N_KNOBS == dataclasses.replace(
+        rec, token_back_mode=X.RUBIN_DEDUP_TOKEN_BACK_MODE
+    )
+    # per-launch kernel choice by EP-uniform tokens per rank (session.use_s2)
+    sess = SimpleNamespace(cfg=cfg, kernels={False: object(), True: object()})
+    pick = S.RubinMegaMoeSession.use_s2
+    for n in (0, 1, 128, 512, X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS - 1):
+        assert pick(sess, n) is True
+    for n in (None, X.RUBIN_PREFILL_WIDE_N_MIN_TOKENS, 2048, 4096, 8192):
+        assert pick(sess, n) is False
+    # unchanged: decode servers, EP16 / EP4 prefill, capacity below the threshold
+    decode, _ = X.select_rubin_buckets(problem, 8, 8192, prefill_worker=False)
+    assert all(b.narrow is None and b.knobs.mma_tiler_mnk[1] == 128 for b in decode)
+    for world in (4, 16):
+        same, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=True)
+        stock, _ = X.select_rubin_bucket(problem, world, 8192)
+        assert same == (X._prefill_dedup(stock),)
+    small_server, _ = X.select_rubin_buckets(problem, 8, 512, prefill_worker=True)
+    assert [b.narrow for b in small_server] == [None]
+
+
+class _FakeWs:
+    """DeviceWorkspace stand-in: regions (name, offset, nbytes, reset) per space."""
+
+    def __init__(self, local, shared, tail):
+        self._r = {"local": local, "shared": shared}
+        self._tail = tail
+
+    def regions(self, space):
+        return tuple(
+            SimpleNamespace(name=n, reset=r, dtype="Int32") for n, _, _, r in self._r[space]
+        )
+
+    def _get(self, name):
+        return next(x for sp in self._r.values() for x in sp if x[0] == name)
+
+    def offset(self, name):
+        return self._get(name)[1]
+
+    def nbytes(self, name):
+        return self._get(name)[2]
+
+    def total_bytes(self, space):
+        return max(o + n for _, o, n, _ in self._r[space])
+
+    def tail_reset_bytes(self, space):
+        return self._tail
+
+    def byte_alignment(self, name):
+        return 16
+
+
+def _fake_kernel(tail, shared_size=256):
+    local = [
+        ("fc1_done", 0, tail - 16, "tail_reset"),
+        ("fc2_done", tail - 16, 16, "tail_reset"),
+        ("epoch", tail, 4, "zero_on_first_allocate"),
+        ("phase", tail + 16, 4, "zero_on_first_allocate"),
+    ]
+    shared = [("signal", 0, 8, "zero_on_first_allocate"), ("x", 16, shared_size, "data")]
+    return SimpleNamespace(_device_workspace=_FakeWs(local, shared, tail))
+
+
+def test_narrow_kernel_shares_the_local_state(monkeypatch):
+    """The narrow kernel shares the session's workspace: the kernel with the shorter
+    tail_reset span sits at the span difference, so the persistent state coincides;
+    any other difference raises (no second workspace, no silent fallback)."""
+
+    def layout(kernel):
+        ws = kernel._device_workspace
+        return tuple(
+            (sp, ws.total_bytes(sp), tuple(
+                (r.name, ws.offset(r.name), ws.nbytes(r.name), r.reset, r.dtype)
+                for r in ws.regions(sp)))
+            for sp in ("local", "shared")
+        )  # fmt: skip
+
+    monkeypatch.setattr(S, "_workspace_layout", layout)
+    wide, narrow = _fake_kernel(16896), _fake_kernel(16896 + 32768)
+    assert S.narrow_local_offsets(wide, narrow) == (32768, 0)
+    assert S.narrow_local_offsets(narrow, wide) == (0, 32768)
+    ww, wn = wide._device_workspace, narrow._device_workspace
+    for name in ("epoch", "phase"):
+        assert 32768 + ww.offset(name) == wn.offset(name)
+    with pytest.raises(RuntimeError, match="shared"):
+        S.narrow_local_offsets(wide, _fake_kernel(16896 + 32768, shared_size=512))
+    # a 16-byte multiple keeps the regions' 16-byte alignment (narrow base 16-aligned)
+    assert S.narrow_local_offsets(wide, _fake_kernel(16896 + 48)) == (48, 0)
+    assert S.narrow_local_align((48, 0)) == 16 and S.narrow_local_align((32768, 0)) == 128
+    with pytest.raises(RuntimeError, match="alignment"):
+        S.narrow_local_offsets(wide, _fake_kernel(16896 + 8))
+    moved = _fake_kernel(16896 + 32768)
+    moved._device_workspace._r["local"][3] = ("phase", 16896 + 32768 + 32, 4,
+                                             "zero_on_first_allocate")  # fmt: skip
+    with pytest.raises(RuntimeError, match="local"):
+        S.narrow_local_offsets(wide, moved)
 
 
 @pytest.mark.parametrize("world", [4, 16])

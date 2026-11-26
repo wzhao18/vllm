@@ -174,7 +174,12 @@ class RubinBucket:
 
     shared: ``(hidden, intermediate)`` of an MXFP8 E4M3 shared expert run inside the
     GenPhase kernel (its tiles overlap the dispatch; its BF16 output lands in its own
-    tensor), or None."""
+    tensor), or None.
+
+    narrow: ``(rows, knobs)``: launches with fewer than ``rows`` EP-uniform live tokens
+    per rank run a second kernel built with ``knobs`` (per-shape tile choice, same
+    variant and math) over the SAME workspace (one arena carve; the session checks the
+    two layouts are compatible), or None."""
 
     variant: Variant
     max_tokens: int
@@ -182,12 +187,19 @@ class RubinBucket:
     max_sm_count: int | None = None
     die_sm_mask32: tuple[int, ...] | None = None
     shared: tuple[int, int] | None = None
+    narrow: tuple[int, RubinKnobs] | None = None
 
     def __post_init__(self) -> None:
         if self.variant not in VARIANTS:
             raise ValueError(f"unknown variant {self.variant!r}.")
         if type(self.max_tokens) is not int or self.max_tokens <= 0:
             raise ValueError("max_tokens must be a positive int.")
+        if self.narrow is not None:
+            rows, knobs = self.narrow
+            if type(rows) is not int or not 0 < rows <= self.max_tokens:
+                raise ValueError("narrow rows must be an int in (0, max_tokens].")
+            if not isinstance(knobs, RubinKnobs):
+                raise ValueError("narrow knobs must be RubinKnobs.")
         if self.variant == "genphase" and self.max_tokens > 1024:
             raise ValueError("genphase buckets hold at most 1024 tokens per rank.")
 
@@ -230,6 +242,8 @@ class RubinMoeConfig:
     max_sm_count: int | None = None
     die_sm_mask32: tuple[int, ...] | None = None
     shared: tuple[int, int] | None = None
+    # (rows, knobs) of the bucket's narrow kernel (RubinBucket.narrow), or None
+    narrow: tuple[int, RubinKnobs] | None = None
 
     @classmethod
     def make(
@@ -271,6 +285,35 @@ class RubinMoeConfig:
             max_sm_count=bucket.max_sm_count,
             die_sm_mask32=bucket.die_sm_mask32,
             shared=bucket.shared,
+            narrow=bucket.narrow,
+        )
+
+    def narrow_config(self) -> RubinMoeConfig:
+        """The config of the narrow kernel (:attr:`narrow` knobs at this capacity, grid
+        policy and placement; admission rules re-checked). A capped grid launches
+        preferred-shape clusters only, as for the main knobs."""
+        if self.narrow is None:
+            raise ValueError("this config has no narrow kernel.")
+        k = self.narrow[1]
+        fallback = k.fallback_cluster_shape_mn
+        if self.max_sm_count is not None or fallback is None:
+            fallback = None
+        else:
+            fallback = tuple(fallback)
+        return dataclasses.replace(
+            self,
+            mma_tiler_mnk=tuple(k.mma_tiler_mnk),
+            cluster_shape_mn=tuple(k.cluster_shape_mn),
+            fallback_cluster_shape_mn=fallback,
+            schedule_policy=tuple(k.schedule_policy),
+            work_id_mode=k.work_id_mode,
+            fc2_use_bulk=k.fc2_use_bulk,
+            fc2_tma_stages=k.fc2_tma_stages,
+            epi_flag_batches=tuple(k.epi_flag_batches),
+            token_in_flag_batch=k.token_in_flag_batch,
+            token_back_mode=k.token_back_mode,
+            reduce_topk_in_kernel=k.reduce_topk_in_kernel,
+            narrow=None,
         )
 
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list

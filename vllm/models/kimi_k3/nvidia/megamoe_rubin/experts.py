@@ -147,6 +147,37 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
 RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_DEDUP_MIN_TOKENS = 4096
+
+# P/D prefill workers at EP8 (TP8+DCP8 SP+EP: 112 local experts per rank) pick the
+# dedup bucket's tile N per launch (per-shape dispatch, same variant and math):
+# launches of at least RUBIN_PREFILL_WIDE_N_MIN_TOKENS EP-uniform tokens per rank run
+# N256 tiles (RUBIN_PREFILL_WIDE_N_KNOBS, the EP8 i2048 phase-interleaved record),
+# smaller ones the bucket's N128 record, as the bucket's narrow kernel over the SAME
+# workspace (one arena carve: no memory beyond the one-bucket server; the session
+# checks the layouts, session.narrow_local_offsets). Routing is skewed (a layer's
+# hottest local expert takes ~3.4x / ~7x the rows of the rank at 1024 / 2048 rows per
+# rank), and each N tile of an expert re-streams its weights: N128 runs 1426 k-tiles
+# per leader CTA at 2048 rows per rank, at ~130 ns of MMA-warp issue each. Measured
+# on VR200 (1 GPU, EP8 per-GPU shape: 112 experts, NVFP4, real per-expert counts of
+# rank 0, CUPTI, 6 layers per size): N128 / N256 main kernel 191.3 / 196.5,
+# 230.5 / 230.5, 289.7 / 277.5, 409.8 / 388.0 us at 128 / 512 / 1024 / 2048 rows per
+# rank. 2-node TP8+DCP8 graph step (ABBA, bitwise-equal outputs): 2048 rows per rank
+# 211.62 -> 206.35 ms, 4096 rows 378.64 -> 365.96 ms.
+RUBIN_PREFILL_WIDE_N_EP_SIZES = (8,)
+RUBIN_PREFILL_WIDE_N_MIN_TOKENS = 1024
+RUBIN_PREFILL_WIDE_N_KNOBS = RubinKnobs(
+    mma_tiler_mnk=(256, 256, 256),
+    cluster_shape_mn=(2, 1),
+    fallback_cluster_shape_mn=None,
+    schedule_policy=("phase_interleave", None),
+    work_id_mode="atomic_counter",
+    fc2_use_bulk=True,
+    fc2_tma_stages=2,
+    epi_flag_batches=(2, 4),
+    token_in_flag_batch=1,
+    token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE,
+    reduce_topk_in_kernel=False,
+)
 # Cluster (2, 1): 106 CTA pairs cover all 212 SMs (cluster (4, 1) packs 46 clusters = 184 CTAs); dynamic B
 # gather on the pair. EP1 (28 experts, NVFP4, fused MXFP8 shared, same session ABBA, bitwise-equal outputs):
 # 55.4 / 56.4 / 59.6 vs 56.7 / 58.2 / 60.9 us at 32 / 96 / 128 tokens per rank.
@@ -313,9 +344,30 @@ def select_rubin_buckets(
     if problem.quant_kind == "nvfp4":
         buckets = [_prefill_dedup(b) for b in buckets]
         main = _prefill_dedup(main)
+    if (
+        prefill_worker
+        and world_size in RUBIN_PREFILL_WIDE_N_EP_SIZES
+        and main.variant in DEDUP_VARIANTS
+        and main.max_tokens >= RUBIN_PREFILL_WIDE_N_MIN_TOKENS
+        and main.knobs.mma_tiler_mnk[1] < RUBIN_PREFILL_WIDE_N_KNOBS.mma_tiler_mnk[1]
+        and not buckets
+    ):
+        main = dataclasses.replace(
+            main,
+            knobs=RUBIN_PREFILL_WIDE_N_KNOBS,
+            narrow=(RUBIN_PREFILL_WIDE_N_MIN_TOKENS, main.knobs),
+        )
+        extra = (
+            f"[{main.variant} {main.max_tokens}] N256 tiles at >= "
+            f"{RUBIN_PREFILL_WIDE_N_MIN_TOKENS} tokens/rank, the N128 record below "
+            "(one workspace)",
+        )
+    else:
+        extra = tuple(
+            f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets
+        )
     for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
-    extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
 
 
