@@ -97,8 +97,10 @@ logger = init_logger(__name__)
 # the 16 sources and projecting them through W_UV) instead of one merge CTA per
 # (head, 16 rows). Same weights, FP32 source order and per-row MMAs: bitwise.
 # DCP16 value bench (4 real + 12 emulated sources, q8, us per call, per-head ->
-# spread): see the L1 DCPV row in DECISIONS.md.
-CORE_SPREAD = batch_table("8:1,16:1")
+# spread): see the L1 DCPV row in DECISIONS.md. Rows 32 (B4 x q8, the core's 1x16
+# variant: 12 per-head merge CTAs -> 192 one-row CTAs): 9.59 -> 5.06 us per call,
+# bitwise (DCPV4 row).
+CORE_SPREAD = batch_table("8:1,16:1,32:1")
 
 __all__ = [
     "QUERY_HEADS",
