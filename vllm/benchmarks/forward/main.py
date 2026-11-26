@@ -334,6 +334,22 @@ def _install_save_hidden() -> None:
 
         layers[i].register_forward_hook(hook)
 
+        def pre_hook(mod, args, kwargs, i=i):
+            # Inputs of the same first sub-call: hidden, topk weights, topk ids.
+            name = _SAVE_CASE[-1] if _SAVE_CASE else "case"
+            key = f"{name}.moein{i}"
+            rank = get_world_group().rank
+            if key in seen or rank != 0 or i > 2:
+                return
+            seen.add(key)
+            for tag, t in zip(("x", "w", "ids"), args[:3]):
+                torch.save(
+                    t.detach().cpu().contiguous(),
+                    os.path.join(out_dir, f"{key}.{tag}.rank{rank}.pt"),
+                )
+
+        layers[i].register_forward_pre_hook(pre_hook, with_kwargs=True)
+
 
 def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any]:
     _SAVE_CASE.append(case.name)
