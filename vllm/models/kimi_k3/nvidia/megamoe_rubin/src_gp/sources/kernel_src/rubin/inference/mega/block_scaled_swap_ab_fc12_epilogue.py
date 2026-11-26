@@ -1402,6 +1402,21 @@ class SwapABGatedActEpilogue(KernelComponent):
         return fc1_atom, fc1_tensor, fc2_atom, fc2_tensor
 
     @cute.jit
+    def _signal_fc2_tile_ready(self, work_tile_info, fc1_done_counter, tidx):
+        """Dedup combine readiness: after the tile's stores have completed (the caller's bulk wait + tile-end
+        barrier), warp 0 of the publishing warpgroup adds one FC2 completion to the tile's FC1-done slot. FC2 of a
+        slot runs only once every FC1 completion has landed, so the slot then reads FC1 + FC2 completions."""
+        if cutlass.const_expr(self.combine_tile_ready):
+            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear2):
+                epilogue_warp = cute.arch.make_warp_uniform(
+                    (tidx % cutlass.Int32(self._EpilogueWarpCnt * 32)) // cutlass.Int32(32)
+                )
+                if epilogue_warp == cutlass.Int32(0):
+                    slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                    with cute.arch.elect_one():
+                        red_async_add_release_gpu_s32(fc1_done_counter.iterator + slot, cutlass.Int32(1))
+
+    @cute.jit
     def run(
         self,
         smem_workspace: SmemWorkspace,
@@ -1734,21 +1749,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "SwapABFc1Epilogue":
         assert len(values) == 0
         return self
-
-    @cute.jit
-    def _signal_fc2_tile_ready(self, work_tile_info, fc1_done_counter, tidx):
-        """Dedup combine readiness: after the tile's stores have completed (the caller's bulk wait + tile-end
-        barrier), warp 0 of the publishing warpgroup adds one FC2 completion to the tile's FC1-done slot. FC2 of a
-        slot runs only once every FC1 completion has landed, so the slot then reads FC1 + FC2 completions."""
-        if cutlass.const_expr(self.combine_tile_ready):
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear2):
-                epilogue_warp = cute.arch.make_warp_uniform(
-                    (tidx % cutlass.Int32(self._EpilogueWarpCnt * 32)) // cutlass.Int32(32)
-                )
-                if epilogue_warp == cutlass.Int32(0):
-                    slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
-                    with cute.arch.elect_one():
-                        red_async_add_release_gpu_s32(fc1_done_counter.iterator + slot, cutlass.Int32(1))
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
