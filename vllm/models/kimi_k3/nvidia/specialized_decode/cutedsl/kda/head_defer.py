@@ -47,11 +47,13 @@ class HeadRecords:
     """The record forms' shared pieces (``KdaHeadVerify``'s geometry: ``vkda``).
 
     The token loop runs ``LOOP_LANES`` lanes per state row: 16 lanes give each thread
-    rows ``group`` and ``group + 8`` (two passes) of 8 columns each, so the per-token
-    chain (decay, row dot, butterfly, update) is half as long per row and the two
-    rows interleave. The row dot sums the same FP32 products in a different order
-    than the 8-lane form (FP32 reassociation only; every other operation is the
-    same per element)."""
+    rows ``group`` and ``group + 8`` (two passes) of 8 columns each. Bit for bit the
+    8-lane form: the 16-lane butterfly's first (xor 8) stage adds the same chunk
+    pairs as the 8-lane chunk tree ((c0 + c2) + (c1 + c3)), the rest is the same
+    butterfly. 16 lanes drop the head from 204 to 126 registers, so at B2 it enters
+    beside the AttnRes CTAs (+1.6 us after the AttnRes start instead of +6.7): KDA-EDGE
+    chain -0.14 / -0.18 us/layer. At B1 (already early) the extra shuffle stage costs
+    +0.11 / +0.15 us/layer, so the B1 head keeps 8 lanes (KDALOOP-1, 2026-11-26)."""
 
     LOOP_LANES = 16
 
@@ -204,6 +206,8 @@ class HeadRecords:
 
 class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
     """``KdaHeadVerify`` under the deferred protocol (module docstring)."""
+
+    LOOP_LANES = 8  # (HeadRecords: B1 enters early already; 16 lanes measured slower)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
