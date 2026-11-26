@@ -172,6 +172,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if mode in ("P", "Q", "QF"):
             paired = True
         self.ring1_mode = mode
+        if type(self) is RubinGroupedExpertsKernel:
+            print(f"RING1 mode {mode} single {self.single} fixed {self.fixed} stages {stages} paired {paired}", flush=True)
         # paired: two consecutive 16 KiB slots share one full / empty barrier (pair
         # ``slot // 2``): one ~0.25 us barrier-stage round per 32 KiB of weights
         # instead of per 16 KiB (hwdb INDEX 39 / 42: the per-issuer cost is per
