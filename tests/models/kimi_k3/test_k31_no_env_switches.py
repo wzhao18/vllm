@@ -24,6 +24,10 @@ ALLOWED = {
     "K31_DCPX_BUILD_DIR",
     "K31_DSAC_BUILD_DIR",
     "CUDA_HOME",
+    # the CuTe DSL's own target-architecture variable (the DSL reads it at start):
+    # cute_cache reads it only so the compile-cache key names the arch the DSL
+    # compiles for; it selects no K3 path
+    "CUTE_DSL_ARCH",
     # stock vLLM settings, honoured with their stock meaning (not K3 feature switches)
     "VLLM_CACHE_ROOT",
     "VLLM_BATCH_INVARIANT",
@@ -41,9 +45,12 @@ ALLOWED = {
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
 }
-# Byte-identical vendored kernel sources (megamoe_rubin/VENDOR.md); their diagnostic
-# variables (MEGA_USE_NCU, MEGA_F4CVT_USE_MANUAL) are never set by vLLM.
-VENDORED = ROOT / "megamoe_rubin" / "src"
+# Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
+# (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
+# upstream's, byte for byte (diagnostics MEGA_USE_NCU, MEGA_F4CVT_USE_MANUAL,
+# MEGA_DIAG_SKIP_TOKEN_BACK, MEGA_DEDUP_WAIT_SLEEP[_MAX]_NS and the DSL's
+# CUTE_DSL_ARCH) and are never set by vLLM.
+VENDORED = (ROOT / "megamoe_rubin" / "src", ROOT / "megamoe_rubin" / "src_gp")
 
 
 def test_no_env_switches():
@@ -52,7 +59,7 @@ def test_no_env_switches():
     for path in sorted(ROOT.rglob("*")):
         if path.suffix not in (".py", ".cu", ".cuh", ".h", ".cpp"):
             continue
-        if path.is_relative_to(VENDORED):
+        if any(path.is_relative_to(v) for v in VENDORED):
             continue
         # macOS AppleDouble metadata ("._x.py" next to x.py on copied trees) is not
         # source; any other file is scanned even when not valid UTF-8 (the patterns
