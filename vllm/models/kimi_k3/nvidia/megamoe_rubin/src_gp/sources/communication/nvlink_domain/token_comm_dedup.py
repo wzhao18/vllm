@@ -112,6 +112,10 @@ class DedupCallTail(GenphaseTail):
         )
 
 
+# Bit offset of the destination-local expert in a pushed dedup routing record (TokenSrcMetadata spare byte 6).
+ROUTE_EXPERT_SHIFT = 48
+
+
 @dataclasses.dataclass(frozen=True)
 class _CopyInfo:
     """Per-route order and count-minus-one, packed into two eight-bit fields."""
@@ -949,7 +953,13 @@ class _DedupMetadataPushRouter(KernelComponent):
                 destination_shift = push_destination_base[expert] - expert_base[expert]
                 peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), expert // Int32(self.experts_per_rank), Int64(0))
             destination_position = source_position + destination_shift
-            stg_b64(destination_metadata_base + peer_offset + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes), metadata)
+            # The destination's local expert rides in the record's spare byte (bits 48..55, unused by the 8-bit
+            # NVLink record): the combine maps a copy's pool row to its token tile (``_wait_block_copies``).
+            local_expert_bits = (Int64(expert) % Int64(self.experts_per_rank)) << Int64(ROUTE_EXPERT_SHIFT)
+            stg_b64(
+                destination_metadata_base + peer_offset + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes),
+                metadata | local_expert_bits,
+            )
             if cutlass.const_expr(self.carry_topk_scores):
                 score = cute.arch.load(source_scores + source_position, cutlass.Float32)
                 stg_f32(destination_scores_base + peer_offset + Int64(destination_position) * Int64(4), score)
@@ -2635,78 +2645,44 @@ class TokenCommDedup(KernelComponent):
         pool_expert_bases: cute.Tensor,
     ) -> None:
         """Last copy of a block with 1 < cnt < K: wait until the (expert, token tile) of every copy has finished
-        FC2, lane j for copy j (lane cnt - 1 for this copy). Copy j < cnt - 1 is found through mailbox word j (its
-        pool row, written by the dispatch this launch); a value is used only if that row lies in an earlier
-        expert's pool this launch and its metadata names this block and order j, otherwise the word is re-read
-        (the dispatch of copy j has not run yet). A tile is done when its FC1-done counter holds every FC1 and FC2
-        completion of the tile. Loads are issued lane-parallel: mailbox, metadata, counters."""
+        FC2; lane j < cnt - 1 handles copy j, lane cnt - 1 this copy. Copy j's pool row comes from mailbox word j
+        (written by the dispatch this launch). A row is used only if it lies in its record's expert's pool this
+        launch (so the record is this launch's), that expert precedes ``local_expert`` and the record names this
+        block and order j; otherwise the word is re-read (copy j's dispatch has not run yet). The tile of a row
+        = the expert's first slot (sum of the earlier experts' tiles) + row offset / tile rows. A tile is done when
+        its FC1-done counter holds every FC1 and FC2 completion."""
         lane_idx = self._lane_idx
-        expert_rounds: cutlass.Constexpr[int] = ceil_div(self.experts_per_rank, 32)
         slot_tokens = Int32(self.tokens_per_fc1_ready_slot)
         tile_done_target = Int32(self.fc1_done_signals_per_token_tile + self.fc2_done_signals_per_token_tile)
         other_copies = metadata.dst_token_cnt - Int32(1)
-        lane_slot = own_slot  # lanes >= cnt - 1: this copy's own tile
-        # Expert tables of the experts before local_expert, lane l of round r = expert 32 r + l: pool rows
-        # [begin, end) and first slot (built here, on the slow path only).
-        lane_pool_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
-        lane_pool_end = cute.make_rmem_tensor((expert_rounds,), Int32)
-        lane_slot_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
-        slot_carry = Int32(0)
-        for expert_round in cutlass.range_constexpr(expert_rounds):
-            round_expert = Int32(expert_round * 32) + lane_idx
-            round_begin = Int32(0)
-            round_size = Int32(0)
-            if round_expert < local_expert:
-                round_begin = pool_expert_bases[round_expert]
-                round_size = owned_sizes[round_expert]
-            round_tiles = (round_size + slot_tokens - Int32(1)) // slot_tokens
-            inclusive_tiles = round_tiles
-            for step_log in cutlass.range_constexpr(5):
-                step = Int32(1 << step_log)
-                previous_tiles = Int32(cute.arch.shuffle_sync(inclusive_tiles, lane_idx - step))
-                if lane_idx >= step:
-                    inclusive_tiles = inclusive_tiles + previous_tiles
-            lane_pool_begin[expert_round] = round_begin
-            lane_pool_end[expert_round] = round_begin + round_size
-            lane_slot_begin[expert_round] = slot_carry + inclusive_tiles - round_tiles
-            slot_carry = slot_carry + Int32(cute.arch.shuffle_sync(inclusive_tiles, Int32(31)))
         mailbox = cute.make_ptr(
             Int32, block_address + Int64(self.copy_mailbox_offset), AddressSpace.gmem, assumed_align=4
         )
+        metadata_words = cute.make_ptr(Int64, token_metadata_pointer.toint(), AddressSpace.gmem, assumed_align=8)
         lane_found = Int32(lane_idx >= other_copies)
+        lane_expert = Int32(0)
+        lane_offset = Int32(0)  # row - the expert's first pool row
         wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
         spin_start_ns = globaltimer_ns()
         missing = Int32(cute.arch.vote_ballot_sync(lane_found == Int32(0)))
         while missing != Int32(0):
-            copy_row = Int32(-1)
             if lane_found == Int32(0):
                 copy_row = cute.arch.load(mailbox + lane_idx, Int32, sem="relaxed", scope="gpu")
-            # Expert of each lane's row: per copy, a ballot over the per-lane expert tables (registers only).
-            row_slot = Int32(-1)
-            for copy_idx in cutlass.range(other_copies, unroll=1):
-                candidate_row = Int32(cute.arch.shuffle_sync(copy_row, copy_idx))
-                for expert_round in cutlass.range_constexpr(expert_rounds):
-                    owns_row = (lane_pool_begin[expert_round] <= candidate_row) & (
-                        candidate_row < lane_pool_end[expert_round]
-                    )
-                    owner_mask = Int32(cute.arch.vote_ballot_sync(owns_row))
-                    if owner_mask != Int32(0):
-                        owner_lane = Int32(cute.arch.popc((owner_mask & (Int32(0) - owner_mask)) - Int32(1)))
-                        owner_begin = Int32(cute.arch.shuffle_sync(lane_pool_begin[expert_round], owner_lane))
-                        owner_slot_begin = Int32(cute.arch.shuffle_sync(lane_slot_begin[expert_round], owner_lane))
-                        if lane_idx == copy_idx:
-                            row_slot = owner_slot_begin + (candidate_row - owner_begin) // slot_tokens
-            if (lane_found == Int32(0)) and (row_slot >= Int32(0)):
-                copy_metadata = TokenSrcMetadata.load(
-                    token_metadata_pointer.toint() + Int64(copy_row) * Int64(TokenSrcMetadata.nbytes)
-                )
-                if (
-                    (copy_metadata.src_token == metadata.src_token)
-                    and (copy_metadata.src_rank == metadata.src_rank)
-                    and (copy_metadata.dst_order_id == lane_idx)
-                ):
-                    lane_found = Int32(1)
-                    lane_slot = row_slot
+                if (copy_row >= Int32(0)) and (copy_row < Int32(self.worst_case_token_count)):
+                    record = cute.arch.load(metadata_words + copy_row, Int64, scope="gpu")
+                    copy_metadata = TokenSrcMetadata.unpack(record)
+                    copy_expert = Int32((record >> Int64(ROUTE_EXPERT_SHIFT)) & Int64(0xFF))
+                    if (
+                        (copy_expert < local_expert)
+                        and (copy_metadata.src_token == metadata.src_token)
+                        and (copy_metadata.src_rank == metadata.src_rank)
+                        and (copy_metadata.dst_order_id == lane_idx)
+                    ):
+                        expert_begin = pool_expert_bases[copy_expert]
+                        if (copy_row >= expert_begin) and (copy_row < expert_begin + owned_sizes[copy_expert]):
+                            lane_found = Int32(1)
+                            lane_expert = copy_expert
+                            lane_offset = copy_row - expert_begin
             missing = Int32(cute.arch.vote_ballot_sync(lane_found == Int32(0)))
             if missing != Int32(0):
                 nanosleep(wait_sleep_ns)
@@ -2716,10 +2692,22 @@ class TokenCommDedup(KernelComponent):
                     print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
                     record=self._device_workspace.ptr(self._call_tail.record_region),
                 )
+        # Tile of copy j: first slot of its expert (warp sum over the earlier experts' tiles) + offset / tile rows.
+        lane_slot = own_slot
+        for copy_idx in cutlass.range(other_copies, unroll=1):
+            copy_expert = Int32(cute.arch.shuffle_sync(lane_expert, copy_idx))
+            earlier_tiles = Int32(0)
+            for expert_round in cutlass.range_constexpr(ceil_div(self.experts_per_rank, 32)):
+                round_expert = Int32(expert_round * 32) + lane_idx
+                if round_expert < copy_expert:
+                    earlier_tiles = earlier_tiles + (owned_sizes[round_expert] + slot_tokens - Int32(1)) // slot_tokens
+            for step_log in cutlass.range_constexpr(5):
+                earlier_tiles = earlier_tiles + Int32(cute.arch.shuffle_sync_bfly(earlier_tiles, offset=1 << step_log))
+            if lane_idx == copy_idx:
+                lane_slot = earlier_tiles + lane_offset // slot_tokens
         wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
         spin_start_ns = globaltimer_ns()
-        lane_waits = Int32(lane_idx <= other_copies)
-        lane_done = Int32(1) - lane_waits
+        lane_done = Int32(lane_idx > other_copies)
         pending = Int32(1)
         while pending != Int32(0):
             if lane_done == Int32(0):
