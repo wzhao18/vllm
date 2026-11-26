@@ -32,7 +32,9 @@ class _MockEplbCommunicator(EplbCommunicator):
     ) -> None:
         self.recv_calls.append((tensors, src_rank, expert_id))
 
-    def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+    def set_transfer_context(
+        self, old_indices: np.ndarray, layer_idx: int, recv_rows=None
+    ) -> None:
         self.context_calls += 1
 
     def execute(self) -> None:
