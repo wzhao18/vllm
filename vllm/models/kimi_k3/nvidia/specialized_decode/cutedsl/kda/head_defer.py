@@ -18,6 +18,7 @@ fold), so no CTA still reads them. Everything else is the stock heads' code.
 
 import cutlass
 import cutlass.cute as cute
+from ..common import diagstamp as ds
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
@@ -554,6 +555,11 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         request, block = rank // KDA_CTAS, rank % KDA_CTAS  # this CTA's KDA role
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        # DIAG (KDA-S1): kt 0 (tid 128) entry / warp 1 (tid 32) PDL wait stamps, CTA key head * CLUSTER + rank
+        dbase, dctr = ds.buffer("kdaexp", 0)
+        saddr = ds.begin(dbase, dctr, head * CLUSTER + rank, tid == 128)
+        wbase, wctr = ds.buffer("kdaexpw1", 0)
+        waddr = ds.begin(wbase, wctr, head * CLUSTER + rank, tid == 32)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles)
@@ -633,6 +639,8 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                cute.arch.griddepcontrol_wait()
+                ds.stamp(waddr, 1)  # PDL wait return (warp 1)
                 self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                 if cutlass.const_expr(self.polled_out):  # after the PDL wait above
                     self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
@@ -661,6 +669,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
+            ds.stamp(saddr, 5)  # in-proj partials pushed
             if cutlass.const_expr(self.rows_total == CLUSTER):  # one row per CTA
                 wait(bar_in)
                 self.round_owned(kt, x_in, mine)
@@ -687,6 +696,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                 if rank < self.rows_total:
                     owned = (mine, shared_o, bar_out, output, norm_w, accepted)
                     self.owned_norm(kt, owned, slots, head, rank, eps)
+        ds.stamp(saddr, 6)  # before the exit barrier
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
 
