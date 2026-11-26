@@ -225,6 +225,9 @@ class KdaHeadVerify(KdaHeadWide):
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 if cutlass.const_expr(staged):
+                    if cutlass.const_expr(self.warp1_weights):  # pre-wait weights
+                        w_args = (bar_full, bar_empty, sA, a_map, row0, *tiles)
+                        self.weight_warp(*w_args, 1)
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                 else:
                     self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
