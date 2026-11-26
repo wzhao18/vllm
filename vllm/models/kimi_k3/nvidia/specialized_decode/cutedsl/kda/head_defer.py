@@ -391,21 +391,28 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 for t in cutlass.range_constexpr(T):
                     inputs[3 * t + 2] = raw_v[t * ROWS + kt]
             gate_owned = raw_g[kt]
-            for t in cutlass.range_constexpr(T):  # window: 3 taps, then the inputs
-                for s in cutlass.range_constexpr(3):
-                    for i in cutlass.range_constexpr(4):
-                        w = t + i
-                        term = taps[s, w] if w < 3 else inputs[3 * (w - 3) + s]
-                        cf = Float32(coeff[s, i])
-                        acc = accum[3 * t + s]
-                        accum[3 * t + s] = fma(Float32(term), cf, acc)
-            # KDA CTA r activates and normalizes only token r's Q / K channels (the
-            # same operations as for every token before) and all-gathers them to the
-            # eight KDA CTAs; its V rows stay local (threads kt < 16, every token).
-            pre_q, pre_k = accum[0], accum[1]
-            for t in cutlass.range_constexpr(1, T):
-                pre_q = Float32(cutlass.select_(rank == t, accum[3 * t], pre_q))
-                pre_k = Float32(cutlass.select_(rank == t, accum[3 * t + 1], pre_k))
+            for t in cutlass.range_constexpr(T):  # V: window of 3 taps, then the inputs
+                for i in cutlass.range_constexpr(4):
+                    w = t + i
+                    term = taps[2, w] if w < 3 else inputs[3 * (w - 3) + 2]
+                    cf = Float32(coeff[2, i])
+                    accum[3 * t + 2] = fma(Float32(term), cf, accum[3 * t + 2])
+            # KDA CTA r activates and normalizes only token r's Q / K channels and
+            # all-gathers them to the eight KDA CTAs (its V rows stay local: threads
+            # kt < 16, every token), so only token r's Q / K windows are convolved:
+            # taps / hop-2 inputs at positions r .. r + 3, the same fma chain from the
+            # bias as for every token (the bias is equal for every token).
+            pre = [accum[0], accum[1]]
+            for s in cutlass.range_constexpr(2):
+                tap0, tap1, tap2 = (Float32(taps[s, j]) for j in range(3))
+                for i in cutlass.range_constexpr(4):
+                    w = rank + i
+                    tap = cutlass.select_(w == 0, tap0, cutlass.select_(w == 1, tap1, tap2))
+                    position = Int32(cutlass.select_(w >= 3, w - 3, Int32(0)))
+                    x_in = Float32(raw_qk[(s * T + position) * 128 + kt])
+                    term = Float32(cutlass.select_(w < 3, Float32(tap), x_in))
+                    pre[s] = fma(term, Float32(coeff[s, i]), pre[s])
+            pre_q, pre_k = pre[0], pre[1]
             if kt < ROWS:  # V pre-activations; thread kt activates (row kt % 16, token
                 for t in cutlass.range_constexpr(T):  # kt // 16) after the barrier
                     shared_v[t * ROWS + kt] = accum[3 * t + 2]
