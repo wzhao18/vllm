@@ -111,6 +111,7 @@ __global__ void __launch_bounds__(32, 1) tlx_push_kernel(
   const int64_t n1 = a.cum[a.n];                     // 1D chunks per destination
   const int64_t n2 = a.o_rows > 0 ? a.o_rows / 8 : 0;  // 2D units per destination (8 rows each)
   const int64_t total = (n1 + n2) * W;
+  if (total == 0) return;  // the init-time load launch: no completion, no epoch
   const int64_t n = g < total ? (total - g + G - 1) / G : 0;
   // Staging-free guard: destination d released as many DSA layers as this rank pushed (local words, written by d).
   const uint32_t epoch = *(volatile uint32_t*)pushed;
