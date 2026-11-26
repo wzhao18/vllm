@@ -2992,17 +2992,6 @@ class KimiLinearForCausalLM(
         self.num_routed_experts = first.num_logical_experts
         self.num_redundant_experts = first.num_redundant_experts
 
-    def eplb_weights_moved(self) -> None:
-        """After EPLB rewrote expert rows: staged (expanded) NVFP4 scale slots are
-        stale; the next forward re-expands every layer from the moved compact planes."""
-        stagings = {
-            id(m.scale_staging): m.scale_staging
-            for m in self.moe_layers
-            if getattr(m, "scale_staging", None) is not None
-        }
-        for staging in stagings.values():
-            staging.invalidate()
-
     def eplb_symmetric_scratch(self):
         """EPLB staging scratch: the largest idle span of the Rubin MegaMoE
         runtimes' symmetric arenas (the routed-expert workspace, idle between
