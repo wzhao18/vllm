@@ -59,6 +59,8 @@ from vllm.v1.attention.ops.shardq import (
     _SymmBuffer,
     fold_split,
     make_shardq_split,
+    token_local_ok,
+    token_local_request_rows,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -796,6 +798,7 @@ def _rank_chunk_specs(
     max_logits_elems: int,
     world: int,
     rank: int,
+    token_local: tuple[int, int] | None = None,
 ) -> list[tuple[slice, slice]]:
     """This rank's indexer chunks of prefill requests ``seq_lens`` /
     ``query_lens``: (request slice, query-token slice of those requests).
@@ -815,14 +818,23 @@ def _rank_chunk_specs(
     and the top-k and logits launches pay per call). The rows scored, hence
     the top-k, are unchanged.
     """
-    rows = [fold_split(np.array([0, int(q)]), world) for q in query_lens]
+    if token_local is not None:
+        # (first token of these requests in the step, step tokens per rank)
+        first, rows_per_rank = token_local
+        starts = first + np.concatenate(([0], np.cumsum(query_lens))).astype(np.int64)
+        rows = token_local_request_rows(starts, rows_per_rank, world)
+    else:
+        rows = [fold_split(np.array([0, int(q)]), world) for q in query_lens]
     n = len(seq_lens)
     out: list[tuple[slice, slice]] = []
     i = 0
     while i < n:
         start, chunk_rows, keys, width = i, np.zeros(world, np.int64), 0, 0
         while i < n:
-            new_rows = chunk_rows + _rank_query_rows(int(query_lens[i]), world)
+            if token_local is not None:
+                new_rows = chunk_rows + np.array([len(x) for x in rows[i]], np.int64)
+            else:
+                new_rows = chunk_rows + _rank_query_rows(int(query_lens[i]), world)
             new_width = max(width, _logits_width(int(seq_lens[i])))
             new_keys = keys + int(seq_lens[i])
             padded = round_up(int(new_rows.max()), _LOGITS_ROW_ALIGN)
@@ -870,6 +882,7 @@ def build_dcp_shardq_context(
     rank: int,
     device: torch.device,
     num_decodes: int = 0,
+    token_local: bool = False,
 ) -> DcpShardQContext | None:
     """The context plan of a step's prefill rows (its requests from
     ``num_decodes`` on) on DCP rank ``rank`` of ``world``. When their context
@@ -939,6 +952,9 @@ def build_dcp_shardq_context(
             max_logits_elems,
             world,
             rank,
+            (int(qsl[g_lo] - qsl[0]), int(qsl[-1] - qsl[0]) // world)
+            if token_local
+            else None,
         )
         chunks = [
             build_prefill_chunk_metadata(
@@ -1188,6 +1204,7 @@ class DcpShardQPlanner:
             return None
         num_decodes = int(is_prefill.argmax())
         num_prefill_tokens = num_tokens - int(qsl[num_decodes])
+        token_local = token_local_ok(num_prefill_tokens, self.world, int(qsl[num_decodes]))
         context = None
         if qsl[-1] != num_tokens or query_lens.min() == 0:
             path = PADDED
@@ -1206,6 +1223,7 @@ class DcpShardQPlanner:
                 self.rank,
                 self.device,
                 num_decodes,
+                token_local,
             )
             path = SHARDQ if context is not None else WORKSPACE
         self.stats.record(path, num_prefill_tokens)
@@ -1221,7 +1239,11 @@ class DcpShardQPlanner:
                 )
             return None
         split = make_shardq_split(
-            qsl[num_decodes:] - qsl[num_decodes], self.world, self.rank, self.device
+            qsl[num_decodes:] - qsl[num_decodes],
+            self.world,
+            self.rank,
+            self.device,
+            token_local=token_local,
         )
         if len(context.groups) > 1:
             # The split lists this rank's tokens in request order (each

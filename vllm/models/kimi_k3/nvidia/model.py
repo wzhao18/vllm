@@ -137,6 +137,7 @@ from vllm.models.kimi_k3.nvidia.ops import (
     sp_local_aux,
 )
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
+from vllm.models.kimi_k3.nvidia.ops import tlx_dsa
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_dielocal as prefill_attn_res_dielocal,
 )
@@ -2046,7 +2047,16 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             dsa_dp.rec(evs)
             return hidden_states, prefix_sum, residual
-        if sp_mxfp8:
+        # TLX-S (ops/tlx_dsa.py): a token-local step's DSA layer keeps this
+        # rank's own rows end to end (no gather before, no reduce-scatter after).
+        tlx = (
+            self.use_sequence_parallel
+            and self._layer_kind == "dsa"
+            and tlx_dsa.step_token_local(self.self_attn)
+        )
+        if tlx:
+            M = None
+        elif sp_mxfp8:
             M = positions.shape[0]
             hidden_states = sp_ag.kimi_sp_all_gather_mxfp8(hidden_states, M)
         elif self.use_sequence_parallel:
@@ -2089,6 +2099,9 @@ class KimiDecoderLayer(nn.Module):
                 hidden_states = out
             else:
                 hidden_states = self._run_dsa_dp(positions, hidden_states)
+        elif tlx:
+            assert not resid_attn
+            hidden_states = self.self_attn.forward_tlx(hidden_states)
         else:
             hidden_states = self._run_self_attn(
                 positions,
@@ -2566,6 +2579,25 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _tlx_step(self) -> bool:
+        """Whether this forward runs its DSA layers token-local (TLX-S). The
+        first forward (the profile run, all ranks) enables TLX-S when every
+        DSA layer and the SP all-gather buffer support it."""
+        from vllm.models.kimi_k3.nvidia.ops import tlx_dsa
+
+        dsa = getattr(self, "_tlx_dsa", None)
+        if dsa is None:
+            dsa = [
+                layer.self_attn
+                for layer in self.layers[self.start_layer : self.end_layer]
+                if getattr(layer, "_layer_kind", "") == "dsa"
+                and not getattr(layer, "_dsa_dp", False)
+                and hasattr(layer.self_attn, "forward_tlx")
+            ]
+            self._tlx_dsa = dsa if tlx_dsa.enable(dsa) else []
+            dsa = self._tlx_dsa
+        return bool(dsa) and tlx_dsa.step_token_local(dsa[0])
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -2598,10 +2630,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
+            # TLX-S (ops/tlx_dsa.py): a token-local step's DSA layers gather
+            # nothing.
+            tlx_step = self._tlx_step()
             # One decoder-layer SP all-gather per layer: their buffer slots.
             sp_ag.begin_forward(
                 sum(
                     not getattr(layer, "_dsa_scatter", False)
+                    and not (tlx_step and getattr(layer, "_layer_kind", "") == "dsa")
                     for layer in self.layers[self.start_layer : self.end_layer]
                 )
             )

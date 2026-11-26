@@ -52,6 +52,11 @@ class ShardQSplit:
     # Destination rank and position there of each ``rank_order`` row.
     row_peer: torch.Tensor
     row_pos: torch.Tensor
+    # Token-local split (TLX-S, Kimi K3.1 DSA): rank r owns the contiguous
+    # sequence-parallel shard [r T / tp, (r + 1) T / tp) of the step's tokens
+    # (its own SP rows), and the layer computes its query with all heads and
+    # its output projection token-locally: no query / output exchange.
+    token_local: bool = False
     # Symmetric-memory (source offsets, destination addresses) per exchange,
     # built once per step and shape.
     sm_rows: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = field(
@@ -80,10 +85,60 @@ def fold_split(query_start_loc: np.ndarray, world: int) -> list[np.ndarray]:
     return out
 
 
+# Rows per rank from which a step may take the token-local split; set by a
+# model that implements the token-local layer (Kimi K3.1 DSA TLX-S,
+# ``kimi_k3.nvidia.ops.tlx_dsa``) when its buffers fit, else None (never).
+TOKEN_LOCAL_MIN_ROWS: int | None = None
+
+
+def token_local_ok(num_tokens: int, world: int, num_decode_tokens: int) -> bool:
+    """A prefill-only step of ``num_tokens`` rows takes the token-local split:
+    whole SP shards of at least ``TOKEN_LOCAL_MIN_ROWS`` rows per rank."""
+    return (
+        TOKEN_LOCAL_MIN_ROWS is not None
+        and num_decode_tokens == 0
+        and num_tokens % world == 0
+        and num_tokens // world >= TOKEN_LOCAL_MIN_ROWS
+    )
+
+
+def sp_split(num_tokens: int, world: int) -> list[np.ndarray]:
+    """Each rank's token ids under the token-local split: its SP shard."""
+    rows = num_tokens // world
+    return [np.arange(r * rows, (r + 1) * rows, dtype=np.int64) for r in range(world)]
+
+
+def token_local_request_rows(
+    starts: np.ndarray, rows_per_rank: int, world: int
+) -> list[list[np.ndarray]]:
+    """Under the token-local split: for requests at global token bounds
+    ``starts`` ([n + 1]), each rank's rows of each request, relative to the
+    request's first token."""
+    out = []
+    for a, b in zip(starts[:-1].tolist(), starts[1:].tolist()):
+        out.append(
+            [
+                np.arange(
+                    max(a, r * rows_per_rank), min(b, (r + 1) * rows_per_rank), dtype=np.int64
+                )
+                - a
+                for r in range(world)
+            ]
+        )
+    return out
+
+
 def make_shardq_split(
-    query_start_loc: np.ndarray, world: int, rank: int, device: torch.device
+    query_start_loc: np.ndarray,
+    world: int,
+    rank: int,
+    device: torch.device,
+    token_local: bool = False,
 ) -> ShardQSplit:
-    per_rank = fold_split(query_start_loc, world)
+    if token_local:
+        per_rank = sp_split(int(query_start_loc[-1]), world)
+    else:
+        per_rank = fold_split(query_start_loc, world)
     counts = [len(x) for x in per_rank]
     host = torch.from_numpy(
         np.stack(
@@ -107,6 +162,7 @@ def make_shardq_split(
         local_idx_cpu=per_rank[rank],
         row_peer=row_peer,
         row_pos=row_pos,
+        token_local=token_local,
     )
 
 

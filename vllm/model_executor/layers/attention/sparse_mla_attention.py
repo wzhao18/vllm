@@ -1353,11 +1353,16 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         shardq = attn_metadata.shardq
         assert shardq is not None and shardq.gathered_context is not None
         split = shardq.split
-        num_heads = split.world * q.shape[1]
+        # Token-local split (TLX-S): ``q`` is already this rank's rows with all
+        # heads, and the value stays token-local (no exchanges).
+        num_heads = q.shape[1] if split.token_local else split.world * q.shape[1]
         nope, lora = w_uk_t.shape[1], w_uk_t.shape[2]
         assert w_uk_t.shape[0] == num_heads and w_uv.shape[:2] == (num_heads, lora)
-        # [T_rank, H, P + R], the exchange buffer.
-        q = shard_q(q, split)
+        if split.token_local:
+            assert q.shape[0] == split.num_local, (q.shape, split.num_local)
+        else:
+            # [T_rank, H, P + R], the exchange buffer.
+            q = shard_q(q, split)
         num_local = q.shape[0]
         ql_nope = q.new_empty((num_local, num_heads, lora))
         torch.bmm(q[..., :nope].transpose(0, 1), w_uk_t, out=ql_nope.transpose(0, 1))
@@ -1369,6 +1374,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         value = out.new_empty((num_local, num_heads, w_uv.shape[2]))
         torch.bmm(out[:, :num_heads].transpose(0, 1), w_uv, out=value.transpose(0, 1))
         del out
+        if split.token_local:
+            return value
         return unshard_out(value, split)
 
     def _forward_mqa_kernel(

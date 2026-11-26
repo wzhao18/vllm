@@ -967,6 +967,135 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
 
+    def forward_tlx(
+        self, q: torch.Tensor, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
+    ) -> torch.Tensor:
+        """A token-local ShardQ step (TLX-S, ``ShardQSplit.token_local``):
+        ``q`` [R, H, P + R_pe] is this rank's own rows' query with all heads,
+        ``kv_c_normed`` / ``k_pe`` the step's new rows of every rank ([T, L] /
+        [T, 1, R_pe], as the replicated projections give them today). The new
+        rows go into the local cache and the workspace as in ``forward``; the
+        rank's rows then run W_UK, the sparse MQA and W_UV with all heads (the
+        body of ``forward_mqa_shardq_proj`` without its two exchanges).
+        Returns the value [R, H * V]. Eager only (as the ShardQ attention)."""
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata[self.layer_name]  # type: ignore[index]
+        shardq = getattr(attn_metadata, "shardq", None)
+        if (
+            not self.use_shardq
+            or shardq is None
+            or shardq.gathered_context is None
+            or not shardq.split.token_local
+            or shardq.num_decode_tokens
+            or self.W_UK_T_shardq is None
+            or self.W_UV_shardq is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError("MLA forward_tlx: not a token-local DCP ShardQ step")
+        slot_mapping = forward_context.slot_mapping
+        assert isinstance(slot_mapping, dict)
+        kv_cache = self.kv_cache
+        self.prepare_kv_cache_update(attn_metadata)
+        self.update_kv_cache(
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping.get(self.layer_name),
+            attn_metadata,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+        if is_quantized_kv_cache(self.kv_cache_dtype) and self.kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+        ):
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        num_actual_toks = attn_metadata.num_actual_tokens
+        self._shardq_insert_new_rows(
+            kv_c_normed[:num_actual_toks],
+            k_pe[:num_actual_toks],
+            kv_cache,
+            attn_metadata,
+            shardq.gathered_context,
+            num_actual_toks,
+        )
+        value = self.impl.forward_mqa_shardq_proj(  # type: ignore[attr-defined]
+            q,
+            self.W_UK_T_shardq,
+            self.W_UV_shardq,
+            self._q_scale,
+            kv_cache,
+            attn_metadata,
+            self,
+        )
+        return value.view(q.shape[0], -1)
+
+    def _shardq_insert_new_rows(
+        self,
+        k_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
+        gathered_context: Any,
+        num_actual_toks: int,
+    ) -> None:
+        """A DCP ShardQ step: the step's new MLA rows into the local cache
+        (owned rows) and the gathered-context workspace (all rows)."""
+        # A DCP ShardQ step's prefill rows attend a gathered copy of their
+        # context, which still lacks the step's tokens; every rank holds
+        # all of them.
+        num_dcp_decode_tokens = gathered_context.num_decode_tokens
+
+        def write_new_tokens(lo: int, hi: int) -> None:
+            # Prefill tokens [lo, hi) (relative to the first one) into
+            # the workspace, which must hold their request group.
+            first = num_dcp_decode_tokens
+            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                k_c_normed[first + lo : first + hi],
+                k_pe[first + lo : first + hi],
+                gathered_context.mla_view(kv_cache),
+                gathered_context.mla_slot_mapping[lo:hi],
+                self.kv_cache_dtype,
+                self._k_scale,
+            )
+
+        if (
+            self._shardq_fused_kv_insert(
+                k_c_normed, k_pe, kv_cache, attn_metadata
+            )
+            is not None
+        ):
+            # The local cache rows (update_kv_cache skipped them) and the
+            # workspace rows of the new tokens, in one kernel.
+            from vllm.v1.attention.ops.dcp_shardq.kv_insert import (
+                shardq_kv_insert,
+            )
+
+            # The slot mapping update_kv_cache left for this write (else
+            # the step's, of this layer's KV cache group).
+            local_slots = self._shardq_local_slots
+            self._shardq_local_slots = None
+            if local_slots is None:
+                local_slots = attn_metadata.slot_mapping
+            local_slots = local_slots[: min(local_slots.numel(), num_actual_toks)]
+            shardq_kv_insert(
+                k_c_normed[: local_slots.numel()],
+                k_pe[: local_slots.numel()],
+                self._k_scale,
+                kv_cache,
+                local_slots,
+                gathered_context.mla_view(kv_cache),
+                gathered_context.mla_slot_mapping,
+                num_dcp_decode_tokens,
+            )
+            gathered_context.write_new_tokens = None
+        elif gathered_context.num_groups == 1:
+            write_new_tokens(0, int(gathered_context.mla_slot_mapping.shape[0]))
+            gathered_context.write_new_tokens = None
+        else:
+            # Each group's tokens land while the attention holds it.
+            gathered_context.write_new_tokens = write_new_tokens
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1126,60 +1255,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         shardq = getattr(attn_metadata, "shardq", None) if self.use_shardq else None
         gathered_context = getattr(shardq, "gathered_context", None)
         if gathered_context is not None:
-            # A DCP ShardQ step's prefill rows attend a gathered copy of their
-            # context, which still lacks the step's tokens; every rank holds
-            # all of them.
-            num_dcp_decode_tokens = gathered_context.num_decode_tokens
-
-            def write_new_tokens(lo: int, hi: int) -> None:
-                # Prefill tokens [lo, hi) (relative to the first one) into
-                # the workspace, which must hold their request group.
-                first = num_dcp_decode_tokens
-                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                    k_c_normed[first + lo : first + hi],
-                    k_pe[first + lo : first + hi],
-                    gathered_context.mla_view(kv_cache),
-                    gathered_context.mla_slot_mapping[lo:hi],
-                    self.kv_cache_dtype,
-                    self._k_scale,
-                )
-
-            if (
-                self._shardq_fused_kv_insert(
-                    k_c_normed, k_pe, kv_cache, attn_metadata
-                )
-                is not None
-            ):
-                # The local cache rows (update_kv_cache skipped them) and the
-                # workspace rows of the new tokens, in one kernel.
-                from vllm.v1.attention.ops.dcp_shardq.kv_insert import (
-                    shardq_kv_insert,
-                )
-
-                # The slot mapping update_kv_cache left for this write (else
-                # the step's, of this layer's KV cache group).
-                local_slots = self._shardq_local_slots
-                self._shardq_local_slots = None
-                if local_slots is None:
-                    local_slots = attn_metadata.slot_mapping
-                local_slots = local_slots[: min(local_slots.numel(), num_actual_toks)]
-                shardq_kv_insert(
-                    k_c_normed[: local_slots.numel()],
-                    k_pe[: local_slots.numel()],
-                    self._k_scale,
-                    kv_cache,
-                    local_slots,
-                    gathered_context.mla_view(kv_cache),
-                    gathered_context.mla_slot_mapping,
-                    num_dcp_decode_tokens,
-                )
-                gathered_context.write_new_tokens = None
-            elif gathered_context.num_groups == 1:
-                write_new_tokens(0, int(gathered_context.mla_slot_mapping.shape[0]))
-                gathered_context.write_new_tokens = None
-            else:
-                # Each group's tokens land while the attention holds it.
-                gathered_context.write_new_tokens = write_new_tokens
+            self._shardq_insert_new_rows(
+                k_c_normed, k_pe, kv_cache, attn_metadata, gathered_context, num_actual_toks
+            )
 
         mha_use_quant_output = (
             quant_key is not None
