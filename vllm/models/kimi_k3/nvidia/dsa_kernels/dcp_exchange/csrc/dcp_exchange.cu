@@ -99,10 +99,6 @@ static __device__ unsigned int g_spin_printed;  // one timeout line per process 
 __device__ __forceinline__ void spin_fail(int* err, int code) {
   atomicCAS(err, 0, code);
   __threadfence_system();
-#ifdef K31_DCPX_DEBUG_PRINT
-  // debug builds: record the code (python check() raises) and continue (no trap)
-  printf("k31dcpx error %d block (%d,%d) thread %d\n", code, blockIdx.x, blockIdx.y, threadIdx.x);
-#else
   // the trap ends the context before the host can read err: name the kernel family,
   // the code (the wait site) and the SM first (K31_SPIN_TIMEOUT, as k31_spin_guard.cuh)
   if (atomicCAS(&g_spin_printed, 0u, 1u) == 0u) {
@@ -112,7 +108,6 @@ __device__ __forceinline__ void spin_fail(int* err, int code) {
            sm, (int)blockIdx.x, (int)blockIdx.y, (int)threadIdx.x);
   }
   __trap();
-#endif
 }
 
 // ------------------------------------------------------------------ memory ops

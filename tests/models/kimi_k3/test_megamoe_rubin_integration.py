@@ -868,6 +868,8 @@ def test_nvfp4_parameters_and_dummy_values(ep, small_bucket):
             top_k=16, max_num_tokens=64,
         )  # fmt: skip
     assert big.quant_kind == "nvfp4" and big.problem.quant_kind == "nvfp4"
+    # K3.1 (top-16, SiTU 4 / 25, rsf 1): stock's wire scale, never FlashInfer's 1.0.
+    assert (big.problem.input_norm_const, big.problem.fc1_norm_const) == (1.0, 16.0)
     assert _params(big) == {
         "w13_weight": ((56, 6144, 1792), torch.uint8),
         "w13_weight_scale": ((56, 6144, 224), torch.float8_e4m3fn),
@@ -912,8 +914,10 @@ def test_nvfp4_load_and_process(monkeypatch, ep, small_bucket):
         )
 
     class Runtime:
-        def prepare_nvfp4_checkpoint_weights(self, *tensors):
-            return W.prepare_nvfp4_checkpoint_weights(*tensors, hidden=128, intermediate=128)
+        def prepare_nvfp4_checkpoint_weights(self, *tensors, fc1_norm_const):
+            return W.prepare_nvfp4_checkpoint_weights(
+                *tensors, hidden=128, intermediate=128, fc1_norm_const=fc1_norm_const
+            )
 
     monkeypatch.setattr(module, "get_runtime", lambda: Runtime())
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op, group: None)
@@ -921,23 +925,30 @@ def test_nvfp4_load_and_process(monkeypatch, ep, small_bucket):
     module.process_weights_after_loading()
     w = module.kernel_weights
     W.validate_kernel_weights(w, quant_kind="nvfp4", experts=4, hidden=128, intermediate=128)
+    # Unit input scales: FC1 input global scale 1; the wire takes the derived
+    # fc1_norm_const (top-2 here: 2), folded exactly into fc2_alpha.
+    n = module.problem.fc1_norm_const
+    assert n == C.nvfp4_fc1_norm_const(top_k=2, situ_beta=4.0, situ_linear_beta=25.0)
+    assert n == 2.0
     assert torch.equal(w.fc1_alpha, expect_fc1)
-    assert torch.equal(w.fc2_alpha, torch.full((4,), 2.0**-12))
+    assert torch.equal(w.fc1_norm_const, torch.full((4,), n))
+    assert torch.equal(w.fc2_alpha, torch.full((4,), 2.0**-12 / n))
     assert all(p.numel() == 0 for p in module.parameters())
     assert len(module.get_expert_weights()) == 7
 
 
 @pytest.mark.parametrize("case", ["gate_up_scale_2", "input_scale"])
 def test_nvfp4_refuses_math_it_cannot_run(monkeypatch, ep, small_bucket, case):
-    """Unequal w1 / w3 weight_scale_2 or non-unit input scales raise on every rank
-    instead of loading a different computation."""
+    """Unequal w1 / w3 weight_scale_2, or an FC1 input scale other than the layer's
+    one staging scale, raise on every rank instead of loading a different
+    computation."""
     ep.world_size, ep.rank_in_group = 2, 0
     module = _nvfp4_experts(_vllm_config(), ep=ep)
     shards = _nvfp4_shards(torch.Generator().manual_seed(5))
     if case == "gate_up_scale_2":
         shards[2, "w3", "weight_scale_2"] = torch.tensor(2.0**-9)
     else:
-        shards[1, "w2", "input_scale"] = torch.tensor(0.5)
+        shards[1, "w1", "input_scale"] = torch.tensor(0.5)
     _load_through_mapping(module, shards)
     monkeypatch.setattr(module, "get_runtime", lambda: object())
     reduced = []
@@ -948,6 +959,30 @@ def test_nvfp4_refuses_math_it_cannot_run(monkeypatch, ep, small_bucket, case):
     with pytest.raises(err, match="weight_scale_2|input_scale"):
         module.process_weights_after_loading()
     assert reduced == [0] and module.kernel_weights is None
+
+
+def test_nvfp4_w2_input_scale_sets_wire_norm(monkeypatch, ep, small_bucket):
+    """A calibrated w2_input_scale (stock a2_gscale = 1 / w2_input_scale) gives that
+    expert its own fc1_norm_const and fc2_alpha = weight_scale_2 / fc1_norm_const."""
+    ep.world_size, ep.rank_in_group = 2, 0
+    module = _nvfp4_experts(_vllm_config(), ep=ep)
+    shards = _nvfp4_shards(torch.Generator().manual_seed(6))
+    shards[1, "w2", "input_scale"] = torch.tensor(0.5)
+    _load_through_mapping(module, shards)
+
+    class Runtime:
+        def prepare_nvfp4_checkpoint_weights(self, *tensors, fc1_norm_const):
+            return W.prepare_nvfp4_checkpoint_weights(
+                *tensors, hidden=128, intermediate=128, fc1_norm_const=fc1_norm_const
+            )
+
+    monkeypatch.setattr(module, "get_runtime", lambda: Runtime())
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op, group: None)
+    module.process_weights_after_loading()
+    w = module.kernel_weights
+    # top-2, SiTU (4, 25): g = 1 -> min(2, 26.9) = 2; g = 2 -> min(4, 26.9) = 4.
+    assert w.fc1_norm_const.tolist() == [2.0, 4.0, 2.0, 2.0]
+    assert torch.equal(w.fc2_alpha, 2.0**-12 / w.fc1_norm_const)
 
 
 def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
@@ -962,9 +997,9 @@ def test_nvfp4_compact_scales_wiring(monkeypatch, ep, small_bucket):
     seen = []
 
     class Runtime:
-        def prepare_nvfp4_checkpoint_weights(self, *tensors):
+        def prepare_nvfp4_checkpoint_weights(self, *tensors, fc1_norm_const):
             return W.prepare_nvfp4_checkpoint_weights(
-                *tensors, hidden=128, intermediate=128
+                *tensors, hidden=128, intermediate=128, fc1_norm_const=fc1_norm_const
             )
 
         def forward(self, hidden, ids, weights, kw, **_):

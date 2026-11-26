@@ -668,13 +668,15 @@ def test_query_overlap_kernels(batch, fp8):
     assert torch.equal(q_c.view(torch.int16), serial[1].view(torch.int16))
 
 
+@pytest.mark.parametrize("sms", [1, 0], ids=["passes", "device"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["ds", "fp8"])
 @pytest.mark.parametrize("batch", [1, 60])
-def test_query_wait_polls_mailbox(batch, fp8):
+def test_query_wait_polls_mailbox(batch, fp8, sms):
     """QueryWait (the DCP q mailbox poll the query overlap moves off MlaQuery)
     returns only once every published chunk of the gathered heads (DCP8 x 12 in
     rows of 128) of the batch's tokens is not the sentinel, and reads nothing
-    past them."""
+    past them: over one CTA (several poll passes) or the device's SMs (one pass,
+    as PreparedDsa sizes it)."""
     import time
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
@@ -687,7 +689,8 @@ def test_query_wait_polls_mailbox(batch, fp8):
 
     dev, q_heads, gathered = "cuda", 128, 8 * HEADS
     width = 576 if fp8 else 1152
-    wait = compile_wait(batch, HEADS, 8, q_heads, fp8)
+    sms = sms or torch.cuda.get_device_properties(dev).multi_processor_count
+    wait = compile_wait(batch, HEADS, 8, q_heads, fp8, 64, sms)
     mailbox = torch.full((64, q_heads, width), 0xFF, device=dev, dtype=torch.uint8)
     mailbox[:batch, :gathered] = 0x11
     mailbox[batch - 1, gathered - 1, -16:] = 0xFF  # the last published chunk
