@@ -38,16 +38,82 @@ from .head_verify import _smem, cute_ext, sm100_utils, utils
 from .head_multi import KdaHeadMulti
 from .head import store_bf16_canonical
 from .head_verify import KDA_CTAS, ROWS, KdaHeadVerify
-from .kernel import sigmoids
+from .kernel import KdaSplit, sigmoids
 from .verify_defer import DECAY_ROW, V_ROW, put_tag
 from .window import conv_put, conv_tap
 
 
 class HeadRecords:
-    """The record forms' shared pieces (``KdaHeadVerify``'s geometry: ``vkda``)."""
+    """The record forms' shared pieces (``KdaHeadVerify``'s geometry: ``vkda``).
+
+    The token loop runs ``LOOP_LANES`` lanes per state row: 16 lanes give each thread
+    rows ``group`` and ``group + 8`` (two passes) of 8 columns each, so the per-token
+    chain (decay, row dot, butterfly, update) is half as long per row and the two
+    rows interleave. The row dot sums the same FP32 products in a different order
+    than the 8-lane form (FP32 reassociation only; every other operation is the
+    same per element)."""
+
+    LOOP_LANES = 16
+
+    def loop_geometry(self):
+        """``vkda`` at ``LOOP_LANES`` lanes per row (rows / CTAs unchanged)."""
+        vk = self.vkda
+        if self.LOOP_LANES != vk.lanes_per_row:
+            schedule = (1, self.LOOP_LANES, 0, KDA_CTAS)
+            self.vkda = KdaSplit(
+                vk.heads, 1, 0, vk.has_bias, schedule, 1, vk.bf16_state
+            )
+            assert self.vkda.rows == ROWS
+            assert self.vkda.groups * self.vkda.passes == ROWS
 
     @cute.jit
-    def rolled_update_defer(self, history, ops, other, sources, t, group_lane, v_row, beta):
+    def state_rows(self, history, state_page, head, value_base, group, group_lane):
+        """The thread's rows ``group + groups * p`` of the state page -> history."""
+        vk = self.vkda
+        for p in cutlass.range_constexpr(vk.passes):
+            for j in cutlass.range_constexpr(vk.chunks):
+                column = 4 * (group_lane + vk.lanes_per_row * j)
+                pointer = at(state_page, head, value_base + group + vk.groups * p, column)
+                values = vk.load_state(pointer)
+                for e in cutlass.range_constexpr(4):
+                    history[p, j, e] = values[e]
+
+    @cute.jit
+    def store_checkpoint(self, history, state, slot, head, value_base, lanes):
+        """``KdaSplit.store_rows`` of every pass into state slot ``slot`` (if > 0)."""
+        vk = self.vkda
+        group, group_lane = lanes
+        page = state[Int64(slot), None, None, None]
+        for p in cutlass.range_constexpr(vk.passes):
+            for j in cutlass.range_constexpr(vk.chunks):
+                column = 4 * (group_lane + vk.lanes_per_row * j)
+                values = [history[p, j, e] for e in range(4)]
+                pointer = at(page, head, value_base + group + vk.groups * p, column)
+                vk.store_state(pointer, values, slot > 0)
+
+    @cute.jit
+    def query_dots(self, history, qr):
+        """``KdaSplit.update``'s query dot of every pass's row, row-reduced."""
+        vk = self.vkda
+        dots = [vk.row_dot(history, qr, p) for p in range(vk.passes)]
+        for shift in reversed(range(vk.lanes_per_row.bit_length() - 1)):
+            for p in range(vk.passes):
+                dots[p] += cute.arch.shuffle_sync_bfly(dots[p], 1 << shift)
+        return dots
+
+    @cute.jit
+    def loop_token(self, history, cur, other, sources, t, lanes, shared_v, beta):
+        """``rolled_update_defer`` of token t on every pass's row (v rows from
+        ``shared_v``)."""
+        vk = self.vkda
+        group, group_lane = lanes
+        v_rows = [shared_v[t * ROWS + group + vk.groups * p] for p in range(vk.passes)]
+        return self.rolled_update_defer(
+            history, cur, other, sources, t, group_lane, v_rows, beta
+        )
+
+    @cute.jit
+    def rolled_update_defer(self, history, ops, other, sources, t, group_lane, v_rows, beta):
         """``rolled_update`` also returning v_new. ``KdaSplit.update`` of pass 0 for token t from register operands (``ops``: q,
         k, decays), software-pipelined: the previous token's query dot (``other``'s q
         against the state before this token's decay, i.e. after the previous token's
@@ -55,23 +121,27 @@ class HeadRecords:
         ``other`` then receives token t + 1's operands. Returns the previous token's
         output; ``query_dot`` gives the last token's."""
         vk = self.vkda
+        P = vk.passes
         kr = ops[1, None, None]
-        dot_q = vk.row_dot(history, other[0, None, None], 0)
+        dot_q = [vk.row_dot(history, other[0, None, None], p) for p in range(P)]
         if t + 1 < self.tokens:
             self.load_operands(other, sources, t + 1, group_lane)
-        for j in cutlass.range_constexpr(vk.chunks):
-            for e in cutlass.range_constexpr(4):
-                history[0, j, e] *= ops[2, j, e]
-        dot_k = vk.row_dot(history, kr, 0)
+        for p in cutlass.range_constexpr(P):
+            for j in cutlass.range_constexpr(vk.chunks):
+                for e in cutlass.range_constexpr(4):
+                    history[p, j, e] *= ops[2, j, e]
+        dot_k = [vk.row_dot(history, kr, p) for p in range(P)]
         for shift in reversed(range(vk.lanes_per_row.bit_length() - 1)):
-            dot_k += cute.arch.shuffle_sync_bfly(dot_k, 1 << shift)
-            dot_q += cute.arch.shuffle_sync_bfly(dot_q, 1 << shift)
-        v_new = (v_row - dot_k) * beta
-        for j in cutlass.range_constexpr(vk.chunks):
-            for e in cutlass.range_constexpr(4):
-                history[0, j, e] = fma(
-                    kr[j, e], v_new, history[0, j, e], ftz=vk.fast_math
-                )
+            for p in range(P):
+                dot_k[p] += cute.arch.shuffle_sync_bfly(dot_k[p], 1 << shift)
+                dot_q[p] += cute.arch.shuffle_sync_bfly(dot_q[p], 1 << shift)
+        v_new = [(v_rows[p] - dot_k[p]) * beta for p in range(P)]
+        for p in cutlass.range_constexpr(P):
+            for j in cutlass.range_constexpr(vk.chunks):
+                for e in cutlass.range_constexpr(4):
+                    history[p, j, e] = fma(
+                        kr[j, e], v_new[p], history[p, j, e], ftz=vk.fast_math
+                    )
         return dot_q, v_new
 
 
@@ -94,7 +164,6 @@ class HeadRecords:
         KDA CTA's hop, i.e. after this fold), the row's corrections loaded up front."""
         vk = self.vkda
         stage_k, stage_d = staging
-        row = value_base + group % ROWS
         for which in cutlass.range_constexpr(2):  # k rows 0 .., decay rows 8 ..
             target = (stage_k, stage_d)[which]
             for c in cutlass.range_constexpr(2):
@@ -105,7 +174,13 @@ class HeadRecords:
                         source = at(record_page, head, DECAY_ROW * which + r, column)
                         copy_g2s(target.iterator + r * 128 + column, source)
         cute.arch.cp_async_commit_group()
-        vs = [record_page[head, V_ROW + i, row] for i in range(7)]
+        vs = [
+            [
+                record_page[head, V_ROW + i, value_base + group + vk.groups * p]
+                for i in range(7)
+            ]
+            for p in range(vk.passes)
+        ]
         cute.arch.cp_async_wait_group(0)
         named_barrier(4, 128)  # every thread's staged chunks
         for i in cutlass.range_constexpr(7):
@@ -113,20 +188,26 @@ class HeadRecords:
                 for j in cutlass.range_constexpr(vk.chunks):
                     column = 4 * (group_lane + vk.lanes_per_row * j)
                     d4 = load_f32x4(stage_d.iterator + i * 128 + column, shared=True)
-                    for e in cutlass.range_constexpr(4):
-                        history[0, j, e] *= d4[e]
+                    for p in cutlass.range_constexpr(vk.passes):
+                        for e in cutlass.range_constexpr(4):
+                            history[p, j, e] *= d4[e]
                 for j in cutlass.range_constexpr(vk.chunks):
                     column = 4 * (group_lane + vk.lanes_per_row * j)
                     k4 = load_f32x4(stage_k.iterator + i * 128 + column, shared=True)
-                    for e in cutlass.range_constexpr(4):
-                        history[0, j, e] = fma(
-                            k4[e], vs[i], history[0, j, e], ftz=vk.fast_math
-                        )
+                    for p in cutlass.range_constexpr(vk.passes):
+                        for e in cutlass.range_constexpr(4):
+                            history[p, j, e] = fma(
+                                k4[e], vs[p][i], history[p, j, e], ftz=vk.fast_math
+                            )
         named_barrier(4, 128)  # the staging buffers read before anyone reuses them
 
 
 class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
     """``KdaHeadVerify`` under the deferred protocol (module docstring)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loop_geometry()
 
     @cute.experimental.kernel
     def kernel(
@@ -319,12 +400,8 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             safe = Int32(0)
         state_page = state[Int64(safe), None, None, None]
         history = zeros((self.vkda.passes, self.vkda.chunks, 4), Float32)
-        for j in cutlass.range_constexpr(self.vkda.chunks):  # (non-KDA CTAs: slot 0)
-            column = 4 * (group_lane + self.vkda.lanes_per_row * j)
-            pointer = at(state_page, head, value_base + group, column)
-            values = self.vkda.load_state(pointer)
-            for e in cutlass.range_constexpr(4):
-                history[0, j, e] = values[e]
+        # (non-KDA CTAs: slot 0)
+        self.state_rows(history, state_page, head, value_base, group, group_lane)
         if (rank < KDA_CTAS) & (slot > 0) & (pending > 0):  # the fold (pre-wait)
             record_page = state[Int64(records), None, None, None]
             self.head_fold(history, record_page, head, pending, value_base, group,
@@ -465,24 +542,29 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 for half in cutlass.range_constexpr(2):
                     t = 2 * pair + half
                     cur, other = buffers[half], buffers[1 - half]
-                    v_row = shared_v[t * ROWS + group % ROWS]
                     beta = shared_beta[t]
-                    out_prev, v_new = self.rolled_update_defer(
-                        history, cur, other, sources, t, group_lane, v_row, beta
+                    out_prev, v_new = self.loop_token(
+                        history, cur, other, sources, t, lanes, shared_v, beta
                     )
                     if (group_lane == 0) & (t > 0):  # (pushed together after the loop)
-                        local_o[(t - 1) * ROWS + group] = self.round_output(out_prev)
+                        for p in cutlass.range_constexpr(self.vkda.passes):
+                            row = group + self.vkda.groups * p
+                            local_o[(t - 1) * ROWS + row] = self.round_output(
+                                out_prev[p]
+                            )
                     if t == 0:  # the one state store: slot 0, after token 0
                         self.store_checkpoint(
                             history, state, slot_rows[0], head, value_base, lanes
                         )
                     elif (group_lane == 0) & live:  # token t's record: corrections
-                        record_page[head, V_ROW + t - 1, value_base + group % ROWS] = (
-                            v_new
-                        )
-            out_last = self.query_dot(history, buffers[1][0, None, None])
+                        for p in cutlass.range_constexpr(self.vkda.passes):
+                            row = value_base + group + self.vkda.groups * p
+                            record_page[head, V_ROW + t - 1, row] = v_new[p]
+            out_last = self.query_dots(history, buffers[1][0, None, None])
             if group_lane == 0:
-                local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
+                for p in cutlass.range_constexpr(self.vkda.passes):
+                    row = group + self.vkda.groups * p
+                    local_o[(T - 1) * ROWS + row] = self.round_output(out_last[p])
             # The outputs of every token: thread kt pushes row kt % 16 of token kt // 16
             # to that token's owner (one remote store per thread instead of eight
             # dependent ones per row lane inside the loop).
@@ -528,6 +610,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.tokens == KDA_CTAS, "KdaHeadMultiDefer: q8 (one token per KDA CTA)"
+        self.loop_geometry()
 
     @cute.experimental.kernel
     def kernel(
@@ -703,12 +786,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             safe = Int32(0)
         state_page = state[Int64(safe), None, None, None]
         history = zeros((self.vkda.passes, self.vkda.chunks, 4), Float32)
-        for j in cutlass.range_constexpr(self.vkda.chunks):
-            column = 4 * (group_lane + self.vkda.lanes_per_row * j)
-            pointer = at(state_page, head, value_base + group, column)
-            values = self.vkda.load_state(pointer)
-            for e in cutlass.range_constexpr(4):
-                history[0, j, e] = values[e]
+        self.state_rows(history, state_page, head, value_base, group, group_lane)
         if (slot > 0) & (pending > 0):  # the fold (pre-wait)
             record_page = state[Int64(records), None, None, None]
             self.head_fold(history, record_page, head, pending, value_base, group,
@@ -854,24 +932,29 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                 for half in cutlass.range_constexpr(2):
                     t = 2 * pair + half
                     cur, other = buffers[half], buffers[1 - half]
-                    v_row = shared_v[t * ROWS + group % ROWS]
                     beta = shared_beta[t]
-                    out_prev, v_new = self.rolled_update_defer(
-                        history, cur, other, sources, t, group_lane, v_row, beta
+                    out_prev, v_new = self.loop_token(
+                        history, cur, other, sources, t, lanes, shared_v, beta
                     )
                     if (group_lane == 0) & (t > 0):
-                        local_o[(t - 1) * ROWS + group] = self.round_output(out_prev)
+                        for p in cutlass.range_constexpr(self.vkda.passes):
+                            row = group + self.vkda.groups * p
+                            local_o[(t - 1) * ROWS + row] = self.round_output(
+                                out_prev[p]
+                            )
                     if t == 0:  # the one state store: slot 0, after token 0
                         self.store_checkpoint(
                             history, state, slot_rows[0], head, value_base, lanes
                         )
                     elif (group_lane == 0) & live:  # token t's record: corrections
-                        record_page[head, V_ROW + t - 1, value_base + group % ROWS] = (
-                            v_new
-                        )
-            out_last = self.query_dot(history, buffers[1][0, None, None])
+                        for p in cutlass.range_constexpr(self.vkda.passes):
+                            row = value_base + group + self.vkda.groups * p
+                            record_page[head, V_ROW + t - 1, row] = v_new[p]
+            out_last = self.query_dots(history, buffers[1][0, None, None])
             if group_lane == 0:
-                local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
+                for p in cutlass.range_constexpr(self.vkda.passes):
+                    row = group + self.vkda.groups * p
+                    local_o[(T - 1) * ROWS + row] = self.round_output(out_last[p])
             # thread kt pushes row kt % 16 of token kt // 16 to that token row's owner
             named_barrier(1, 128)
             position = self.vkda.output_position(value_base + kt % ROWS)
