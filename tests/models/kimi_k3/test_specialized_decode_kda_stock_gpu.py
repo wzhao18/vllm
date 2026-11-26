@@ -78,6 +78,9 @@ from vllm.models.kimi_k3.nvidia.kda import (  # noqa: E402
     resolve_kda_spec_decode_backend,
 )
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata  # noqa: E402
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (  # noqa: E402
+    PreparedProjection,
+)
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import (  # noqa: E402
     prepared,
 )
@@ -318,8 +321,20 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q, seed):
     got = torch.empty(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
     fold.run(x, projected, operands, caches=got_caches, slots=table, accepted=accepted)
     torch.cuda.synchronize()
-    # the published rows (the prepared verify's last reader re-arms their F_A)
+    # the published rows (the prepared verify's last reader re-arms their F_A); at
+    # q = 8 the fold publishes only F_A / beta: the pair's Q / K / V / gate rows come
+    # from the plain projection of the same tactic (same K slices and rank-order
+    # sums), whose F_A / beta rows must equal the fold's bit for bit
     published = projected.clone()
+    if q == 8:
+        plain = PreparedProjection(weight, {rows: providers.WIDE_B64[PITCH]}).prepare()
+        published = torch.zeros_like(projected)
+        plain.run(x, published)
+        torch.cuda.synchronize()
+        fa_beta = slice(4 * DIM, 4 * DIM + 128 + 6)
+        assert not (bits(published[:, fa_beta]) != bits(projected[:, fa_beta])).any(), (
+            "fold F_A / beta rows vs the plain projection"
+        )
     assert_projection(published, weight, x, 4 * DIM + 128 + 6)
     core.run(
         projected, got, caches=got_caches, slots=table, accepted=accepted,
