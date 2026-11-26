@@ -32,9 +32,8 @@ from .sharded import compile_gather, owned
 # PDL successor is released. Same values and order per address. They also spread each
 # cluster exchange's DSMEM pushes over one thread per (value, peer) (``spread_push``;
 # same values; 4 real ranks, us/layer: KdaHead next -0.01..-0.02, in-proj -0.04).
-# One-token clusters there also run the exchanges after the delta lands with per-warp
-# pushes and per-warp totals (``ClusterAttnRes(warp_push=True)``): no CTA barrier
-# between the delta landing and the output row. Bitwise.
+# One-token clusters there also form the totals of the exchanges after the delta lands
+# in every warp (``ClusterAttnRes(warp_push=True)``): no totals barrier. Bitwise.
 STORES_FIRST_SMS = 152
 # Rubin: register budgets (per thread) of the vote-polled (``poll_warp``) variants by
 # block count: the LSU-poll variants' allocation, where the vote alone takes more (6

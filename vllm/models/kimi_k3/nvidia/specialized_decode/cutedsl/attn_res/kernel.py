@@ -128,12 +128,13 @@ class ClusterAttnRes:
         # ``spread_push``: the exchange's 7 x count DSMEM pushes come from 7 x count
         # threads (one each) instead of count threads pushing to every peer.
         self.spread_push = spread_push
-        # ``warp_push`` (Rubin): the exchanges after the delta lands (post statistics,
-        # final norm) push each warp's butterfly sum to the 7 peers from the lanes
-        # that hold it, and every warp forms the totals itself from the peers' four
-        # warp partials (``exchange_warps``), so neither the warp-partials barrier
-        # before the pushes nor the totals barrier after them is on the output path.
-        # Each total is the same expression in the same order: bitwise.
+        # ``warp_push`` (Rubin): after the exchanges that follow the delta landing
+        # (post statistics, final norm) every warp forms the totals itself from the
+        # peers' values and shuffles them to its lanes (``exchange_warps``), so the
+        # totals barrier is not on the output path. The same sums in the same order:
+        # bitwise. (Pushing each warp's partial instead of the CTA sum, which would
+        # also drop the barrier before the pushes, measured slower: 4x the DSMEM
+        # pushes cost +0.06 us/call at 8 rows and +0.25-0.48 at 64, 1 GPU.)
         self.warp_push = warp_push
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
@@ -182,27 +183,28 @@ class ClusterAttnRes:
     def exchange_warps(
         self, values, count: cutlass.Constexpr, kpad: cutlass.Constexpr, bufs, r, ids
     ):
-        """``exchange`` (``warp_push``, count <= 4): returns the ``count`` totals in
-        every thread's registers. Peer slot [rank, value, warp] = rank * 16 + 4 * value
-        + warp; a peer's value is (w0 + w1) + (w2 + w3), then the peers sum into two
-        alternating accumulators, exactly as ``exchange``."""
-        _, peer_buf, _, bars = bufs
+        """``exchange`` (``warp_push``) returning the ``count`` totals in every
+        thread's registers: lanes < count of each warp sum the peers' values (the same
+        two alternating accumulators) and shuffle them, instead of threads < count
+        storing them for a CTA barrier."""
+        wb, peer_buf, _, bars = bufs
         peer_buf, bar = peer_buf[r, None], bars.iterator + r
         rank, _, tid = ids
         lane, warp = tid % 32, tid // 32
         reduced, index = scatter_reduce(values, lane, kpad)
-        # every lane of a 32 / kpad group holds its value: lane p of it pushes to peer p
-        peer = lane & (32 // kpad - 1)
-        if (peer < 7) & (index < count):
-            slot = peer_buf.iterator + rank * 16 + 4 * index + warp
-            push_float(slot, reduced, bar, peer)
+        if (lane & (32 // kpad - 1)) == 0 and index < count:
+            wb[warp * 16 + index] = reduced
+        group_barrier(0)
+        if tid < 7 * count:
+            i, peer = tid % count, tid // count
+            value = (wb[i] + wb[16 + i]) + (wb[32 + i] + wb[48 + i])
+            push_float(peer_buf.iterator + rank * 16 + i, value, bar, peer)
         wait(bar)
         mine = Float32(0)
         if lane < count:
             sums = [Float32(0), Float32(0)]
             for p in cutlass.range_constexpr(7):
-                w = [peer_buf[p * 16 + 4 * lane + k] for k in range(4)]
-                sums[p % 2] += (w[0] + w[1]) + (w[2] + w[3])
+                sums[p % 2] += peer_buf[p * 16 + lane]
             mine = sums[0] + sums[1]
         totals = cute.make_rmem_tensor(count, Float32)
         for k in cutlass.range_constexpr(count):
@@ -236,8 +238,7 @@ class ClusterAttnRes:
         peer_buf = alloc(smem, Float32, (3, 112))
         total = alloc(smem, Float32, (3, 16))
         bars = alloc(smem, Uint64, 3, 8)
-        warps = 4 if self.warp_push else 1  # warp_push: four partials per value
-        arm_exchanges(bars, (self.npre, warps * self.npost, warps * int(self.final)))
+        arm_exchanges(bars, (self.npre, self.npost, int(self.final)))
         return warp_buf, peer_buf, total, bars
 
     @cute.jit
