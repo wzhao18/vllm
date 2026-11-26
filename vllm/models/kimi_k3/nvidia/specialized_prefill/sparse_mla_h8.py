@@ -16,7 +16,8 @@ Pipeline (P-MLA runs 45-61):
 * Softmax ping-pong: warpgroup u % 2 owns 64-key subtile u. A thread (= head, TMEM
   lane) loads its whole 64-key row with one tcgen05.ld (S released at once), takes
   the row max, receives the lazy-max m of subtile u - 1 from the other warpgroup
-  (mailbox + producer bar.arrive / consumer bar.sync), and writes E4M3 P. The two
+  (mailbox + producer bar.arrive / consumer bar.sync), and writes E4M3 P; l sums those
+  E4M3 values (not the FP32 P), so O / l normalizes the weights PV used. The two
   warps of a sub-partition therefore work on different subtiles. A 64-value row needs
   more than 80 registers: the CTA has 20 warps (ptxas only honours setmaxnreg region
   budgets above the launch count at <= 640 threads), softmax warpgroups run at 144.
@@ -97,7 +98,11 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
     tma_store2d,
 )
 
-P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
+# P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 445 < 448 (E4M3 max), m the lazy max (raised
+# only when a subtile's max exceeds it by more than THR). P_PRE 6 keeps the E4M3 P of the
+# far tail out of subnormals (4: L0 error vs FP32 up to 1.7x trtllm-gen's on real text even
+# with l from the quantized P); THR 2.8 is the headroom left (more rescales than 4.5)
+P_PRE, THR = 6, 2.8
 NS = 6  # 64-key KV stages
 # cpa 2: a gather warp signals stage g full once its stage g - CPA_LAG + 1 copies are done
 # (one arrive per warp; per-thread cp.async.mbarrier arrives serialize at ~0.9 us per stage)
@@ -377,6 +382,22 @@ def tmem_ld_max32(addr):
             "tcgen05.wait::ld.sync.aligned;")
     return (code, ",".join(["=f"] * 33 + ["r", "~{memory}"]), (Uint32(addr),),
             (Float32,) * 33)
+
+
+@asm((Float32, Float32), pure=True)
+def e4m3x16_sum2(w0, w1, w2, w3):
+    """Pair sums of the 16 E4M3 values in four packed words (even, odd bytes), so that
+    l sums exactly the P that the PV MMA reads: E4M3 -> F16x2 (exact), F16x2 adds (16
+    values <= 448 each: no overflow, 2^-11 rounding), F32 result."""
+    code = "{ .reg .b16 l0, h0, l1, h1, l2, h2, l3, h3; .reg .b32 s, t; .reg .f16 a, b; "
+    for k in range(4):
+        code += f"mov.b32 {{l{k}, h{k}}}, ${k + 2}; "
+    code += "cvt.rn.f16x2.e4m3x2 s, l0; cvt.rn.f16x2.e4m3x2 t, h0; add.rn.f16x2 s, s, t; "
+    for k in range(1, 4):
+        code += (f"cvt.rn.f16x2.e4m3x2 t, l{k}; add.rn.f16x2 s, s, t; "
+                 f"cvt.rn.f16x2.e4m3x2 t, h{k}; add.rn.f16x2 s, s, t; ")
+    code += "mov.b32 {a, b}, s; cvt.f32.f16 $0, a; cvt.f32.f16 $1, b; }"
+    return code, "=f,=f,r,r,r,r", (Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3))
 
 
 @cute.jit
@@ -1806,9 +1827,14 @@ class SparseMlaPrefillH8:
                         p1 = ex2(xv[k + 1])
                         p2 = ex2(xv[k + 2])
                         p3 = ex2(xv[k + 3])
-                    a0, a1 = fadd2(a0, a1, p0, p1)
-                    b0, b1 = fadd2(b0, b1, p2, p3)
                     w.append(cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16)))
+                # l from the quantized P (the PV operand): numerator and denominator see
+                # the same weights, so a large P's E4M3 rounding cancels in O / l
+                s0, s1 = e4m3x16_sum2(w[0], w[1], w[2], w[3])
+                if cutlass.const_expr(ch % 2 == 0):
+                    a0, a1 = fadd2(a0, a1, s0, s1)
+                else:
+                    b0, b1 = fadd2(b0, b1, s0, s1)
                 st_shared_v4(pbuf + Uint32(h * 64) + (
                     (Uint32(ch) ^ ((Uint32(h) >> Uint32(1)) & Uint32(3))) << Uint32(4)),
                     w[0], w[1], w[2], w[3])
