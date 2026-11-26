@@ -101,6 +101,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         super().__init__(
             experts, grid, slots, publish, stages, trace, pool, dies, static_groups
         )
+        self.issuers = 1  # ``body`` streams from warp 0's lane 0
         self.capacity, self.blocks = (capacity, capacity // 64)
         self.words = capacity // 32  # token mask words per expert
         # Each expert's masks (and running counts) one word (count) apart beyond its

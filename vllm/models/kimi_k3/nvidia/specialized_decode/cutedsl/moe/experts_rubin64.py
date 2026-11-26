@@ -167,6 +167,14 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         # costs). ``ExpertsKernel.fc2_steal`` (a claim per victim) lost.
         self.pool_zone, self.pool_grain = pool
         self.grain, self.zone, self.victims = (pool[1], 0, 0)
+        # Weight issuers: lanes 0..issuers-1 of warp 0 each issue every issuers-th
+        # stage of the same ring (same slots, same order: the MMAs see the same
+        # stages). One TMA issuing thread completes ~1 stage per ~0.23-0.27 us (16 KiB
+        # box + 1 KiB scales) at any ring depth, ~65-75 GB/s per SM; two reach
+        # 120-130 GB/s per SM alone and ~15.5 TB/s die-local on all 212 SMs at depth 7
+        # (EXP-ISSUE-1, lanes/MOE/issue1/tma_stride.cu). A subclass that streams from
+        # one lane sets 1.
+        self.issuers = 2
         # Published modes: every lane stages its own row's BF16 half of each pair's
         # FC2 row (``fc2``) instead of ``pack_pair`` and four gathering shuffles per
         # token (the same words at the same addresses): the staging kept up to ~7 us
@@ -272,7 +280,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 cute.arch.mbarrier_init(queue.iterator + i, 1)
                 cute.arch.mbarrier_init(pmeta.iterator + i, 1)
             for i in cutlass.range_constexpr(3):
-                cute.arch.mbarrier_init(claims.iterator + i, 1)
+                # the hand-over's empty barrier: every issuer reads the entry
+                count = self.issuers if i == 1 else 1
+                cute.arch.mbarrier_init(claims.iterator + i, count)
             cute.arch.mbarrier_init_fence()
             for descriptor in maps:
                 prefetch_map(descriptor)  # parameter space: no proxy fence
@@ -290,6 +300,16 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         dst = sm.iterator + self.off_sfa + slot * 1024
         copy_evict(dst, scales.iterator + offset, size, full.iterator + slot)
 
+    def mine(self, issued):
+        """Whether this issuer lane issues stage ``issued`` (every lane of the
+        producer walks the same stages and keeps the same slot / phase counts)."""
+        return True if self.issuers == 1 else issued % self.issuers == thread()[2]
+
+    def lead(self):
+        """The producer's lane 0: the one-per-CTA side effects (unit queue, claim
+        kick, stamps)."""
+        return True if self.issuers == 1 else thread()[2] == 0
+
     @cute.jit
     def issue(
         self, ring, slot, phase, issued, meta, tma, fc2: cutlass.Constexpr, more=None
@@ -299,17 +319,18 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         metadata (the MMA warp walks FC1 and the static FC2 jobs itself)."""
         sm, barriers, metadata = ring[:3]
         desc, scales, row, chunk, offset, size = tma
-        if issued >= self.stages:
-            self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
-        if cutlass.const_expr(meta is not None):
-            for i in cutlass.range_constexpr(4):
-                metadata[4 * slot + i] = meta[i]
-        full = barriers.iterator + slot
-        box = 12288 if fc2 else 16384
-        cute.arch.mbarrier_arrive_and_expect_tx(full, box + size)
-        self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size)
-        if cutlass.const_expr(fc2):
-            cute.arch.mbarrier_arrive(full, arrive_count=32)
+        if self.mine(issued):
+            if issued >= self.stages:
+                self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            if cutlass.const_expr(meta is not None):
+                for i in cutlass.range_constexpr(4):
+                    metadata[4 * slot + i] = meta[i]
+            full = barriers.iterator + slot
+            box = 12288 if fc2 else 16384
+            cute.arch.mbarrier_arrive_and_expect_tx(full, box + size)
+            self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size)
+            if cutlass.const_expr(fc2):
+                cute.arch.mbarrier_arrive(full, arrive_count=32)
         slot += 1
         if slot == self.stages:
             slot, phase = (Int32(0), phase ^ 1)
@@ -322,7 +343,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         slot, phase, issued, pushed, current = state
         unit, job = (j // self.jobs, j % self.jobs)
         if unit != current:
-            pushed = self.push_unit(ring[0], pushed, unit)
+            if self.lead():
+                pushed = self.push_unit(ring[0], pushed, unit)
             current = unit
         expert = experts[unit]
         row = expert * 3584 + job * 128
@@ -410,10 +432,12 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             kick = lo
         for j in cutlass.range(lo, hi, unroll=1):
             if j == kick:
-                cute.arch.mbarrier_arrive(bars.iterator + 2)
+                if self.lead():
+                    cute.arch.mbarrier_arrive(bars.iterator + 2)
             state = self.fc2_job(ring, state, maps, experts, ranges, j, False)
         if hi <= kick:
-            cute.arch.mbarrier_arrive(bars.iterator + 2)
+            if self.lead():
+                cute.arch.mbarrier_arrive(bars.iterator + 2)
         taken, ended = (Int32(0), False)
         while not ended:
             self.sync(bars.iterator, taken & 1)
@@ -426,7 +450,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 for j in cutlass.range(first, first + self.pool_grain, unroll=1):
                     state = self.fc2_job(ring, state, maps, experts, ranges, j, True)
         slot, phase, issued, pushed, current = state
-        self.push_unit(sm, pushed, Int32(-1))
+        if self.lead():
+            self.push_unit(sm, pushed, Int32(-1))
         return slot, phase, issued
 
     @cute.jit
@@ -497,23 +522,27 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     ring, slot, phase, issued, None, tma, False
                 )
                 if issued == 1:
-                    self.stamp(3)
+                    if self.lead():
+                        self.stamp(3)
                 ks += 1
                 if ks == 14:
                     ks, tile, r = (Int32(0), tile + 1, r + 1)
                     if r == 3:
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
-        self.stamp(4)
+        if self.lead():
+            self.stamp(4)
         state = (slot, phase, issued, Int32(0), Int32(-1))
         work = (ring, state, maps, experts, ranges, *steal)
         slot, phase, issued = self.fc2_pool(*work)
-        if issued >= self.stages:
-            self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
-        for i in cutlass.range_constexpr(4):
-            metadata[4 * slot + i] = Int32(2 if i == 0 else 0)
-        cute.arch.mbarrier_arrive(barriers.iterator + slot, arrive_count=33)
-        self.stamp(5)
+        if self.mine(issued):  # the end stage
+            if issued >= self.stages:
+                self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            for i in cutlass.range_constexpr(4):
+                metadata[4 * slot + i] = Int32(2 if i == 0 else 0)
+            cute.arch.mbarrier_arrive(barriers.iterator + slot, arrive_count=33)
+        if self.lead():
+            self.stamp(5)
 
     @cute.jit
     def consume(self, sm, tmem, ranges):
@@ -1233,7 +1262,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             self.stamp(11)
         if warp == 0:
-            if lane == 0:
+            if lane < self.issuers:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
                 self.stream(*weights, (workspace, generation & 1))
         else:
