@@ -22,6 +22,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
+from ..common import routediag as rd  # DIAG (never merge)
 from ..common.primitives import (
     alloc,
     asm,
@@ -124,6 +125,8 @@ class WsGemm:
         tid, _, _ = cute.arch.thread_idx()
         lane, warp = tid % 32, tid // 32
         group, part = lane // 4, lane % 4
+        dbase, dctr = rd.buffer("wsgemm", self.m)
+        daddr = rd.begin(dbase, dctr, block, tid == 0)  # DIAG slot 0 entry, 6 smid
         tile, quarter = warp // self.kq, warp % self.kq
         row = (cta * self.rt + tile) * 16 + group
         here = live = None
@@ -172,6 +175,7 @@ class WsGemm:
             wr = self.load_weights(wp, live)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
+        rd.stamp(daddr, 1)  # DIAG: PDL wait returned
         if cutlass.const_expr(self.grouped):
             if warp == 0:
                 self.stage_x(x, xs, bars, kpart, lane)
@@ -233,9 +237,11 @@ class WsGemm:
                         push_float(dst, tuple(values), owned.iterator + s, peer)
             if cutlass.const_expr(self.grouped and g > 0):
                 self.settle(args, red, recv, owned, cta, kpart, warp, lane, g - 1, here)
+        rd.stamp(daddr, 2)  # DIAG: MMAs done (tid 0's warp)
         if cutlass.const_expr(self.grouped):
             last = self.groups - 1
             self.settle(args, red, recv, owned, cta, kpart, warp, lane, last, here)
+            rd.stamp(daddr, 3)  # DIAG: settled / published (tid 0's warp)
         else:
             cute.arch.sync_threads()
             if cutlass.const_expr(self.ks > 1):
@@ -245,6 +251,7 @@ class WsGemm:
             if cutlass.const_expr(self.ks > 1):
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
+            rd.stamp(daddr, 3)  # DIAG: gathered / published
 
     def load_weights(self, wp, live=None):
         """This warp's register-resident weight fragments (``rb`` K blocks; traced
