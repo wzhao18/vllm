@@ -283,6 +283,9 @@ def order16(bits: Uint32) -> Uint32:
 STORE = 1  # IndexerScore mode: the logits only (no histograms / row bounds)
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
 SLOTS = 96  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
+# candidate columns rotate within a warp every 2^ROT_SHIFT key tiles (publish_rot):
+# a fixed key position spreads over 32 columns, the shuffle runs once per block
+ROT_SHIFT = 5
 # words per row: lane counts, then SLOTS words per lane and two spill words (a lane
 # is clamped to its spill slot once per tile pair, so it never writes past them)
 REGION = (SLOTS + 3) * TILE
@@ -848,6 +851,7 @@ class IndexerScore:
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
             thr = Uint32(0)
+            rs = cute.make_rmem_tensor((3,), Int64)
             cand0 = ptr0
             cand1 = ptr1
             p0 = ptr0
@@ -867,16 +871,22 @@ class IndexerScore:
                 roff = Int64(0)
                 if cutlass.const_expr(self.split):
                     roff = Int64(items[item, 6]) * 2
-                cand0 = out_a + row_base[row0] * 2 + roff + lt * 4
-                cand1 = out_a + row_base[row1] * 2 + roff + lt * 4
-                # rotated candidate columns (publish_rot): p0 = this thread's packed
-                # counts (row 0 low 16 bits, row 1 high) of the column it publishes
-                # into, p1 = the tile it last published; lim0 / lim1 = the rows'
-                # region bases
-                p0 = Int64(0)
-                p1 = Int64(t_hi)
-                lim0 = cand0 - lt * 4
-                lim1 = cand1 - lt * 4
+                rowb0 = out_a + row_base[row0] * 2 + roff
+                rowb1 = out_a + row_base[row1] * 2 + roff
+                # rotated candidate columns (publish_rot): key lane (warp q, lane l)
+                # of tile t publishes into column 32 q + (l + (t >> ROT_SHIFT)) mod 32;
+                # p0 / p1 point into the current column, rs = (its limits, block)
+                bp = Int32(t_hi) >> ROT_SHIFT
+                col = Int64(wq * 32 + ((lt % 32 + bp) & 31)) * 4
+                cand0 = rowb0 + col
+                cand1 = rowb1 + col
+                p0 = cand0 + TILE * 4
+                p1 = cand1 + TILE * 4
+                rs[0] = cand0 + (SLOTS + 1) * TILE * 4
+                rs[1] = cand1 + (SLOTS + 1) * TILE * 4
+                rs[2] = Int64(bp)
+                lim0 = rs[0]
+                lim1 = rs[1]
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: wt[j][i] = heads 2i, 2i + 1
@@ -908,7 +918,7 @@ class IndexerScore:
             for pp in cutlass.range(n_edge, unroll=1):
                 ptr0, ptr1, p0, p1 = self.tile_pair(
                     True, t_hi - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
+                    w, ptr0, ptr1, p0, p1, thr, rs, lim1, end0, end1, ntiles,
                     key_in_tile, hist0, hist1,
                 )
                 ph = ph ^ 1
@@ -927,29 +937,31 @@ class IndexerScore:
                 tw = (Uint32(t_hi - 2 * n_edge) << Uint32(16)) | Uint32(lt)
                 for pp in cutlass.range(n_edge, npairs, unroll=1):
                     p0, p1, tw = self.pair_rot(
-                        ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                        ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, rs, rs,
                         hc, sc, tw, key_in_tile,
                     )
                     ph = ph ^ 1
+                p0 = cutlass.min(p0, rs[0])
+                p1 = cutlass.min(p1, rs[1])
                 p0, p1 = self.stage_tail(
-                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tw, p0, p1, thr, lim0, lim1,
+                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tw, p0, p1, thr, rs,
                     key_in_tile,
                 )
             else:
                 for pp in cutlass.range(n_edge, npairs, unroll=1):
                     ptr0, ptr1, p0, p1 = self.tile_pair(
                         False, t_hi - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                        w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
+                        w, ptr0, ptr1, p0, p1, thr, rs, lim1, end0, end1, ntiles,
                         key_in_tile, hist0, hist1,
                     )
                     ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # the counts of the column this thread published into last
                 # (a full column counts as overflowed: the row is recomputed)
-                colf = Int64(wq * 32 + ((lt % 32 + Int32(p1)) & 31)) * 4
-                cf = Uint32(p0)
-                st_global_u32(lim0 + colf, cutlass.min(cf & Uint32(0xFFFF), Uint32(SLOTS)))
-                st_global_u32(lim1 + colf, cutlass.min(cf >> Uint32(16), Uint32(SLOTS)))
+                cb0 = rs[0] - (SLOTS + 1) * TILE * 4
+                cb1 = rs[1] - (SLOTS + 1) * TILE * 4
+                st_global_u32(cb0, Uint32((p0 - cb0) // (TILE * 4) - 1))
+                st_global_u32(cb1, Uint32((p1 - cb1) // (TILE * 4) - 1))
             elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
@@ -986,6 +998,9 @@ class IndexerScore:
         # head-half pipeline: the TMEM load of the next half (heads 16-31 of this
         # stage, then heads 0-15 of the next stage) is issued before this half's
         # math; a stage is released as soon as its last half landed
+        if cutlass.const_expr(self.mode >= PUBLISH):
+            p0 = cutlass.min(p0, lim0[0])
+            p1 = cutlass.min(p1, lim0[1])
         if cutlass.const_expr(self.epi == 3):
             for st in cutlass.range_constexpr(ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st, ph)
@@ -1025,7 +1040,7 @@ class IndexerScore:
                 if kidx >= end1 or t >= ntiles:
                     r = r | Uint32(0xFFFF0000)
             if cutlass.const_expr(self.mode >= PUBLISH):
-                p0, p1 = self.publish_rot(p0, p1, r, thr, t, lim0, lim1, key_in_tile)
+                p0, p1 = self.publish_rot(p0, p1, r, thr, t, lim0, key_in_tile)
             elif cutlass.const_expr(edge):
                 if t < ntiles:
                     st_global_u16(ptr0 - st * TILE * 2, r)
@@ -1041,36 +1056,49 @@ class IndexerScore:
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
-    def publish_rot(self, c, tp, r, thr, t, rb0, rb1, kit):
+    def publish_rot(self, p0, p1, r, thr, t, rs, kit):
         """Publish both tokens' logits of tile t (row thresholds thr) into ROTATED
         candidate columns: key lane (warp q, lane l) of tile t writes column
-        32 q + (l + t) mod 32, so keys at a fixed position mod 128 (attention sinks
-        every 64 tokens, say) spread over 32 columns instead of filling one (loop 9:
-        real text overflowed SLOTS on every row). Each column's count travels with
-        it: going from tile tp to tile t, this thread takes lane l - (tp - t)'s
-        packed counts (c: row 0 low 16 bits, row 1 high). The select recovers the
-        key from the column and the tile word. A count past SLOTS stays overflowed."""
-        lane = Int32(kit >> 2)
-        wq = Int32(kit & 3)
-        d = Int32(tp) - t
-        cc = Uint32(cute.arch.shuffle_sync(Int32(Uint32(c)), (lane - d) & 31))
-        c0 = cutlass.min(cc & Uint32(0xFFFF), Uint32(SLOTS))
-        c1 = cutlass.min(cc >> Uint32(16), Uint32(SLOTS))
-        col = Int64(wq * 32 + ((lane + t) & 31)) * 4
-        p0 = rb0 + col + Int64(c0 + Uint32(1)) * (TILE * 4)
-        p1 = rb1 + col + Int64(c1 + Uint32(1)) * (TILE * 4)
-        q0, q1 = publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
-        c0 = c0 + Uint32((q0 - p0) // (TILE * 4))
-        c1 = c1 + Uint32((q1 - p1) // (TILE * 4))
-        return Int64((c1 << Uint32(16)) | c0), Int64(t)
+        32 q + (l + (t >> ROT_SHIFT)) mod 32, so keys at a fixed position mod 128
+        (attention sinks every 64 tokens, say) spread over 32 columns instead of
+        filling one (loop 9: real text overflowed SLOTS on every row). Within a
+        block of 2^ROT_SHIFT tiles a thread keeps its column and pointers (the
+        unrotated fast path); entering a new block (warp-uniform) it converts its
+        pointers to counts, takes lane l - (block change)'s counts by a warp
+        shuffle and re-points into its new column. rs = (row 0 / row 1 column
+        limits, current block), updated in place. The select recovers the key from
+        the column and the tile word."""
+        b = t >> ROT_SHIFT
+        bp = Int32(rs[2])
+        if b != bp:
+            lane = Int32(kit >> 2)
+            wq = Int32(kit & 3)
+            ob0 = rs[0] - (SLOTS + 1) * TILE * 4
+            ob1 = rs[1] - (SLOTS + 1) * TILE * 4
+            c0 = Uint32((cutlass.min(p0, rs[0]) - ob0) // (TILE * 4) - 1)
+            c1 = Uint32((cutlass.min(p1, rs[1]) - ob1) // (TILE * 4) - 1)
+            cc = Uint32(cute.arch.shuffle_sync(Int32((c1 << Uint32(16)) | c0),
+                                               (lane - (bp - b)) & 31))
+            oc = Int64(wq * 32 + ((lane + bp) & 31)) * 4
+            nc = Int64(wq * 32 + ((lane + b) & 31)) * 4
+            nb0 = ob0 - oc + nc
+            nb1 = ob1 - oc + nc
+            p0 = nb0 + Int64((cc & Uint32(0xFFFF)) + Uint32(1)) * (TILE * 4)
+            p1 = nb1 + Int64((cc >> Uint32(16)) + Uint32(1)) * (TILE * 4)
+            rs[0] = nb0 + (SLOTS + 1) * TILE * 4
+            rs[1] = nb1 + (SLOTS + 1) * TILE * 4
+            rs[2] = Int64(b)
+            p0 = cutlass.min(p0, rs[0])
+            p1 = cutlass.min(p1, rs[1])
+        return publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
 
     @cute.jit
-    def stage_tail(self, h1, w, ss, tw, p0, p1, thr, rb0, rb1, kit):
+    def stage_tail(self, h1, w, ss, tw, p0, p1, thr, rs, kit):
         """Heads 16-31 of a stage (h1) into its running sums, then publish both
         tokens' logits of tile t (tw >> 16)."""
         ss = self.reduce_half(h1, w, ss, HEADS // 2)
         r = self.combine2(ss)
-        return self.publish_rot(p0, p1, r, thr, Int32(tw >> Uint32(16)), rb0, rb1, kit)
+        return self.publish_rot(p0, p1, r, thr, Int32(tw >> Uint32(16)), rs, kit)
 
     @cute.jit
     def pair_rot(self, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
@@ -1079,6 +1107,8 @@ class IndexerScore:
         first loads, finish the previous stage (the carry hc / sc / tw for stage 0, the
         pair's own stage 0 for stage 1); returns with stage 1's second half (heads
         16-31, loaded) and first-half sums in the carry."""
+        p0 = cutlass.min(p0, lim0[0])
+        p1 = cutlass.min(p1, lim0[1])
         hp = [hc[i] for i in range(HEADS)]
         sp = [[sc[0], sc[1]], [sc[2], sc[3]]]
         tp = tw
@@ -1086,7 +1116,7 @@ class IndexerScore:
             col = tmem_q + st * N
             cute.arch.mbarrier_wait(acc_full + st, ph)
             h0 = tmem_ld32(col)
-            p0, p1 = self.stage_tail(hp, w, sp, tp, p0, p1, thr, lim0, lim1, kit)
+            p0, p1 = self.stage_tail(hp, w, sp, tp, p0, p1, thr, lim0, kit)
             h0 = tmem_wait_n(*h0)
             h1 = tmem_ld32(col + 16 * BQ)
             ss = self.reduce_half(h0, w, None, 0)
@@ -2006,7 +2036,7 @@ def _quad_code(ties: bool, write: bool) -> str:
     write: the key index of each take is stored at shared $12 and $12 advances one
     word ($0 returns it), each tie likewise at $13 ($1); pb = $14. No branches."""
     cmp = "gt" if ties else "ge"
-    code = "{ .reg .pred v, g, e; .reg .b32 x, q, tq, rq; "
+    code = "{ .reg .pred v, g, e; .reg .b32 x, q, tq, rq, bq; "
     if write:
         code += "mov.b32 $0, $13; mov.b32 $1, $14; "
     else:
@@ -2021,7 +2051,7 @@ def _quad_code(ties: bool, write: bool) -> str:
             # (rotated columns, IndexerScore.publish_rot); pb = (4 lane) % 32 |
             # (lane >> 3) << 8, column = 4 lane + k
             code += (f"shr.u32 tq, ${6 + k}X, 16; shl.b32 q, tq, 7; "
-                     f"and.b32 rq, $14X, 0xFF; add.u32 rq, rq, {k}; sub.u32 rq, rq, tq; "
+                     f"and.b32 rq, $14X, 0xFF; add.u32 rq, rq, {k}; shr.u32 bq, tq, {ROT_SHIFT}; sub.u32 rq, rq, bq; "
                      "and.b32 rq, rq, 31; shl.b32 rq, rq, 2; add.u32 q, q, rq; "
                      "shr.u32 rq, $14X, 8; add.u32 q, q, rq; "
                      "@g st.shared.b32 [$0], q; @g add.u32 $0, $0, 4; ")
@@ -2141,7 +2171,7 @@ class CandSelect2:
             # rotated columns (IndexerScore.publish_rot): column 32 q + c of tile t
             # holds key lane (q, (c - t) mod 32) = key 4 ((c - t) mod 32) + q
             tile_k = Int32(wd[k] >> Uint32(16))
-            pos = tile_k * TILE + 4 * (((lane_k % 32) - tile_k) & 31) + lane_k // 32
+            pos = tile_k * TILE + 4 * (((lane_k % 32) - (tile_k >> ROT_SHIFT)) & 31) + lane_k // 32
             res.append((valid, pos, key16_of_word(wd[k])))
         return res
 
