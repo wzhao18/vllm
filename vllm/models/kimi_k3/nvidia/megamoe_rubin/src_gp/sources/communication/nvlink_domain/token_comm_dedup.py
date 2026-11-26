@@ -2336,7 +2336,7 @@ class TokenCommDedup(KernelComponent):
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(issue_pool_token) * Int64(TokenSrcMetadata.nbytes)
                 )
-                if cutlass.const_expr(self.token_back_enabled):
+                if cutlass.const_expr(False):
                     # Copy mailbox (combine readiness, ``copy_mailbox_offset``): every non-last copy of a block with
                     # 1 < cnt < K records its pool row for the last copy's combine wait.
                     if (metadata.dst_token_cnt > Int32(1)) and (metadata.dst_token_cnt < Int32(self.topk)):
