@@ -95,12 +95,12 @@ def main():
         st0 = torch.zeros(a.nseq, 3 * P, 3, dtype=torch.bfloat16, device=dev)
         # compile both forms before any timing (the overlapped one with all
         # tiles local: no waits, no pushers)
-        zero = torch.zeros(64, dtype=torch.int32, device=dev)
+        zero = torch.zeros(128, dtype=torch.int32, device=dev)
         sx0 = torch.full((M * HIDDEN // 32,), 127, dtype=torch.uint8, device=dev)
         x0 = torch.zeros(M, HIDDEN, dtype=torch.float8_e4m3fn, device=dev)
         gemm(x0, sx0, st0.clone(), qsl, lines, init, null_block_id=NULL_BLOCK_ID)
         gemm(x0, sx0, st0.clone(), qsl, lines, init, null_block_id=NULL_BLOCK_ID,
-             ag=_LocalAg(zero.data_ptr(), M // cl))  # fmt: skip
+             ag=_LocalAg(zero.data_ptr() + 256, M // cl))  # fmt: skip
         torch.accelerator.synchronize()
         sp_ag.enable_overlap(idle, cl)
         sp_ag.begin_forward(1 << 30)
@@ -117,7 +117,7 @@ def main():
             wrq, wrs = mxfp8_e4m3_quantize(wr, is_sf_swizzled_layout=True)
             agp = AgPlainGemm(wq, ws.view(torch.uint8).reshape(-1), gemm.tactic)
             qkv0 = torch.empty(M, 3 * P, dtype=torch.bfloat16, device=dev)
-            agp(x0, sx0, qkv0, _LocalAg(zero.data_ptr(), M // cl))
+            agp(x0, sx0, qkv0, _LocalAg(zero.data_ptr() + 256, M // cl))
             e8 = torch.float8_e8m0fnu
 
             def stock_g():

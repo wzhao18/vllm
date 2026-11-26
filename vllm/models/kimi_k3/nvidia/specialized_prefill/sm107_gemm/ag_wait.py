@@ -66,6 +66,20 @@ def _fence_proxy_async_global(*, loc=None, ip=None) -> None:
     )
 
 
+@dsl_user_op
+def count_trigger(ctr: Int64, *, loc=None, ip=None) -> None:
+    """Diagnostics: one per GEMM CTA after its PDL trigger (flags word 3)."""
+    llvm.inline_asm(
+        None,
+        [Int64(ctr - Int64(244)).ir_value(loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.add.u32 [$0], 1;",
+        "l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def wait_rows(ctr: Int64, cl_idx: Int32, target: Int32, lo: Int32, hi: Int32):
     """Wait until counter ``cl_idx`` (u32 at ``ctr + 4 * cl_idx``) reaches
@@ -81,11 +95,12 @@ def wait_rows(ctr: Int64, cl_idx: Int32, target: Int32, lo: Int32, hi: Int32):
                 _nanosleep()
                 if globaltimer_ns() - t0 > Uint64(SPIN_LIMIT_NS):
                     cute.printf(
-                        "K31_SPIN_TIMEOUT kernel=sp_ag_gemm tile={} target={} count={} arrival={} pushers_started={} pushers_past_first_wait={}",
+                        "K31_SPIN_TIMEOUT kernel=sp_ag_gemm tile={} target={} count={} arrival={} pushers_started={} pushers_past_first_wait={} gemm_ctas_triggered={}",
                         cl_idx, target, v,
                         _ld_acquire_sys_u32(ctr - Int64(256)),
                         _ld_acquire_sys_u32(ctr - Int64(252)),
                         _ld_acquire_sys_u32(ctr - Int64(248)),
+                        _ld_acquire_sys_u32(ctr - Int64(244)),
                     )
                     _trap()
                 v = _ld_acquire_sys_u32(addr)

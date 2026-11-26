@@ -1783,6 +1783,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             tile_sched = ag_wait.RotatedTileScheduler.wrap(tile_sched, ag_rot, ag_ncl_m)
             # Pusher grid (PDL secondary) may start once every CTA is resident.
             cute.arch.griddepcontrol_launch_dependents()
+            if tidx == 0:
+                ag_wait.count_trigger(ag_ctr)
         work_tile = tile_sched.initial_work_tile_info()
         dsched_args = None
         if cutlass.const_expr(die):

@@ -145,10 +145,10 @@ class PrefillKdaConvInProj:
 
             from .sm107_gemm.kda_conv_gemm import ag_tactic, cluster_rows
 
-            ctr = torch.zeros(64, dtype=torch.int32, device=dev)
+            ctr = torch.zeros(128, dtype=torch.int32, device=dev)  # flags-buffer layout: counters at +256 B
             self._gemm(
                 x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID,
-                ag=_LocalAg(ctr.data_ptr(), rows // cluster_rows(ag_tactic(self._gemm.tactic))),
+                ag=_LocalAg(ctr.data_ptr() + 256, rows // cluster_rows(ag_tactic(self._gemm.tactic))),
             )  # fmt: skip
             # The graph-capturable form (no conv epilogue): q|k|v columns only.
             from .sm107_gemm.kda_conv_gemm import AgPlainGemm
@@ -157,7 +157,7 @@ class PrefillKdaConvInProj:
             qkv = torch.empty(rows, nq, dtype=torch.bfloat16, device=dev)
             self._ag_plain(
                 x, sx, qkv,
-                _LocalAg(ctr.data_ptr(), rows // cluster_rows(ag_tactic(self._gemm.tactic))),
+                _LocalAg(ctr.data_ptr() + 256, rows // cluster_rows(ag_tactic(self._gemm.tactic))),
             )  # fmt: skip
             torch.cuda.synchronize(dev)
             sp_ag.enable_overlap(idle, cluster_rows(ag_tactic(self._gemm.tactic)))

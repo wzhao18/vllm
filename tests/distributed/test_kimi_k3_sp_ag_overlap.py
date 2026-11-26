@@ -139,10 +139,10 @@ def _worker(local_rank: int, world_size: int, port: int, q: mp.Queue):
             st1, st2 = st.clone(), st.clone()
             o1, _ = gemm(oqa.data, oqa.scale.view(torch.uint8).reshape(-1), st1, qsl, lines,
                          init, null_block_id=NULL_BLOCK_ID)  # fmt: skip
-            zero = torch.zeros(64, dtype=torch.int32, device=device)
+            zero = torch.zeros(128, dtype=torch.int32, device=device)
             o2, _ = gemm(oqa.data, oqa.scale.view(torch.uint8).reshape(-1), st2, qsl, lines,
                          init, null_block_id=NULL_BLOCK_ID,
-                         ag=_LocalAg(zero.data_ptr(), m // cl))  # fmt: skip
+                         ag=_LocalAg(zero.data_ptr() + 256, m // cl))  # fmt: skip
             torch.accelerator.synchronize()
             assert torch.equal(o1, o2) and torch.equal(st1, st2), "rotated GEMM differs"
             say("ag GEMM (all local, rotated) bitwise ok")
