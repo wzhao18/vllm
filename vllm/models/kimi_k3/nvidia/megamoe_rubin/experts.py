@@ -141,11 +141,13 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 # EP sizes whose NVFP4 decode servers add the EP32 wide-EP decode bucket (GenPhase,
 # RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank, fused shared expert under specialized
 # decode) below their larger decode bucket (select_rubin_buckets). EP16 (56 experts/GPU)
-# and EP64 (14) otherwise run the inference kernel at every decode step, with a separate
-# router, the plain top-k reduce and the side-stream shared expert. Same math (the
+# otherwise runs the inference kernel at every decode step, with a separate router, the
+# plain top-k reduce and the side-stream shared expert. Measured (step_d -e 16, NVFP4,
+# 24 layers, k3, CUDA graph, solo A/B): B16 / 32 / 48 per DP rank 5143 / 5005 / 5473 us
+# -> 4489 / 4355 / 4816 us. Same math (the
 # shared expert's MXFP8 operands; the routed kernels' fp32 accumulation per tile).
 # VLLM_K31_EP_FUSED_DECODE=0 restores the previous buckets (A/B).
-RUBIN_FUSED_DECODE_EP_SIZES = (16, 64)
+RUBIN_FUSED_DECODE_EP_SIZES = (16,)
 
 
 def _fused_decode_enabled() -> bool:
@@ -335,7 +337,7 @@ def select_rubin_buckets(
         and (buckets[0] if buckets else main).variant != "genphase"
         and _fused_decode_enabled()
     ):
-        # EP16 / EP64 inference-kernel decode (a GenPhase server gets the bucket from
+        # EP16 inference-kernel decode (a GenPhase server gets the bucket from
         # enable_fused_shared instead): the EP32 wide-EP decode bucket (GenPhase, decode
         # scheduler, RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank) below the existing
         # ones, so SP decode shards of at most that many tokens run the src_gp kernel

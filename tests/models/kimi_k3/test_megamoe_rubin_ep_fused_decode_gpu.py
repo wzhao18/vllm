@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EP16 / EP64 NVFP4 decode on the EP32 128-token GenPhase decode bucket
+"""EP16 NVFP4 decode on the EP32 128-token GenPhase decode bucket
 (select_rubin_buckets, RUBIN_FUSED_DECODE_EP_SIZES), one VR200.
 
 The bucket runs the src_gp GenPhase kernel with RUBIN_GENPHASE_DECODE_KNOBS at 56 (EP16)
-and 14 (EP64) local experts instead of 28. Checks, on a native ModelOpt NVFP4 layer
+local experts instead of 28. Checks, on a native ModelOpt NVFP4 layer
 (test_megamoe_rubin_nvfp4_native_gpu helpers), that it matches the stock NVFP4 MoE math
 and the quantization-faithful oracle to the same bound as the EP32 decode bucket, and
 that it agrees with the inference-kernel bucket these servers ran before (same
@@ -70,7 +70,7 @@ def _run(state, n, seed):
     return hidden, ids, wts, out
 
 
-@pytest.mark.parametrize("experts", [56, 14])
+@pytest.mark.parametrize("experts", [56])
 @pytest.mark.parametrize("n", [1, 24, 37, 96, 128])
 def test_gp128_decode_bucket_matches_stock_and_previous(build, experts, n):
     gp = build(experts, "gp128")
