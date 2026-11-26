@@ -586,11 +586,12 @@ class RubinExpertsKernel(ExpertsKernel):
         cute.arch.sync_threads()
 
     @cute.jit
-    def route_warp(self, sm, ids, batch):
+    def route_warp(self, sm, ids, batch, early=None):
         """``ExpertsKernel.route`` (capacity > 2) by warp 0 alone after ``route_init``,
         without CTA barriers: lane l holds routing pairs 4l..4l+3, so first occurrences
         rank in the same order (the same units, token slots and distinct count).
-        Returns the distinct count."""
+        Returns the distinct count and, with ``early`` (the w13 descriptor and scales),
+        whether lane 0 already issued the CTA's first FC1(A) stage (``first_stage``)."""
         lane = thread()[2]
         misc = self.off_misc
         table = view(sm.iterator, self.off_h, Int32, self.experts)
@@ -638,6 +639,9 @@ class RubinExpertsKernel(ExpertsKernel):
             ballot = Uint32(cute.arch.vote_ballot_sync(first))
             rank += Int32(cute.arch.popc(ballot & below))
             distinct += Int32(cute.arch.popc(ballot))
+        skip = Int32(0)
+        if cutlass.const_expr(early is not None):
+            skip = self.first_stage(sm, early, mine, firstk, rank, distinct, valid)
         for j in cutlass.range_constexpr(4):
             if valid & (firstk[j] == base + j):
                 uof[base + j] = rank
@@ -648,7 +652,43 @@ class RubinExpertsKernel(ExpertsKernel):
             for j in cutlass.range_constexpr(4):
                 pair = base + j
                 slots[uof[firstk[j]] * 8 + pair // 16] = Int8(pair % 16)
-        return distinct
+        return distinct, skip
+
+    @cute.jit
+    def first_stage(self, sm, early, mine, firstk, rank, distinct, valid):
+        """``route_warp`` (HT-EXPERTS item 1): as soon as the distinct count is known,
+        the CTA's first FC1(A) stage (``partition``'s group 0 range, ``produce16``'s
+        first issue into slot 0) is issued by lane 0, its expert taken from the lane
+        that holds that first occurrence (a ballot and a shuffle), before the unit
+        tables are written and before the partition / producer setup. Returns 1 if
+        issued (``produce16`` then starts at the range's second stage, slot 1)."""
+        lane, cta = (thread()[2], thread()[3])
+        middle = distinct
+        if distinct > 40:
+            middle = (distinct * 50 + 99) // 100
+        size = 14 * 3 * middle
+        lo = cta * size // self.grid
+        hi = (cta + 1) * size // self.grid
+        index = lo // 42  # partition's first FC1(A) unit (tiles 3, group 0 starts at 0)
+        pick, n = (Int32(-1), rank)
+        for j in cutlass.range_constexpr(4):
+            if valid & (firstk[j] == 4 * lane + j):
+                if n == index:
+                    pick = mine[j]
+                n += 1
+        ballot = Uint32(cute.arch.vote_ballot_sync(pick >= 0))
+        source = Int32(cute.arch.popc((ballot & (~ballot + Uint32(1))) - Uint32(1)))
+        expert = shuffle(pick, source)
+        issued = Int32(lo < hi)
+        w13, w13_scales = early
+        if (lane == 0) & (lo < hi):
+            ks, r = (lo % 14, lo // 14 % 3)
+            row = expert * self.w13_rows + r * 128
+            offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
+            barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.stages)
+            cute.arch.mbarrier_arrive_and_expect_tx(barriers.iterator, 16384 + 1024)
+            self.fetch(sm, w13, w13_scales, barriers, Int32(0), row, ks, offset, Int32(1024))
+        return issued
 
     @cute.jit
     def load_image(self, sm, plan, cta):
@@ -728,20 +768,27 @@ class RubinExpertsKernel(ExpertsKernel):
                 cute.arch.mbarrier_arrive(barriers + stage)
 
     @cute.jit
-    def produce16(self, sm, maps, w13_scales, w2_scales, ranges, experts, workspace):
+    def produce16(
+        self, sm, maps, w13_scales, w2_scales, ranges, experts, workspace, skip=None
+    ):  # fmt: skip
         """``stream`` for TP16 capacity 8: FC1(A), FC1(B) stages, the static FC2(A)
         and FC2(B) tiles, then claimed FC2(B) pool grains; every unit change is queued
         for the hidden loader (-1 ends). FC1 stages carry no metadata (``consume``
-        walks them from the partition)."""
+        walks them from the partition). ``skip`` 1: ``first_stage`` issued the
+        first FC1(A) stage into slot 0."""
         stages, (w13, w2) = (self.stages, maps)
         barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.parts * stages)
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * stages)
         ring = (sm, barriers, metadata, w2_scales)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        if cutlass.const_expr(skip is not None):
+            slot, issued = (skip, skip)
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
+            if cutlass.const_expr(group == 0 and skip is not None):
+                lo += skip
             ks, tile = (lo % 14, 3 * ranges[group, 0] + lo // 14)
-            r, index = (tile % 3, self.first_unit(ranges, 0, group))
+            r, index = (tile % 3, tile // 3)  # = first_unit for the unskipped lo
             expert = experts[index]
             for s in cutlass.range(lo, hi, unroll=1):
                 row = expert * self.w13_rows + r * 128
@@ -1447,11 +1494,13 @@ class RubinExpertsKernel(ExpertsKernel):
         if cutlass.const_expr(self.xearly == 1):
             if tid == 96:
                 self.load_image(sm, x, cta)
+        skip = Int32(0)
         if cutlass.const_expr(self.lean_route):
             shared_distinct = view(sm.iterator, self.off_misc + 860, Int32, 1)
             distinct = Int32(0)
+            early = (maps[0], w13_scales) if self.polled and self.packed else None
             if warp == 0:
-                distinct = self.route_warp(sm, source, batch)
+                distinct, skip = self.route_warp(sm, source, batch, early)
                 if lane == 0:
                     shared_distinct[0] = distinct
                 named_barrier(ROUTED, 384, arrive=True)
@@ -1489,7 +1538,10 @@ class RubinExpertsKernel(ExpertsKernel):
         if warp == 0:
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
-                self.produce16(*weights, workspace)
+                if cutlass.const_expr(self.lean_route and self.polled and self.packed):
+                    self.produce16(*weights, workspace, skip)
+                else:
+                    self.produce16(*weights, workspace)
                 counters[cta] = call_count + 1
                 if cta < self.slots - self.grid:
                     counters[self.grid + cta] = call_count + 1
