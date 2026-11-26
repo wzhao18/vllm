@@ -740,7 +740,8 @@ class PreparedDsa:
         with torch.accelerator.device_index(device.index):
             if self.box is not None:
                 args = batch, self.heads, self.dcp, self.box.q_heads, self.fp8
-                wait = compile_wait(*args, self.box.cap)
+                sms = torch.cuda.get_device_properties(device).multi_processor_count
+                wait = compile_wait(*args, self.box.cap, sms)
             norm = None
             if mode in NORM:
                 norm = compile_norm(batch, self.heads, pitch)
