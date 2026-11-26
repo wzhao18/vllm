@@ -1085,15 +1085,13 @@ class DcpValue:
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         v = 32 * (warp // 4) + 8 * (warp % 4) + group
-        # DIAG (DSTAMP): per-CTA ring "dcpv" (pushed only: the DSA core's tail). Slots:
+        # DIAG (DSTAMP): per-CTA ring "dcpv<B>" (every DcpValue: B4 runs FlashInfer + push). Slots:
         # 0 entry, 1 PDL wait returned, 2 polled-split wait, 3 trigger, 4 LSEs landed,
         # 5 partials polled + merged, 6 %smid, 7 end.
         dctas = self.grid[0] * self.grid[1] * self.grid[2]
         dcta = (pusher * self.grid[1] + tile) * H + head
-        daddr = Int64(0)
-        if cutlass.const_expr(self.pushed):
-            dbase, dctr = dd.ring_buffer("dcpv%d" % B, dctas)
-            daddr = dd.ring_begin(dbase, dctr, dctas, dcta, tid == 0)
+        dbase, dctr = dd.ring_buffer("dcpv%d" % B, dctas)
+        daddr = dd.ring_begin(dbase, dctr, dctas, dcta, tid == 0)
         if cutlass.const_expr(self.lpc is not None):
             # this step's LPC prefix and range (lpc_table, as the core): built after the
             # PDL wait below, read by every thread's valid_splits (lpc_filled)
