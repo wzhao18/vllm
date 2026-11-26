@@ -47,7 +47,8 @@ def test_warm_prefill_glue_runs(monkeypatch, layout):
         local_projection_size=P,
         local_num_heads=H,
         head_dim=D,
-        in_proj_padding=0,
+        # KDA pads the projection rows to 16 elements (kda.py in_proj_padding).
+        in_proj_padding=-(4 * P + D + H) % 16,
         conv1d=SimpleNamespace(
             weight=torch.zeros((3 * P, 1, K), dtype=torch.bfloat16, device=device)
         ),
