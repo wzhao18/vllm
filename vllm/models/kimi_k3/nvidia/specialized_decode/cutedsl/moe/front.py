@@ -166,9 +166,12 @@ class RouteSitu:
         lanes 0-15 then renormalize the sigmoids in rank order (``publish``)."""
         ids, weights, scale = out
         lane = cute.arch.thread_idx()[0] % 32
+        mine_keys = cute.make_rmem_tensor(28, Uint32)  # 896 = 32 x 28: conflict-free
+        for j in c.range_constexpr(28):  # every load issues before the compaction stores
+            mine_keys[j] = keys[lane + 32 * j]
         count = Int32(0)
-        for j in c.range_constexpr(28):  # 896 = 32 x 28: conflict-free columns
-            count += Int32(keys[lane + 32 * j] >= threshold)
+        for j in c.range_constexpr(28):
+            count += Int32(mine_keys[j] >= threshold)
         total = count
         for shift in c.range_constexpr(5):  # inclusive scan over lanes
             got = cute.arch.shuffle_sync(total, max(lane - (1 << shift), 0))
@@ -177,11 +180,12 @@ class RouteSitu:
         n = cute.arch.shuffle_sync(total, 31)
         offset = total - count
         for j in c.range_constexpr(28):
-            key = keys[lane + 32 * j]
+            key = mine_keys[j]
             if key >= threshold:
                 dense[offset] = (Uint64(key) << 32) | Uint64(~Uint32(lane + 32 * j))
                 offset += 1
         cute.arch.sync_warp()
+        rd.stamp(daddr, 4)  # DIAG: compacted
         if n <= 32:  # usually
             mine, rank = Uint64(0), Int32(0)
             if lane < n:
@@ -201,7 +205,6 @@ class RouteSitu:
                 if (index < n) & (rank < 16):
                     self.chosen(mine, rank, ids, sig, picked, token, signal)
         cute.arch.sync_warp()
-        rd.stamp(daddr, 4)  # DIAG: ranked (ids stored)
         self.publish(picked, weights, scale, token)
 
     @cute.jit
