@@ -268,6 +268,107 @@ __global__ void __launch_bounds__(32, 1) sp_ag_tma_push_kernel(
 
 static cudaStream_t tp_cur() { return c10::cuda::getCurrentCUDAStream().stream(); }
 
+// PX probe (TLX, never merged): the same push over up to PX_MAXSEG source segments in one grid. Unit u = (global chunk
+// u / W over the concatenated segments, destination (rank + 1 + u % W) % W); completion as sp_ag_tma_push_kernel.
+#define PX_MAXSEG 8
+struct PxSegs { int64_t src[PX_MAXSEG]; int64_t nb[PX_MAXSEG]; int64_t off[PX_MAXSEG]; int64_t cum[PX_MAXSEG + 1]; int n; };
+template <int NS>
+__global__ void __launch_bounds__(32, 1) px_tma_push_kernel(
+    const PxSegs sg, const int64_t* __restrict__ dst_slot, const int64_t* __restrict__ ctr, uint64_t done, int rank,
+    int W, int chunk, uint64_t limit) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ __align__(8) uint64_t bar[NS];
+  const int64_t nch = sg.cum[sg.n];
+  if (threadIdx.x != 0 || nch == 0) return;
+  for (int i = 0; i < NS; ++i) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(tp_sa(&bar[i])));
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  const int G = gridDim.x, g = blockIdx.x;
+  const int64_t total = nch * W;
+  const int64_t n = g < total ? (total - g + G - 1) / G : 0;
+  uint64_t dsts[NS];
+  uint32_t nbs[NS];
+  uint32_t ph = 0;
+  auto issue = [&](int64_t k) {
+    const int64_t u = g + k * (int64_t)G, c = u / W;
+    int si = 0;
+    while (si + 1 < sg.n && c >= sg.cum[si + 1]) ++si;
+    const int64_t off = (c - sg.cum[si]) * chunk;
+    const int d = (rank + 1 + (int)(u % W)) % W;
+    const uint32_t nb = (uint32_t)min((int64_t)chunk, sg.nb[si] - off);
+    const int s = (int)(k % NS);
+    dsts[s] = (uint64_t)dst_slot[d] + sg.off[si] + off;
+    nbs[s] = nb;
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1;\n}"
+                 :: "r"(tp_sa(&bar[s])), "r"(nb) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(tp_sa(smem + (size_t)s * chunk)), "l"((const uint8_t*)sg.src[si] + off), "r"(nb),
+                    "r"(tp_sa(&bar[s])) : "memory");
+  };
+  for (int64_t k = 0; k < NS - 1 && k < n; ++k) issue(k);
+  for (int64_t k = 0; k < n; ++k) {
+    const int s = (int)(k % NS);
+    const uint32_t a = tp_sa(&bar[s]), p = (ph >> s) & 1u;
+    asm volatile("{\n.reg .pred q;\nW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 q, [%0], %1;\n@!q bra W_%=;\n}"
+                 :: "r"(a), "r"(p) : "memory");
+    ph ^= 1u << s;
+    asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                 :: "l"(dsts[s]), "r"(tp_sa(smem + (size_t)s * chunk)), "r"(nbs[s]) : "memory");
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
+    if (k + NS - 1 < n) issue(k + NS - 1);
+  }
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+  __threadfence_system();
+  uint32_t prev;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(done) : "memory");
+  if (prev != (uint32_t)(G - 1)) return;
+  *(volatile uint32_t*)done = 0u;
+  __threadfence_system();
+  for (int i = 0; i < W; ++i) {
+    const uint64_t c = (uint64_t)ctr[(rank + 1 + i) % W];
+    asm volatile("red.release.sys.global.add.u32 [%0], 1;" :: "l"(c) : "memory");
+  }
+  const uint64_t own = (uint64_t)ctr[rank];
+  const uint32_t target = (uint32_t)W;
+  const uint64_t t0 = tp_now();
+  uint32_t v;
+  while ((int32_t)((v = tp_ld_acq(own)) - target) < 0) {
+    __nanosleep(32);
+    if (tp_now() - t0 > limit) {
+      printf("K31_SPIN_TIMEOUT kernel=px_tma_push rank=%d target=%u seen=%u\n", rank, target, v);
+      __trap();
+    }
+  }
+  asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" :: "l"(own), "r"(0u - target) : "memory");
+}
+
+
+void px_tma_push(std::vector<int64_t> srcs, std::vector<int64_t> nbs, std::vector<int64_t> offs, torch::Tensor dst_slot,
+                 torch::Tensor ctr, int64_t done, int64_t rank, int64_t W, int64_t chunk, int64_t grid, int64_t limit) {
+  TORCH_CHECK(srcs.size() == nbs.size() && nbs.size() == offs.size() && srcs.size() <= PX_MAXSEG, "px_tma_push: segments");
+  TORCH_CHECK(dst_slot.numel() == W && ctr.numel() == W, "px_tma_push: [W] address tensors");
+  PxSegs sg{};
+  sg.n = (int)srcs.size();
+  sg.cum[0] = 0;
+  for (int i = 0; i < sg.n; ++i) {
+    TORCH_CHECK(nbs[i] > 0 && nbs[i] % 16 == 0 && offs[i] % 16 == 0 && srcs[i] % 16 == 0, "px_tma_push: 16-byte aligned");
+    sg.src[i] = srcs[i]; sg.nb[i] = nbs[i]; sg.off[i] = offs[i];
+    sg.cum[i + 1] = sg.cum[i] + (nbs[i] + chunk - 1) / chunk;
+  }
+  auto k = px_tma_push_kernel<2>;
+  const int smem = (int)(2 * chunk);
+  static int smem_set = 0;
+  if (smem_set < smem) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    smem_set = smem;
+  }
+  k<<<(unsigned)grid, 32, smem, tp_cur()>>>(sg, dst_slot.data_ptr<int64_t>(), ctr.data_ptr<int64_t>(), (uint64_t)done,
+                                            (int)rank, (int)W, (int)chunk, (uint64_t)limit);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
 void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, torch::Tensor ctr, int64_t done, int64_t rank,
                     int64_t W, int64_t chunk, int64_t grid, int64_t limit) {
   TORCH_CHECK(src.is_cuda() && src.is_contiguous(), "sp_ag_tma_push: contiguous CUDA source");
@@ -294,6 +395,8 @@ _TMA_CPP = r"""
 #include <torch/extension.h>
 void sp_ag_tma_push(torch::Tensor, torch::Tensor, int64_t, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t,
                     int64_t);
+void px_tma_push(std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, torch::Tensor, torch::Tensor, int64_t,
+                 int64_t, int64_t, int64_t, int64_t, int64_t);
 """
 
 _tma_lock = threading.Lock()
@@ -320,7 +423,7 @@ def _tma_module():
                 name=f"k3_sp_ag_tma_{tag}",
                 cpp_sources=_TMA_CPP,
                 cuda_sources=_TMA_CUDA,
-                functions=["sp_ag_tma_push"],
+                functions=["sp_ag_tma_push", "px_tma_push"],
                 extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
                 build_directory=build,
                 verbose=False,
@@ -331,6 +434,70 @@ def _tma_module():
 def tma_push_capable(device) -> bool:
     """The TMA push needs a Blackwell-family GPU (sm_100f code: SM 10.x)."""
     return torch.cuda.get_device_capability(device)[0] == 10
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# PX probe overlay (TLX day-1 in-step probe, designs/tp8comm-sol.md sec 4; NEVER MERGED). K31_PX = comma flags:
+#   kda_tma : the KDA MXFP8 gather goes through the TMA push (rows + scales, one launch, counted completion, no barrier)
+#   kda_w   : + the KDA layer's own W_o shard bytes (1536 x 7168 MXFP8 + E8M0 = 11,354,112 B per source; 79.5 MB ingress)
+#   dsa_w   : the DSA BF16 TMA gather also carries W_qb|W_g|W_o shard bytes (51,118,080 B per source; 357.8 MB ingress)
+# Weight bytes are real parameter bytes of the layer's attention module, written into the dead tail of the SAME slot:
+# bytes [world * max_rows * hidden * (1 + 1/32), 2 * world * max_rows * hidden) of a slot are written by no gather
+# (BF16 gathers end at 2 * world * rows * hidden <= world * max_rows * hidden * 2 only when rows = max_rows; the
+# init check below requires rows_max_step <= max_rows / 2, true at MNBT 65536 for p2k/p4k) and read by nobody.
+# The model's math is unchanged (bitwise); no memory is allocated.
+_PX = frozenset(f for f in os.environ.get("K31_PX", "").split(",") if f)
+_PX_KDA_W_BYTES = 1536 * 7168 * 33 // 32
+_PX_DSA_W_BYTES = 1536 * 2304 * 2 + 7168 * 1536 * 2 + 1536 * 7168 * 2
+_px_src: list[tuple[int, int]] | None = None  # (address, bytes) of the next gather's shadow segments
+_px_logged: set[str] = set()
+
+
+def px_enabled(flag: str) -> bool:
+    return flag in _PX
+
+
+def px_set_shadow(module: torch.nn.Module | None, kind: str) -> None:
+    """Announce the shadow weight bytes of the next gather (kind 'kda' or 'dsa'): parameter bytes of ``module``
+    (o_proj for KDA; q_b|g|o projections for DSA), cycled to the design's per-source byte count, 16-byte aligned."""
+    global _px_src
+    _px_src = None
+    if module is None or not ((kind == "kda" and "kda_w" in _PX) or (kind == "dsa" and "dsa_w" in _PX)):
+        return
+    target = _PX_KDA_W_BYTES if kind == "kda" else _PX_DSA_W_BYTES
+    cache = getattr(module, "_px_shadow_cache", None)
+    if cache is None:
+        keys = ("o_proj",) if kind == "kda" else ("q_b", "wq_b", "g_proj", "gate", "o_proj")
+        params = [(n, t) for n, t in list(module.named_parameters()) + list(module.named_buffers())
+                  if t.is_cuda and t.is_contiguous() and any(k in n for k in keys)]
+        if sum(t.numel() * t.element_size() for _, t in params) < 4096:
+            params = [(n, t) for n, t in module.named_parameters() if t.is_cuda and t.is_contiguous()]
+        params.sort(key=lambda x: -x[1].numel() * x[1].element_size())
+        segs, left, i = [], target, 0
+        while left > 0:
+            n, t = params[i % len(params)]
+            addr = (t.data_ptr() + 15) // 16 * 16
+            nb = min(left, (t.data_ptr() + t.numel() * t.element_size() - addr) // 16 * 16)
+            if nb >= 16:
+                segs.append((addr, nb))
+                left -= nb
+            i += 1
+            assert i < 64, "PX shadow: no usable parameter bytes"
+        cache = segs
+        module._px_shadow_cache = cache
+        if kind not in _px_logged:
+            _px_logged.add(kind)
+            logger.warning(
+                "K31_PX shadow %s: %d B per source from %s", kind, sum(b for _, b in segs),
+                [(n, tuple(t.shape), str(t.dtype)) for n, t in params[:6]],
+            )
+    _px_src = cache
+
+
+def _px_take() -> list[tuple[int, int]]:
+    global _px_src
+    s, _px_src = (_px_src or []), None
+    return s
 
 
 class SymmSpAllGather:
@@ -395,6 +562,22 @@ class SymmSpAllGather:
                 self.storage[:0], self.peer_ptrs[0], 0, self.ctr_ptrs[0], self.done_ptrs[0],
                 self.rank, self.world, _TMA_CHUNK, 1, _TMA_SPIN_NS,
             )  # fmt: skip
+            if _PX:
+                _tma_module().px_tma_push(
+                    [], [], [], self.peer_ptrs[0], self.ctr_ptrs[0], self.done_ptrs[0],
+                    self.rank, self.world, _TMA_CHUNK, 1, _TMA_SPIN_NS,
+                )  # fmt: skip
+        # PX: dead tail of each slot (bytes), after the MXFP8 scale region; shadow bytes land at tail + rank * B.
+        esz = torch.empty((), dtype=dtype).element_size()
+        self.px_tail = self.world * max_rows * hidden_size * (1 + 1 / MXFP8_BLOCK)
+        self.px_tail = int(self.px_tail + 15) // 16 * 16
+        self.px_tail_bytes = self.slot_numel * esz - self.px_tail
+        if _PX:
+            need = self.world * max(_PX_KDA_W_BYTES, _PX_DSA_W_BYTES if "dsa_w" in _PX else 0)
+            assert self.tma, "K31_PX needs the TMA push (SM 10.x)"
+            assert need <= self.px_tail_bytes, f"K31_PX: shadow {need} B > slot tail {self.px_tail_bytes} B"
+            logger.warning("K31_PX=%s: slot tail %d B from byte %d (max_rows %d), allocates nothing",
+                           ",".join(sorted(_PX)), self.px_tail_bytes, self.px_tail, max_rows)
         torch.accelerator.synchronize()
         self.handle.barrier()
 
@@ -430,6 +613,19 @@ class SymmSpAllGather:
         self.count += 1
         return slot
 
+    def _px_push(self, slot: int, segs: list[tuple[int, int, int]]) -> None:
+        """One PX push of (src address, bytes, byte offset in each rank's slot) segments; counted completion."""
+        shadow = _px_take()
+        for j, (a, nb) in enumerate(shadow):
+            off = self.px_tail + self.rank * sum(b for _, b in shadow) + sum(b for _, b in shadow[:j])
+            segs.append((a, nb, off))
+        units = sum(cdiv(nb, _TMA_CHUNK) for _, nb, _ in segs) * self.world
+        _tma_module().px_tma_push(
+            [a for a, _, _ in segs], [nb for _, nb, _ in segs], [o for _, _, o in segs],
+            self.peer_ptrs[slot], self.ctr_ptrs[slot], self.done_ptrs[slot], self.rank, self.world,
+            _TMA_CHUNK, min(self.num_sms, units), _TMA_SPIN_NS,
+        )  # fmt: skip
+
     def gather_mxfp8(
         self, data: torch.Tensor, scale: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -457,6 +653,17 @@ class SymmSpAllGather:
         # Slot layout in bytes: rows from 0, scales from world * max_rows *
         # hidden (inside the BF16 slot of 2 * world * max_rows * hidden).
         sf_base = self.world * self.max_rows * hidden
+        if "kda_tma" in _PX and data_words.data_ptr() % 16 == 0 and sf_words.data_ptr() % 16 == 0:
+            self._px_push(slot, [
+                (data_words.data_ptr(), data_words.numel() * 4, self.rank * data_words.numel() * 4),
+                (sf_words.data_ptr(), sf_bytes, sf_base + self.rank * sf_bytes),
+            ])  # fmt: skip
+            start = slot * self.slot_numel * self.storage.element_size()
+            raw = self.storage.view(torch.uint8)
+            out = raw[start : start + self.world * rows * hidden]
+            sf = raw[start + sf_base : start + sf_base + self.world * sf_bytes]
+            return out.view(data.dtype).view(self.world * rows, hidden), sf
+        _px_take()
         _push_shard2_kernel[
             (
                 min(
@@ -491,6 +698,14 @@ class SymmSpAllGather:
         x = x.contiguous()
         numel = rows * hidden
         nbytes = numel * x.element_size()
+        if self.tma and nbytes % 16 == 0 and x.data_ptr() % 16 == 0 and _px_src:
+            assert self.world * nbytes <= self.px_tail, "K31_PX: BF16 gather reaches the slot tail"
+            self._px_push(slot, [(x.data_ptr(), nbytes, self.rank * nbytes)])
+            start = slot * self.slot_numel
+            return self.storage[start : start + self.world * numel].view(
+                self.world * rows, hidden
+            )
+        _px_take()
         if self.tma and nbytes % 16 == 0 and x.data_ptr() % 16 == 0:
             # Every rank adds to this rank's slot counter once all its bytes
             # landed: the push returns with the gather complete, and no

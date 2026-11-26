@@ -2048,8 +2048,10 @@ class KimiDecoderLayer(nn.Module):
             return hidden_states, prefix_sum, residual
         if sp_mxfp8:
             M = positions.shape[0]
+            sp_ag.px_set_shadow(self.self_attn, "kda" if self._layer_kind == "kda" else "dsa")  # PX probe only
             hidden_states = sp_ag.kimi_sp_all_gather_mxfp8(hidden_states, M)
         elif self.use_sequence_parallel:
+            sp_ag.px_set_shadow(self.self_attn, "kda" if self._layer_kind == "kda" else "dsa")  # PX probe only
             hidden_states = sp_ag.kimi_sp_all_gather(hidden_states)
             # Remove SP padding before attention.
             hidden_states = hidden_states[: positions.shape[0]]
