@@ -38,7 +38,7 @@ from .experts_rubin import (
     peers_bytes,
     peers_offset,
 )
-from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
+from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel, diag_ring
 from .experts_vw import RubinVWExpertsKernel
 from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
@@ -476,6 +476,7 @@ def compile_rubin64(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
         static_groups=static,
     )  # fmt: skip
+    moe.diag_ring = diag_ring(device)  # DIAG (GRPSTAMP)
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
     if publish == "push":  # + shared rows, the RS mailbox bases, capacity
