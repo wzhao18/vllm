@@ -51,6 +51,7 @@ from ..common.primitives import (
     thread,
     view,
 )
+from ..common import routediag as rd  # DIAG (never merge)
 from ..common.tensormap import GridMap, map_address, prefetch_map
 from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
@@ -237,6 +238,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     def stamp(self, slot: cutlass.Constexpr[int]):
         if cutlass.const_expr(self.trace != 0):
             stamp_at(Int64(self.trace) + Int64(thread()[3]) * 512, slot)
+        dbase, dctr = rd.buffer16("g64", self.grid)  # DIAG (never merge)
+        rd.stamp16(dbase, dctr, thread()[3], slot)
 
     @cute.jit
     def __call__(self, *args):
