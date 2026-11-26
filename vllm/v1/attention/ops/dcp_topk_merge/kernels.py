@@ -537,6 +537,31 @@ def _st_release_sys(addr: Int64, value: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _ld_volatile_u32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr)],
+            "ld.volatile.global.u32 $0, [$1];",
+            "=r,l,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_relaxed_sys_u32(addr: Int64, v, *, loc=None, ip=None) -> None:
+    _asm_void(
+        [Int64(addr), Int32(v)],
+        "st.relaxed.sys.global.u32 [$1], $2;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _globaltimer(*, loc=None, ip=None) -> Int64:
     return Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", loc=loc, ip=ip))
 
@@ -559,6 +584,8 @@ _NUM_BINS = 1 << _RADIX_BITS
 _SPIN_TIMEOUT_NS = 600 * 10**9
 # Block-table entries the mailbox select keeps in shared memory (4 KiB).
 _TABLE_CACHE = 1024
+# cut16: ties at the cut up to this many take the exact-rank path.
+_TIE_RANK_MAX = 64
 
 
 def _gid_bits(world_size: int) -> int:
@@ -1047,11 +1074,19 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         stamps: bool = False
         # Cut-only radix passes (``_make_radix_select``); dispatch: = fold.
         fast: bool = False
+        # Folded mailbox rows select with one warp per source rank: per-warp
+        # poll of its source's slot, a 16-bin register (nibble) histogram per
+        # 4-bit digit of ord16 - lo with one cut warp, tie rank by a compact
+        # tie list, the owner's rows emitted by its own warp (ballots), the
+        # saturation mask from per-source min / count. Same selected set, rows,
+        # row order, counts and saturation word as the radix select.
+        cut16: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
         stamps = compile_key.stamps
         fast = compile_key.fast
+        cut16 = compile_key.cut16
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
         exact = compile_key.exact
@@ -1096,6 +1131,13 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             stamps=stamps,
             fast=fast,
         )
+        # cut16: candidate j of source w sits in warp w, lane j % 32, register
+        # j // 32 (kpt per lane; a warp's bin counts stay below 256).
+        kpt = local_topk // _WARP
+        if cut16:
+            assert fold and mailbox and exact and not emit_ids and block_size > 0
+            assert local_topk % _WARP == 0 and kpt <= 7
+            assert world_size <= num_warps and box_words % 2 == 0
         num_r1 = world_size * local_topk
         rescue_keys = num_r1 + num_slots * topk
         rescue_per_thread = -(-rescue_keys // tb_size)
@@ -1246,10 +1288,21 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 cute.struct.MemRange[Int32, recv_words if exact else 4], 16
             ]
             stage: cute.struct.Align[
-                cute.struct.MemRange[Int32, world_size * box_words if mailbox else 4],
+                cute.struct.MemRange[
+                    Int32, world_size * box_words if mailbox and not cut16 else 4
+                ],
                 16,
             ]
             tab: cute.struct.Align[cute.struct.MemRange[Int32, max(table_cache, 4)], 16]
+            # cut16: per-warp [min, max, count, -] of its source, its 16 bin
+            # counts (bytes), the cut state, the tie list, the poll times.
+            wstat: cute.struct.Align[cute.struct.MemRange[Int32, 4 * num_warps], 16]
+            wh: cute.struct.Align[cute.struct.MemRange[Int32, 4 * num_warps], 16]
+            ctl: cute.struct.Align[cute.struct.MemRange[Int32, 8], 16]
+            ties: cute.struct.Align[
+                cute.struct.MemRange[Int32, num_keys if cut16 else 4], 16
+            ]
+            tpoll: cute.struct.Align[cute.struct.MemRange[Int64, num_warps], 8]
 
         @cute.jit
         def poll_row(
@@ -1456,6 +1509,553 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 )
                 peer = _ld_i64(peer_flags + Int64(tid) * Int64(8))
                 _st_release_sys(peer + flag_offset, flag)
+
+        @cute.jit
+        def nib_level(
+            vals: cute.Tensor,
+            prefix: Int32,
+            sh: Int32,
+            above: Int32,
+            lane: Int32,
+            warp: Int32,
+            wh: cute.Tensor,
+            ctl: cute.Tensor,
+        ):
+            """One 4-bit digit of the cut: every thread counts its eligible
+            values (>= 0) under ``prefix`` into 16 nibble counters, each warp
+            reduces them to bytes, the one cut warp sums the warps and finds
+            the bin of the (topk - above)-th largest. Writes (prefix * 16 +
+            bin, count above the bin, count in the bin) in ``ctl[0:3]``; two CTA
+            barriers."""
+            alo = Uint32(0)
+            ahi = Uint32(0)
+            for i in cutlass.range_constexpr(kpt):
+                d = vals[i]
+                if d >= Int32(0) and (d >> (sh + Int32(4))) == prefix:
+                    b = (d >> sh) & Int32(15)
+                    one = Uint32(1) << recast_val(Int32(4) * (b & Int32(7)), Uint32)
+                    if b < Int32(8):
+                        alo = alo + one
+                    else:
+                        ahi = ahi + one
+            m4 = Uint32(0x0F0F0F0F)
+            f0 = cute.arch.warp_redux_sync(alo & m4, "add")
+            f1 = cute.arch.warp_redux_sync((alo >> Uint32(4)) & m4, "add")
+            f2 = cute.arch.warp_redux_sync(ahi & m4, "add")
+            f3 = cute.arch.warp_redux_sync((ahi >> Uint32(4)) & m4, "add")
+            if lane == Int32(0):
+                wh[warp * Int32(4)] = recast_val(f0, Int32)
+                wh[warp * Int32(4) + Int32(1)] = recast_val(f1, Int32)
+                wh[warp * Int32(4) + Int32(2)] = recast_val(f2, Int32)
+                wh[warp * Int32(4) + Int32(3)] = recast_val(f3, Int32)
+            cute.arch.sync_threads()
+            if warp == Int32(0):
+                g0 = Uint32(0)
+                g1 = Uint32(0)
+                g2 = Uint32(0)
+                g3 = Uint32(0)
+                if lane < Int32(num_warps):
+                    g0 = recast_val(wh[lane * Int32(4)], Uint32)
+                    g1 = recast_val(wh[lane * Int32(4) + Int32(1)], Uint32)
+                    g2 = recast_val(wh[lane * Int32(4) + Int32(2)], Uint32)
+                    g3 = recast_val(wh[lane * Int32(4) + Int32(3)], Uint32)
+                m8 = Uint32(0x00FF00FF)
+                x0 = cute.arch.warp_redux_sync(g0 & m8, "add")
+                x1 = cute.arch.warp_redux_sync((g0 >> Uint32(8)) & m8, "add")
+                x2 = cute.arch.warp_redux_sync(g1 & m8, "add")
+                x3 = cute.arch.warp_redux_sync((g1 >> Uint32(8)) & m8, "add")
+                x4 = cute.arch.warp_redux_sync(g2 & m8, "add")
+                x5 = cute.arch.warp_redux_sync((g2 >> Uint32(8)) & m8, "add")
+                x6 = cute.arch.warp_redux_sync(g3 & m8, "add")
+                x7 = cute.arch.warp_redux_sync((g3 >> Uint32(8)) & m8, "add")
+                bn = lane & Int32(15)
+                odd = bn & Int32(1)
+                q2 = (bn >> Int32(1)) & Int32(1)
+                xe = x0
+                if bn >= Int32(8):
+                    xe = x4
+                    if odd != Int32(0):
+                        xe = x6
+                        if q2 != Int32(0):
+                            xe = x7
+                    elif q2 != Int32(0):
+                        xe = x5
+                else:
+                    if odd != Int32(0):
+                        xe = x2
+                        if q2 != Int32(0):
+                            xe = x3
+                    elif q2 != Int32(0):
+                        xe = x1
+                hf = recast_val((bn >> Int32(2)) & Int32(1), Uint32)
+                c = Int32(0)
+                if lane < Int32(16):
+                    c = recast_val((xe >> (Uint32(16) * hf)) & Uint32(0xFFFF), Int32)
+                suf = c
+                for o in cutlass.range_constexpr(4):
+                    y = cute.arch.shuffle_sync_down(suf, offset=1 << o)
+                    if lane + Int32(1 << o) < Int32(16):
+                        suf += y
+                need = Int32(topk) - above
+                ge = recast_val(
+                    cute.arch.vote_ballot_sync(lane < Int32(16) and suf >= need), Uint32
+                )
+                tb = recast_val(cute.arch.popc(ge), Int32) - Int32(1)
+                sb = cute.arch.shuffle_sync(suf, tb)
+                cbb = cute.arch.shuffle_sync(c, tb)
+                if lane == Int32(0):
+                    ctl[0] = prefix * Int32(16) + tb
+                    ctl[1] = above + sb - cbb
+                    ctl[2] = cbb
+            cute.arch.sync_threads()
+
+        @cute.jit
+        def cut16_body(
+            row: Int32,
+            tid: Int32,
+            lane: Int32,
+            warp: Int32,
+            storage,
+            dbg_row: Int64,
+            req_id: cute.Tensor,
+            block_table: cute.Tensor,
+            rows_out: cute.Tensor,
+            valid_out: cute.Tensor,
+            dcp_rank: Int32,
+            stride_rows: Int32,
+            sat_word: cute.Tensor,
+            seq2: cute.Tensor,
+            logits: cute.Tensor,
+            row_ends: cute.Tensor,
+            peer_recv: Int64,
+            peer_flags: Int64,
+            max_rows: Int32,
+            box: Int64,
+            ordinals: cute.Tensor,
+            gathered: cute.Tensor,
+        ):
+            hist = storage.hist.get_tensor(cute.make_layout((hist_words,)))
+            warp_totals = storage.warp_totals.get_tensor(cute.make_layout((num_warps,)))
+            scalars = storage.scalars.get_tensor(cute.make_layout((8,)))
+            notsat = storage.notsat.get_tensor(cute.make_layout((16,)))
+            prefix_ptr = storage.prefix.data_ptr()
+            tab = storage.tab.get_tensor(cute.make_layout((max(table_cache, 4),)))
+            wstat = storage.wstat.get_tensor(cute.make_layout((4 * num_warps,)))
+            wh = storage.wh.get_tensor(cute.make_layout((4 * num_warps,)))
+            ctl = storage.ctl.get_tensor(cute.make_layout((8,)))
+            ties = storage.ties.get_tensor(cute.make_layout((num_keys,)))
+            tpoll = storage.tpoll.get_tensor(cute.make_layout((num_warps,)))
+            empty = Int32(_EMPTY)
+            gid_mask_c = (1 << gid_bits) - 1
+            # Step metadata: the row's block-table entries, loaded while the
+            # mailbox fills (read after the first barrier).
+            req = req_id[row]
+            width = cutlass.min(Int32(block_table.shape[1]), Int32(table_cache))
+            for i in cutlass.range(tid, width, tb_size, unroll=1):
+                tab[i] = block_table[req, i]
+            ordinal = ordinals[row]
+            # Poll: warp w < W reads source w's slot (candidate 32 i + lane in
+            # register i; lane i < kpt also reads bit-plane word i's two marked
+            # halves) until no word is empty, then re-arms what it read.
+            words = cute.make_rmem_tensor((kpt,), Int32)
+            for i in cutlass.range_constexpr(kpt):
+                words[i] = Int32(0)
+            plo = Int32(0)
+            phi = Int32(0)
+            slot = (
+                box
+                + (Int64(ordinal & Int32(1)) * Int64(max_rows) + Int64(row))
+                * Int64(row_chunks * 16)
+                + Int64(warp) * Int64(box_words * 4)
+            )
+            if warp < Int32(world_size):
+                pend = Int32(1)
+                start = _globaltimer()
+                while pend != Int32(0):
+                    bad = Int32(0)
+                    for i in cutlass.range_constexpr(kpt):
+                        words[i] = _ld_volatile_u32(
+                            slot + Int64(Int32(i * _WARP) + lane) * Int64(4)
+                        )
+                        if words[i] == empty:
+                            bad = Int32(1)
+                    if lane < Int32(kpt):
+                        at = slot + Int64(Int32(local_topk) + Int32(2) * lane) * Int64(4)
+                        plo = _ld_volatile_u32(at)
+                        phi = _ld_volatile_u32(at + Int64(4))
+                        if plo == empty or phi == empty:
+                            bad = Int32(1)
+                    ok = cute.arch.vote_all_sync(bad == Int32(0))
+                    pend = Int32(1)
+                    if ok:
+                        pend = Int32(0)
+                    if pend != Int32(0):
+                        if _globaltimer() - start > Int64(_SPIN_TIMEOUT_NS):
+                            cute.printf(
+                                "DCP top-k mailbox timeout row=%d ordinal=%d\n",
+                                row,
+                                ordinal,
+                            )
+                            _trap()
+                for i in cutlass.range_constexpr(kpt):
+                    _st_relaxed_sys_u32(
+                        slot + Int64(Int32(i * _WARP) + lane) * Int64(4), empty
+                    )
+                if lane < Int32(kpt):
+                    at = slot + Int64(Int32(local_topk) + Int32(2) * lane) * Int64(4)
+                    _st_relaxed_sys_u32(at, empty)
+                    _st_relaxed_sys_u32(at + Int64(4), empty)
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if lane == Int32(0):
+                    tpoll[warp] = _globaltimer()
+            if tid == Int32(0):
+                ctl[3] = Int32(0)
+            cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(16), _globaltimer())
+            if cutlass.const_expr(not hold):
+                cute.arch.griddepcontrol_launch_dependents()
+            # Decode: bit-plane word i (lane i) -> every lane.
+            plane = (Uint32(recast_val(plo, Uint32)) & Uint32(0xFFFF)) | (
+                Uint32(recast_val(phi, Uint32)) << Uint32(16)
+            )
+            keys = cute.make_rmem_tensor((kpt,), Uint64)
+            wmin = Int32(0x10000)
+            wmax = Int32(0)
+            wcnt = Int32(0)
+            for i in cutlass.range_constexpr(kpt):
+                high = recast_val(
+                    cute.arch.shuffle_sync(recast_val(plane, Int32), Int32(i)), Uint32
+                )
+                key = Uint64(0)
+                if warp < Int32(world_size):
+                    key = _decode_key(
+                        recast_val(words[i], Uint32),
+                        high,
+                        Int32(i * _WARP) + lane,
+                        recast_val(warp, Uint32),
+                        world_size,
+                        gid_bits,
+                    )
+                keys[i] = key
+                if key != Uint64(0):
+                    sc = Int32(key >> Uint64(gid_bits))
+                    wmin = cutlass.min(wmin, sc)
+                    wmax = cutlass.max(wmax, sc)
+                    wcnt += Int32(1)
+            wmin = cute.arch.warp_redux_sync(wmin, "min")
+            wmax = cute.arch.warp_redux_sync(wmax, "max")
+            wcnt = cute.arch.warp_redux_sync(wcnt, "add")
+            if lane == Int32(0):
+                wstat[warp * Int32(4)] = wmin
+                wstat[warp * Int32(4) + Int32(1)] = wmax
+                wstat[warp * Int32(4) + Int32(2)] = wcnt
+            cute.arch.sync_threads()
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    tmax = tpoll[0]
+                    for w in cutlass.range_constexpr(num_warps):
+                        tmax = cutlass.max(tmax, tpoll[w])
+                    _st_i64(dbg_row + Int64(8), tmax)
+                    _st_i64(dbg_row + Int64(24), _globaltimer())
+            lo = Int32(0x10000)
+            hi = Int32(0)
+            total = Int32(0)
+            for w in cutlass.range_constexpr(world_size):
+                lo = cutlass.min(lo, wstat[4 * w])
+                hi = cutlass.max(hi, wstat[4 * w + 1])
+                total += wstat[4 * w + 2]
+            # The cut, as a 64-bit key: selected = non-empty keys >= cutkey.
+            cutkey = Uint64(1)
+            tau = Int32(0)
+            if total == Int32(topk):
+                tau = lo
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(48), Int64(0))
+            if total > Int32(topk):
+                # ord16 - lo per key (-1: empty), the digits of the score levels.
+                sv = cute.make_rmem_tensor((kpt,), Int32)
+                for i in cutlass.range_constexpr(kpt):
+                    sv[i] = Int32(-1)
+                    if keys[i] != Uint64(0):
+                        sv[i] = Int32(keys[i] >> Uint64(gid_bits)) - lo
+                rng = hi - lo
+                nlev = Int32(1)
+                while (rng >> (Int32(4) * nlev)) != Int32(0):
+                    nlev += Int32(1)
+                prefix = Int32(0)
+                above = Int32(0)
+                cb = Int32(0)
+                for lev in cutlass.range(nlev, unroll=1):
+                    sh = Int32(4) * (nlev - Int32(1) - lev)
+                    nib_level(sv, prefix, sh, above, lane, warp, wh, ctl)
+                    prefix = ctl[0]
+                    above = ctl[1]
+                    cb = ctl[2]
+                tau = lo + prefix
+                need_t = Int32(topk) - above
+                cutkey = Uint64(tau) << Uint64(gid_bits)
+                if cutlass.const_expr(stamps):  # noqa: SIM102
+                    if tid == Int32(0):
+                        _st_i64(dbg_row + Int64(48), _globaltimer())
+                if need_t < cb:
+                    if cb <= Int32(_TIE_RANK_MAX):
+                        # Few ties at tau: the need_t lowest global ids by exact
+                        # rank. Each warp's tied keys go to the list at the offset
+                        # of its warp in the last level's per-warp counts of bin
+                        # tau (no atomics).
+                        tb = prefix & Int32(15)
+                        wi = (tb >> Int32(3)) * Int32(2) + (tb & Int32(1))
+                        sb8 = recast_val(Int32(8) * ((tb & Int32(7)) >> Int32(1)), Uint32)
+                        off = Int32(0)
+                        for w in cutlass.range_constexpr(num_warps):
+                            if Int32(w) < warp:
+                                off += recast_val(
+                                    (recast_val(wh[Int32(4 * w) + wi], Uint32) >> sb8)
+                                    & Uint32(0xFF),
+                                    Int32,
+                                )
+                        ltm = (Uint32(1) << recast_val(lane, Uint32)) - Uint32(1)
+                        for i in cutlass.range_constexpr(kpt):
+                            is_t = sv[i] == prefix
+                            bal = recast_val(cute.arch.vote_ballot_sync(is_t), Uint32)
+                            if is_t:
+                                ties[
+                                    off + recast_val(cute.arch.popc(bal & ltm), Int32)
+                                ] = Int32(keys[i] & Uint64(gid_mask_c))
+                            off += recast_val(cute.arch.popc(bal), Int32)
+                        cute.arch.sync_threads()
+                        # Exact rank (ids are unique): the tied key with need_t - 1
+                        # larger ones (smaller ids) is the last selected.
+                        if tid < cb:
+                            v = ties[tid]
+                            r = Int32(0)
+                            for u in cutlass.range(cb, unroll=4):
+                                if ties[u] > v:
+                                    r += Int32(1)
+                            if r == need_t - Int32(1):
+                                ctl[3] = v
+                        cute.arch.sync_threads()
+                        cutkey = cutkey | Uint64(recast_val(ctl[3], Uint32))
+                    else:
+                        # Many ties: further 4-bit levels over the tied keys' ~gid.
+                        gv = cute.make_rmem_tensor((kpt,), Int32)
+                        for i in cutlass.range_constexpr(kpt):
+                            gv[i] = Int32(-1)
+                            if sv[i] == prefix:
+                                gv[i] = Int32(keys[i] & Uint64(gid_mask_c))
+                        nlev_g = (gid_bits + 3) // 4
+                        gp = Int32(0)
+                        for lev in cutlass.range(nlev_g, unroll=1):
+                            sh = Int32(4) * (Int32(nlev_g - 1) - lev)
+                            nib_level(gv, gp, sh, above, lane, warp, wh, ctl)
+                            gp = ctl[0]
+                            above = ctl[1]
+                        cutkey = cutkey | Uint64(recast_val(gp, Uint32))
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(32), _globaltimer())
+            # Rows: this rank's warp emits its selected rows (a block past the
+            # table dropped) in the radix select's order: by its thread index
+            # (rank * N + j) % tb_size, i.e. the wrapped candidates first.
+            if warp == dcp_rank:
+                jw = Int32(tb_size) - (Int32(local_topk) * dcp_rank) % Int32(tb_size)
+                if jw > Int32(local_topk):
+                    jw = Int32(local_topk)
+                ltm = (Uint32(1) << recast_val(lane, Uint32)) - Uint32(1)
+                bals = cute.make_rmem_tensor((kpt,), Uint32)
+                n_all = Int32(0)
+                n_jw = Int32(0)
+                for i in cutlass.range_constexpr(kpt):
+                    key = keys[i]
+                    sel = False
+                    if key != Uint64(0) and key >= cutkey:
+                        gid = Uint32(gid_mask_c) - Uint32(key & Uint64(gid_mask_c))
+                        local = recast_val(gid // Uint32(world_size), Int32)
+                        sel = local // Int32(block_size) < Int32(block_table.shape[1])
+                    bals[i] = recast_val(cute.arch.vote_ballot_sync(sel), Uint32)
+                    lo_i = jw - Int32(i * _WARP)
+                    if lo_i >= Int32(_WARP):
+                        n_jw += recast_val(cute.arch.popc(bals[i]), Int32)
+                    elif lo_i > Int32(0):
+                        n_jw += recast_val(
+                            cute.arch.popc(
+                                bals[i]
+                                & ((Uint32(1) << recast_val(lo_i, Uint32)) - Uint32(1))
+                            ),
+                            Int32,
+                        )
+                    n_all += recast_val(cute.arch.popc(bals[i]), Int32)
+                pre = Int32(0)
+                for i in cutlass.range_constexpr(kpt):
+                    if ((bals[i] >> recast_val(lane, Uint32)) & Uint32(1)) != Uint32(0):
+                        j = Int32(i * _WARP) + lane
+                        pos = pre + recast_val(cute.arch.popc(bals[i] & ltm), Int32)
+                        if j >= jw:
+                            pos = pos - n_jw
+                        else:
+                            pos = pos + n_all - n_jw
+                        gid = Uint32(gid_mask_c) - Uint32(keys[i] & Uint64(gid_mask_c))
+                        local = recast_val(gid // Uint32(world_size), Int32)
+                        block = local // Int32(block_size)
+                        entry = Int32(0)
+                        if block < Int32(table_cache):
+                            entry = tab[block]
+                        else:
+                            entry = block_table[req, block]
+                        rows_out[row, pos] = entry * stride_rows + (
+                            local - block * Int32(block_size)
+                        )
+                    pre += recast_val(cute.arch.popc(bals[i]), Int32)
+                if lane == Int32(0):
+                    ctl[4] = n_all
+            # Saturation: rank r sent N words, all above tau16 (from its warp's
+            # min / count); tau16 = 0 below K candidates.
+            mask = Int32(0)
+            for w in cutlass.range_constexpr(world_size):
+                if wstat[4 * w + 2] == Int32(local_topk) and wstat[4 * w] > tau:
+                    mask = mask | Int32(1 << w)
+            num_sat = recast_val(cute.arch.popc(recast_val(mask, Uint32)), Int32)
+            if num_sat > Int32(num_slots):
+                mask = Int32(0)
+            cute.arch.sync_threads()
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(40), _globaltimer())
+            num_owned = ctl[4]
+            for i in cutlass.range(num_owned + tid, rows_out.shape[1], tb_size, unroll=1):
+                rows_out[row, i] = Int32(-1)
+            if tid == Int32(0):
+                valid_out[row] = num_owned
+                sat_word[row] = (mask << Int32(16)) | tau
+                ordinals[row] = ordinal + Int32(1)
+            if mask != Int32(0):
+                # The rescue re-reads the other ranks' round-1 words.
+                if warp < Int32(world_size):
+                    for i in cutlass.range_constexpr(kpt):
+                        gathered[warp, row, Int32(i * _WARP) + lane] = words[i]
+                    if lane < Int32(kpt):
+                        gathered[warp, row, Int32(local_topk) + lane] = recast_val(
+                            plane, Int32
+                        )
+                if ((mask >> dcp_rank) & Int32(1)) != Int32(0):
+                    pslot = recast_val(
+                        cute.arch.popc(
+                            recast_val(mask & ((Int32(1) << dcp_rank) - Int32(1)), Uint32)
+                        ),
+                        Int32,
+                    )
+                    push_buf = storage.push.get_tensor(cute.make_layout((recv_words,)))
+                    push_local_topk(
+                        row,
+                        tid,
+                        lane,
+                        warp,
+                        hist,
+                        warp_totals,
+                        scalars,
+                        push_buf,
+                        logits,
+                        row_ends,
+                        pslot,
+                        dcp_rank,
+                        seq2,
+                        peer_recv,
+                        peer_flags,
+                        max_rows,
+                    )
+                cute.arch.sync_threads()
+                if tid < Int32(16):
+                    notsat[tid] = Int32(0)
+                cute.arch.sync_threads()
+                rescue_row(
+                    row,
+                    mask,
+                    tau,
+                    tid,
+                    lane,
+                    warp,
+                    notsat,
+                    hist,
+                    warp_totals,
+                    scalars,
+                    prefix_ptr,
+                    gathered,
+                    rows_out,
+                    req_id,
+                    block_table,
+                    rows_out,
+                    valid_out,
+                    dcp_rank,
+                    stride_rows,
+                    seq2,
+                    peer_recv,
+                    peer_flags,
+                    max_rows,
+                    tab,
+                )
+            if cutlass.const_expr(stamps):
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    _st_i64(dbg_row + Int64(56), _globaltimer())
+
+        @cute.kernel
+        def device_kernel_cut16(
+            gathered: cute.Tensor,
+            out: cute.Tensor,
+            req_id: cute.Tensor,
+            block_table: cute.Tensor,
+            rows_out: cute.Tensor,
+            valid_out: cute.Tensor,
+            dcp_rank: Int32,
+            stride_rows: Int32,
+            sat_word: cute.Tensor,
+            seq2: cute.Tensor,
+            logits: cute.Tensor,
+            row_ends: cute.Tensor,
+            peer_recv: Int64,
+            peer_flags: Int64,
+            max_rows: Int32,
+            box: Int64,
+            ordinals: cute.Tensor,
+            dbg: Int64,
+        ):
+            row, _, _ = cute.arch.block_idx()
+            tid, _, _ = cute.arch.thread_idx()
+            lane = cute.arch.lane_idx()
+            warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            dbg_row = dbg + Int64(row) * Int64(64)
+            if cutlass.const_expr(stamps):  # noqa: SIM102
+                if tid == Int32(0):
+                    _st_i64(dbg_row, _globaltimer())
+            smem = cutlass.memory.SmemAllocator()
+            storage = smem.allocate(SharedStorage, 16)
+            cut16_body(
+                row,
+                tid,
+                lane,
+                warp,
+                storage,
+                dbg_row,
+                req_id,
+                block_table,
+                rows_out,
+                valid_out,
+                dcp_rank,
+                stride_rows,
+                sat_word,
+                seq2,
+                logits,
+                row_ends,
+                peer_recv,
+                peer_flags,
+                max_rows,
+                box,
+                ordinals,
+                gathered,
+            )
 
         @cute.kernel
         def device_kernel(
@@ -1733,6 +2333,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 if tid == Int32(0):
                     _st_i64(dbg_row + Int64(56), _globaltimer())
 
+        launch_kernel = device_kernel_cut16 if cut16 else device_kernel
+
         @cute.jit
         def host_entrypoint(
             gathered: cute.Tensor,
@@ -1756,7 +2358,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             stream,
         ):
             # Unused outputs / exact-only and mailbox inputs are placeholders.
-            device_kernel(
+            launch_kernel(
                 gathered,
                 out,
                 req_id,
@@ -1799,7 +2401,23 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         hold: bool = False,
         stamps: bool = False,
         fast: bool | None = None,
+        cut16: bool | None = None,
     ) -> CompileKey:
+        fast_key = fold if fast is None else fast
+        # Per-shape dispatch: the folded mailbox rows select whose sources fit
+        # one warp each (N = 32 x <= 7 candidates per lane, W <= 16 warps).
+        cut16_auto = (
+            fold
+            and fast_key
+            and mailbox
+            and exact
+            and not emit_ids
+            and block_size > 0
+            and local_topk % 32 == 0
+            and local_topk // 32 <= 7
+            and world_size <= 16
+        )
+        cut16_key = cut16_auto if cut16 is None else cut16
         return self.CompileKey(
             topk=topk,
             local_topk=local_topk,
@@ -1812,7 +2430,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             fold=fold,
             hold=hold,
             stamps=stamps,
-            fast=fold if fast is None else fast,
+            fast=fast_key,
+            cut16=cut16_key,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
@@ -1847,6 +2466,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         hold: bool = False,
         stamps: torch.Tensor | None = None,
         fast: bool | None = None,
+        cut16: bool | None = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1861,6 +2481,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             hold=hold,
             stamps=stamps is not None,
             fast=fast,
+            cut16=cut16,
         )
         if mailbox is None:
             mailbox_args = (0, _dummy_i32(gathered.device))
