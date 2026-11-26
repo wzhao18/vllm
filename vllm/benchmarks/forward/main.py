@@ -218,6 +218,15 @@ def apply_eplb_load(runner, path: str) -> dict[str, Any]:
         k: (_gather_rows(_row_sums(m), ep), m.physical_to_logical_map.cpu().clone())
         for k, m in state.model_states.items()
     }
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.experts import KimiK3MegaMoEExperts
+
+    stg = [
+        m.scale_staging
+        for m in runner.get_model().modules()
+        if isinstance(m, KimiK3MegaMoEExperts) and m.scale_staging is not None
+    ][:1]
+    if stg:
+        stats["staging_before"] = {"held": list(stg[0].held), "pending": stg[0].pending}
     free0 = torch.cuda.mem_get_info()[0]
     torch.accelerator.synchronize()
     t0 = _time.perf_counter()
@@ -254,6 +263,8 @@ def apply_eplb_load(runner, path: str) -> dict[str, Any]:
             "first": [(int(a), int(b)) for a, b in bad.nonzero()[:8].tolist()],
             "per_tensor_wrong": (expected != after_sums).sum((0, 1)).tolist(),
         }
+    if stg:
+        stats["staging_after"] = {"held": list(stg[0].held), "pending": stg[0].pending}
     stats["rearrange_wall_s"] = round(wall, 4)
     stats["rearrange_free_mem_delta_mib"] = round((free1 - free0) / 2**20, 1)
     logger.info("EPLB load %s applied: busiest/mean rank load %s", path, stats)
