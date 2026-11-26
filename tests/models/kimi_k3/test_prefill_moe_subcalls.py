@@ -25,10 +25,9 @@ def _cfg(backend=KIMI_K3_MEGA_MOE):
     return SimpleNamespace(kernel_config=SimpleNamespace(moe_backend=backend))
 
 
-def _policy(mnbt=16384, tp=1, sp=False, shard=False, backend=KIMI_K3_MEGA_MOE):
+def _policy(mnbt=16384, tp=1, sp=False, backend=KIMI_K3_MEGA_MOE):
     return P.prefill_moe_policy(
-        _cfg(backend), tp_size=tp, sequence_parallel=sp, token_shard=shard,
-        max_num_tokens=mnbt,
+        _cfg(backend), tp_size=tp, sequence_parallel=sp, max_num_tokens=mnbt,
     )  # fmt: skip
 
 
@@ -37,7 +36,7 @@ def test_policy_applies_to_tp1_prefill_batches_only():
     assert p == P.PrefillMoEPolicy(capacity=C, max_num_tokens=16384) and p.subcalls
     assert _policy(mnbt=32768).capacity == C
     for kw in (
-        dict(mnbt=C), dict(tp=4), dict(sp=True), dict(shard=True),
+        dict(mnbt=C), dict(tp=4), dict(sp=True),
         dict(backend="deep_gemm_mega_moe"),
     ):  # fmt: skip
         assert _policy(**kw) is None, kw

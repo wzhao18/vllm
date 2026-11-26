@@ -151,20 +151,24 @@ def capacity_pages(max_tokens: int, max_reqs: int) -> int:
 
 def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) -> int:
     """Most tokens of a step that keeps the DCP path under DCP ShardQ (whose
-    steps never fall back for a full workspace): its leading decode rows plus fewer than
-    ``sparse_mla_shard_q_min_tokens`` prefill tokens, or a padded step of at
-    most the DCP workspace's tokens."""
-    from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
-
-    scheduler_config = vllm_config.scheduler_config
-    few_tokens = (
-        scheduler_config.max_num_seqs * decode_query_len
-        + vllm_config.attention_config.sparse_mla_shard_q_min_tokens
-        - 1
+    steps never fall back for a full workspace): its leading decode rows plus
+    fewer than ``sparse_mla_shard_q_min_tokens`` prefill tokens
+    (``dcp_shardq_few_token_rows``), or a padded step (a FULL decode graph) of
+    at most the DCP workspace's tokens. On a DCP ShardQ instance the DCP
+    workspace already covers the few-token steps, so this equals
+    ``get_dcp_workspace_max_num_tokens``: every such step fits the direct
+    workspaces."""
+    from vllm.v1.attention.ops.dcp import (
+        dcp_shardq_few_token_rows,
+        get_dcp_workspace_max_num_tokens,
     )
+
     return min(
-        scheduler_config.max_num_batched_tokens,
-        max(few_tokens, get_dcp_workspace_max_num_tokens(vllm_config)),
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        max(
+            dcp_shardq_few_token_rows(vllm_config, decode_query_len),
+            get_dcp_workspace_max_num_tokens(vllm_config, dcp_shardq=True),
+        ),
     )
 
 
@@ -352,6 +356,18 @@ class DcpShardQContext:
     rank_major: "RankMajorPlan | None" = None
     # Per layer, under ``rank_major``: the copies into the peers in flight.
     mla_in_flight: "InFlight | None" = None
+    # Under ``rank_major``: the next DSA layer's copies, issued a layer ahead
+    # (``prefetch``), by the address of that layer's MLA cache.
+    mla_prefetch: "tuple[int, InFlight] | None" = None
+    # Under ``rank_major``: the MLA cache address of the DSA layer whose
+    # attention consumed its copies (``after_attend``) since its last gather. A
+    # repeated attention over that same gathered context (no new gather, e.g. a
+    # replicated-query recompute) has nothing in flight and issues nothing.
+    mla_attended: int | None = None
+    # Under ``rank_major``: the forward context and the MLA caches and block
+    # tables of its DSA layers that attend this context, in layer order
+    # (``_dsa_layers``).
+    dsa_layers: "tuple[Any, list[tuple[torch.Tensor, torch.Tensor]]] | None" = None
 
     # The workspace's pages of 64 tokens address its views and block table.
     block_size = PAGE_TOKENS
@@ -473,10 +489,22 @@ class DcpShardQContext:
 
         plan = self.rank_major
         assert plan is not None
-        mla_rows = buffer.storage[: self.pages * self.layout.mla_page_bytes]
-        rank_major.pack(
-            plan, mla_cache, mla_block_table, self.num_decodes, mla_rows
-        )
+        prefetched = self.mla_prefetch
+        self.mla_prefetch = None
+        self.mla_attended = None
+        if prefetched is not None:
+            # This layer's MLA rows were packed and copied a layer ahead.
+            if prefetched[0] != mla_cache.data_ptr():
+                raise RuntimeError(
+                    "DCP ShardQ: the prefetched context rows are of another "
+                    "layer than the one gathering"
+                )
+            self.mla_in_flight = prefetched[1]
+        else:
+            mla_rows = buffer.storage[: self.pages * self.layout.mla_page_bytes]
+            rank_major.pack(
+                plan, mla_cache, mla_block_table, self.num_decodes, mla_rows
+            )
         if self.max_local_pages:
             DCP_CONTEXT_PUSH_KERNEL(
                 mla_cache=mla_cache,
@@ -493,6 +521,8 @@ class DcpShardQContext:
                 index_row_bytes=self.layout.index_row_bytes,
                 push_mla=False,
             )
+        if prefetched is not None:
+            return
         # The copies start once the indexer rows went out: they would slow
         # that push (on the critical path) by sharing NVLink with it.
         packed = torch.cuda.Event()
@@ -506,6 +536,100 @@ class DcpShardQContext:
             index_cache.device,
         )
 
+    def _dsa_layers(self) -> "list[tuple[torch.Tensor, torch.Tensor]]":
+        """The (MLA cache, block table) of each DSA layer of the forward that
+        attends this context, in layer (registration) order, from the forward
+        context; empty without one."""
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return []
+        forward_context = get_forward_context()
+        if self.dsa_layers is None or self.dsa_layers[0] is not forward_context:
+            layers = []
+            metadata = forward_context.attn_metadata
+            if isinstance(metadata, dict):
+                for name, layer in forward_context.no_compile_layers.items():
+                    layer_metadata = metadata.get(name)
+                    shardq = getattr(layer_metadata, "shardq", None)
+                    if getattr(shardq, "gathered_context", None) is not self:
+                        continue
+                    cache = getattr(layer, "kv_cache", None)
+                    if (
+                        isinstance(cache, torch.Tensor)
+                        and cache.dim() == 3
+                        and cache.shape[-1] == self.layout.mla_row_bytes
+                    ):
+                        layers.append((cache, layer_metadata.block_table))
+            self.dsa_layers = (forward_context, layers)
+        return self.dsa_layers[1]
+
+    def _prefetch(
+        self, mla_cache: torch.Tensor, mla_block_table: torch.Tensor, after_layer: bool
+    ) -> None:
+        """Pack and copy the context MLA rows of the DSA layer of ``mla_cache``
+        on the side stream, from now on (``rank_major.copy_to_peers``)."""
+        from vllm.v1.attention.ops.dcp_shardq import rank_major
+
+        plan = self.rank_major
+        assert plan is not None and self.mla_prefetch is None
+        _check_issue_not_captured()
+        buffer = _workspace(self.layout, self.pages, mla_cache.device)
+        mla_rows = buffer.storage[: self.pages * self.layout.mla_page_bytes]
+        now = torch.cuda.Event()
+        now.record()
+        self.mla_prefetch = (
+            mla_cache.data_ptr(),
+            rank_major.copy_to_peers(
+                plan,
+                get_tp_group().device_group,
+                _peer_ptrs_host(buffer),
+                self.layout.mla_row_bytes,
+                now,
+                mla_cache.device,
+                pack_args=(mla_cache, mla_block_table, self.num_decodes, mla_rows),
+                after_layer=after_layer,
+            ),
+        )
+
+    def prefetch_first(self) -> None:
+        """At the start of the forward: issue the first DSA layer's copies."""
+        if self.rank_major is None or self.mla_prefetch is not None:
+            return
+        layers = self._dsa_layers()
+        if layers:
+            self._prefetch(*layers[0], after_layer=False)
+
+    def after_attend(self, mla_cache: torch.Tensor) -> None:
+        """After the sparse attention of the DSA layer of ``mla_cache`` (under
+        ``rank_major``): issue the next DSA layer's copies, or reset the landed
+        words this layer's wait read when no DSA layer follows in the step."""
+        from vllm.v1.attention.ops.dcp_shardq import rank_major
+
+        in_flight = self.mla_in_flight
+        if in_flight is None and self.mla_attended == mla_cache.data_ptr():
+            # The same layer's attention again over its already gathered
+            # context: its copies were waited for and the next layer's issued.
+            return
+        assert in_flight is not None and in_flight.waited
+        self.mla_in_flight = None
+        self.mla_attended = mla_cache.data_ptr()
+        layers = self._dsa_layers()
+        ptrs = [cache.data_ptr() for cache, _ in layers]
+        if layers and mla_cache.data_ptr() not in ptrs:
+            raise RuntimeError(
+                "DCP ShardQ: a sparse attention over the gathered context of a "
+                "layer outside the step's DSA layers"
+            )
+        index = ptrs.index(mla_cache.data_ptr()) if layers else -1
+        if 0 <= index < len(layers) - 1:
+            self._prefetch(*layers[index + 1], after_layer=True)
+        else:
+            rank_major.release(in_flight.flags, in_flight.rank)
+
     @property
     def mla_slot_mapping(self) -> torch.Tensor:
         """int64 [num_prefill_tokens]: the workspace MLA row of each new
@@ -514,6 +638,24 @@ class DcpShardQContext:
             assert self.rank_major.slot_mapping is not None
             return self.rank_major.slot_mapping
         return self.slot_mapping
+
+    def before_attend(self, mla_cache: torch.Tensor) -> None:
+        """Before a sparse attention of the DSA layer of ``mla_cache`` over this
+        context (under ``rank_major``): order the current stream after the
+        layer's context MLA rows landed (``wait_mla``). A repeated attention of
+        the layer that already consumed its copies reads the workspace as it is,
+        which is only sound while no next-layer prefetch is overwriting it: the
+        prefetch issued after the first attention packs into this rank's region
+        and copies into the peers' regions on the side stream, unordered with
+        this one. Raises then instead of racing."""
+        if self.mla_in_flight is None and self.mla_attended == mla_cache.data_ptr():
+            if self.mla_prefetch is not None:
+                raise RuntimeError(
+                    "DCP ShardQ: a repeated attention of a DSA layer while the next "
+                    "layer's context rows are being copied into the workspace it reads"
+                )
+            return
+        self.wait_mla()
 
     def wait_mla(self) -> None:
         """Order the current stream after every rank's context MLA rows landed
@@ -561,6 +703,100 @@ class DcpShardQContext:
         return int(self.group_local_bounds[group]), int(
             self.group_local_bounds[group + 1]
         )
+
+
+# Whether this process planned a rank-major step (else a forward skips the
+# search for its contexts).
+_RANK_MAJOR_PLANNED = False
+
+
+def _step_rank_major_contexts() -> list[DcpShardQContext]:
+    """The forward's DCP ShardQ contexts with a rank-major plan."""
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not _RANK_MAJOR_PLANNED or not is_forward_context_available():
+        return []
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        return []
+    contexts: dict[int, DcpShardQContext] = {}
+    for layer_metadata in metadata.values():
+        context = getattr(
+            getattr(layer_metadata, "shardq", None), "gathered_context", None
+        )
+        if context is not None and context.rank_major is not None:
+            contexts.setdefault(id(context), context)
+    return list(contexts.values())
+
+
+def _prefetch_first_now() -> None:
+    for context in _step_rank_major_contexts():
+        context.prefetch_first()
+        if context.mla_prefetch is not None:
+            logger.info_once(
+                "DCP ShardQ: the context MLA rows of each DSA layer are copied "
+                "a DSA layer ahead (%d DSA layers).",
+                len(context._dsa_layers()),
+            )
+        else:
+            logger.warning_once(
+                "DCP ShardQ: no DSA layer of the step found in the forward "
+                "context; the context MLA rows are copied after each indexer "
+                "gather."
+            )
+
+
+def _check_issue_not_captured() -> None:
+    """The copies' sizes and offsets come from the step's plan on the host, so
+    their issue must run on every step: never inside a CUDA graph that vLLM
+    replays for other batches. A DCP ShardQ step is a mixed batch, which never
+    runs in a FULL graph (``dcp_shardq_configured``), and under a PIECEWISE /
+    breakable capture the issue points (the forward start's eager break and the
+    sparse attention op, an eager break) run outside the capture. A one-shot
+    capture of one exact batch (the forward bench, runtime mode NONE) replays
+    that batch's plan and may capture them."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    mode = (
+        get_forward_context().cudagraph_runtime_mode
+        if is_forward_context_available()
+        else CUDAGraphMode.NONE
+    )
+    if mode != CUDAGraphMode.NONE:
+        raise RuntimeError(
+            "DCP ShardQ: the context-row copies would be captured into a "
+            f"{mode.name} CUDA graph, which replays them with another step's plan"
+        )
+
+
+def prefetch_first_context_rows() -> None:
+    """At the start of a model forward (before its first layer): issue the
+    copies of the first DSA layer's context MLA rows of a rank-major DCP
+    ShardQ step (``DcpShardQContext.prefetch_first``), so they run under the
+    layers before it. Under a breakable CUDA graph capture (each attention op
+    an eager break) this runs as an eager break of its own on every instance
+    that can plan DCP ShardQ steps, whatever the capture batch: each replay
+    looks the step's contexts up again and issues its plan's copies."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    capture = BreakableCUDAGraphCapture.current()
+    if capture is not None and capture._capturing:
+        from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
+        from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.ops.dcp import dcp_shardq_configured
+
+        config = get_current_vllm_config_or_none()
+        shardq = _RANK_MAJOR_PLANNED or (
+            config is not None and dcp_shardq_configured(config)
+        )
+        mode = get_forward_context().cudagraph_runtime_mode
+        if shardq and mode != CUDAGraphMode.FULL:
+            capture.add_eager(_prefetch_first_now)
+            return
+    _prefetch_first_now()
 
 
 # DeepGEMM's prefill logits: rows padded to its 4-token Q block, row stride a
@@ -675,6 +911,7 @@ def build_dcp_shardq_context(
     indexer chunks are per rank (``_rank_chunk_specs``): no collective runs
     between a group's chunks.
     """
+    global _RANK_MAJOR_PLANNED
     num_reqs = common_attn_metadata.num_reqs
     query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
     seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
@@ -762,6 +999,7 @@ def build_dcp_shardq_context(
             to_device,
         )
         if rank_major is not None:
+            _RANK_MAJOR_PLANNED = True
             rank_major.slot_mapping = to_device(
                 rank_major_slots(rank_major, seq_lens, query_lens), torch.int64
             )

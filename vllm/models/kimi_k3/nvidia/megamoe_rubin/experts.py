@@ -865,6 +865,27 @@ class KimiK3MegaMoEExperts(nn.Module):
         # shard of its DP batch (sequence_parallel_chunk).
         self.sequence_parallel = True
 
+    def full_grid_beside_shared_expert(self) -> None:
+        """The P/D prefill workers' counterpart of :meth:`reserve_sms_for_shared_expert`:
+        every bucket keeps the full persistent grid (prefill steps are SM-throughput-bound
+        in MegaMoE: TP8+DCP8 NVFP4, 4096 rows per rank, 884 -> 1182 us per layer on the
+        148-SM cap) and the caller overlaps the shared expert by stream priority
+        (``KimiMoE._overlapped_forward``). Same sequence-parallel EP accounting."""
+        if self.kernel_weights is not None:
+            raise RuntimeError(
+                f"{self.prefix}: full_grid_beside_shared_expert after the runtime "
+                "was built."
+            )
+        if any(b.max_sm_count is not None for b in self.buckets):
+            raise RuntimeError(f"{self.prefix}: a bucket is already SM-capped.")
+        self.sequence_parallel = True
+
+    def shared_overlap(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` tokens on this rank runs on an SM-capped
+        bucket (the caller then runs the shared expert on a side stream beside it);
+        False on a full-grid bucket (the caller overlaps by stream priority)."""
+        return self.select_bucket(num_tokens).max_sm_count is not None
+
     def enable_fused_shared(self, hidden: int, intermediate: int) -> bool:
         """Switch this layer's wide-EP decode bucket (``RUBIN_WIDE_EP_DECODE_TOKENS``
         tokens per rank, the D3-32 SP shard; added below a larger GenPhase bucket,

@@ -189,7 +189,10 @@ def test_init_fails_closed(monkeypatch):
     monkeypatch.setattr(
         distributed, "get_dcp_group", lambda: SimpleNamespace(cpu_group=None)
     )
-    monkeypatch.setattr(dcp, "get_dcp_workspace_max_num_tokens", lambda cfg: 64)
+    monkeypatch.setattr(
+        dcp, "get_dcp_workspace_max_num_tokens", lambda cfg, dcp_shardq=False: 64
+    )
+    monkeypatch.setattr(dcp, "dcp_shardq_configured", lambda cfg: False)
     monkeypatch.setattr(cp_common, "direct_cp_enabled", lambda *args: True)
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(kernels, "init_dcp_topk_rescue_workspace", allocate)

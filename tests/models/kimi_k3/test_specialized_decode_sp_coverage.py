@@ -295,7 +295,6 @@ def decoder(kind, index, *, tokens=128):
     moe = index > 0
     mlp = SimpleNamespace(
         use_mega_moe=moe,
-        moe_token_shard=0,
         experts=SimpleNamespace(max_num_tokens=tokens),
     )
     return SimpleNamespace(
@@ -497,10 +496,6 @@ BUILD_FAILURES = {
     "megamoe_tokens": (
         dict(layers=set_layer(stack(), 3, **{"mlp.experts.max_num_tokens": 64})),
         "moe", r"layer 3: MegaMoE max_num_tokens 64 < 128 shard rows",
-    ),
-    "moe_token_shard": (
-        dict(layers=set_layer(stack(), 4, **{"mlp.moe_token_shard": 4})),
-        "moe", r"layer 4: not MegaMoE on the SP shard",
     ),
     "not_megamoe": (
         dict(layers=set_layer(stack(), 2, **{"mlp.use_mega_moe": False})),
