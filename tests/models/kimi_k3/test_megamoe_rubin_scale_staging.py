@@ -270,3 +270,57 @@ def test_side_stream_schedule_under_cuda_graph_replay(one_rank):
 
 def _planes_view(w):
     return w.fc1[1].view(torch.uint8), w.fc2[1].view(torch.uint8)
+
+
+@cuda
+def test_breakable_capture_with_eager_breaks_between_layers(one_rank):
+    """Production prefill graphs are breakable (piecewise) captures: an eager break
+    (attention) ends the segment between two MoE layers. The one-ahead expansion must
+    not fork a side stream there (cudaErrorStreamCaptureUnjoined at the break); the
+    replay still gives each layer its own planes."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    layers = _nvfp4_layers(4, 8, hidden=512, intermediate=512, device="cuda")
+    want = [_planes(w) for w in layers]
+    mods = _modules(layers)
+    staging = S.install(mods, None)
+    seen = [torch.empty_like(torch.cat(p, dim=1)) for p in want]
+    eager_runs = [0]
+
+    def attention():  # an eager break, as kda.py / the MLA attention ops
+        eager_runs[0] += 1
+
+    def forward(cap):
+        for o, m in enumerate(mods):
+            if cap is not None and o:
+                cap.add_eager(attention)
+            staging.before_kernel(o)
+            seen[o].copy_(torch.cat(_planes_view(m.kernel_weights), dim=1))
+            staging.after_kernel(o)
+            if cap is not None:
+                assert staging.pending is None  # nothing forked to the side stream
+
+    forward(None)  # eager: compiles, warms
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cap = BreakableCUDAGraphCapture()
+        with cap:
+            forward(cap)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    assert cap.num_eager_breaks == 3 and cap.num_graphs == 4
+    for s in seen:
+        s.zero_()
+    staging.slots[0].fill_(0xEE)
+    staging.slots[1].fill_(0xEE)
+    cap.replay()
+    torch.cuda.synchronize()
+    for o in range(4):
+        assert torch.equal(seen[o], torch.cat(want[o], dim=1)), o
+    # an eager forward after the capture still uses the side stream
+    forward(None)
+    torch.cuda.synchronize()
+    for o in range(4):
+        assert torch.equal(seen[o], torch.cat(want[o], dim=1)), o
