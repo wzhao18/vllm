@@ -1095,22 +1095,34 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         a poll that finds a row unwritten sleeps before it retries. The line's routing
         weights and (two-shot) its owner's slot address are loaded before the poll:
         after the line's last row lands only the sum and the push remain (two
-        dependent global loads there cost ~0.5 us on the kernel's end). ``sm``: unused
-        here (the wide engines' die-local finalize reads the CTA's census rank)."""
+        dependent global loads there cost ~0.5 us on the kernel's end). A warp's two
+        lines (line and line + 10 grid, the first CTAs' warps at 64 tokens) run at
+        once, one per half-warp (HT-EXPERTS B8 tail): each lane polls and sums four
+        columns (two words per staged row, the same slot-order FMA chain per column)
+        instead of the warp finishing the first line before it polls the second.
+        ``sm``: unused here (the wide engines' die-local finalize reads the CTA's
+        census rank)."""
         _, warp, lane, cta = thread()
-        for line in range(cta * 10 + warp - 2, batch * 56, self.grid * 10):
+        half, hl = (lane >> 4, lane & 15)
+        stride: cutlass.Constexpr = self.grid * 10
+        total = batch * 56
+        for first in range(cta * 10 + warp - 2, total, 2 * stride):
+            line = first + half * stride
+            live = line < total
+            if not live:
+                line = first
             token, column = line // 56, line % 56 * 64
             source = workspace.iterator + self.ws_stage
-            source += (Int64(token) * 16 * 1792 + column // 2 + lane) * 4
-            words = cute.make_rmem_tensor(16, Uint32)
+            source += (Int64(token) * 16 * 1792 + column // 2 + 2 * hl) * 4
+            words = cute.make_rmem_tensor((16, 2), Uint32)
             scale = cute.make_rmem_tensor(16, Float32)
             for slot in cutlass.range_constexpr(16):
                 scale[slot] = Float32(weights[token * 16 + slot])
+            chunk = column + 4 * hl
             target = Int64(0)
             if cutlass.const_expr(self.publish == "twoshot"):
                 recv, peers, rslot = box[0:3]
                 width: cutlass.Constexpr = recv.shape[2]
-                chunk = column + 8 * (lane & 7)
                 owner = chunk // width
                 place = cute.crd2idx((rslot, token, chunk - owner * width), recv.layout)
                 target = Int64(peers[owner]) + Int64(place) * 2
@@ -1118,27 +1130,41 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             sgn, sgt = spin_start()
             while not ready:
                 bad = False
-                for slot in cutlass.range_constexpr(16):
-                    words[slot] = load_volatile(source + slot * 7168)[0]
-                    bad |= words[slot] == Uint32(4294967295)
+                if live:
+                    for slot in cutlass.range_constexpr(16):
+                        got = load_volatile(source + slot * 7168, count=2)
+                        words[slot, 0], words[slot, 1] = (got[0], got[1])
+                        bad |= got[0] == Uint32(4294967295)
+                        bad |= got[1] == Uint32(4294967295)
                 ready = cute.arch.vote_all_sync(not bad)
                 if not ready:
                     sleep_ns(64)
                 sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
-            low, high = Float32(0), Float32(0)
-            for slot in cutlass.range_constexpr(16):
-                store_words(source + slot * 7168, (Uint32(4294967295),))
-                low = fma(bf16(words[slot]), scale[slot], low)
-                high = fma(bf16(words[slot], True), scale[slot], high)
-            word = pack_pair(low, high, policy="latent")
-            packed = [shuffle(word, 4 * (lane & 7) + i) for i in range(4)]
-            if lane < 8:
+            sums = cute.make_rmem_tensor(4, Float32)
+            for c in cutlass.range_constexpr(4):
+                sums[c] = Float32(0)
+            if live:
+                for slot in cutlass.range_constexpr(16):
+                    store_words(source + slot * 7168, (Uint32(4294967295),) * 2)
+                    for w in cutlass.range_constexpr(2):
+                        word = words[slot, w]
+                        sums[2 * w] = fma(bf16(word), scale[slot], sums[2 * w])
+                        sums[2 * w + 1] = fma(
+                            bf16(word, True), scale[slot], sums[2 * w + 1]
+                        )
+            own = [
+                pack_pair(sums[2 * w], sums[2 * w + 1], policy="latent")
+                for w in range(2)
+            ]
+            # Lane hl (even) pushes columns 4 hl .. 4 hl + 7: its words, lane hl + 1's.
+            packed = [own[0], own[1]]
+            packed += [shuffle(own[0], lane + 1), shuffle(own[1], lane + 1)]
+            if live & (hl % 2 == 0):
                 if cutlass.const_expr(self.publish == "twoshot"):
                     store_relaxed(target, packed)  # ``twoshot.push``, address ahead
                 else:
                     mc, parity, rank = box[0:3]
-                    offset = ((parity * self.tp + rank) * 64 + token) * 3584 + column
-                    offset += 8 * lane
+                    offset = ((parity * self.tp + rank) * 64 + token) * 3584 + chunk
                     multicast_words(mc + Int64(offset) * 2, packed)
 
     def staged_word(self, pair, tile, warp):
