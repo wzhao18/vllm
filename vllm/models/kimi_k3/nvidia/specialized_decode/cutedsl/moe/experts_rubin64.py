@@ -67,6 +67,39 @@ from .experts_rubin import (
 
 shuffle = cute.arch.shuffle_sync
 
+# DIAG (GRPSTAMP, never merge): in-step phase stamps of RubinGroupedExpertsKernel into a
+# %gridid-keyed ring [DIAG_RING, 256 CTAs, 512 B] (32 slots of 16 B: {%globaltimer, 0}
+# + %smid at +8; slot 15 = {gridid, distinct | call_count << 32}). Plain stores only.
+# On when GRPSTAMP_RING=1 at compile time; the ring per device is DIAG_RINGS[device].
+import os as _os  # noqa: E402
+
+import torch as _torch  # noqa: E402
+
+DIAG_RING = 512
+DIAG_RINGS: dict = {}
+
+
+def diag_ring(device):
+    """The device's ring address (allocated on first use) or 0 when stamps are off."""
+    if _os.environ.get("GRPSTAMP_RING", "0") != "1":
+        return 0
+    if device not in DIAG_RINGS:
+        with _torch.accelerator.device_index(device):
+            DIAG_RINGS[device] = _torch.zeros(
+                DIAG_RING * 256 * 64, dtype=_torch.int64, device=f"cuda:{device}"
+            )
+    return DIAG_RINGS[device].data_ptr()
+
+
+@asm(Uint64)
+def _gridid():
+    return "mov.u64 $0, %gridid;", "=l", ()
+
+
+@asm()
+def _st64x2(pointer, a, b):
+    return "st.global.v2.u64 [$0], {$1, $2};", "l,l,l,~{memory}", (pointer, a, b)
+
 
 @asm(Uint32, pure=True)
 def stage_bits(value):
@@ -187,6 +220,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         # trace (benchmarks only): a global address; (%globaltimer, %smid) stamps in
         # 16 slots of 16 B per CTA at trace + 512 cta.
         self.trace = trace
+        self.diag_ring = 0  # DIAG (GRPSTAMP): ring base or 0
         # RubinExpertsKernel.encode_maps' packed maps.
         self.packed, self.parts, self.grid_maps = True, 1, True
         self.stages = stages
@@ -234,8 +268,29 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def stamp(self, slot: cutlass.Constexpr[int]):
-        if cutlass.const_expr(self.trace != 0):
+        if cutlass.const_expr(self.diag_ring != 0):
+            stamp_at(self.diag_row(), slot)
+        elif cutlass.const_expr(self.trace != 0):
             stamp_at(Int64(self.trace) + Int64(thread()[3]) * 512, slot)
+
+    @cute.jit
+    def diag_row(self):
+        """DIAG (GRPSTAMP): this CTA's 512 B row of the gridid-keyed ring."""
+        gid = Int64(_gridid())
+        row = (gid & (DIAG_RING - 1)) * 256 + Int64(thread()[3])
+        return Int64(self.diag_ring) + row * 512
+
+    @cute.jit
+    def dstamp(self, slot):
+        """DIAG (GRPSTAMP): a stamp at a runtime slot (ring only)."""
+        if cutlass.const_expr(self.diag_ring != 0):
+            stamp_at(self.diag_row(), slot)
+
+    @cute.jit
+    def diag_meta(self, distinct, call_count):
+        if cutlass.const_expr(self.diag_ring != 0):
+            word = Int64(distinct) | (Int64(call_count) << 32)
+            _st64x2(self.diag_row() + 240, Int64(_gridid()), word)
 
     @cute.jit
     def __call__(self, *args):
@@ -574,6 +629,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 ks += 1
                 if ks == 14:
                     ks = Int32(0)
+        if lane == 0:
+            self.dstamp(24)  # DIAG (GRPSTAMP): last FC1 MMA issued
         # FC2: the static jobs (FC2(A), then FC2(B) less its pooled zone), walked;
         # then the pool's jobs as the producer claimed them (stage metadata).
         bars = (full, empty, accempty, accfull, hfull, hempty)
@@ -706,6 +763,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     unit, tile = (item // self.jobs, item % self.jobs)
                     self.fc2(sm, workspace, output, values, unit, tile, ranges)
             offset += count
+            if cutlass.const_expr(k == 1):  # DIAG (GRPSTAMP): FC1 hidden stored
+                if (thread()[2] == 0) & (thread()[1] % 4 == 0):
+                    self.dstamp(28 + eg)
         # The pool: this group's uses offset + m (m of its parity); pmeta[acc]'s phase
         # counts the earlier pool uses of the slot (m // 16).
         accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
@@ -1221,6 +1281,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if tid == 0:
             self.stamp(2)
         distinct, call_count, generation = (routed[0], routed[1], routed[2])
+        if tid == 0:
+            self.diag_meta(distinct, call_count)
         experts = self.tables(sm)[0]
         fence_tmem()
         tmem = tmem_base[0]
@@ -1246,6 +1308,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     self.stamp(12)
                 if cutlass.const_expr(self.publish):
                     self.finalize(workspace, output, batch, scalars[3:])
+                if lane == 0:
+                    self.dstamp(25)  # DIAG (GRPSTAMP): warp 2 finalize done
             elif warp == 3:
                 self.gather_x(sm, x, ranges, batch)
                 if lane == 0:
@@ -1256,6 +1320,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 cute.arch.sync_warp()
                 if cutlass.const_expr(self.publish):
                     self.finalize(workspace, output, batch, scalars[3:])
+                if lane == 0:
+                    self.dstamp(26)  # DIAG (GRPSTAMP): warp 3 finalize done
             else:
                 if cutlass.const_expr(self.publish == "push"):  # before any accumulator
                     self.push_shared(scalars[3:9], batch, tid - 128, cta, 256)
@@ -1264,6 +1330,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 )
                 if tid == 128:
                     self.stamp(10)
+                if lane == 0:
+                    self.dstamp(16 + warp - 4)  # DIAG (GRPSTAMP): per epilogue warp
         release_tmem(tmem, 512, warp, 3)
         if tid == 0:
             self.stamp(13)
