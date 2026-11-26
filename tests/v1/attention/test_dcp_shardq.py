@@ -49,6 +49,34 @@ pytestmark = pytest.mark.skipif(
     reason="CuTe DSL on SM100 is required",
 )
 
+
+@pytest.fixture(autouse=True)
+def _own_deepgemm_cache(tmp_path_factory, monkeypatch):
+    """Give each test (and the ranks it spawns) its own DeepGEMM JIT cache
+    directory, seeded with the shared one's kernels.
+
+    The ranks' "no kernel compiled or loaded in the step" checks watch the
+    DeepGEMM cache directory (jit_monitor), where a kernel load is a newer
+    ``.committed`` mtime. A shared cache directory (one per cluster
+    workspace) is touched by every process that loads from it, so another
+    job loading ``sm100_paged_mqa_logits_metadata`` during the step failed
+    the check on a step that loaded nothing. With its own copy the watch sees
+    this test's builds and loads only; the kernels the shared cache already
+    holds stay built."""
+    import shutil
+
+    from vllm import envs
+
+    base = os.environ.get("DG_JIT_CACHE_DIR") or os.path.join(
+        envs.VLLM_CACHE_ROOT, "deep_gemm"
+    )
+    own = tmp_path_factory.mktemp("deep_gemm")
+    shared = os.path.join(base, "cache")
+    if os.path.isdir(shared):
+        shutil.copytree(shared, own / "cache", dirs_exist_ok=True)
+    monkeypatch.setenv("DG_JIT_CACHE_DIR", str(own))
+
+
 PAGE = 64
 # The MLA cache's kernel blocks span several pages, as in a packed block row.
 MLA_BLOCK = 4 * PAGE
