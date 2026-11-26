@@ -37,6 +37,7 @@ from cutlass.cute.arch import store_async_dsmem
 
 from ..attn_res.kernel import BESIDE_SMEM
 from ..common.primitives import (
+    asm,
     at,
     copy_g2s,
     fma,
@@ -75,6 +76,19 @@ MAX_OWNED = 2  # token rows a CTA owns (32 rows over 24 CTAs)
 LOOP_THREADS = 192  # six loop warps: 24 rows x 8 lanes
 
 
+@asm(cutlass.Uint64)
+def _globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+@asm()
+def _red_max_u64(ptr, value):
+    return "red.relaxed.gpu.global.max.u64 [$0], $1;", "l,l,~{memory}", (Int64(ptr), value)
+
+
+STAMP_SLOTS = 16
+
+
 @cute.jit
 def _min(a, b):
     return cutlass.select_(a < b, a, b)
@@ -85,6 +99,19 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
     ``accepted`` [requests]; ``slots`` [requests, >= 8] (row 0: state, row 1: records,
     the deferred protocol). Warps 0-2: weights / x + re-arm / MMA; warp 3: gate; warps
     4-9: the projection epilogue (4-7), hop 1 / 2 and the recurrence (4-9)."""
+
+    # DIAG (bench only): %globaltimer phase stamps, u64 [cta, STAMP_SLOTS] at this
+    # global address (0: none compiled in)
+    STAMP_ADDR = 0
+
+    @cute.jit
+    def stamp(self, slot: cutlass.Constexpr, when=True):
+        if cutlass.const_expr(self.STAMP_ADDR != 0):
+            rank, head, _ = cute.arch.block_idx()
+            cta = Int64(head) * 24 + Int64(rank)
+            if when:
+                address = Int64(self.STAMP_ADDR) + (cta * STAMP_SLOTS + slot) * 8
+                _red_max_u64(address, _globaltimer())
 
     def __init__(
         self, heads, *, requests=4, tokens=8, stages=5, cta_k=64, tmem_tiles=15,
@@ -230,6 +257,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         owned = (N - rank + R24_CLUSTER - 1) // R24_CLUSTER  # token rows owned
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        self.stamp(0, tid == 0)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles)
@@ -326,6 +354,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset, request, block, base, nrows)
             early = self.r24_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            self.stamp(12, kt == 0)
             cute.arch.cluster_wait()
             if warp_idx < 8:  # the other B_ISSUERS - 1 warps of x's tiles
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
@@ -336,6 +365,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
                     partial, section, split_rank, x_in, bar_in,
                 )  # fmt: skip
             wait(bar_in)
+            self.stamp(5, kt == 0)
             if kt < 128:
                 for s in cutlass.range_constexpr(MAX_OWNED):
                     if s < owned:
@@ -362,6 +392,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
                         r = rank + R24_CLUSTER * s
                         owned_args = (mine, shared_o, bar_out, output, norm_w, accepted)
                         self.norm_owned(kt, owned_args, slots, head, r, s, eps)
+            self.stamp(11, kt == 0)
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
     # --------------------------------------------------------------- projection
@@ -375,6 +406,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         cute.arch.griddepcontrol_wait()
+        self.stamp(2, (issuer == 0) & (cute.arch.lane_idx() == 0))
         for k_tile in cutlass.range(issuer, tiles, B_ISSUERS, unroll=1):
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(b_full + k_tile, tile_bytes)
@@ -425,8 +457,11 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
                     source = a_desc + stage * a_step + 2 * kb
                     _copy_to_tmem(base + N + columns * k + 8 * kb, source)
                 tcgen05.commit(bar_empty + stage, None, self.cta_group)
+        self.stamp(1, cute.arch.lane_idx() == 0)
         for k in cutlass.range_constexpr(staged):  # A from tensor memory
             cute.arch.mbarrier_wait(b_full + k, 0)
+            if cutlass.const_expr(k == 0):
+                self.stamp(3, cute.arch.lane_idx() == 0)
             _fence_tcgen05()
             with cute.arch.elect_one():
                 for kb in cutlass.range_constexpr(k_blocks):
@@ -482,6 +517,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         )
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        self.stamp(4, epi_tid == 0)
         _fence_tcgen05()
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         cute.arch.fence_view_async_tmem_load()
@@ -653,6 +689,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         cute.arch.cluster_wait()
         token = T * request + group % T
         ar, beta = self.poll_fa(fa_beta, counter, target, token, quarter, head)
+        self.stamp(13, lane == 0)
         cute.arch.griddepcontrol_launch_dependents()
         if slot > 0:
             first = KC * request
@@ -675,6 +712,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
             if (quarter == 0) & (group < T):  # this CTA's betas
                 beta_gate = self.activate(Float32(beta))
                 push_float(shared_beta.iterator + group, beta_gate, barrier, rank)
+            self.stamp(7)
         self.rearm_r24(counter, target, lane, fa_beta)
 
     @cute.jit
@@ -720,6 +758,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         if slot > 0:
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
+            self.stamp(6, kt == 0)
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
             vrow = _min(kt, nrows - 1)
             for t in cutlass.range_constexpr(T):
@@ -775,6 +814,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
             named_barrier(1, LOOP_THREADS)  # shared_v, slot_rows
             wait(bar_qk)
             wait(bar_gate)
+            self.stamp(8, kt == 0)
             if (block == 0) & live & (kt < 128):
                 self.key_records(record_page, head, kt, shared_k, shared_decay)
             lanes = (group, group_lane)
@@ -808,6 +848,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
                 local_o[(T - 1) * RMAX + group] = self.round_output(out_last)
+            self.stamp(9, kt == 0)
             named_barrier(1, LOOP_THREADS)
             # thread kt: row kt % 24 of token kt // 24 -> that token row's owner
             t_o, r_o = kt // RMAX, kt % RMAX
@@ -864,5 +905,6 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
                 out_gate = sigmoids([gate])[0]
             nw = norm_w[kt]
             wait(bar_out + s)
+            self.stamp(10, kt == 0)
             box = cute.make_tensor(shared_o.iterator + s * 128, cute.make_layout(128))
             self.norm_row(kt, box, output, r, qk_channel, nw, out_gate, eps)
