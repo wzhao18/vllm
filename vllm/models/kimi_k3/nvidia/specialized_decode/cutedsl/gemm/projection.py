@@ -96,6 +96,28 @@ def weight_map(weight, rows):
     return tensor_maps([spec], weight.device)
 
 
+def weight_box_map(weight, rows, tiles):
+    """Device TMA map of ``weight`` [N, K] (row pitch kept) as a 3-D tensor {64 K,
+    N rows, K / 64 blocks} (strides: the row pitch, 128 B) with box {64, ``rows``,
+    ``tiles``}: one TMA op lands ``tiles`` consecutive K tiles as the SW128 images
+    ``weight_map``'s 2-D boxes would (each {64, rows}, the next one rows x 128 B
+    later), so a ``tiles`` x 16 KiB ring stage is one op instead of ``tiles``."""
+    types = cuda.CUtensorMapDataType
+    dtype = {
+        torch.bfloat16: types.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        torch.float16: types.CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    }[weight.dtype]
+    swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+    l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+    n, k = weight.shape
+    if k % 64:
+        raise ValueError(f"weight K {k} is not a multiple of the 64-wide K block")
+    pitch = weight.stride(0) * weight.element_size()
+    dims, strides = (64, n, k // 64), (pitch, 64 * weight.element_size())
+    spec = (weight.data_ptr(), dtype, dims, strides, (64, rows, tiles), swizzle, l2)
+    return tensor_maps([spec], weight.device)
+
+
 class PreparedProjection:
     """Split-K projection with a per-batch tactic table and caller-owned outputs."""
 

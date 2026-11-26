@@ -61,6 +61,19 @@ def _tma_load_evict_first(smem, mbar, tensor_map, k0, row0, *, loc=None, ip=None
 
 
 @dsl_user_op
+def _tma_load_box3_evict_first(smem, mbar, tensor_map, row0, block0, *, loc=None, ip=None):
+    """One {64, rows, tiles} box of a ``projection.weight_box_map`` map at K block
+    ``block0`` (K = 64 ``block0``) and row ``row0``, L2 evict_first."""
+    code = "{ .reg .b64 pol; .reg .b32 k0; mov.b32 k0, 0; "
+    code += "createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+    code += "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx"
+    code += "::bytes.L2::cache_hint [$0], [$1, {k0, $2, $3}], [$4], pol; }"
+    operands = [smem.toint().ir_value(), tensor_map.ir_value(), row0.ir_value()]
+    operands += [block0.ir_value(), mbar.toint().ir_value()]
+    _asm(code, "r,l,r,r,r", operands, loc, ip)
+
+
+@dsl_user_op
 def _wait_cluster(mbar, phase, *, loc=None, ip=None):
     """``cute.arch.mbarrier_wait`` at ``.acquire.cluster`` (remote ``st.async``)."""
     code = "{ .reg .pred P1; LAB_WAIT: "

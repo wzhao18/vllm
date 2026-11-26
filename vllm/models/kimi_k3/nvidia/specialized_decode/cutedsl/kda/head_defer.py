@@ -626,7 +626,10 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         if warp_idx < 3:
             cute.arch.cluster_wait()
             if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                if cutlass.const_expr(self.stage_tiles > 1):  # 3-D box stages
+                    self.box_weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                else:
+                    self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")

@@ -53,7 +53,15 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
-from ..gemm.splitk import SplitKGemm, SplitKTactic, _fence_tcgen05, _smem
+from ..gemm.splitk import (
+    ATOM_K,
+    SplitKGemm,
+    SplitKTactic,
+    _acquire_tensor_map,
+    _fence_tcgen05,
+    _smem,
+    _tma_load_box3_evict_first,
+)
 from .head import (
     A_DESC_HIGH,
     B_DESC_HIGH,
@@ -115,12 +123,18 @@ def _align(offset, alignment):
 
 class KdaHeadMulti(KdaHeadVerify):
     """``KdaHeadVerify`` for ``requests`` x ``tokens`` verify rows (request-major);
-    ``accepted`` [requests], ``slots`` [requests, >= tokens]. Ring ``stages`` shrink so
-    the resident x tiles of every token fit beside an AttnRes CTA."""
+    ``accepted`` [requests], ``slots`` [requests, >= tokens]. Ring ``stages`` (K tile
+    slots) shrink so the resident x tiles of every token fit beside an AttnRes CTA.
+
+    ``stage_tiles`` > 1: each weight-ring stage is that many consecutive K tiles,
+    landed by one 3-D TMA box (``projection.weight_box_map``; ``a_map`` is then that
+    map) as the same SW128 16 KiB images at consecutive slots, so the MMA descriptors
+    are unchanged; the MMA warp waits, stages to tensor memory and releases per stage
+    (half the ring events at 2). Same MMAs in the same order."""
 
     def __init__(
         self, heads, *, requests=2, tokens=8, stages=7, cta_k=64, tmem_tiles=15,
-        early_loads=21, bf16_state=True, has_bias=False, hidden=7168,
+        early_loads=21, bf16_state=True, has_bias=False, hidden=7168, stage_tiles=1,
     ):  # fmt: skip
         # KdaHeadVerify's set-up (its B1 x q 8 geometry check), then this kernel's q
         super().__init__(
@@ -139,6 +153,11 @@ class KdaHeadMulti(KdaHeadVerify):
         self.cta_k, self.k_tiles = cta_k, hidden // cta_k // SECTIONS
         assert n + tmem_tiles * cta_k // 2 <= 512 and tmem_tiles > 0
         assert stages > early_loads - tmem_tiles, "pre-wait A tiles beyond TMEM"
+        self.stage_tiles = stage_tiles
+        if stage_tiles > 1:  # whole stages: of the ring, the K range, the early tiles
+            assert cta_k == ATOM_K, "one 128-byte swizzle atom per K tile"
+            assert stages % stage_tiles == 0 and self.k_tiles % stage_tiles == 0
+            assert early_loads % stage_tiles == 0, "the PDL wait at a stage boundary"
         T = tokens
         # The kernel's shared memory in allocation order (with each buffer's alignment).
         parts = (
@@ -291,7 +310,10 @@ class KdaHeadMulti(KdaHeadVerify):
         if warp_idx < 3:
             cute.arch.cluster_wait()
             if warp_idx == 0:
-                self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                if cutlass.const_expr(self.stage_tiles > 1):  # 3-D box stages
+                    self.box_weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
+                else:
+                    self.weight_warp(bar_full, bar_empty, sA, a_map, row0, *tiles)
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -352,6 +374,42 @@ class KdaHeadMulti(KdaHeadVerify):
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
     @cute.experimental.jit
+    def box_weight_warp(
+        self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
+        row0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
+    ):  # fmt: skip
+        """``KdaHeadWide.weight_warp`` at ``stage_tiles`` > 1: one 3-D box per stage
+        (``stage_tiles`` K tiles at consecutive slots) and the PDL wait before the
+        stage of K tile ``early_loads``."""
+        st: cutlass.Constexpr = self.stage_tiles
+        stages = self.num_ab_stage // st
+        tile_bytes = cute.size_in_bytes(
+            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
+        )
+        _acquire_tensor_map(a_map)
+        empty_phase = cutlass.Int32(1)
+        for step in cutlass.range(k_tile_count // st, unroll=1):
+            stage = step % stages
+            if step == self.early_loads // st:
+                cute.arch.griddepcontrol_wait()
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    bar_full + stage, tile_bytes * st
+                )
+            with cute.arch.elect_one():
+                box = s_tile[None, None, None, stage * st].iterator
+                block = k_tile_start + step * st  # K tiles are 64-wide K blocks
+                _tma_load_box3_evict_first(box, bar_full + stage, a_map, row0, block)
+            if stage == stages - 1:
+                empty_phase = empty_phase ^ 1
+        for tail in cutlass.range(stages, unroll=1):  # every stage released
+            stage = (tail + k_tile_count // st) % stages
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            if stage == stages - 1:
+                empty_phase = empty_phase ^ 1
+
+    @cute.experimental.jit
     def staged_mma_multi(
         self, bar_full, bar_empty, b_full, bar_mma_epilog, bar_tmem_alloc,
         sA: cute.Tensor, sB: cute.Tensor, tmem_base_ptr,
@@ -360,7 +418,8 @@ class KdaHeadMulti(KdaHeadVerify):
         first N tensor-memory columns and the staged A tiles after it."""
         N: cutlass.Constexpr = self.rows_total
         mma_smem, mma_tmem = _mma_ops(self.rows_total)
-        stages, staged, k_blocks = self.num_ab_stage, self.tmem_tiles, self.cta_k // 16
+        st: cutlass.Constexpr = self.stage_tiles
+        stages, staged, k_blocks = self.num_ab_stage // st, self.tmem_tiles, self.cta_k // 16
         a_layout = cute.slice_(sA.layout, (None, None, None, 0))
         b_layout = cute.slice_(sB.layout, (None, None, None, 0))
         a_step = cute.size_in_bytes(sA.element_type, a_layout) // 16
@@ -375,14 +434,16 @@ class KdaHeadMulti(KdaHeadVerify):
         a_desc = ((sA.iterator.toint() >> 4) & 0x3FFF) | 0x10000
         b_desc = ((sB.iterator.toint() >> 4) & 0x3FFF) | 0x10000
         for k in cutlass.range_constexpr(staged):
-            stage, phase = k % stages, (k // stages) % 2
-            cute.arch.mbarrier_wait(bar_full + stage, phase)
-            _fence_tcgen05()
+            stage, phase = k // st % stages, (k // st // stages) % 2
+            if cutlass.const_expr(k % st == 0):  # the stage's first K tile
+                cute.arch.mbarrier_wait(bar_full + stage, phase)
+                _fence_tcgen05()
             with cute.arch.elect_one():
                 for kb in cutlass.range_constexpr(k_blocks):
-                    source = a_desc + stage * a_step + 2 * kb
+                    source = a_desc + (stage * st + k % st) * a_step + 2 * kb
                     _copy_to_tmem(base + N + columns * k + 8 * kb, source)
-                tcgen05.commit(bar_empty + stage, None, self.cta_group)
+                if cutlass.const_expr(k % st == st - 1):  # the stage's last K tile
+                    tcgen05.commit(bar_empty + stage, None, self.cta_group)
         for k in cutlass.range_constexpr(staged):  # A from tensor memory
             cute.arch.mbarrier_wait(b_full + k, 0)
             _fence_tcgen05()
@@ -391,16 +452,31 @@ class KdaHeadMulti(KdaHeadVerify):
                     b = b_desc + k * b_step + 2 * kb
                     accumulate = Int32(0 if k == 0 and kb == 0 else 1)
                     mma_tmem(base, base + N + columns * k + 8 * kb, b, accumulate)
-        for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
-            ring_stage, ring_phase = k % stages, (k // stages) % 2
-            cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
-            cute.arch.mbarrier_wait(b_full + k, 0)
-            _fence_tcgen05()
-            with cute.arch.elect_one():
-                for kb in cutlass.range_constexpr(k_blocks):
-                    a_ring = a_desc + ring_stage * a_step + 2 * kb
-                    mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
-                tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
+        if cutlass.const_expr(st == 1):
+            for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
+                ring_stage, ring_phase = k % stages, (k // stages) % 2
+                cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
+                cute.arch.mbarrier_wait(b_full + k, 0)
+                _fence_tcgen05()
+                with cute.arch.elect_one():
+                    for kb in cutlass.range_constexpr(k_blocks):
+                        a_ring = a_desc + ring_stage * a_step + 2 * kb
+                        mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
+                    tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
+        else:  # a stage is waited on at its first K tile (above, if staged began it)
+            for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
+                ring_stage, ring_phase = k // st % stages, (k // st // stages) % 2
+                if k % st == 0:
+                    cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
+                cute.arch.mbarrier_wait(b_full + k, 0)
+                _fence_tcgen05()
+                slot = ring_stage * st + k % st
+                with cute.arch.elect_one():
+                    for kb in cutlass.range_constexpr(k_blocks):
+                        a_ring = a_desc + slot * a_step + 2 * kb
+                        mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
+                    if k % st == st - 1:
+                        tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)  # the release lands in phase 1
@@ -797,7 +873,7 @@ def compile_head_multi(
 
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
-    stages, tmem_tiles, early = MULTI_TILE[requests, tokens]
+    stages, tmem_tiles, early, stage_tiles = multi_tile(requests, tokens)
     kind = HEAD_MULTI_KIND
     if kind is None:  # the record form under the record protocol (head_defer)
         from .head_defer import KdaHeadMultiDefer
@@ -808,6 +884,7 @@ def compile_head_multi(
     kernel = kind(
         heads, requests=requests, tokens=tokens, stages=stages, tmem_tiles=tmem_tiles,
         early_loads=early, hidden=hidden, bf16_state=bf16_state, has_bias=has_bias,
+        stage_tiles=stage_tiles,
     )  # fmt: skip
     kernel.polled_out = polled
     args = (matrix(1), matrix(1), cutlass.Int64(0), *tensors, *scalars)
@@ -815,12 +892,21 @@ def compile_head_multi(
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
 
-# ``KdaHeadMulti``'s (ring stages, tensor-memory K tiles, A tiles before the PDL wait)
-# per (requests, tokens): KdaHeadVerify's 15 / 21 with the ring cut to what fits beside
-# an AttnRes CTA once x is resident for every token (2 x 8: 7 stages; the 21 early
-# tiles still fit: 15 to tensor memory, 6 in the ring). 2 x 4 has the M8 head's x and
-# keeps its tile (VERIFY_STAGES 10).
-MULTI_TILE = {(2, 8): (7, 15, 21), (2, 4): (10, 15, 21)}
+# ``KdaHeadMulti``'s (ring K tile slots, tensor-memory K tiles, A tiles before the PDL
+# wait[, K tiles per ring stage]) per (requests, tokens): KdaHeadVerify's 15 / 21 with
+# the ring cut to what fits beside an AttnRes CTA once x is resident for every token.
+# 2 x 4 has the M8 head's x and keeps its tile (VERIFY_STAGES 10).
+# 2 x 8: 32 KiB stages (two K tiles per 3-D box; KDA-S1, KDABOX-1: one 32 KiB op per
+# issuer lands 28 tiles in 4.45 us vs 7.01 for 16 KiB ops), 4 stages (8 slots, 222 of
+# the 224 KB beside an AttnRes CTA), 22 early tiles = what the ring holds before x
+# (pairs 0-6 staged out, pairs 7-10 held). Was (7, 15, 21) with 16 KiB stages.
+MULTI_TILE = {(2, 8): (8, 15, 22, 2), (2, 4): (10, 15, 21)}
+
+
+def multi_tile(requests, tokens):
+    """``MULTI_TILE``'s (slots, tensor-memory tiles, early tiles, stage tiles)."""
+    stages, tmem_tiles, early, *rest = MULTI_TILE[requests, tokens]
+    return stages, tmem_tiles, early, (rest[0] if rest else 1)
 # The class ``compile_head_multi`` builds (``head_defer.set_head_protocol``); None:
 # the deferred-verify record form under ``prepared.record_protocol``, else KdaHeadMulti.
 HEAD_MULTI_KIND = None

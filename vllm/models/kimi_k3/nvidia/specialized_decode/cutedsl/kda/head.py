@@ -65,7 +65,7 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
-from ..gemm.projection import matrix_view, weight_map
+from ..gemm.projection import matrix_view, weight_box_map, weight_map
 from ..gemm.splitk import (
     ATOM_K,
     SplitKGemm,
@@ -1539,14 +1539,15 @@ def head_constructs(heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_
                 hidden=hidden, **options,
             )  # fmt: skip
         else:
-            from .head_multi import MULTI_TILE, KdaHeadMulti
+            from .head_multi import MULTI_TILE, KdaHeadMulti, multi_tile
 
             if batch % q or (batch // q, q) not in MULTI_TILE:
                 return False
-            stages, tmem_tiles, early = MULTI_TILE[batch // q, q]
+            stages, tmem_tiles, early, stage_tiles = multi_tile(batch // q, q)
             KdaHeadMulti(
                 heads, requests=batch // q, tokens=q, stages=stages,
-                tmem_tiles=tmem_tiles, early_loads=early, hidden=hidden, **options,
+                tmem_tiles=tmem_tiles, early_loads=early, hidden=hidden,
+                stage_tiles=stage_tiles, **options,
             )  # fmt: skip
     except (AssertionError, ValueError):
         return False
@@ -1692,6 +1693,10 @@ class PreparedKdaHead:
         # rows: the polled variant follows ``polled``
         self.verify = tuple(v for v in verify if tile is not None)
         self.verify_kernels: dict = {}
+        # the weight map per verify shape (a 3-D box map where ring stages hold
+        # several K tiles: ``head_multi.MULTI_TILE``), by K tiles per stage
+        self.verify_maps: dict = {}
+        self.box_maps: dict = {}
 
     def runs(self, batch, q):
         """Whether steps of ``batch`` rows at verify length ``q`` run this head (the
@@ -1742,10 +1747,19 @@ class PreparedKdaHead:
                         self.tile, self.weight.shape[1], b in self.polled,
                     )  # fmt: skip
                 else:  # several requests: KdaHeadMulti
+                    from .head_multi import multi_tile
+
                     self.verify_kernels[b, q] = compile_head_multi(
                         self.core.heads, bf16_state, self.core.has_bias, specs, arch,
                         b // q, self.weight.shape[1], b in self.polled, tokens=q,
                     )  # fmt: skip
+                    stage_tiles = multi_tile(b // q, q)[3]
+                    if stage_tiles > 1:
+                        if stage_tiles not in self.box_maps:
+                            self.box_maps[stage_tiles] = weight_box_map(
+                                self.weight, 128, stage_tiles
+                            )
+                        self.verify_maps[b, q] = self.box_maps[stage_tiles]
         return self
 
     def run_verify(self, x, out, *, caches, slots, accepted, rearm=None):
@@ -1775,9 +1789,10 @@ class PreparedKdaHead:
             raise ValueError("KdaHeadVerify: a polled batch needs the buffer to re-arm")
         address = rearm.data_ptr() if rearm is not None else 0
         target = self.fa_tiles * -(-b // fa_tactic[1])  # SignalGemm's tile owners
+        a_map = self.verify_maps.get((b, q), self.map)
         self.verify_kernels[b, q](
             matrix_view(self.weight), matrix_view(x),
-            cutlass.Int64(self.map.data_ptr()),
+            cutlass.Int64(a_map.data_ptr()),
             *views, *self.core.scalars, counter, Int32(target),
             cutlass.Int64(address), stream(self.device),
         )  # fmt: skip
