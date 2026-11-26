@@ -320,7 +320,7 @@ class OprojConsumer:
         mailbox, prefix, _, _, _, _, output, xmoe, hints, eps, out_eps = args[:11]
         if cutlass.const_expr(self.out_mc):
             output = args[11:13]
-        _, _, _, post, total, bars, parts, pf = state
+        _, _, _, post, _, bars, parts, pf = state
         mix, maximum, exponent_sum, qpart = block_mix
         thread, _, _ = cute.arch.thread_idx()
         group, tid = thread // 128, thread % 128
@@ -374,7 +374,7 @@ class OprojConsumer:
             idx = reduce_scatter(partial, self.npost, lane)
             if idx < self.npost:
                 for peer in range(lane & (32 // self.npost - 1), 7, 32 // self.npost):
-                    dst = at(post, rank, warp, idx)
+                    dst = at(post, rank, idx, warp)  # [peer, value, warp]
                     push_float(dst, partial[0], bars.iterator + 1, peer)
             words = pack8(prefix_value)
             store_words(at(prefix, token, h), words)
@@ -383,28 +383,34 @@ class OprojConsumer:
             if cutlass.const_expr(xmoe is not None):
                 cute.arch.fence_acq_rel_gpu()
             self.wait_exchange(bars.iterator + 1)
-            if tid < self.npost:
+            # Every warp forms the totals (lane v: value v, the same sums in the same
+            # order) and shuffles them to its lanes: no CTA barrier on the output path.
+            mine = Float32(0)
+            if lane < self.npost:
                 sums = [Float32(0)] * 4
                 for peer in cutlass.range_constexpr(7):
                     for w in cutlass.range_constexpr(4):
-                        sums[w] = add_rn(sums[w], post[peer, w, tid])
-                total[tid] = tree_reduce(sums, add_rn)
-            named_barrier()
+                        sums[w] = add_rn(sums[w], post[peer, lane, w])
+                mine = tree_reduce(sums, add_rn)
+            totals = cute.make_rmem_tensor(4, Float32)
+            for v in cutlass.range_constexpr(self.npost):
+                totals[v] = cute.arch.shuffle_sync(mine, v)
             norm = self.fragment(pf, 2, tid)
             final = cute.make_rmem_tensor(8, Float32)
             if cutlass.const_expr(self.nb > 0):
-                lp = mul_rn(total[3], rstd(total[2], eps))
+                lp = mul_rn(totals[3], rstd(totals[2], eps))
                 mx = max(maximum, lp)
                 alpha = cute.math.exp(maximum - mx, fastmath=True)
                 ep = cute.math.exp(lp - mx, fastmath=True)
                 den = fma(alpha, exponent_sum, ep)
-                a2, t1 = mul_rn(alpha, alpha), total[1]
+                a2, t1 = mul_rn(alpha, alpha), totals[1]
                 ae2 = mul_rn(mul_rn(2.0, alpha), ep)
-                quad = fma(a2, t1, fma(ae2, total[0], mul_rn(mul_rn(ep, ep), total[2])))
+                tail = mul_rn(mul_rn(ep, ep), totals[2])
+                quad = fma(a2, t1, fma(ae2, totals[0], tail))
                 scale = rstd(quad, mul_rn(mul_rn(out_eps, den), den))
                 ca, cp = mul_rn(alpha, scale), mul_rn(ep, scale)
             else:
-                cp = rstd(total[0], out_eps)
+                cp = rstd(totals[0], out_eps)
             for j in cutlass.range_constexpr(4):
                 value = pair_op((cp, cp), two(prefix_value, j), op="mul")
                 if cutlass.const_expr(self.nb > 0):
