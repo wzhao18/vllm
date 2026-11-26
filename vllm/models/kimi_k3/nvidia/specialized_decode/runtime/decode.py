@@ -346,6 +346,7 @@ class SpecializedDecode:
                 has_delta=d is not layers[0],
                 carveout=self.attention[d.layer_idx].before_carveout,
                 ring_only=self.attention[d.layer_idx].before_ring_only,
+                ring_tokens=self.attention[d.layer_idx].before_tokens,
             )
             for d in layers
         }

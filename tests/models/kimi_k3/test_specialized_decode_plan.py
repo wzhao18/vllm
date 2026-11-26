@@ -633,6 +633,58 @@ def test_attn_res_carveout_on_the_decode_ring_only(monkeypatch, ring_only):
             assert code[:2] == ("carved", 100)
 
 
+def test_attn_res_ring_tokens_before_a_kda_head(monkeypatch):
+    """``ring_tokens`` (HEAD_BEFORE_TOKENS, the AttnRes before a KdaHead layer): the
+    bound ring compiles the token-batched code (carved like the ring) and ``run_ring``
+    launches it for those rows only; other rows and the aux variant keep one token
+    per cluster."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
+        prepared,
+    )
+
+    device = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    monkeypatch.setattr(prepared, "architecture", lambda device: "sm_107a")
+    monkeypatch.setattr(prepared, "to_cute", lambda tensor, *args: tensor)
+    monkeypatch.setattr(prepared, "kernel_registers", lambda code, index: 0)
+    monkeypatch.setattr(prepared, "compile_consumer", lambda *key: key)
+    carved = lambda code, index, value: ("carved", value, code)  # noqa: E731
+    monkeypatch.setattr(prepared, "prepare_shared_carveout", carved)
+    launched = []
+    monkeypatch.setattr(prepared.PreparedAttnRes, "_launch",
+                        lambda self, code, *args: launched.append(code))  # fmt: skip
+    weights = [torch.zeros(4)] * 3
+    attn_res = prepared.PreparedAttnRes(weights, (2, True, -1, False), (1e-6,) * 2,
+                                        carveout=100, ring_tokens={16: 2})  # fmt: skip
+    attn_res.bind_ring(torch.zeros(1, 64, 4))
+    attn_res.bind_aux()
+    assert set(attn_res.ring_token_codes) == {2}
+    batched = attn_res.ring_token_codes[2]
+    assert batched[:2] == ("carved", 100) and batched[2][-1] == 2  # tokens
+    for rows, want in ((16, batched), (8, attn_res.ring[0]), (32, attn_res.ring[0])):
+        attn_res.run_ring(torch.zeros(rows, 4), None, None)
+        assert launched.pop() is want
+    attn_res.run_ring(torch.zeros(16, 4), None, None, aux=torch.zeros(16, 4))
+    assert launched.pop() is attn_res.aux[1]
+    plain = prepared.PreparedAttnRes(weights, (2, True, -1, False), (1e-6,) * 2)
+    plain.bind_ring(torch.zeros(1, 64, 4))
+    assert plain.ring_token_codes == {}
+    # 16 blocks: one exchange round holds one token -> one token per cluster
+    deep = prepared.PreparedAttnRes(weights, (16, True, -1, False), (1e-6,) * 2,
+                                    ring_tokens={16: 2})  # fmt: skip
+    deep.bind_ring(torch.zeros(1, 64, 4))
+    assert deep.ring_token_codes == {}
+
+
+def test_kda_head_rows_take_a_token_batched_attn_res():
+    """HEAD_BEFORE_TOKENS names KdaHead rows only (TP16: the B2 x q8 KdaHeadMulti)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import providers
+
+    table = providers.batch_table(providers.HEAD_BEFORE_TOKENS.get(16, ""))
+    multi = providers.batch_table(providers.HEAD_MULTI_FP32.get(8, ""))
+    assert table == {16: 2} and set(table) <= set(multi)
+
+
 def bf16_ulp(values):
     exponent = torch.floor(torch.log2(values.abs().clamp_min(2.0**-126)))
     return torch.exp2(exponent - 7)

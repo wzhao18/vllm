@@ -54,6 +54,13 @@ RUBIN_VOTE_REGISTERS = {6: 80}
 ROWS_TOKENS: dict = {"*": "193-256:2"}
 
 
+def rows_tokens_fit(nb, final=False):
+    """Most tokens one ``ClusterAttnResRows`` cluster serves at ``nb`` blocks."""
+    from .rows import rows_tokens as fit
+
+    return fit(nb, final)
+
+
 def rows_tokens(rows):
     return rows_policy(ROWS_TOKENS, Shape(rows), 1)
 
@@ -96,8 +103,16 @@ class PreparedAttnRes:
     the decode ring's codes (``bind_ring``) take it, the others (plain, wide rows,
     row-sharded) keep the default."""
 
-    def __init__(self, weights, key, eps, carveout=None, ring_only=False):
+    def __init__(
+        self, weights, key, eps, carveout=None, ring_only=False, ring_tokens=None
+    ):
         self.device = weights[0].device
+        # Bound-ring batches (rows -> tokens per 7-CTA cluster) that run the
+        # token-batched ``ClusterAttnResRows`` (bitwise the same outputs) instead of one
+        # token per cluster, so the next layer's big-register CTAs find whole SMs while
+        # this kernel waits for the MoE output (``providers.HEAD_BEFORE_TOKENS``).
+        self.ring_tokens = dict(ring_tokens or {})
+        self.ring_token_codes: dict = {}
         self.views = tuple(to_cute(w.reshape(-1)) for w in weights)
         self.key, self.eps = key, tuple(map(cutlass.Float32, eps))
         self.sanitize = False
@@ -135,8 +150,9 @@ class PreparedAttnRes:
 
     @classmethod
     def for_target(
-        cls, target, *, final=False, has_delta=True, carveout=None, ring_only=False
-    ):
+        cls, target, *, final=False, has_delta=True, carveout=None, ring_only=False,
+        ring_tokens=None,
+    ):  # fmt: skip
         if final:
             norm, query = target.output_attn_res_norm, target.output_attn_res_proj
             output, nb, write = target.norm, target.num_attn_res_blocks, -1
@@ -147,7 +163,8 @@ class PreparedAttnRes:
             write = target.block_write_idx if target.is_block_write_layer else -1
         weights = (norm.weight, query.weight, output.weight)
         eps = (norm.variance_epsilon, output.variance_epsilon)
-        return cls(weights, (nb, has_delta, write, final), eps, carveout, ring_only)
+        key = (nb, has_delta, write, final)
+        return cls(weights, key, eps, carveout, ring_only, ring_tokens)
 
     @classmethod
     def for_post(cls, decoder):
@@ -169,6 +186,13 @@ class PreparedAttnRes:
         shape = tuple(mailbox.shape[:2])
         self.sanitize = sanitize
         self.ring = self._compile(*shape, ring=True), to_cute(mailbox), shape
+        # (at most what one cluster exchange round holds at this block count)
+        most = rows_tokens_fit(self.key[0], self.key[3])
+        self.ring_tokens = {r: min(t, most) for r, t in self.ring_tokens.items()}
+        tokens = {t for r, t in self.ring_tokens.items() if t > 1 and r <= shape[1]}
+        self.ring_token_codes = {
+            t: self._compile(*shape, tokens=t, ring=True) for t in tokens
+        }
 
     def bind_ring_rows(self, mailbox):
         """The wide batches' Lamport input ring [slots, cap > 64, 7168] (the wide MoE
@@ -251,6 +275,9 @@ class PreparedAttnRes:
                 code = batched[0] if aux is None else batched[1]
             return self._launch(code, self.ring_rows[1], prefix, blocks, out, aux)
         code = self.ring[0] if aux is None else self.aux[1]
+        tokens = self.ring_tokens.get(rows, 1)
+        if aux is None and tokens in self.ring_token_codes:
+            code = self.ring_token_codes[tokens]
         return self._launch(code, self.ring[1], prefix, blocks, out, aux)
 
     def run(self, delta, prefix, blocks, out, aux=None):

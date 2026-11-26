@@ -119,6 +119,17 @@ MLA_BEFORE_CARVEOUT = 100
 # memory it uses) is placed beside an AttnRes CTA while the AttnRes waits for the MoE
 # output.
 HEAD_BEFORE_CARVEOUT = 100
+# TP16 Rubin KdaHead rows whose preceding AttnRes (the bound MoE-tail ring) runs
+# ``ClusterAttnResRows`` with this many tokens per 7-CTA cluster (rows:tokens). A
+# KdaHead CTA (256 threads x 204 registers, 210944 B) is placed only on an SM without a
+# MoE-tail CTA (shared memory) and with at most one 96-register AttnRes CTA (register
+# file); at 16 rows the 112 one-token AttnRes CTAs leave no such SMs for its 6-CTA
+# clusters until AttnRes CTAs exit, so the head entered at AttnRes start + 4.99 us
+# instead of B1's + 1.54 (16-rank STAMP-1125a CUPTI) and streamed its weights after
+# the wait. 56 two-token CTAs (bitwise the same AttnRes outputs) restore B1's lead.
+# 1 GPU, real ClusterAttnRes + KdaHeadMultiDefer, production-resource experts / tail /
+# o-proj neighbours (lanes/KDA/edge/chain_res.py): see KDA-EDGE RES-2.
+HEAD_BEFORE_TOKENS = {16: "16:2"}
 # Devices with more SMs than GB300's 152 (Rubin), B64 (spec verify B8 x q8): split-K
 # stages of both in-projections (64, 64, 2, stages). 1-GPU, cold weights, us per call
 # after a 10 us PDL predecessor, MLA rows: 6 stages 7.75 vs 5 stages 8.34 (KDA rows
@@ -611,6 +622,8 @@ class Attention:
         # ring_only): no DSA tactic above 64 rows stages weights in tensor memory, and
         # at 384-768 rows carve-out 100 slows the AttnRes and the cuBLAS in-projection.
         self.before_ring_only = False
+        # Batches whose preceding AttnRes ring runs token-batched (HEAD_BEFORE_TOKENS).
+        self.before_tokens: dict = {}
         # MLA / DSA batches whose in-projection stages its weights in tensor memory.
         self.tmem_batches = ()
         if kind in ("mla", "dsa") and any(len(t) > 4 for t in policies.values()):
@@ -775,6 +788,9 @@ class Attention:
                     fa_out, polled=polled, verify=verify,
                 )  # fmt: skip
                 self.before_carveout = HEAD_BEFORE_CARVEOUT
+                tokens = batch_table(HEAD_BEFORE_TOKENS.get(tp, ""))
+                heads = {rows for rows, _ in verify} | set(batches)
+                self.before_tokens = {r: t for r, t in tokens.items() if r in heads}
                 self.head_state = state
         else:
             heads = attention.num_local_heads
