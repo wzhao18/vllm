@@ -354,10 +354,10 @@ class RouteSitu:
                 rank += Int32(km[0, j] > group)
             low = redux(group if rank < 16 else Uint32(0xFFFFFFFF))
             if c.const_expr(self.lean):  # the rest is warp 0's: no CTA barrier
-                dense = view(cand.iterator, 0, Uint64, (896,))
+                pool = view(cand.iterator, 0, Uint64, (896,))
                 out = (ids, weights, scale)
                 rd.stamp(daddr, 3)  # DIAG: cutoff (warp 0)
-                self.top16(keys, low, dense, sig, picked, out, token, signal, daddr)
+                self.top16(keys, low, pool, sig, picked, out, token, signal, daddr)
                 rd.stamp(daddr, 5)  # DIAG: tid 0's publish stores issued
             elif lane == 0:
                 cutoff[0] = low
