@@ -56,6 +56,7 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     HOME_SHIFT,
+    W2_PITCH,
     RubinExpertsKernel,
     die_words,
     nth_set,
@@ -973,7 +974,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         address = Int64(row) * 1792 + mid % 14 * 128
                     else:
                         row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                        address = Int64(row) * 128
+                        address = Int64(row) * W2_PITCH
                     live = (tid < self.grid) & (lo < hi)
                     dies.append(live & ((address >> HOME_SHIFT & 1) != 0))
             for p in cutlass.range_constexpr(4):
