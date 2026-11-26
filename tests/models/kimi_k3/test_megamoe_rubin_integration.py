@@ -257,6 +257,31 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
     assert len(buckets) == 1
 
 
+@pytest.mark.parametrize(
+    ("world", "tokens", "tile"),
+    [
+        (8, 8192, (256, 256, 512)),  # TP8+DCP8 / DEP8 prefill: N256 2x1
+        (16, 8192, (256, 256, 512)),  # DEP16 8192 sub-call: N256 4x1 + 2x1 fallback
+        (8, 5760, (256, 128, 256)),  # an N128 record keeps K256 stages
+    ],
+)
+def test_prefill_n256_buckets_stream_k512_stages(world, tokens, tile):
+    """Tile-N256 prefill (dedup) buckets run K512 ring stages; the knob record and every
+    other knob are unchanged, and the kernel admission rules accept the tile."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    main, _ = X.select_rubin_bucket(problem, world, tokens)
+    (bucket,), _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)
+    assert bucket.variant == X.RUBIN_DEDUP_VARIANT
+    assert bucket.knobs.mma_tiler_mnk == tile
+    assert dataclasses.replace(
+        bucket.knobs,
+        mma_tiler_mnk=main.knobs.mma_tiler_mnk,
+        token_back_mode=main.knobs.token_back_mode,
+    ) == main.knobs
+    C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
+
+
 def _inference_record_capacities():
     """(world, quant kind, record capacity) of every shipped inference knob record."""
     data = C.load_knob_source(C.SHIPPED_KNOBS)

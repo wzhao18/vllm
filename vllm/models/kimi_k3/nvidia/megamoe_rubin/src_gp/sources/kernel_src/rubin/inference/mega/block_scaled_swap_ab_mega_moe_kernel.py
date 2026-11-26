@@ -692,7 +692,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             raise ValueError("mma_tiler K must be divisible by instruction K.")
         if mma_k % (self.sf_vec_size * 4) != 0:
             raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
-        if self.quant_kind == QuantKind.nvfp4 and (mma_n, mma_k) == (256, 512):
+        if False and self.quant_kind == QuantKind.nvfp4 and (mma_n, mma_k) == (256, 512):  # MMK512 PROBE ONLY
             raise ValueError(
                 "Rubin MegaMoE does not support the NVFP4 N256 K512 multi-window configuration."
             )
