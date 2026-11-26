@@ -5,6 +5,7 @@ and the latent shard into a multicast mailbox row; the routing kernel polls all 
 logits, ranks the top16 (sigmoid + bias, renormalized) and Lamport-copies the latent."""
 
 import functools
+import os
 
 import cutlass as c
 import cutlass.cute as cute
@@ -594,6 +595,12 @@ MERGED_WIDE = {8: "16-32:1", 16: "16-32:1"}
 # DL7 B4 2333.4 -> 2244.6, DL3 B8 2362.5 -> 2283.6 (the 1-GPU MoE layer proxy had read
 # +0.8..+1.5 us/layer, the wrong sign as at M64); logits within 1.2e-6 of FP64.
 FRONT_TMEM_WIDE = {288: "16-32:1,64:1"}
+# K31CH_FRONT_TMEM: a batch table of further packed front rows on ``MoeFrontTmem64``,
+# appended to the TP16 entry (the same math as its rows above).
+if os.environ.get("K31CH_FRONT_TMEM"):
+    FRONT_TMEM_WIDE = {
+        288: f"{FRONT_TMEM_WIDE[288]},{os.environ['K31CH_FRONT_TMEM']}",
+    }
 # Shared-expert split-K tactics (M tile, N tile, split, stages) by width (TP8 768, TP16
 # 384): gate_up, then down.
 SHARED_TACTICS = {
