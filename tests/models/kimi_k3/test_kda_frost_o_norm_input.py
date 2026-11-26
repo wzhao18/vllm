@@ -3,14 +3,15 @@
 """Layer-level regression: the KDA prefill core output must reach the o_norm.
 
 ``KimiK3DeltaAttention.forward`` in the TP > 1 prefill configuration (fused GEMM-AR
-o_proj set, so the MXFP8 o_norm is off and ``o_mxfp8`` is None; FROST / persistent
-core on a pure prefill step) with every buffer that ``kda.py`` allocates with
+set on a BF16 o_proj, so the MXFP8 o_norm is off and ``o_mxfp8`` is None; FROST /
+persistent core on a pure prefill step) with every buffer that ``kda.py`` allocates with
 ``torch.empty`` poisoned (NaN, or a finite value), against the stock FlashKDA core
 on the same layer. On int53 the FROST / persistent core left ``core_attn_out``
 unwritten and the in-place gated o_norm normalized that uninitialized memory:
 NaN / non-reproducible TP8 + DCP8 prefill steps (BUG-DCP8-1).
 
-The MXFP8 o_norm route (DEP, TP1) is covered as well, at ``_forward`` level.
+The MXFP8 o_norm route is covered as well: DEP / TP1 at ``_forward`` level, and
+TP > 1 with an MXFP8 o_proj, whose fused GEMM-RS/AR takes the MXFP8 o_norm output.
 """
 
 from types import MethodType, SimpleNamespace
@@ -301,3 +302,92 @@ def test_mxfp8_o_norm_prefill_reads_the_core_output(kda_env, core):
     assert torch.isfinite(deq_nan).all()
     torch.testing.assert_close(codes_nan, codes_fin, atol=0, rtol=0)
     assert _rel_rms(deq_nan, deq_ref) < 3e-2
+
+
+class _FakeMxfp8GemmRsAr(_FakeGemmRsAr):
+    """The fused GEMM-RS/AR o_proj of an MXFP8 o_proj: takes the MXFP8 activation
+    the gated o_norm wrote (records what it was handed)."""
+
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+        self.handed = []
+
+    def should_run(self, x) -> bool:
+        return True
+
+    def apply(self, x, linear, residual=None, residual_row0=0, copy_out=True):
+        self.inputs.append(type(x).__name__)
+        self.handed.append(x)
+        return super().apply(x, linear, residual, residual_row0, copy_out)
+
+
+def _dequant_activation(qa) -> torch.Tensor:
+    from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
+
+    T, K = qa.orig_shape
+    rows = (T + 127) // 128 * 128
+    s = unswizzle_mxfp8_scale(qa.scale, rows, K)[:T].float()
+    deq = qa.data.float().view(T, K // 32, 32) * torch.exp2(s.view(T, K // 32, 1) - 127)
+    return deq.view(T, K)
+
+
+@pytest.mark.parametrize("core", ["persistent", "frost"])
+@torch.inference_mode()
+def test_tp_prefill_mxfp8_o_norm_feeds_gemm_rs(kda_env, core, monkeypatch):
+    """TP > 1 prefill with an MXFP8 o_proj: the gated o_norm writes the MXFP8
+    activation and the fused GEMM-RS/AR consumes it (no BF16 o_norm output, no
+    separate quantize); finite, poison-independent, and equal to the BF16 TP
+    route (in-place o_norm, then the o_proj's own MXFP8 quantization) up to that
+    quantization."""
+    from vllm.models.kimi_k3.nvidia import mxfp8 as mxfp8_mod
+    from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+
+    if not _core_supported(core):
+        pytest.skip(f"{core} KDA prefill core unavailable")
+    x = _inputs()
+    positions = torch.arange(x.T, device="cuda")
+
+    handed = {}
+
+    def run(c: str, poison: float, mx: bool):
+        kda_env(poison)
+        monkeypatch.setattr(mxfp8_mod, "takes_mxfp8_activation", lambda *linears: mx)
+        rs_ar = _FakeMxfp8GemmRsAr()
+        layer = _layer(x, c, rs_ar)
+        if mx:
+            layer.o_proj = lambda a: (_dequant_activation(a) @ x.w_o.float().t(),)
+        out = KimiK3DeltaAttention.forward(layer, x.hidden, positions)
+        torch.accelerator.synchronize()
+        assert rs_ar.calls == 1
+        assert layer._o_norm_mxfp8_ok is mx
+        assert rs_ar.inputs == (["QuantizedActivation"] if mx else ["Tensor"])
+        handed[mx, poison != poison] = rs_ar.handed[0]
+        return out.float().clone()
+
+    out_nan = run(core, float("nan"), True)
+    out_fin = run(core, 3.0e4, True)
+    ref = run(core, float("nan"), False)
+    assert torch.isfinite(out_nan).all(), "the MXFP8 o_norm read uninitialized memory"
+    torch.testing.assert_close(out_nan, out_fin, atol=0, rtol=0)
+    assert _rel_rms(out_nan, ref) < 3e-2
+
+    # Bitwise: the MXFP8 activation the GEMM-RS/AR is handed equals the stock
+    # route's (in-place BF16 o_norm, then GemmRsAr's own mxfp8_e4m3_quantize).
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+    from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
+
+    qa, bf16 = handed[True, True], handed[False, True]  # both NaN-poisoned
+    codes, sf = mxfp8_e4m3_quantize(bf16.contiguous(), is_sf_swizzled_layout=True)
+    rows = (x.T + 127) // 128 * 128
+    torch.testing.assert_close(
+        qa.data.view(torch.uint8), codes.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        unswizzle_mxfp8_scale(qa.scale.view(torch.uint8), rows, P)[: x.T],
+        unswizzle_mxfp8_scale(sf.view(torch.uint8), rows, P)[: x.T],
+        atol=0,
+        rtol=0,
+    )

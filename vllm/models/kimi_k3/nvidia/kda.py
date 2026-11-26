@@ -438,10 +438,12 @@ def frost_out_feeds_o_norm(
     """Whether a FROST / persistent prefill output may skip its copy into
     ``core_attn_out``: only on a pure prefill step (the output covers all of
     ``core_attn_out``) whose gated o_norm is the MXFP8 prefill kernel, the one
-    o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``).
+    o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``);
+    callers pass ``o_mxfp8`` only when that kernel runs (no fused GEMM-RS/AR).
     Every other o_norm (the in-place ``kda_norm.rmsnorm_gated_`` that runs when
-    o_proj takes a BF16 tensor, e.g. the TP fused GEMM-AR o_proj, which then
-    quantizes it to MXFP8 itself for the MXFP8 o_proj) normalizes
+    o_proj takes a BF16 tensor, i.e. a BF16 or non-online-MXFP8 o_proj, and
+    ``kda_norm.rmsnorm_gated_mxfp8`` feeding the TP fused GEMM-RS/AR of an MXFP8
+    o_proj) normalizes
     ``core_attn_out`` itself, so the output must land there first: skipping the
     copy left it uninitialized (NaN / non-reproducible TP8 + DCP8 prefill)."""
     return (
@@ -1154,7 +1156,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 return gemm.add_into(qa, prefix)
             return gemm.store_into(qa, prefix)
         if o_mxfp8 is not None:
-            return self.o_proj(o_mxfp8.activation())[0]
+            qa = o_mxfp8.activation()
+            if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(qa):
+                # The fused GEMM-RS/AR consumes the MXFP8 activation the gated
+                # o_norm wrote (the same codes and F8_128x4 scales its own
+                # mxfp8_e4m3_quantize of the BF16 norm output would give), so
+                # the BF16 norm output and its separate quantize pass are gone.
+                return self.gemm_rs_ar.apply(qa, self.o_proj, copy_out=False)
+            return self.o_proj(qa)[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
             # Same precision as the stock o_proj: for the MXFP8 o_proj the fused
@@ -1272,10 +1281,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if self._o_norm_mxfp8_ok is None:
             from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
 
-            self._o_norm_mxfp8_ok = (
-                self.gemm_rs_ar is None
-                and takes_mxfp8_activation(self.o_proj)
-            )
+            # The fused GEMM-RS/AR takes the MXFP8 activation as well (apply()).
+            self._o_norm_mxfp8_ok = takes_mxfp8_activation(self.o_proj)
         return (
             self._o_norm_mxfp8_ok
             and core_attn_out.is_contiguous()
@@ -1839,7 +1846,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                 )
                             )
                             if frost_out_feeds_o_norm(
-                                flashkda_out, core_attn_out, frost_out, o_mxfp8
+                                flashkda_out,
+                                core_attn_out,
+                                frost_out,
+                                o_mxfp8 if self.gemm_rs_ar is None else None,
                             ):
                                 # Pure prefill: o_norm reads the FROST output.
                                 prefill_core_out = frost_out
@@ -1981,9 +1991,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             o_mxfp8 is not None
             and m.num_prefills > 0
             and self.kda_prefill_backend == "flashkda"
+            and self.gemm_rs_ar is None
         ):
             # Prefill: the HBM-rate gated o_norm + MXFP8 kernel (same layout
-            # contract as kda_norm, checked in forward()).
+            # contract as kda_norm, checked in forward()). Not for the fused
+            # GEMM-RS/AR o_proj: there kda_norm.rmsnorm_gated_mxfp8 below gives
+            # the codes and scales of the stock route (in-place BF16 o_norm,
+            # then mxfp8_e4m3_quantize) bitwise; this kernel sums the squares in
+            # another order.
             specialized_prefill_kda.o_norm_mxfp8(
                 prefill_core_out,
                 g2.flatten(-2),

@@ -41,6 +41,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 from vllm.cute_utils import _tcgen05, mbarrier, simple_tma_copy, to_cta0_smem
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 
@@ -1426,14 +1427,15 @@ class GemmRsAr:
             == self.partial.untyped_storage().data_ptr()
         )
 
-    def should_run(self, x: torch.Tensor) -> bool:
+    def should_run(self, x: "torch.Tensor | QuantizedActivation") -> bool:
         # Use the same threshold for RS and AR for now. Small-M shapes are
         # supported but faster on the existing LL path.
-        return x.shape[0] >= 128
+        rows = x.orig_shape[0] if isinstance(x, QuantizedActivation) else x.shape[0]
+        return rows >= 128
 
     def apply(
         self,
-        x: torch.Tensor,
+        x: "torch.Tensor | QuantizedActivation",
         linear: LinearBase,
         residual: torch.Tensor | None = None,
         residual_row0: int = 0,
@@ -1449,6 +1451,11 @@ class GemmRsAr:
         ``residual`` (optional, BF16 ``[R, N]``, contiguous): added in the GEMM
         epilogue to rows ``[residual_row0, residual_row0 + R)`` of this rank's
         partial before the reduction, i.e. contributed exactly once to the sum.
+
+        ``x`` may be a pre-quantized MXFP8 ``QuantizedActivation`` (FP8 codes +
+        F8_128x4-swizzled E8M0 scales, ``ops/mxfp8_act.py`` layout) for an MXFP8
+        ``linear``: its producer already quantized the BF16 value the way
+        ``mxfp8_e4m3_quantize`` does, so the GEMM skips its own quantize pass.
         """
         from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
             FlashInferCutedslMxfp8LinearKernel,
@@ -1463,16 +1470,21 @@ class GemmRsAr:
             w = w.t()
         w_sf = getattr(linear, "weight_scale", None)
 
+        x_sf = None
+        if isinstance(x, QuantizedActivation):
+            x_sf = x.scale
+            x = x.data
+            assert x.dtype == torch.float8_e4m3fn
+        else:
+            assert x.dtype == torch.bfloat16
         assert x.ndim == 2
         M, K = x.shape
         assert 0 < M <= self.max_M
-        assert x.dtype == torch.bfloat16
         assert x.device == self.device
         assert x.is_contiguous()
         assert w.device == self.device
         N = self.N
         dtype = "mxfp8" if w.dtype == torch.float8_e4m3fn else "bf16"
-        x_sf = None
         if dtype == "mxfp8":
             from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
                 mxfp8_e4m3_quantize,
@@ -1484,12 +1496,18 @@ class GemmRsAr:
             assert w_sf.numel() == N * (K // 32)
             assert w.shape == (N, K) and K % 128 == 0
             assert w.is_contiguous()
-            x, x_sf = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+            if x_sf is None:
+                x, x_sf = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+            else:
+                # F8_128x4: rows padded to 128, scale columns to 4.
+                assert x_sf.is_contiguous() and x_sf.device == self.device
+                assert x_sf.numel() == (M + 127) // 128 * 128 * (K // 32)
             # The kernel declares the scales as E8M0; the stored/quantized
             # tensors carry the same bits as uint8.
             x_sf = x_sf.view(torch.float8_e8m0fnu)
             w_sf = w_sf.view(torch.float8_e8m0fnu)
         else:
+            assert x_sf is None, "an MXFP8 activation needs an MXFP8 linear"
             assert w_sf is None
             assert w.shape == (N, K) and K % 64 == 0
             assert w.dtype == torch.bfloat16
