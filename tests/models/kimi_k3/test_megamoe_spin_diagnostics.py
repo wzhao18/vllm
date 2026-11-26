@@ -163,7 +163,7 @@ def test_spin_record_format_names_missing_ranks():
 
 def test_every_dedup_guard_writes_a_record():
     src = (PKG / "src_gp/sources/communication/nvlink_domain/token_comm_dedup.py").read_text()
-    assert src.count("record=") == src.count("print_flag=") == 8
+    assert src.count("record=") == src.count("print_flag=") == 10
     session = (PKG / "session.py").read_text()
     assert "_write_spin_record_address()" in session
 
