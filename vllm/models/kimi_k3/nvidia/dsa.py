@@ -949,7 +949,7 @@ class KimiK3DSAAttention(nn.Module):
         # Weights + every rank's new rows; returns once all landed here.
         tlx.push(self.q_b_proj.weight, self.g_proj.weight, self.o_proj.weight, R)
         kv_c_all, k_pe_all, wkv_all = tlx.recv_rows(R)
-        q = torch.mm(q_c, tlx.w_qb.t()).view(R, -1, self.qk_head_dim)
+        q = tlx.gemm("qb", q_c, q_c.new_empty((R, tlx_dsa.QB_N))).view(R, -1, self.qk_head_dim)
         # Indexer: this rank's query rows, every rank's keys (fused insert).
         index_q = indexer.wq_index(q_c)[0].view(
             -1, indexer.index_num_heads, indexer.index_head_dim
@@ -960,7 +960,7 @@ class KimiK3DSAAttention(nn.Module):
         wrapper.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
         value = q.new_empty((R, q.shape[1] * self.v_head_dim))
         wrapper.mla_attn.forward_tlx(q, kv_c_all, k_pe_all.unsqueeze(1), value)
-        gate = torch.mm(hidden_states, tlx.w_g.t())
+        gate = tlx.gemm("g", hidden_states, hidden_states.new_empty((R, tlx_dsa.G_N)))
         if wrapper.gate_sigmoid_mul is not None:
             attn_out = wrapper.gate_sigmoid_mul(value, gate)
         else:

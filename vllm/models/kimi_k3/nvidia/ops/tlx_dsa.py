@@ -33,13 +33,9 @@ The kernel returns once every rank's bytes for this rank landed (counted
 completion, one release add per source and rank).
 
 Memory (no new allocation): the staging region and the row buffers alias the
-dead tails of the SP all-gather slots (``SymmSpAllGather``): under TLX no BF16
-gather runs (the DSA gathers are gone; the KDA gathers are MXFP8, rows + scales
-<= 51.6% of a slot; the model's final gather takes the stock path), so bytes
-[world * max_rows * hidden * (1 + 1/32), slot end) of each slot are written and
-read by TLX only. Slot 0's tail holds the weights, slot 1's the rows. The
-init check below asserts the fit; when it fails (MNBT below 65536 for the
-weights region) TLX is not enabled and says so once.
+GEMM-RS ``partial`` workspace and the dead tails of the SP all-gather slots
+(``TlxDsa``: lifetimes and layout). Fits at MNBT >= 16384 at TP8; raises at
+init otherwise.
 
 WAR safety: a peer pushes into my staging / row buffers for DSA layer D' only
 after it started D', i.e. finished every layer before, including the MoE of
@@ -95,7 +91,8 @@ static cudaStream_t tx_cur() { return c10::cuda::getCurrentCUDAStream().stream()
 struct __align__(64) TxArgs {
   CUtensorMap m[8];
   int64_t src[TX_MAXSEG], nb[TX_MAXSEG], off[TX_MAXSEG], cum[TX_MAXSEG + 1];
-  int64_t base[8];  // destination base addresses (1D segments)
+  int64_t base[16];  // destination base addresses of buffer b at [b * 8 + d] (1D segments)
+  int bi[TX_MAXSEG];  // destination buffer of each 1D segment
   int64_t o_src;
   int n, o_rows;
 };
@@ -133,7 +130,7 @@ __global__ void __launch_bounds__(32, 1) tlx_push_kernel(
       const int64_t off = (c - a.cum[si]) * chunk;
       nb = (uint32_t)min((int64_t)chunk, a.nb[si] - off);
       p = (const uint8_t*)a.src[si] + off;
-      kind[s] = 0; aux[s] = a.base[d] + a.off[si] + off;
+      kind[s] = 0; aux[s] = a.base[a.bi[si] * 8 + d] + a.off[si] + off;
     } else {
       const int64_t j = c - n1;
       nb = 8u * 3072u;
@@ -230,11 +227,13 @@ static TxEncodeFn tx_encode() {
   return fn;
 }
 
-void tlx_push(std::vector<int64_t> src, std::vector<int64_t> nb, std::vector<int64_t> off, std::vector<int64_t> base,
+void tlx_push(std::vector<int64_t> src, std::vector<int64_t> nb, std::vector<int64_t> off, std::vector<int64_t> bi,
+              std::vector<int64_t> base,
               int64_t o_src, int64_t o_rows, std::vector<int64_t> o_dst, torch::Tensor ctr, int64_t done, int64_t freew,
               int64_t pushed, int64_t rank, int64_t W, int64_t grid, int64_t limit) {
   TORCH_CHECK(src.size() == nb.size() && nb.size() == off.size() && src.size() <= TX_MAXSEG, "tlx_push: segments");
-  TORCH_CHECK((int64_t)base.size() == W && W <= 8 && ctr.numel() == W, "tlx_push: W");
+  TORCH_CHECK(base.size() % W == 0 && base.size() <= 16 && W <= 8 && ctr.numel() == W, "tlx_push: W");
+  TORCH_CHECK(bi.size() == src.size(), "tlx_push: segment buffers");
   TORCH_CHECK(o_rows % 8 == 0 && (o_rows == 0 || (int64_t)o_dst.size() == W), "tlx_push: W_o rows");
   static std::map<std::pair<int64_t, int64_t>, std::vector<CUtensorMap>> maps;
   TxArgs a;
@@ -242,10 +241,11 @@ void tlx_push(std::vector<int64_t> src, std::vector<int64_t> nb, std::vector<int
   a.n = (int)src.size();
   for (int i = 0; i < a.n; ++i) {
     TORCH_CHECK(nb[i] > 0 && nb[i] % 16 == 0 && off[i] % 16 == 0 && src[i] % 16 == 0, "tlx_push: 16-byte aligned");
-    a.src[i] = src[i]; a.nb[i] = nb[i]; a.off[i] = off[i];
+    a.src[i] = src[i]; a.nb[i] = nb[i]; a.off[i] = off[i]; a.bi[i] = (int)bi[i];
+    TORCH_CHECK(bi[i] >= 0 && (bi[i] + 1) * W <= (int64_t)base.size(), "tlx_push: segment buffer index");
     a.cum[i + 1] = a.cum[i] + (nb[i] + _CHUNK_ - 1) / _CHUNK_;
   }
-  for (int d = 0; d < W; ++d) a.base[d] = base[d];
+  for (size_t j = 0; j < base.size(); ++j) a.base[(j / W) * 8 + j % W] = base[j];
   a.o_src = o_src; a.o_rows = (int)o_rows;
   if (o_rows > 0) {
     TORCH_CHECK(o_src % 16 == 0, "tlx_push: W_o source alignment");
@@ -289,7 +289,8 @@ void tlx_release(torch::Tensor freew_at_src) {
 
 _CPP = r"""
 #include <torch/extension.h>
-void tlx_push(std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, int64_t, int64_t,
+void tlx_push(std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>,
+              int64_t, int64_t,
               std::vector<int64_t>, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 void tlx_release(torch::Tensor);
 """
@@ -326,120 +327,186 @@ def _module():
     return _ext
 
 
-class TlxDsa:
-    """Staging, row buffers and words of the DSA TLX-S path over one
-    ``SymmSpAllGather`` (its slot tails and signal pads)."""
+class _Region:
+    """A dead byte range of a symmetric buffer: buffer index (0 = SP all-gather storage, 1 = GEMM-RS partial),
+    byte offset in the buffer, size; ``used`` bytes allocated from its start."""
 
-    def __init__(self, spag) -> None:
+    def __init__(self, buf: int, off: int, size: int, name: str) -> None:
+        self.buf, self.off, self.size, self.used, self.name = buf, off, size, 0, name
+
+    def take(self, nbytes: int) -> int | None:
+        nbytes = (nbytes + 255) // 256 * 256
+        if self.used + nbytes > self.size:
+            return None
+        o = self.off + self.used
+        self.used += nbytes
+        return o
+
+
+class TlxDsa:
+    """Staging, row buffers and words of the DSA TLX-S path, aliased (no new memory) in
+
+    * the GEMM-RS ``partial`` workspace (symm [MNBT, 7168] BF16): between two GEMM-RS calls nothing reads or writes
+      it. A peer pushes into my partial for DSA layer L only after its own GEMM-RS of the layer before returned,
+      whose per-CTA exit barrier waits for every rank's same CTA, i.e. after every rank finished pulling my partial;
+      my next GEMM-RS writes it after my o_proj (the last reader) on the same stream;
+    * the SP all-gather slot tails (no gather of a TLX step writes past 51.6% of a slot: the DSA gathers are gone,
+      the KDA gathers are MXFP8, the model's final gather takes the stock path).
+
+    Layout (``_pack``): W_o (contiguous, K-major, written by the 3D tensor-store push), W_qb, W_g (split along N at
+    shard boundaries when no region holds it whole; each part is its own GEMM writing a column block of the output,
+    cuBLAS ldc), and the three row planes, first fit over the regions. Fits at MNBT >= 16384 (partial 234.9 MB +
+    two tails of 113.7 MB at TP8); raises at init otherwise (no silent fallback)."""
+
+    def __init__(self, spag, rs) -> None:
         self.spag = spag
         self.world, self.rank = spag.world, spag.rank
+        W = self.world
         esz = spag.storage.element_size()
         self.slot_bytes = spag.slot_numel * esz
-        tail = spag.world * spag.max_rows * spag.hidden_size * 33 // 32
-        self.tail = (tail + 255) // 256 * 256
-        self.tail_bytes = self.slot_bytes - self.tail
+        tail = (spag.world * spag.max_rows * spag.hidden_size * 33 // 32 + 255) // 256 * 256
         self.max_rows = spag.max_rows
-        rows_need = (self.world + 1) * spag.max_rows * ROW_BYTES  # 3 planes x (W recv + 1 send) x max_rows
-        self.ok = (
-            spag.tma
-            and self.world == 8
-            and spag.hidden_size == 7168
-            and W_BYTES <= self.tail_bytes
-            and rows_need <= self.tail_bytes
-        )
-        if not self.ok:
-            logger.warning(
-                "Kimi K3.1 DSA TLX-S not enabled: needs TP8, the TMA push and "
-                "%d B (weights) / %d B (rows) in the SP all-gather slot tails, "
-                "which have %d B at max_rows %d (raise max_num_batched_tokens).",
-                W_BYTES, rows_need, self.tail_bytes, spag.max_rows,
-            )
-            return
-        numel = spag.storage.numel()
-        self.bases = [
-            spag.handle.get_buffer(p, [numel], spag.storage.dtype, 0).data_ptr() for p in range(self.world)
-        ]
         dev = spag.storage.device
-        # Words at the end of each rank's signal pad, below the SP all-gather's
-        # 4 (2 counters + 2 local done counts): [16 free words][ctr][done][pushed].
+        numel = spag.storage.numel()
+        sp_bases = [spag.handle.get_buffer(p, [numel], spag.storage.dtype, 0).data_ptr() for p in range(W)]
+        pr_bases = [
+            rs.partial_handle.get_buffer(p, list(rs.partial.shape), rs.partial.dtype, 0).data_ptr() for p in range(W)
+        ]
+        self.bases = sp_bases + pr_bases
+        self.raws = (spag.storage.view(torch.uint8), rs.partial.view(torch.uint8))
+        regions = [
+            _Region(1, 0, rs.partial.numel() * rs.partial.element_size(), "gemm_rs_partial"),
+            _Region(0, tail, self.slot_bytes - tail, "sp_ag_slot0_tail"),
+            _Region(0, self.slot_bytes + tail, self.slot_bytes - tail, "sp_ag_slot1_tail"),
+        ]
+        self.layout = self._pack(regions)
+        # Words at the end of each rank's SP all-gather signal pad, below its 4 (2 counters + 2 local done counts):
+        # [16 free words][ctr][done][pushed].
         pads, pad = spag.handle.signal_pad_ptrs, spag.handle.signal_pad_size
-        top = pad - 4 * 4
-        free_off = top - 4 * 32
+        free_off = pad - 4 * 4 - 4 * 32
         self.ctr = torch.tensor([p + free_off + 4 * 16 for p in pads], dtype=torch.int64, device=dev)
         self.done = pads[self.rank] + free_off + 4 * 17
         self.pushed = pads[self.rank] + free_off + 4 * 18
         self.freew = pads[self.rank] + free_off  # [W] words: word d = releases by destination d
-        # Release targets: my word in each source's free array.
         self.release_to = torch.tensor(
-            [pads[p] + free_off + 4 * self.rank for p in range(self.world)], dtype=torch.int64, device=dev
+            [pads[p] + free_off + 4 * self.rank for p in range(W)], dtype=torch.int64, device=dev
         )
         self.num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        # Weight staging (slot 0 tail): [q_b | g | o] full weights; row buffers (slot 1 tail): recv [8 x max_rows]
-        # then this rank's send rows.
-        self.w_off = self.tail
-        self.qb_off = self.w_off
-        self.g_off = self.qb_off + QB_N * QB_K * 2
-        self.o_off = self.g_off + G_N * G_K * 2
-        self.rows_off = self.slot_bytes + self.tail
-        raw = spag.storage.view(torch.uint8)
-        self.raw = raw
-        bf = torch.bfloat16
-        self.w_qb = raw[self.qb_off : self.qb_off + QB_N * QB_K * 2].view(bf).view(QB_N, QB_K)
-        self.w_g = raw[self.g_off : self.g_off + G_N * G_K * 2].view(bf).view(G_N, G_K)
-        self.w_o = raw[self.o_off : self.o_off + O_N * O_K * 2].view(bf).view(O_N, O_K)
-        # Load the kernels now (empty launches), not inside a step.
         m = _module()
-        m.tlx_push([], [], [], [0] * self.world, 0, 0, [], self.ctr, self.done, self.freew, self.pushed,
-                   self.rank, self.world, 1, _SPIN_NS)
-        m.tlx_release(torch.zeros(self.world, dtype=torch.int64, device=dev))
+        m.tlx_push([], [], [], [], self.bases, 0, 0, [], self.ctr, self.done, self.freew, self.pushed,
+                   self.rank, W, 1, _SPIN_NS)
+        m.tlx_release(torch.zeros(W, dtype=torch.int64, device=dev))
         logger.info(
-            "Kimi K3.1 DSA TLX-S: staging %.1f MB + rows %.1f MB in the SP all-gather slot tails "
-            "(%.1f MB each at max_rows %d); no new memory.",
-            W_BYTES / 1e6, rows_need / 1e6, self.tail_bytes / 1e6, spag.max_rows,
+            "Kimi K3.1 DSA TLX-S staging (no new memory, max_rows %d): %s", self.max_rows,
+            "; ".join(f"{r.name} {r.used / 1e6:.1f} of {r.size / 1e6:.1f} MB" for r in regions),
         )
 
-    # Row planes (slot 1 tail): per plane (kv_c 512, k_pe 64, wkv 192 BF16 columns) a receive region of
-    # world x max_rows rows, rank r's rows at r * R (so the step's rows of all ranks are one [world R, w] tensor),
-    # then this rank's send rows.
-    def _plane(self, i: int, R: int, which: int) -> torch.Tensor:
-        widths = (KV_C, K_PE, WKV)
-        base = self.rows_off + (self.world + 1) * self.max_rows * 2 * sum(widths[:i])
-        rb = widths[i] * 2
+    def _view(self, buf: int, off: int, nbytes: int) -> torch.Tensor:
+        return self.raws[buf][off : off + nbytes]
+
+    def _pack(self, regions: list) -> dict:
+        """First-fit layout (module docstring); raises with the shortfall when it does not fit."""
+        bf = torch.bfloat16
+        out: dict = {}
+
+        def place(name: str, nbytes: int):
+            for r in sorted(regions, key=lambda r: r.size - r.used):
+                o = r.take(nbytes)
+                if o is not None:
+                    return r.buf, o
+            free = sum(r.size - r.used for r in regions)
+            raise RuntimeError(
+                f"Kimi K3.1 DSA TLX-S: {name} ({nbytes / 1e6:.1f} MB) fits no dead region "
+                f"(free {[(r.name, round((r.size - r.used) / 1e6, 1)) for r in regions]} MB, {free / 1e6:.1f} in "
+                f"all) at max_rows {self.max_rows}; TLX-S needs max_num_batched_tokens >= 16384 at TP8"
+            )
+
+        def matrix(name: str, n: int, k: int, shard: int) -> list:
+            """N-parts [(n0, n1, buf, off, view)] of an [n, k] BF16 matrix, split at shard boundaries."""
+            for parts in range(1, n // shard + 1):
+                if (n // shard) % parts:
+                    continue
+                step = n // parts
+                saved = [(r.used) for r in regions]
+                try:
+                    res = []
+                    for j in range(parts):
+                        buf, off = place(f"{name}[{j}/{parts}]", step * k * 2)
+                        res.append((j * step, (j + 1) * step, buf, off,
+                                    self._view(buf, off, step * k * 2).view(bf).view(step, k)))
+                    return res
+                except RuntimeError:
+                    for r, u in zip(regions, saved):
+                        r.used = u
+                    if parts == n // shard:
+                        raise
+            raise AssertionError
+
+        buf, off = place("W_o", O_N * O_K * 2)
+        out["o"] = (buf, off, self._view(buf, off, O_N * O_K * 2).view(bf).view(O_N, O_K))
+        # W_g before W_qb: at MNBT 16384 W_o + W_qb fill the partial (232.8 of 234.9 MB) and W_g's two N halves the
+        # slot tails (88.1 of 113.7 MB each), the fewest GEMM parts.
+        out["g"] = matrix("W_g", G_N, G_K, SHARD_G)
+        out["qb"] = matrix("W_qb", QB_N, QB_K, SHARD_QB)
+        out["planes"] = []
+        for i, w in enumerate((KV_C, K_PE, WKV)):
+            out["planes"].append(place(f"rows plane {i}", (self.world + 1) * self.max_rows * w * 2) + (w,))
+        return out
+
+    # Row planes: per plane (kv_c 512, k_pe 64, wkv 160 BF16 columns) a receive region of world x max_rows rows,
+    # rank r's rows at r * R (so the step's rows of all ranks are one [world R, w] tensor), then the send rows.
+    def _plane(self, i: int, R: int, which: int) -> tuple[int, int, torch.Tensor]:
+        buf, base, w = self.layout["planes"][i]
+        rb = w * 2
+        assert R <= self.max_rows
         if which == self.world:
             o, n = base + self.world * self.max_rows * rb, R
         elif which >= 0:
             o, n = base + which * R * rb, R
         else:
             o, n = base, self.world * R
-        assert R <= self.max_rows
-        return self.raw[o : o + n * rb].view(torch.bfloat16).view(n, widths[i])
+        return buf, o, self._view(buf, o, n * rb).view(torch.bfloat16).view(n, w)
 
     def send_rows(self, R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """This rank's send rows: (kv_c [R, 512], k_pe [R, 64], wkv [R, 160]) BF16."""
-        return tuple(self._plane(i, R, self.world) for i in range(3))  # type: ignore[return-value]
+        return tuple(self._plane(i, R, self.world)[2] for i in range(3))  # type: ignore[return-value]
 
     def recv_rows(self, R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Every rank's rows in rank order (= the step's token order): ([W R, 512], [W R, 64], [W R, 160])."""
-        return tuple(self._plane(i, R, -1) for i in range(3))  # type: ignore[return-value]
+        return tuple(self._plane(i, R, -1)[2] for i in range(3))  # type: ignore[return-value]
+
+    @property
+    def w_o(self) -> torch.Tensor:
+        return self.layout["o"][2]
+
+    def gemm(self, which: str, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """out [R, N] = x @ W_full.T for the staged q_b / g weight (one cuBLAS GEMM per N part; FP32 accumulate)."""
+        for n0, n1, _, _, w in self.layout[which]:
+            torch.mm(x, w.t(), out=out[:, n0:n1])
+        return out
 
     def push(self, w_qb: torch.Tensor, w_g: torch.Tensor, w_o: torch.Tensor, R: int) -> None:
         """One launch: this rank's W_qb / W_g / W_o shards into every rank's staging and its R send rows into every
-        rank's receive block; returns (stream order) once every rank's bytes for this rank landed."""
+        rank's receive planes; returns (stream order) once every rank's bytes for this rank landed."""
         W, r = self.world, self.rank
         assert w_qb.shape == (SHARD_QB, QB_K) and w_g.shape == (SHARD_G, G_K) and w_o.shape == (O_N, SHARD_O)
         assert w_qb.is_contiguous() and w_g.is_contiguous() and w_o.is_contiguous()
         segs = []
         for i in range(3):
-            send, dst = self._plane(i, R, W), self._plane(i, R, r)
-            segs.append((send.data_ptr(), send.numel() * 2, dst.data_ptr() - self.raw.data_ptr()))
-        segs += [
-            (w_qb.data_ptr(), w_qb.numel() * 2, self.qb_off + r * SHARD_QB * QB_K * 2),
-            (w_g.data_ptr(), w_g.numel() * 2, self.g_off + r * SHARD_G * G_K * 2),
-        ]
-        units = (sum(-(-nb // _CHUNK) for _, nb, _ in segs) + O_N // _BR) * W
+            _, _, send = self._plane(i, R, W)
+            buf, o, _ = self._plane(i, R, r)
+            segs.append((send.data_ptr(), send.numel() * 2, o, buf))
+        for which, w, shard in (("qb", w_qb, SHARD_QB), ("g", w_g, SHARD_G)):
+            row0 = r * shard
+            n0, n1, buf, off, _ = next(p for p in self.layout[which] if p[0] <= row0 < p[1])
+            assert row0 + shard <= n1
+            segs.append((w.data_ptr(), w.numel() * 2, off + (row0 - n0) * w.shape[1] * 2, buf))
+        obuf, ooff, _ = self.layout["o"]
+        units = (sum(-(-nb // _CHUNK) for _, nb, _, _ in segs) + O_N // _BR) * W
         _module().tlx_push(
-            [a for a, _, _ in segs], [nb for _, nb, _ in segs], [o for _, _, o in segs], self.bases,
-            w_o.data_ptr(), O_N, [b + self.o_off for b in self.bases], self.ctr, self.done, self.freew, self.pushed,
+            [a for a, _, _, _ in segs], [nb for _, nb, _, _ in segs], [o for _, _, o, _ in segs],
+            [b for _, _, _, b in segs], self.bases, w_o.data_ptr(), O_N,
+            [self.bases[obuf * W + d] + ooff for d in range(W)], self.ctr, self.done, self.freew, self.pushed,
             r, W, min(self.num_sms, units), _SPIN_NS,
         )  # fmt: skip
 
@@ -480,15 +547,15 @@ def enable(dsa_layers: list) -> bool:
     from vllm.v1.attention.ops import shardq
 
     t = get()
-    bad = [i for i, a in enumerate(dsa_layers) if not layer_ok(a)]
-    if t is None or bad or not dsa_layers:
-        if dsa_layers:
-            logger.warning(
-                "Kimi K3.1 DSA TLX-S not enabled (%s).",
-                "buffers" if t is None else f"{len(bad)} DSA layers unsupported",
-            )
+    if t is None or not dsa_layers:
         shardq.TOKEN_LOCAL_MIN_ROWS = None
         return False
+    bad = [i for i, a in enumerate(dsa_layers) if not layer_ok(a)]
+    if bad:
+        raise RuntimeError(
+            f"Kimi K3.1 DSA TLX-S: {len(bad)} DSA layers lack the supported form (BF16 q_b / g / o shards of the TP8 "
+            "shapes, fused indexer insert, 160-wide wkv_index, NoPE, ShardQ)"
+        )
     shardq.TOKEN_LOCAL_MIN_ROWS = MIN_ROWS
     logger.info("Kimi K3.1 DSA TLX-S enabled for prefill steps of >= %d rows per rank.", MIN_ROWS)
     return True
@@ -509,14 +576,24 @@ def step_token_local(attn) -> bool:
 
 
 def get() -> TlxDsa | None:
-    """The process's TLX-S DSA state (None when not enabled)."""
+    """The process's TLX-S DSA state (None when the instance has no SP all-gather buffer / GEMM-RS workspace, or
+    steps never reach MIN_ROWS rows per rank). Raises when TLX-S applies but its staging fits no dead region."""
     global _tlx, _tlx_init_done
     if not _tlx_init_done:
         _tlx_init_done = True
+        from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar
         from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 
         spag = sp_ag._sp_all_gather
-        if spag is not None:
-            t = TlxDsa(spag)
-            _tlx = t if t.ok else None
+        rs = getattr(gemm_rs_ar, "_gemm_rs_ar", None)
+        if (
+            spag is not None
+            and rs is not None
+            and spag.tma
+            and spag.world == 8
+            and spag.hidden_size == 7168
+            and rs.N == 7168
+            and spag.max_rows >= MIN_ROWS
+        ):
+            _tlx = TlxDsa(spag, rs)
     return _tlx
