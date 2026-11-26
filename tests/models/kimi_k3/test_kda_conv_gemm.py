@@ -570,7 +570,8 @@ def test_fused_in_proj_defers_to_eager_break(monkeypatch):
     with torch.cuda.graph(graph):
         assert not fused.defer_to_break(qa)  # plain (one-shot) capture
     seen = []
-    with BreakableCUDAGraphCapture():
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side), BreakableCUDAGraphCapture():
         seen.append(fused.defer_to_break(qa))
         seen.append(fused.defer_to_break(small))
         mode["m"] = CUDAGraphMode.FULL
@@ -578,6 +579,6 @@ def test_fused_in_proj_defers_to_eager_break(monkeypatch):
     assert seen == [True, False, False]
     monkeypatch.setattr(kda_conv_in_proj, "DEFER_TO_BREAK", False)
     mode["m"] = CUDAGraphMode.PIECEWISE
-    with BreakableCUDAGraphCapture():
+    with torch.cuda.stream(side), BreakableCUDAGraphCapture():
         seen.append(fused.defer_to_break(qa))
     assert seen[-1] is False
