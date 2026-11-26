@@ -36,7 +36,9 @@ from ..cutedsl.mla.prepared import choose as mla_choose
 from ..cutedsl.mla.rows import compile_rows
 from ..cutedsl.moe.dense import PreparedDenseMLP
 from ..cutedsl.moe.experts_runtime import (
+    W2_DENSE,
     PersistentExperts,
+    dense_w2,
     place,
     route_mailbox,
     rubin64,
@@ -569,6 +571,8 @@ class SpecializedDecode:
             w13, w2 = (
                 w.view(torch.uint8) for w in (routed.w13_weight, routed.w2_weight)
             )
+            if W2_DENSE:  # K31EX_W2_DENSE: the experts kernels read dense w2 rows
+                w2 = dense_w2(routed, dies)
             weights = w13, routed.w13_weight_scale, w2, routed.w2_weight_scale
             experts = PersistentExperts(
                 *weights, beta=beta, linear_beta=linear_beta, dies=dies, q=self.q
