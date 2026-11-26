@@ -98,9 +98,8 @@ def make_fused_moe_layer(
         torch.randn(re.w13_weight_scale.data.shape, device=device) / 5
     ).to(re.w13_weight_scale.data.dtype)
 
+    # Builds the modular kernel too (MoERunner.maybe_init_modular_kernel is gone).
     nvfp4_fused_moe.process_weights_after_loading(re)
-
-    fml.maybe_init_modular_kernel()
 
     return fml
 
