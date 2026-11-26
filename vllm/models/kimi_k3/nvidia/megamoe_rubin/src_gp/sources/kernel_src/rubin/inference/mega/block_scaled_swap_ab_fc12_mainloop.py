@@ -48,6 +48,12 @@ from .shared_expert_mainloop import SharedKindMainloopMixin
 # Kernel name gains _pr2<probe>.
 PR2_PROBE = os.environ.get("PR2_PROBE", "")
 PR2_DUPN = int(os.environ.get("PR2_DUPN", "48"))
+# PR2 loop 9 (EXPERIMENT ONLY): pairub = upper bound of the weight-stationary rest pair. A work unit whose token tile is
+# an expert's rest (tile_n_idx >= 1, valid tokens <= PR2_PAIRN) runs NO k-loop (no weight/token loads, no MMA): its
+# accumulator is drained as is (stale finite values, wrong math). pairubr = pairub + the pair's SMEM ring cost (each AB
+# stage padded by PR2_RINGPAD bytes = the rest's extra B + SFB per CTA stage), so the ring may lose stages.
+PR2_PAIRN = int(os.environ.get("PR2_PAIRN", "128"))
+PR2_RINGPAD = int(os.environ.get("PR2_RINGPAD", "10240"))
 
 
 class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
@@ -359,10 +365,16 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             )
         mbarrier_bytes = int(cutlass.Int64.width) // 8
         ab_stage_cost_bytes = self.ab_stage_payload_bytes + 2 * mbarrier_bytes
+        if PR2_PROBE == "pairubr":
+            ab_stage_cost_bytes += PR2_RINGPAD  # PR2 EXPERIMENT ONLY
         # Accumulator + TMEM-deallocation mbarriers plus the 8 B-aligned TMEM holding word.
         tmem_holding_buffer_bytes = 8
         plan_tail_bytes = (2 * self.num_accumulator_pipeline_stages + 2) * mbarrier_bytes + tmem_holding_buffer_bytes
         self.num_ab_pipeline_stages = (self.mainloop_smem_budget_bytes - plan_tail_bytes) // ab_stage_cost_bytes
+        if PR2_PROBE:
+            import sys as _sys  # PR2 EXPERIMENT ONLY: ring geometry on record
+            print(f"PR2_RING probe={PR2_PROBE} tile={self.mma_tiler_mnk} budget={self.mainloop_smem_budget_bytes} "
+                  f"stage_cost={ab_stage_cost_bytes} stages={self.num_ab_pipeline_stages}", file=_sys.stderr)
         if self.num_ab_pipeline_stages < 1:
             raise ValueError(
                 f"One AB stage needs {ab_stage_cost_bytes + plan_tail_bytes} bytes, exceeding the "
@@ -955,6 +967,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         expected_tx: Optional[Int32] = None,
     ) -> pipeline.PipelineState:
         """Load one tile's weight and weight-scale k tiles of one kind (routed or shared)."""
+        if cutlass.const_expr(PR2_PROBE in ("pairub", "pairubr")):
+            # PR2 EXPERIMENT ONLY: a paired rest tile rides its partner's weight stages (upper bound: no k-loop).
+            k_tile_count = Int32(k_tile_count)
+            if work_tile.tile_n_idx >= Int32(1) and work_tile.valid_tokens_in_cta_tile <= Int32(PR2_PAIRN):
+                k_tile_count = Int32(0)
         thread_mma = tiled_mma.get_slice(self.mma_cta_index)
         real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor("a", a_tensor, work_tile)
         real_sfa, sfa_descriptor_ptr = kernel_extension.get_gmem_tensor("sfa", sfa_tensor, work_tile)
@@ -1217,6 +1234,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         expected_tx: Optional[Int32] = None,
     ) -> pipeline.PipelineState:
         """Load one tile's token and token-scale k tiles of one kind (routed or shared)."""
+        if cutlass.const_expr(PR2_PROBE in ("pairub", "pairubr")):
+            # PR2 EXPERIMENT ONLY: a paired rest tile rides its partner's weight stages (upper bound: no k-loop).
+            k_tile_count = Int32(k_tile_count)
+            if work_tile.tile_n_idx >= Int32(1) and work_tile.valid_tokens_in_cta_tile <= Int32(PR2_PAIRN):
+                k_tile_count = Int32(0)
         (
             b_cta_layout,
             sfb_cta_layout,
@@ -1614,6 +1636,11 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         instructions_per_stage: int,
     ) -> pipeline.PipelineState:
         """One tile's k loop of one kind, prefetching the next stage's readiness."""
+        if cutlass.const_expr(PR2_PROBE in ("pairub", "pairubr")):
+            # PR2 EXPERIMENT ONLY: a paired rest tile rides its partner's weight stages (upper bound: no k-loop).
+            k_tile_count = Int32(k_tile_count)
+            if work_tile.tile_n_idx >= Int32(1) and work_tile.valid_tokens_in_cta_tile <= Int32(PR2_PAIRN):
+                k_tile_count = Int32(0)
         (
             fragment_a,
             fragment_b,
