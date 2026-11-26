@@ -76,6 +76,45 @@ class HeadRecords:
 
 
     @cute.jit
+    def local_qk_norm(self, kt, accum, shared_q, shared_k, scratch, scale):
+        """Every token's activated, L2-normalized Q / K channel ``kt`` into ``shared_q``
+        / ``shared_k`` (token-major), from this CTA's own convolution outputs
+        (``accum``): the same operations, in the same order, as the distributed form
+        applies to its one token (``sigmoids`` is elementwise), so the same values bit
+        for bit without the q / k all-gather (a cluster round per layer). ``scratch``
+        (>= 8 T floats, this CTA's only) holds the per-warp sums of squares; the
+        caller's next ``named_barrier(1, 128)`` publishes the results. Exactness of the
+        records protocol: a KDA CTA's hop-2 bytes arrive from every CTA of its request
+        after that CTA's fold, so ``bar_hop`` already orders the key records' writes
+        after every fold's reads (the all-gather's former second role)."""
+        T: cutlass.Constexpr = self.tokens
+        lane, warp = kt % 32, kt // 32
+        for t in cutlass.range_constexpr(T):
+            pre_q, pre_k = accum[3 * t], accum[3 * t + 1]
+            q, k = Float32(0), Float32(0)
+            if cutlass.const_expr(self.stock):
+                q, k = self.silu(pre_q), self.silu(pre_k)
+            else:
+                act = sigmoids([pre_q, pre_k])
+                q, k = pre_q * act[0], pre_k * act[1]
+            square_q, square_k = warp_sum(q * q), warp_sum(k * k)
+            if lane == 0:
+                scratch[8 * t + warp] = square_q
+                scratch[8 * t + warp + 4] = square_k
+            shared_q[128 * t + kt] = q
+            shared_k[128 * t + kt] = k
+        named_barrier(1, 128)
+        for t in cutlass.range_constexpr(T):
+            r = 8 * t
+            qn = (scratch[r] + scratch[r + 2]) + (scratch[r + 1] + scratch[r + 3])
+            kn = (scratch[r + 4] + scratch[r + 6]) + (scratch[r + 5] + scratch[r + 7])
+            fq = self.norm_factor(qn + 1.0e-6, scale)
+            fk = self.norm_factor(kn + 1.0e-6)
+            q, k = shared_q[128 * t + kt], shared_k[128 * t + kt]
+            shared_q[128 * t + kt] = self.normalized(q, fq, scale)
+            shared_k[128 * t + kt] = self.normalized(k, fk)
+
+    @cute.jit
     def key_records(self, record_page, head, kt, shared_k, shared_decay):
         """Column ``kt``'s k / decay records of tokens 1 .. q - 1."""
         for u in cutlass.range_constexpr(1, self.tokens):
@@ -127,6 +166,10 @@ class HeadRecords:
 
 class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
     """``KdaHeadVerify`` under the deferred protocol (module docstring)."""
+
+    # Every KDA CTA activates and normalizes all T tokens' Q / K channels from its own
+    # hop-2 inputs (HeadRecords.local_qk) instead of token r's plus an all-gather.
+    local_qk = True
 
     @cute.experimental.kernel
     def kernel(
@@ -216,9 +259,12 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 )
                 cute.arch.mbarrier_init(bar_out, 1)
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_out, 512)
-                # every KDA CTA's normalized q / k of its token (DISTRIBUTED_QK)
-                cute.arch.mbarrier_init(bar_qk, 1)
-                cute.arch.mbarrier_arrive_and_expect_tx(bar_qk, KDA_CTAS * 2 * 128 * 4)
+                if cutlass.const_expr(not self.local_qk):
+                    # every KDA CTA's normalized q / k of its token (DISTRIBUTED_QK)
+                    cute.arch.mbarrier_init(bar_qk, 1)
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        bar_qk, KDA_CTAS * 2 * 128 * 4
+                    )
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM traffic
 
@@ -399,46 +445,58 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                         cf = Float32(coeff[s, i])
                         acc = accum[3 * t + s]
                         accum[3 * t + s] = fma(Float32(term), cf, acc)
-            # KDA CTA r activates and normalizes only token r's Q / K channels (the
-            # same operations as for every token before) and all-gathers them to the
-            # eight KDA CTAs; its V rows stay local (threads kt < 16, every token).
-            pre_q, pre_k = accum[0], accum[1]
-            for t in cutlass.range_constexpr(1, T):
-                pre_q = Float32(cutlass.select_(rank == t, accum[3 * t], pre_q))
-                pre_k = Float32(cutlass.select_(rank == t, accum[3 * t + 1], pre_k))
             if kt < ROWS:  # V pre-activations; thread kt activates (row kt % 16, token
                 for t in cutlass.range_constexpr(T):  # kt // 16) after the barrier
                     shared_v[t * ROWS + kt] = accum[3 * t + 2]
-            if cutlass.const_expr(self.stock):
-                q, k = self.silu(pre_q), self.silu(pre_k)
-                out_gate = self.activate(Float32(gate_owned))
-            else:  # (the three sigmoids' fast paths together)
-                act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
-                q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
-            square_q, square_k = warp_sum(q * q), warp_sum(k * k)
-            if lane == 0:
-                reductions[warp] = square_q
-                reductions[warp + 4] = square_k
-            named_barrier(1, 128)
-            pre_v = shared_v[kt]
-            shared_v[kt] = self.silu_v(pre_v)
-            qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
-            kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
-            fq = self.norm_factor(qn + 1.0e-6, scale)
-            fk = self.norm_factor(kn + 1.0e-6)
-            q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
-            q_ptr = shared_q.iterator + rank * 128 + kt
-            k_ptr = shared_k.iterator + rank * 128 + kt
-            for dest in cutlass.range_constexpr(KDA_CTAS):
-                push_float(q_ptr, q_n, bar_qk, dest)
-                push_float(k_ptr, k_n, bar_qk, dest)
+            if cutlass.const_expr(self.local_qk):  # every token's q / k here
+                out_gate = Float32(0)
+                if cutlass.const_expr(self.stock):
+                    out_gate = self.activate(Float32(gate_owned))
+                else:
+                    out_gate = sigmoids([Float32(gate_owned)])[0]
+                self.local_qk_norm(kt, accum, shared_q, shared_k, local_o, scale)
+                pre_v = shared_v[kt]
+                shared_v[kt] = self.silu_v(pre_v)
+            else:
+                # KDA CTA r activates and normalizes only token r's Q / K channels
+                # (the same operations as for every token before) and all-gathers them
+                # to the eight KDA CTAs; its V rows stay local (threads kt < 16).
+                pre_q, pre_k = accum[0], accum[1]
+                for t in cutlass.range_constexpr(1, T):
+                    pre_q = Float32(cutlass.select_(rank == t, accum[3 * t], pre_q))
+                    pre_k = Float32(cutlass.select_(rank == t, accum[3 * t + 1], pre_k))
+                if cutlass.const_expr(self.stock):
+                    q, k = self.silu(pre_q), self.silu(pre_k)
+                    out_gate = self.activate(Float32(gate_owned))
+                else:  # (the three sigmoids' fast paths together)
+                    act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
+                    q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
+                square_q, square_k = warp_sum(q * q), warp_sum(k * k)
+                if lane == 0:
+                    reductions[warp] = square_q
+                    reductions[warp + 4] = square_k
+                named_barrier(1, 128)
+                pre_v = shared_v[kt]
+                shared_v[kt] = self.silu_v(pre_v)
+                qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
+                kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
+                fq = self.norm_factor(qn + 1.0e-6, scale)
+                fk = self.norm_factor(kn + 1.0e-6)
+                q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
+                q_ptr = shared_q.iterator + rank * 128 + kt
+                k_ptr = shared_k.iterator + rank * 128 + kt
+                for dest in cutlass.range_constexpr(KDA_CTAS):
+                    push_float(q_ptr, q_n, bar_qk, dest)
+                    push_float(k_ptr, k_n, bar_qk, dest)
             if kt < T:  # the tokens' checkpoint slots, for the rolled loop
                 slot_rows[kt] = slots[0, kt]
-            named_barrier(1, 128)  # shared_v, slot_rows
-            wait(bar_qk)
+            named_barrier(1, 128)  # shared_v, slot_rows (local_qk: shared_q / k)
+            if cutlass.const_expr(not self.local_qk):
+                wait(bar_qk)
             wait(bar_gate)
-            # every KDA CTA's q / k arrived (each sends after its fold): partition 0
-            # writes the k / decay records (async stores, drained under the loop)
+            # every KDA CTA's q / k arrived, or with local_qk its hop-2 bytes (each sends
+            # them after its fold): partition 0 writes the k / decay records (async
+            # stores, drained under the loop)
             if (partition == 0) & live:
                 self.key_records(record_page, head, kt, shared_k, shared_decay)
             # The token loop is a rolled loop (the next token's operands double-buffered
@@ -524,6 +582,8 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
 
 class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
     """``KdaHeadMulti`` (q = 8) under the deferred protocol (module docstring)."""
+
+    local_qk = True  # (KdaHeadVerifyDefer.local_qk)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -612,10 +672,11 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             )
             cute.arch.mbarrier_init(bar_out, 1)
             cute.arch.mbarrier_arrive_and_expect_tx(bar_out, 512)
-            cute.arch.mbarrier_init(bar_qk, 1)
-            # the normalized q / k of the request's tokens (KDA CTA j: token j)
-            qk_bytes = min(T, KDA_CTAS) * 2 * 128 * 4
-            cute.arch.mbarrier_arrive_and_expect_tx(bar_qk, qk_bytes)
+            if cutlass.const_expr(not self.local_qk):
+                cute.arch.mbarrier_init(bar_qk, 1)
+                # the normalized q / k of the request's tokens (KDA CTA j: token j)
+                qk_bytes = min(T, KDA_CTAS) * 2 * 128 * 4
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_qk, qk_bytes)
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM traffic
 
@@ -736,6 +797,46 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
 
 
     @cute.jit
+    def distributed_qk(
+        self, kt, accum, block, gate_owned, shared_v, reductions, shared_q, shared_k,
+        bar_qk, first, scale,
+    ):  # fmt: skip
+        """The all-gather form (``local_qk`` False): KDA CTA j of the request activates
+        and normalizes only token j's Q / K channels and all-gathers them to the
+        request's eight KDA CTAs; returns token ``block``'s output gate."""
+        T: cutlass.Constexpr = self.tokens
+        lane, warp = kt % 32, kt // 32
+        pre_q, pre_k = accum[0], accum[1]
+        for t in cutlass.range_constexpr(1, T):
+            pre_q = Float32(cutlass.select_(block == t, accum[3 * t], pre_q))
+            pre_k = Float32(cutlass.select_(block == t, accum[3 * t + 1], pre_k))
+        out_gate = Float32(0)
+        if cutlass.const_expr(self.stock):
+            q, k = self.silu(pre_q), self.silu(pre_k)
+            out_gate = self.activate(Float32(gate_owned))
+        else:
+            act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
+            q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
+        square_q, square_k = warp_sum(q * q), warp_sum(k * k)
+        if lane == 0:
+            reductions[warp] = square_q
+            reductions[warp + 4] = square_k
+        named_barrier(1, 128)
+        pre_v = shared_v[kt]
+        shared_v[kt] = self.silu_v(pre_v)
+        qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
+        kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
+        fq = self.norm_factor(qn + 1.0e-6, scale)
+        fk = self.norm_factor(kn + 1.0e-6)
+        q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
+        q_ptr = shared_q.iterator + block * 128 + kt
+        k_ptr = shared_k.iterator + block * 128 + kt
+        for dest in cutlass.range_constexpr(KDA_CTAS):
+            push_float(q_ptr, q_n, bar_qk, first + dest)
+            push_float(k_ptr, k_n, bar_qk, first + dest)
+        return out_gate
+
+    @cute.jit
     def multi_main(
         self, kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
     ):
@@ -784,56 +885,28 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                         cf = Float32(coeff[s, i])
                         acc = accum[3 * t + s]
                         accum[3 * t + s] = fma(Float32(term), cf, acc)
-            # KDA CTA j of the request activates and normalizes only token j's Q / K
-            # channels and all-gathers them to the request's eight KDA CTAs.
-            pre_q, pre_k = accum[0], accum[1]
-            for t in cutlass.range_constexpr(1, T):
-                pre_q = Float32(cutlass.select_(block == t, accum[3 * t], pre_q))
-                pre_k = Float32(cutlass.select_(block == t, accum[3 * t + 1], pre_k))
             if kt < ROWS:
                 for t in cutlass.range_constexpr(T):
                     shared_v[t * ROWS + kt] = accum[3 * t + 2]
-            if cutlass.const_expr(self.stock):
-                q, k = self.silu(pre_q), self.silu(pre_k)
-                if cutlass.const_expr(T == KDA_CTAS):
+            if cutlass.const_expr(self.local_qk):  # (KdaHeadVerifyDefer.verify_main)
+                out_gate = Float32(0)
+                if cutlass.const_expr(self.stock):
                     out_gate = self.activate(Float32(gate_owned))
+                else:
+                    out_gate = sigmoids([Float32(gate_owned)])[0]
+                self.local_qk_norm(kt, accum, shared_q, shared_k, local_o, scale)
+                pre_v = shared_v[kt]
+                shared_v[kt] = self.silu_v(pre_v)
             else:
-                if cutlass.const_expr(T == KDA_CTAS):
-                    act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
-                    q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
-                else:  # (owners gate their rows in ``owned_norm``)
-                    act = sigmoids([pre_q, pre_k])
-                    q, k = pre_q * act[0], pre_k * act[1]
-            square_q, square_k = warp_sum(q * q), warp_sum(k * k)
-            if lane == 0:
-                reductions[warp] = square_q
-                reductions[warp + 4] = square_k
-            named_barrier(1, 128)
-            if cutlass.const_expr(T * ROWS == 128):  # noqa: SIM114
-                pre_v = shared_v[kt]
-                shared_v[kt] = self.silu_v(pre_v)
-            elif kt < T * ROWS:  # (row kt % 16, token kt // 16)
-                pre_v = shared_v[kt]
-                shared_v[kt] = self.silu_v(pre_v)
-            qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
-            kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
-            fq = self.norm_factor(qn + 1.0e-6, scale)
-            fk = self.norm_factor(kn + 1.0e-6)
-            q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
-            q_ptr = shared_q.iterator + block * 128 + kt
-            k_ptr = shared_k.iterator + block * 128 + kt
-            if cutlass.const_expr(T == KDA_CTAS):  # noqa: SIM114
-                for dest in cutlass.range_constexpr(KDA_CTAS):
-                    push_float(q_ptr, q_n, bar_qk, first + dest)
-                    push_float(k_ptr, k_n, bar_qk, first + dest)
-            elif block < T:  # KDA CTAs past the request's tokens normalize none
-                for dest in cutlass.range_constexpr(KDA_CTAS):
-                    push_float(q_ptr, q_n, bar_qk, first + dest)
-                    push_float(k_ptr, k_n, bar_qk, first + dest)
+                out_gate = self.distributed_qk(
+                    kt, accum, block, gate_owned, shared_v, reductions, shared_q,
+                    shared_k, bar_qk, first, scale,
+                )  # fmt: skip
             if kt < T:
                 slot_rows[kt] = slots[request, kt]
-            named_barrier(1, 128)  # shared_v, slot_rows
-            wait(bar_qk)
+            named_barrier(1, 128)  # shared_v, slot_rows (local_qk: shared_q / k)
+            if cutlass.const_expr(not self.local_qk):
+                wait(bar_qk)
             wait(bar_gate)
             # the request's KDA CTAs' q / k arrived (each sends after its fold): its
             # block-0 CTA writes the k / decay records under the loop
