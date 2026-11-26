@@ -147,6 +147,12 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
 RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_DEDUP_MIN_TOKENS = 4096
+# Tile N256 prefill buckets stream K512 per operand-ring stage (four K128 MMAs, i.e. two
+# K256 tiles, per FULL/EMPTY barrier round) instead of K256: half the ring stages for the
+# same bytes, same SMEM (3 x 76 KiB vs 6 x 38 KiB per CTA) and TMEM plan, and the same
+# K128 MMA sequence into each accumulator (bitwise-identical output).
+RUBIN_PREFILL_K512_TILE_N = 256
+RUBIN_PREFILL_K512_TILE_K = 512
 # Cluster (2, 1): 106 CTA pairs cover all 212 SMs (cluster (4, 1) packs 46 clusters = 184 CTAs); dynamic B
 # gather on the pair. EP1 (28 experts, NVFP4, fused MXFP8 shared, same session ABBA, bitwise-equal outputs):
 # 55.4 / 56.4 / 59.6 vs 56.7 / 58.2 / 60.9 us at 32 / 96 / 128 tokens per rank.
@@ -321,20 +327,19 @@ def select_rubin_buckets(
 
 def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
     """A prefill-sized inference bucket on the refreshed dedup-combine kernel (same
-    tile/schedule knobs, token back from standalone warps); others unchanged."""
+    tile/schedule knobs, K512 ring stages at tile N256, token back from standalone
+    warps); others unchanged."""
     if (
         bucket.variant != "inference"
         or bucket.die_sm_mask32 is not None
         or bucket.max_tokens < RUBIN_DEDUP_MIN_TOKENS
     ):
         return bucket
-    return dataclasses.replace(
-        bucket,
-        variant=RUBIN_DEDUP_VARIANT,
-        knobs=dataclasses.replace(
-            bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE
-        ),
-    )
+    knobs = dataclasses.replace(bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE)
+    if knobs.mma_tiler_mnk[1] == RUBIN_PREFILL_K512_TILE_N:
+        m, n, _ = knobs.mma_tiler_mnk
+        knobs = dataclasses.replace(knobs, mma_tiler_mnk=(m, n, RUBIN_PREFILL_K512_TILE_K))
+    return dataclasses.replace(bucket, variant=RUBIN_DEDUP_VARIANT, knobs=knobs)
 
 
 def _genphase_decode(bucket: RubinBucket) -> RubinBucket:

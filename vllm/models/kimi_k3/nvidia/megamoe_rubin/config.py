@@ -350,12 +350,6 @@ class RubinMoeConfig:
                 f"Rubin {self.quant_kind} tile K must be {2 * instruction_k} or "
                 f"{4 * instruction_k}, got {tiler[2]}."
             )
-        if (
-            self.quant_kind == "nvfp4"
-            and tiler[1] == 256
-            and tiler[2] == 4 * instruction_k
-        ):
-            raise ValueError("nvfp4 does not support (N=256, K=4x-instruction) tiles.")
         if len(self.cluster_shape_mn) != 2:
             raise ValueError("cluster_shape_mn must be a 2-tuple.")
         cm, cn = self.cluster_shape_mn
