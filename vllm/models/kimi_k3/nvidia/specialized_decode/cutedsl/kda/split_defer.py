@@ -42,6 +42,9 @@ class KdaSplitDefer(RecoverKdaSplit):
     # The fold after the PDL wait, under the input loads (its state loads then
     # overlap them as the stock verify's do) instead of before the wait.
     fold_late = False
+    # The value rows' conv window (this CTA's own channels: no other CTA reads them)
+    # written right after the input loads instead of after the token loop.
+    v_window_early = True
     # The fold unrolled over the record slots with selects (``fold_selected``).
     fold_unrolled = True
 
@@ -187,6 +190,16 @@ class KdaSplitDefer(RecoverKdaSplit):
                     if pending > 0:
                         wait(rec_barrier, 0, scope="cta")
                         self.fold(history, rec, pending, value_base, group, group_lane)
+                if cutlass.const_expr(self.v_window_early):  # off the output tail
+                    if thread < self.rows:
+                        channel = 2 * dim + value_channel
+                        window = (
+                            taps[2, 1],
+                            taps[2, 2],
+                            *(inputs[3 * t + 2] for t in range(T)),
+                        )
+                        for i, value in enumerate(window):
+                            conv_page[channel, i] = conv_type(value)
 
                 vs, squares, qks = [], [], []
                 for t in cutlass.range_constexpr(T):  # window: 3 taps, then the inputs
@@ -294,15 +307,16 @@ class KdaSplitDefer(RecoverKdaSplit):
                         if cutlass.const_expr(t == 0):  # the one state store: slot 0
                             span = (start, stop)
                             self.store_rows(history, state_row, span, lanes, slot > 0)
-                if thread < self.rows:
-                    channel = 2 * dim + value_channel
-                    window = (
-                        taps[2, 1],
-                        taps[2, 2],
-                        *(inputs[3 * t + 2] for t in range(T)),
-                    )
-                    for i, value in enumerate(window):
-                        conv_page[channel, i] = conv_type(value)
+                if cutlass.const_expr(not self.v_window_early):
+                    if thread < self.rows:
+                        channel = 2 * dim + value_channel
+                        window = (
+                            taps[2, 1],
+                            taps[2, 2],
+                            *(inputs[3 * t + 2] for t in range(T)),
+                        )
+                        for i, value in enumerate(window):
+                            conv_page[channel, i] = conv_type(value)
 
                 for t in cutlass.range_constexpr(T):
                     if partition == t % self.cluster:
