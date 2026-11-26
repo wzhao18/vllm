@@ -2539,20 +2539,14 @@ class TokenCommDedup(KernelComponent):
             next_dense_token = Int32(0)
         next_dense_token = self.next_token(next_dense_token)
         completed_slot_prefix = Int32(0)
+        expert_slot_begin = Int32(0)
         expert_valid_begin = Int32(0)
         local_expert = Int32(0)
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
             # Slots [0, expert_slot_end) = every token tile of the experts <= local_expert.
-            expert_slot_end = Int32(0)
-            for expert_round in cutlass.range_constexpr(expert_rounds):
-                round_slot_end = Int32(cute.arch.shuffle_sync(
-                    lane_slot_begin[expert_round]
-                    + (lane_pool_end[expert_round] - lane_pool_begin[expert_round] + slot_tokens - Int32(1)) // slot_tokens,
-                    local_expert % Int32(32)))
-                if local_expert // Int32(32) == Int32(expert_round):
-                    expert_slot_end = round_slot_end
+            expert_slot_end = expert_slot_begin + (expert_token_count + slot_tokens - Int32(1)) // slot_tokens
             while next_dense_token < expert_valid_end:
                 token_in_expert = next_dense_token - expert_valid_begin
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
@@ -2606,6 +2600,7 @@ class TokenCommDedup(KernelComponent):
                 next_dense_token = self.next_token(next_dense_token)
 
             expert_valid_begin = expert_valid_end
+            expert_slot_begin = expert_slot_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()
 
