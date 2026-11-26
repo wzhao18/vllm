@@ -71,6 +71,10 @@ from .rebalance_execute import (
 logger = init_logger(__name__)
 
 
+# Assuming 8 GPUs per node, this supports up to (1023 + 1) / 8 = 128 nodes.
+MAX_EXPERT_REDUNDANCY = 1023
+
+
 def _compute_eplb_load_stats(
     num_tokens_per_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -369,6 +373,46 @@ class EplbState:
         ]
         return global_physical_to_logical_map
 
+    @staticmethod
+    def build_initial_logical_maps(
+        physical_to_logical_map: torch.Tensor,
+        num_logical_experts: int,
+        physical_expert_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's ``logical_to_physical_map`` (logical, max replicas) and
+        ``logical_replica_count`` (logical,) for ``physical_to_logical_map``.
+
+        A logical expert holds at most every physical slot the other logical
+        experts leave free, so the width is ``physical_expert_capacity -
+        num_logical_experts + 1`` (1 without redundant experts), capped at
+        MAX_EXPERT_REDUNDANCY + 1. Sizing it for MAX_EXPERT_REDUNDANCY regardless
+        cost layers x logical x 1024 x 8 B (Kimi K3.1: 92 x 896 -> 0.63 GiB/GPU,
+        allocated before KV sizing). Every reader pads to or reads the width
+        from the map's shape.
+        """
+        assert physical_expert_capacity >= num_logical_experts, (
+            physical_expert_capacity,
+            num_logical_experts,
+        )
+        width = min(
+            MAX_EXPERT_REDUNDANCY + 1,
+            physical_expert_capacity - num_logical_experts + 1,
+        )
+        device = physical_to_logical_map.device
+        logical_to_physical_map = torch.full(
+            (num_logical_experts, width), -1, device=device
+        )
+        logical_replica_count = torch.zeros(
+            (num_logical_experts,), device=device, dtype=torch.long
+        )
+        for i in range(physical_to_logical_map.shape[0]):
+            logical_idx = physical_to_logical_map[i]
+            if logical_idx < 0:
+                continue
+            logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
+            logical_replica_count[logical_idx] += 1
+        return logical_to_physical_map, logical_replica_count
+
     def validate_ep_configuration(self, new_model: MixtureOfExperts):
         """Validate that the expert parallel configuration of
         the new model is the same as the existing models.
@@ -444,36 +488,17 @@ class EplbState:
                 (0, physical_expert_capacity - model.num_physical_experts),
                 value=-1,
             )
-        # Assuming 8 GPUs per node, this supports up to
-        # (1023 + 1) / 8 = 128 nodes for now.
-        # TODO(rui): make this configurable
-        MAX_EXPERT_REDUNDANCY = 1023
         assert model.num_redundant_experts <= MAX_EXPERT_REDUNDANCY, (
             f"num_redundant_experts {model.num_redundant_experts} "
             f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}"
         )
-        # A logical expert holds at most every physical slot the others leave
-        # free. Sizing the map for MAX_EXPERT_REDUNDANCY regardless cost
-        # layers x logical x 1024 x 8 B (K3.1: 92 x 896 -> 0.63 GiB/GPU of KV).
-        max_slots_per_logical_expert = min(
-            MAX_EXPERT_REDUNDANCY + 1,
-            max(1, physical_expert_capacity - model.num_logical_experts + 1),
+        logical_to_physical_map, logical_replica_count = (
+            EplbState.build_initial_logical_maps(
+                physical_to_logical_map[: model.num_physical_experts],
+                model.num_logical_experts,
+                physical_expert_capacity,
+            )
         )
-        logical_to_physical_map = torch.full(
-            (model.num_logical_experts, max_slots_per_logical_expert),
-            -1,
-            device=self.device,
-        )
-        logical_replica_count = torch.zeros(
-            (model.num_logical_experts,),
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        for i in range(model.num_physical_experts):
-            logical_idx = physical_to_logical_map[i]
-            logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
-            logical_replica_count[logical_idx] += 1
 
         # Duplicate initial mapping for all layers
         physical_to_logical_map = (
