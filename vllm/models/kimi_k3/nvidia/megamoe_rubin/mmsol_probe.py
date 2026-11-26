@@ -319,17 +319,23 @@ class MmsolPushProbe:
         if not (self.ok and self.launch_on) or torch.cuda.is_current_stream_capturing():
             return
         ws = session.kernel._device_workspace
-        names_sh = {r.name for r in ws.regions("shared")}
-        names_lo = {r.name for r in ws.regions("local")}
-        if _PRE_REDUCED not in names_sh or _ORDER not in names_lo:
-            raise RuntimeError("MMSOL probe: this MegaMoE variant has no pre_reduced / order regions")
+        names = {sp: {r.name for r in ws.regions(sp)} for sp in ("local", "shared", "tmp")}
+        if _PRE_REDUCED not in names["shared"]:
+            raise RuntimeError(f"MMSOL probe: no {_PRE_REDUCED} in shared regions {sorted(names['shared'])}")
         pr_off, pr_bytes = ws.offset(_PRE_REDUCED), ws.nbytes(_PRE_REDUCED)
         dst_local = session.shared_workspace.data_ptr() + pr_off
         slice_b = (pr_bytes // self.world) // 256 * 256
         if slice_b < 2 * _STAGE:
             raise RuntimeError(f"MMSOL probe: pre_reduced slice {slice_b} B too small")
+        # The order buffer is a local 'data' region: in the separate tmp buffer when the kernel has one.
+        if _ORDER in names["tmp"] and session.tmp_buffer is not None:
+            base = session.tmp_buffer
+        elif _ORDER in names["local"]:
+            base = session.local_workspace
+        else:
+            raise RuntimeError(f"MMSOL probe: no {_ORDER} (local {sorted(names['local'])}, tmp {sorted(names['tmp'])})")
         ord_off, ord_bytes = ws.offset(_ORDER), ws.nbytes(_ORDER)
-        csrc = session.local_workspace[ord_off : ord_off + ord_bytes]
+        csrc = base[ord_off : ord_off + ord_bytes]
         dsrc = session.x.view(torch.uint8).view(-1)
         dspan = max(16, dsrc.numel() - _STAGE)
         cspan = max(16, csrc.numel() - _STAGE)
