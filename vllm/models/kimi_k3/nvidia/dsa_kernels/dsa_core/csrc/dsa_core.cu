@@ -637,31 +637,36 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
     cut2 = radix_cut(r2, n1 + __popc(mask) * K, K, gb, hist, wt, sc, tid, lane, warp, &full2);
   }
   if (dbg && tid == 0) dbg[21] = now_ns();
-  // ---- this rank's selected keys in the select's order -> flat KV rows
+  // ---- this rank's selected keys in the select's order -> flat KV rows. The select
+  // keeps flat key f in register (f / 512) of thread f % 512 and emits in (thread,
+  // register) order: thread tid takes the own flats tid + 512 i in i order, at the
+  // block-scanned position of its count.
   const int obase = me_sat ? n1 + sme * K : p.rank * N;
-  const int ocount = me_sat ? K : N;
+  const int oend = obase + (me_sat ? K : N);
   const uint64_t c = mask ? cut2 : cut;
-  int total = 0;
-  for (int b0 = 0; b0 < ocount; b0 += kThreads) {
-    const int j = b0 + tid;
-    int row = -1, f = 0;
-    if (j < ocount) {
-      const uint64_t k = mask ? r2(obase + j) : r1(obase + j);
-      if (k != 0 && k >= c) {
-        const uint32_t gid = (uint32_t)(gmask - (k & gmask));
-        const int local = (int)(gid / (uint32_t)W);
-        const int blk = local / p.block_size;
-        if (blk < p.bt_width) {
-          const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
-          row = e * p.stride_rows + (local - blk * p.block_size);
-          f = 1;
-        }
-      }
+  auto own_row = [&](int f) -> int {  // flat key f -> its KV row if selected, else -1
+    const uint64_t k = mask ? r2(f) : r1(f);
+    if (k == 0 || k < c) return -1;
+    const uint32_t gid = (uint32_t)(gmask - (k & gmask));
+    const int local = (int)(gid / (uint32_t)W);
+    const int blk = local / p.block_size;
+    if (blk >= p.bt_width) return -1;  // (a block past the table: dropped, as the select)
+    const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
+    return e * p.stride_rows + (local - blk * p.block_size);
+  };
+  const int f0 = obase - obase % kThreads + tid;  // this thread's first flat >= obase - 511
+  int mine = 0;
+  for (int f = f0; f < oend; f += kThreads)
+    if (f >= obase && own_row(f) >= 0) ++mine;
+  int total;
+  int pos = block_scan(mine, wt, lane, warp, &total) - mine;
+  for (int f = f0; f < oend && mine > 0; f += kThreads) {
+    if (f < obase) continue;
+    const int row = own_row(f);
+    if (row >= 0) {
+      if (pos < kMaxK) sIdx[pos] = row;
+      ++pos;
     }
-    int tot;
-    const int incl = block_scan(f, wt, lane, warp, &tot);
-    if (f && total + incl - 1 < kMaxK) sIdx[total + incl - 1] = row;
-    total += tot;
   }
   const int n = min(total, kMaxK);
   for (int k = n + tid; k < kMaxK; k += kThreads) sIdx[k] = -1;

@@ -206,7 +206,10 @@ def _check(group, ws, n) -> None:
                 torch.accelerator.synchronize()
                 core.check()
                 assert torch.equal(valid_b, valid_a), f"{what}/{rep}: counts"
-                assert torch.equal(rows_b, rows_a), f"{what}/{rep}: rows"
+                assert torch.equal(rows_b.sort(1).values, rows_a.sort(1).values), (
+                    f"{what}/{rep}: row sets"
+                )
+                assert torch.equal(rows_b, rows_a), f"{what}/{rep}: row order"
                 got = boxes.snap()
                 for i, (x, y) in enumerate(zip(got, want)):
                     assert torch.equal(x, y), f"{what}/{rep}: box {i}"
