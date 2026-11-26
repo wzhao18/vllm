@@ -261,12 +261,13 @@ def test_selective_topk_long_rows_random(recover_all):
     ],
 )
 def test_split_publish_matches_unsplit(monkeypatch, reqs, zero_rows):
-    """Key-tile split PUBLISH units (pub_split 2 / 4: each item's tiles in that many
-    ranges, each into its own candidate region copy, concatenated per key lane) give
-    the unsplit top-k bit for bit, order included, and the same recomputed rows."""
+    """Key-tile split PUBLISH units (pub_split 2 / 3: each item's tiles in that many
+    ranges, each into its own candidate region copy, staged per segment in range
+    order) give the unsplit top-k bit for bit, order included, and the same
+    recomputed rows."""
     q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, zero_rows)
     outs, flags = [], []
-    for cap in (1, 2, 4):
+    for cap in (1, 2, 3):
         monkeypatch.setattr(pidx, "PUB_SPLIT_MAX", cap)
         sp = pidx.SelectivePlan(
             [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
@@ -279,11 +280,47 @@ def test_split_publish_matches_unsplit(monkeypatch, reqs, zero_rows):
     for i in (1, 2):
         assert torch.equal(flags[0], flags[i])
         same = (outs[0] == outs[i]).all(1)
-        assert same.all(), f"split {(1, 2, 4)[i]}: {int((~same).sum())} rows differ"
+        assert same.all(), f"split {(1, 2, 3)[i]}: {int((~same).sum())} rows differ"
     t0 = 0
     for (rows, kv), base in zip(reqs, bases):
         ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
         got = outs[1][t0 : t0 + rows].to(torch.int64)
         got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
         assert (got == ref).all(1).all(), f"request ({rows}, {kv})"
+        t0 += rows
+
+
+def test_segment_overflow_recomputed(monkeypatch):
+    """A segment that reaches its capacity (shrunk here to 256 entries) has the
+    row recomputed by the exact full path: those rows still equal stock, the output
+    is identical across calls and between split and unsplit PUBLISH, and rows whose
+    segments stay below the capacity are settled from their candidates."""
+    reqs = [(64, 20000), (37, 1000), (128, 30000)]
+    q, q_scale, w16, k8, k_sf, bases = _inputs(reqs)
+    monkeypatch.setattr(pidx, "SEG_CAP", 256)
+    outs, flags = [], []
+    for cap, reps in ((1, 2), (3, 1)):
+        monkeypatch.setattr(pidx, "PUB_SPLIT_MAX", cap)
+        sp = pidx.SelectivePlan(
+            [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
+        )
+        for _ in range(reps):
+            out = torch.full((sp.t, K), -7, dtype=torch.int32, device="cuda")
+            row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
+            outs.append(out)
+            flags.append((row_bin[1 : 3 * sp.t : 3] != 0).cpu())
+    for i in (1, 2):
+        assert torch.equal(flags[0], flags[i])
+        assert torch.equal(outs[0], outs[i]), f"output {i} differs from output 0"
+    # 20000 / 30000-key rows: ~4096 candidates, ~1024 per segment > 256
+    assert flags[0][:64].all() and flags[0][101:].all()
+    # 1000-key rows keep every key: 250 per segment
+    assert not flags[0][64:101].any()
+    t0 = 0
+    for (rows, kv), base in zip(reqs, bases):
+        ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
+        got = outs[0][t0 : t0 + rows].to(torch.int64)
+        got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
+        ok = (got == ref).all(1)
+        assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
         t0 += rows

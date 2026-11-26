@@ -17,7 +17,7 @@ top-k re-reading them) by a selective path that never materializes the logits
                 stages. The epilogue (two tokens per warpgroup, one thread per key)
                 forms the BF16 logit at stock precision and, in PUBLISH mode,
                 appends every key at or above the row threshold to the row's
-                candidate region (per key lane: a count, then SLOTS words).
+                candidate region (SEGS append segments of (key, BF16) entries).
   CandSelect2   exact top-k of each row from its candidates (one exact histogram
                 pass; ties at the k-th value to the lowest key index).
   recovery      rows CandSelect2 cannot settle (too few candidates, a full lane,
@@ -282,14 +282,28 @@ def order16(bits: Uint32) -> Uint32:
 
 STORE = 1  # IndexerScore mode: the logits only (no histograms / row bounds)
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
-SLOTS = 96  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
-# candidate columns rotate within a warp every 2^ROT_SHIFT key tiles (publish_rot):
-# a fixed key position spreads over 32 columns, the shuffle runs once per block
+# PUBLISH candidates: per row, SEGS append segments of 8-byte entries (key index,
+# BF16 value). Epilogue warp q of a warpgroup appends to segment (q + t >> ROT_SHIFT)
+# mod SEGS while it scores key tile t: ownership rotates every 2^ROT_SHIFT tiles, so
+# keys at a fixed position mod 128 (attention sinks) spread over every segment.
+CAP = 12288  # rows with at most CAP keys keep every key; CandSelect2 stages CAP entries
+SEGS = 4
+SEG_CAP = CAP // SEGS  # entries per segment; a segment reaching it -> row recomputed
+SEG_PAD = 2 * 32  # one tile pair of a warp past the end (clamped once per pair)
 ROT_SHIFT = 5
-# words per row: lane counts, then SLOTS words per lane and two spill words (a lane
-# is clamped to its spill slot once per tile pair, so it never writes past them)
-REGION = (SLOTS + 3) * TILE
-CAP = SLOTS * TILE
+HDR = 16  # header words of a row region: the SEGS segment counts
+
+
+def seg_bytes(seg_cap: int) -> int:
+    return (seg_cap + SEG_PAD) * 8
+
+
+def region_words(seg_cap: int) -> int:
+    """Int32 words of one row's candidate region (header, then the segments)."""
+    return HDR + SEGS * seg_bytes(seg_cap) // 4
+
+
+REGION = region_words(SEG_CAP)
 
 
 @asm(Uint32, pure=True)
@@ -303,17 +317,23 @@ def ge_bf16x2(r, thr):
 
 
 @asm()
-def publish2(p0, p1, r, thr, tw):
-    """Low BF16 of r >= low of thr: store (tw | low) at p0 and advance it one
-    128-word slot; the high halves likewise at p1."""
+def append2(p0, p1, r, thr, key, ltm):
+    """Warp append of one tile: lanes whose low BF16 of r >= low of thr store the
+    entry (key, r) at p0 + 8 x (such lanes below them); p0 (warp-uniform) advances
+    by the warp's count. The high halves likewise at p1, entry (key, r >> 16)."""
     code = (
-        "{ .reg .pred a, b; .reg .b32 v, u; setp.ge.bf16x2 a|b, $4, $5; "
-        "prmt.b32 v, $4, $6, 0x7610; prmt.b32 u, $4, $6, 0x7632; "
-        "@a st.global.b32 [$2], v; @a add.u64 $0, $2, 512; "
-        "@b st.global.b32 [$3], u; @b add.u64 $1, $3, 512; }"
+        "{ .reg .pred a, b; .reg .b32 m0, m1, o0, o1, v; .reg .b64 d0, d1; "
+        "setp.ge.bf16x2 a|b, $4, $5; "
+        "vote.sync.ballot.b32 m0, a, 0xffffffff; vote.sync.ballot.b32 m1, b, 0xffffffff; "
+        "and.b32 o0, m0, $7; popc.b32 o0, o0; and.b32 o1, m1, $7; popc.b32 o1, o1; "
+        "mad.wide.u32 d0, o0, 8, $2; mad.wide.u32 d1, o1, 8, $3; shr.u32 v, $4, 16; "
+        "@a st.global.v2.b32 [d0], {$6, $4}; @b st.global.v2.b32 [d1], {$6, v}; "
+        "popc.b32 m0, m0; popc.b32 m1, m1; "
+        "mad.wide.u32 $0, m0, 8, $2; mad.wide.u32 $1, m1, 8, $3; }"
     )
-    return code, "=l,=l,0,1,r,r,r,~{memory}", (
-        Int64(p0), Int64(p1), Uint32(r), Uint32(thr), Uint32(tw)), (Int64, Int64)
+    return code, "=l,=l,l,l,r,r,r,r,~{memory}", (
+        Int64(p0), Int64(p1), Uint32(r), Uint32(thr), Uint32(key), Uint32(ltm)
+    ), (Int64, Int64)
 
 
 @cute.jit
@@ -355,7 +375,7 @@ class IndexerScore:
 
     def __init__(
         self, ctas: int, mode: int = 0, topk: int = 2048, epi: int = 0,
-        split: bool = False,
+        split: bool = False, seg_cap: int = SEG_CAP,
     ):
         """mode: 0 logits + per-row top-k bound (row_bin); STORE logits only;
         PUBLISH candidates at or above the row thresholds (row_bin), no logits.
@@ -365,6 +385,7 @@ class IndexerScore:
         rows' histograms go to ``ghist`` slot rows, finished by RowBound)."""
         assert not split or mode in (0, PUBLISH)
         self.split = split
+        self.seg_cap = seg_cap
         self.mode = mode
         self.ctas = ctas
         self.topk = topk
@@ -543,6 +564,8 @@ class IndexerScore:
             w: cute.struct.Align[cute.struct.MemRange[Uint32, Q_STAGES * BQ * 16], 16]
             hist: cute.struct.Align[cute.struct.MemRange[Uint32, BQ * S_BINS], 16]
             wscan: cute.struct.Align[cute.struct.MemRange[Uint32, EPI_WG * 4], 16]
+            # PUBLISH segment hand-over: per warpgroup, block parity, row, segment
+            hand: cute.struct.Align[cute.struct.MemRange[Uint32, EPI_WG * 2 * 2 * SEGS], 16]
 
         smem = utils.SmemAllocator()
         st = smem.allocate(Storage)
@@ -597,7 +620,9 @@ class IndexerScore:
         if warp < PRODUCER:
             self.epilogue(
                 tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
-                logits, row_bin, (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint()),
+                logits, row_bin,
+                (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint(),
+                 st.hand.data_ptr().toint()),
                 warp, tidx, bid,
                 lane, ghist,
             )
@@ -806,7 +831,7 @@ class IndexerScore:
         histogram of the top 11 bits. At the end of the item the warpgroup finds,
         per row, the rank (in value order) of the bin holding the topk-th largest
         logit and the count above it (``row_bin``), for the select."""
-        end_a, w_a, hist_a, wscan_a = sm
+        end_a, w_a, hist_a, wscan_a, hand_a = sm
         wg = warp // 4
         lt = tidx % 128
         wq = warp % 4  # = lt // 32, warp-uniform: TMEM addresses stay in uniform registers
@@ -851,42 +876,34 @@ class IndexerScore:
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
             thr = Uint32(0)
-            rs = cute.make_rmem_tensor((3,), Int64)
-            cand0 = ptr0
-            cand1 = ptr1
+            rs = cute.make_rmem_tensor((5,), Int64)
             p0 = ptr0
             p1 = ptr1
-            lim0 = ptr0
             lim1 = ptr1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
-                # and their candidate lists (row_base in 16-bit units)
+                # and their candidate regions (row_base in 16-bit units)
                 thr = (Uint32(row_bin[3 * row1]) << Uint32(16)) | (
                     Uint32(row_bin[3 * row0]) & Uint32(0xFFFF)
                 )
-                # this thread's column of each row's candidate region: word 0
-                # the count, then one word per kept key (tile << 16 | BF16)
                 # split PUBLISH units (key-tile ranges of one item) write their own
                 # candidate region copy: field 6 = its offset in 16-bit units
                 roff = Int64(0)
                 if cutlass.const_expr(self.split):
                     roff = Int64(items[item, 6]) * 2
-                rowb0 = out_a + row_base[row0] * 2 + roff
-                rowb1 = out_a + row_base[row1] * 2 + roff
-                # rotated candidate columns (publish_rot): key lane (warp q, lane l)
-                # of tile t publishes into column 32 q + (l + (t >> ROT_SHIFT)) mod 32;
-                # p0 / p1 point into the current column, rs = (its limits, block)
-                bp = Int32(t_hi) >> ROT_SHIFT
-                col = Int64(wq * 32 + ((lt % 32 + bp) & 31)) * 4
-                cand0 = rowb0 + col
-                cand1 = rowb1 + col
-                p0 = cand0 + TILE * 4
-                p1 = cand1 + TILE * 4
-                rs[0] = cand0 + (SLOTS + 1) * TILE * 4
-                rs[1] = cand1 + (SLOTS + 1) * TILE * 4
+                # this warp appends to segment (wq + block) mod SEGS of each row
+                # (publish_seg); p0 / p1 = its next entry, rs = (segment limits,
+                # block, hand-over slots, warpgroup)
+                bp = Int32(t_hi - 1) >> ROT_SHIFT
+                seg = Int64((wq + bp) & (SEGS - 1))
+                sb = HDR * 4 + seg * seg_bytes(self.seg_cap)
+                p0 = out_a + row_base[row0] * 2 + roff + sb
+                p1 = out_a + row_base[row1] * 2 + roff + sb
+                rs[0] = p0 + self.seg_cap * 8
+                rs[1] = p1 + self.seg_cap * 8
                 rs[2] = Int64(bp)
-                lim0 = rs[0]
-                lim1 = rs[1]
+                rs[3] = Int64(hand_a + wg * (2 * 2 * SEGS * 4))
+                rs[4] = Int64(wg)
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: wt[j][i] = heads 2i, 2i + 1
@@ -956,12 +973,16 @@ class IndexerScore:
                     )
                     ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
-                # the counts of the column this thread published into last
-                # (a full column counts as overflowed: the row is recomputed)
-                cb0 = rs[0] - (SLOTS + 1) * TILE * 4
-                cb1 = rs[1] - (SLOTS + 1) * TILE * 4
-                st_global_u32(cb0, Uint32((p0 - cb0) // (TILE * 4) - 1))
-                st_global_u32(cb1, Uint32((p1 - cb1) // (TILE * 4) - 1))
+                # the count of the segment this warp owns last (the warpgroup's
+                # warps own the SEGS segments) into the row header; a full segment
+                # (count SEG_CAP) has the row recomputed
+                if lane == 0:
+                    sb0 = rs[0] - self.seg_cap * 8
+                    sb1 = rs[1] - self.seg_cap * 8
+                    seg = Int64((wq + Int32(rs[2])) & (SEGS - 1))
+                    hd = HDR * 4 + seg * seg_bytes(self.seg_cap) - seg * 4
+                    st_global_u32(sb0 - hd, Uint32((cutlass.min(p0, rs[0]) - sb0) >> 3))
+                    st_global_u32(sb1 - hd, Uint32((cutlass.min(p1, rs[1]) - sb1) >> 3))
             elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
@@ -1040,7 +1061,7 @@ class IndexerScore:
                 if kidx >= end1 or t >= ntiles:
                     r = r | Uint32(0xFFFF0000)
             if cutlass.const_expr(self.mode >= PUBLISH):
-                p0, p1 = self.publish_rot(p0, p1, r, thr, t, lim0, key_in_tile)
+                p0, p1 = self.publish_seg(p0, p1, r, thr, t, lim0, key_in_tile)
             elif cutlass.const_expr(edge):
                 if t < ntiles:
                     st_global_u16(ptr0 - st * TILE * 2, r)
@@ -1056,41 +1077,38 @@ class IndexerScore:
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
-    def publish_rot(self, p0, p1, r, thr, t, rs, kit):
-        """Publish both tokens' logits of tile t (row thresholds thr) into ROTATED
-        candidate columns: key lane (warp q, lane l) of tile t writes column
-        32 q + (l + (t >> ROT_SHIFT)) mod 32, so keys at a fixed position mod 128
-        (attention sinks every 64 tokens, say) spread over 32 columns instead of
-        filling one (loop 9: real text overflowed SLOTS on every row). Within a
-        block of 2^ROT_SHIFT tiles a thread keeps its column and pointers (the
-        unrotated fast path); entering a new block (warp-uniform) it converts its
-        pointers to counts, takes lane l - (block change)'s counts by a warp
-        shuffle and re-points into its new column. rs = (row 0 / row 1 column
-        limits, current block), updated in place. The select recovers the key from
-        the column and the tile word."""
+    def publish_seg(self, p0, p1, r, thr, t, rs, kit):
+        """Append both tokens' candidates of tile t (row thresholds thr) to this
+        warp's segment of each row: entry (key index, BF16), at the warp's running
+        offset plus the matching lanes below (append2). Segment (q + (t >> ROT_SHIFT))
+        mod SEGS belongs to warp q of the warpgroup, so ownership rotates every
+        2^ROT_SHIFT tiles; entering a new block (warpgroup-uniform) every warp leaves
+        its count in shared memory, one warpgroup barrier, then it takes the count of
+        its new segment (the previous owner's, warp q - 1). Each segment is filled in
+        (block, tile, lane) order: a fixed function of the keys. rs = (segment
+        limits of both rows, block, hand-over slots, warpgroup), updated in place."""
         b = t >> ROT_SHIFT
         bp = Int32(rs[2])
         if b != bp:
-            lane = Int32(kit >> 2)
             wq = Int32(kit & 3)
-            ob0 = rs[0] - (SLOTS + 1) * TILE * 4
-            ob1 = rs[1] - (SLOTS + 1) * TILE * 4
-            c0 = Uint32((cutlass.min(p0, rs[0]) - ob0) // (TILE * 4) - 1)
-            c1 = Uint32((cutlass.min(p1, rs[1]) - ob1) // (TILE * 4) - 1)
-            cc = Uint32(cute.arch.shuffle_sync(Int32((c1 << Uint32(16)) | c0),
-                                               (lane - (bp - b)) & 31))
-            oc = Int64(wq * 32 + ((lane + bp) & 31)) * 4
-            nc = Int64(wq * 32 + ((lane + b) & 31)) * 4
-            nb0 = ob0 - oc + nc
-            nb1 = ob1 - oc + nc
-            p0 = nb0 + Int64((cc & Uint32(0xFFFF)) + Uint32(1)) * (TILE * 4)
-            p1 = nb1 + Int64((cc >> Uint32(16)) + Uint32(1)) * (TILE * 4)
-            rs[0] = nb0 + (SLOTS + 1) * TILE * 4
-            rs[1] = nb1 + (SLOTS + 1) * TILE * 4
+            so = (wq + bp) & (SEGS - 1)
+            sn = (wq + b) & (SEGS - 1)
+            sb0 = rs[0] - self.seg_cap * 8
+            sb1 = rs[1] - self.seg_cap * 8
+            ha = Int32(rs[3]) + (bp & 1) * (2 * SEGS * 4)
+            st_shared_u32(ha + so * 4, Uint32((cutlass.min(p0, rs[0]) - sb0) >> 3))
+            st_shared_u32(ha + (SEGS + so) * 4, Uint32((cutlass.min(p1, rs[1]) - sb1) >> 3))
+            wg_sync(Int32(rs[4]))
+            c0 = ld_shared_u32(ha + sn * 4)
+            c1 = ld_shared_u32(ha + (SEGS + sn) * 4)
+            d = Int64(sn - so) * seg_bytes(self.seg_cap)
+            p0 = sb0 + d + Int64(c0) * 8
+            p1 = sb1 + d + Int64(c1) * 8
+            rs[0] = sb0 + d + self.seg_cap * 8
+            rs[1] = sb1 + d + self.seg_cap * 8
             rs[2] = Int64(b)
-            p0 = cutlass.min(p0, rs[0])
-            p1 = cutlass.min(p1, rs[1])
-        return publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
+        key = (Uint32(t) << Uint32(7)) + Uint32(kit)
+        return append2(p0, p1, r, thr, key, lanemask_lt())
 
     @cute.jit
     def stage_tail(self, h1, w, ss, tw, p0, p1, thr, rs, kit):
@@ -1098,7 +1116,7 @@ class IndexerScore:
         tokens' logits of tile t (tw >> 16)."""
         ss = self.reduce_half(h1, w, ss, HEADS // 2)
         r = self.combine2(ss)
-        return self.publish_rot(p0, p1, r, thr, Int32(tw >> Uint32(16)), rs, kit)
+        return self.publish_seg(p0, p1, r, thr, Int32(tw >> Uint32(16)), rs, kit)
 
     @cute.jit
     def pair_rot(self, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
@@ -2029,14 +2047,15 @@ STAGE = CS2_BINS + TIE_RANK  # staged output row (K words) + the ranked ties
 
 
 def _quad_code(ties: bool, write: bool) -> str:
-    """PTX over one lane quad of candidate slot $1 (counts $2-$5, words $6-$9) of a
-    positive-threshold row (t = $10, the BF16 bits of the k-th value). Takes are
-    the valid words above t (ties=True) or at or above t (ties=False); with
-    ties=True the valid words at t are ties. count: $0 = $11 + takes + ties << 16.
-    write: the key index of each take is stored at shared $12 and $12 advances one
-    word ($0 returns it), each tie likewise at $13 ($1); pb = $14. No branches."""
+    """PTX over one entry quad of candidate chunk $1 (counts $2-$5, value words
+    $6-$9) of a positive-threshold row (t = $10, the BF16 bits of the k-th value).
+    Takes are the valid entries above t (ties=True) or at or above t (ties=False);
+    with ties=True the valid entries at t are ties. count: $0 = $11 + takes + ties
+    << 16. write: the key index ($14-$17) of each take is stored at shared $12 and
+    $12 advances one word ($0 returns it), each tie likewise at $13 ($1). No
+    branches."""
     cmp = "gt" if ties else "ge"
-    code = "{ .reg .pred v, g, e; .reg .b32 x, q, tq, rq, bq; "
+    code = "{ .reg .pred v, g, e; .reg .b32 x; "
     if write:
         code += "mov.b32 $0, $13; mov.b32 $1, $14; "
     else:
@@ -2047,16 +2066,9 @@ def _quad_code(ties: bool, write: bool) -> str:
         if ties:
             code += "setp.eq.and.u32 e, x, $10X, v; "
         if write:
-            # key = tile * 128 + 4 * ((column % 32 - tile) mod 32) + column // 32
-            # (rotated columns, IndexerScore.publish_rot); pb = (4 lane) % 32 |
-            # (lane >> 3) << 8, column = 4 lane + k
-            code += (f"shr.u32 tq, ${6 + k}X, 16; shl.b32 q, tq, 7; "
-                     f"and.b32 rq, $14X, 0xFF; add.u32 rq, rq, {k}; shr.u32 bq, tq, {ROT_SHIFT}; sub.u32 rq, rq, bq; "
-                     "and.b32 rq, rq, 31; shl.b32 rq, rq, 2; add.u32 q, q, rq; "
-                     "shr.u32 rq, $14X, 8; add.u32 q, q, rq; "
-                     "@g st.shared.b32 [$0], q; @g add.u32 $0, $0, 4; ")
+            code += f"@g st.shared.b32 [$0], ${14 + k}X; @g add.u32 $0, $0, 4; "
             if ties:
-                code += "@e st.shared.b32 [$1], q; @e add.u32 $1, $1, 4; "
+                code += f"@e st.shared.b32 [$1], ${14 + k}X; @e add.u32 $1, $1, 4; "
         else:
             code += "@g add.u32 $0, $0, 1; "
             if ties:
@@ -2087,7 +2099,7 @@ def _quad_code(ties: bool, write: bool) -> str:
 @asm(Uint32)
 def count4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
     """n + this lane quad's takes + (ties << 16) (ties = ties not all taken)."""
-    return _quad_code(True, False), "=r," + ",".join(["r"] * 11), (
+    return _quad_code(True, False), "=&r," + ",".join(["r"] * 11), (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
 
@@ -2095,27 +2107,42 @@ def count4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
 @asm(Uint32)
 def count4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
     """n + this lane quad's takes when every tie is taken."""
-    return _quad_code(False, False), "=r," + ",".join(["r"] * 11), (
+    return _quad_code(False, False), "=&r," + ",".join(["r"] * 11), (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
 
 
 @asm()
-def write4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, pb):
-    """Stage this lane quad's takes at tk and ties at te; returns both advanced."""
-    return _quad_code(True, True), "=r,=r," + ",".join(["r"] * 14) + ",~{memory}", (
+def write4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, k0, k1, k2, k3):
+    """Stage this entry quad's takes at tk and ties at te; returns both advanced."""
+    return _quad_code(True, True), "=&r,=&r," + ",".join(["r"] * 17) + ",~{memory}", (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
-        Int32(tk), Int32(te), Uint32(pb)), (Int32, Int32)
+        Int32(tk), Int32(te), Uint32(k0), Uint32(k1), Uint32(k2), Uint32(k3)), (Int32, Int32)
 
 
 @asm()
-def write4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, pb):
-    """Stage this lane quad's takes (every tie taken) at tk; returns tk advanced."""
-    return _quad_code(False, True), "=r,=r," + ",".join(["r"] * 14) + ",~{memory}", (
+def write4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, k0, k1, k2, k3):
+    """Stage this entry quad's takes (every tie taken) at tk; returns tk advanced."""
+    return _quad_code(False, True), "=&r,=&r," + ",".join(["r"] * 17) + ",~{memory}", (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
-        Int32(tk), Int32(te), Uint32(pb)), (Int32, Int32)
+        Int32(tk), Int32(te), Uint32(k0), Uint32(k1), Uint32(k2), Uint32(k3)), (Int32, Int32)
+
+
+@asm()
+def cp_async8(dst, src):
+    return "cp.async.ca.shared.global [$0], [$1], 8;", "r,l,~{memory}", (Int32(dst), Int64(src))
+
+
+@asm()
+def cp_async_commit():
+    return "cp.async.commit_group;", "~{memory}", ()
+
+
+@asm()
+def cp_async_wait_all():
+    return "cp.async.wait_group 0;", "~{memory}", ()
 
 
 @asm()
@@ -2126,31 +2153,40 @@ def st_global_v4(address, a, b, c, d):
 
 
 class CandSelect2:
-    """Exact top-k of each row from its PUBLISH candidates, persistent and
-    double-buffered: a CTA walks rows bid, bid + G, ...; while it selects row r,
-    one bulk copy brings the next row's candidate lines (the first max lane count
-    128-word slots of its region) into the other shared buffer, and the counts of
-    the row after are already in flight. A thread reads four key lanes of a slot
-    per 16-byte load (warp w takes the slots w, w + 8, ...). Every candidate is at
-    or above the row's PUBLISH threshold thr, so one pass of a 2048-bin histogram
-    of order16(key) - order16(thr) gives the exact k-th value t (BF16 values: one
-    bin each); a row whose k-th value is not resolved there (keep-all rows, a span
-    of more than 2048 values) takes a min/max-ranged histogram and, when the range
-    needs it, a second pass over the low bits. Keys above t are emitted (warp
-    ballots at per-warp bases from a count pass and a block scan: no atomics, the
-    output order is a fixed function of the candidates, so the order-sensitive
-    sparse MLA reproduces); of the ties at t the lowest key indices are emitted
-    at their rank among the ties, found by a histogram of their tiles. Rows with fewer
-    candidates than min(k, row length), an overflowed lane or more than CS2_BINS
-    ties are flagged in row_bin[3 r + 1] (recomputed by the caller). Output order
-    is unspecified. Rows with a positive threshold (every candidate a positive
-    BF16, ordered by its bits) take branch-free histogram and emission passes
-    (hist4_pos, emit4_pos); up to TIE_RANK ties are ranked directly."""
+    """Exact top-k of each row from its PUBLISH candidates, persistent: a CTA walks
+    rows bid, bid + G, ... Row r's candidates are the entries of its SEGS append
+    segments in each of the ``nsplit`` PUBLISH range copies (headers: the counts);
+    they are staged into shared memory by 8-byte cp.async in (segment, copy, entry)
+    order - per segment the copies in range order, which is the unsplit segment
+    (ownership is a function of the absolute key tile), so split and unsplit
+    PUBLISH stage the same entries in the same order. Two staging halves of CAP / 2
+    entries: while a row is selected the next one is staged into the other half
+    when both fit one; a larger row takes the whole buffer and is staged after the
+    previous row. A thread reads four entries of a 128-entry chunk (warp w takes the
+    chunks w, w + 8, ...). Every candidate is at or above the row's PUBLISH
+    threshold thr, so one pass of a 2048-bin histogram of order16(value) -
+    order16(thr) gives the exact k-th value t (BF16 values: one bin each); a row
+    whose k-th value is not resolved there (keep-all rows, a span of more than 2048
+    values) takes a min/max-ranged histogram and, when the range needs it, a second
+    pass over the low bits. Keys above t are emitted (warp ballots at per-warp bases
+    from a count pass and a block scan: no atomics, the output order is a fixed
+    function of the staged candidates, so the order-sensitive sparse MLA
+    reproduces); of the ties at t the lowest key indices are emitted at their rank
+    among the ties, found by a histogram of their tiles. Rows with fewer candidates
+    than min(k, row length), a segment (summed over the copies) reaching seg_cap or
+    more than CS2_BINS ties are flagged in row_bin[3 r + 1] (recomputed by the
+    caller). Rows with a positive threshold (every candidate a positive BF16,
+    ordered by its bits) take branch-free histogram and emission passes (hist4_pos,
+    write4); up to TIE_RANK ties are ranked directly."""
 
-    def __init__(self, topk: int, ctas: int, skeleton: bool = False):
+    def __init__(self, topk: int, ctas: int, skeleton: bool = False, nsplit: int = 1,
+                 seg_cap: int = SEG_CAP):
+        assert SEGS * seg_cap <= CAP and SEGS * nsplit <= 16
         self.topk = topk
         self.ctas = ctas
         self.skeleton = skeleton
+        self.nsplit = nsplit
+        self.seg_cap = seg_cap
 
     @cute.jit
     def __call__(self, cand, row_len, row_bin, out, s):
@@ -2160,20 +2196,24 @@ class CandSelect2:
 
     @cute.jit
     def quad(self, buf_a, cnt4, q, s):
-        """Lanes 4q .. 4q + 3 of slot s: (valid, key index, order16 key) each."""
-        wd = lds_v4(buf_a + (s * TILE + 4 * q) * 4)
+        """Entries 4q .. 4q + 3 of chunk s: (valid, key index, order16 key) each."""
+        e01 = lds_v4(buf_a + (s * TILE + 4 * q) * 8)
+        e23 = lds_v4(buf_a + (s * TILE + 4 * q) * 8 + 16)
+        ent = [(e01[0], e01[1]), (e01[2], e01[3]), (e23[0], e23[1]), (e23[2], e23[3])]
         res = []
         for k in cutlass.range_constexpr(4):
-            lane_k = 4 * q + k
             valid = Uint32(0)
             if s < Int32(cnt4[k]):
                 valid = Uint32(1)
-            # rotated columns (IndexerScore.publish_rot): column 32 q + c of tile t
-            # holds key lane (q, (c - t) mod 32) = key 4 ((c - t) mod 32) + q
-            tile_k = Int32(wd[k] >> Uint32(16))
-            pos = tile_k * TILE + 4 * (((lane_k % 32) - (tile_k >> ROT_SHIFT)) & 31) + lane_k // 32
-            res.append((valid, pos, key16_of_word(wd[k])))
+            res.append((valid, Int32(ent[k][0]), key16_of_word(ent[k][1])))
         return res
+
+    @cute.jit
+    def quad_words(self, buf_a, q, s):
+        """Entries 4q .. 4q + 3 of chunk s: (value words, key words)."""
+        e01 = lds_v4(buf_a + (s * TILE + 4 * q) * 8)
+        e23 = lds_v4(buf_a + (s * TILE + 4 * q) * 8 + 16)
+        return [e01[1], e01[3], e23[1], e23[3]], [e01[0], e01[2], e23[0], e23[2]]
 
     @cute.jit
     def zero_hist(self, hist_a, tid):
@@ -2261,74 +2301,99 @@ class CandSelect2:
         return base
 
     @cute.jit
-    def stage_counts(self, c, slot, cnt_a, part_a, tid, w, lane):
-        """Lane tid's count of the next row (threads < TILE): clamped count in
-        shared memory, per-warp (sum, max, overflow) partials."""
+    def load_counts(self, cand, cs, row, tid):
+        """Thread j < SEGS x nsplit: the count of segment j // nsplit in copy
+        j % nsplit of ``row`` (staging order); 0 for the other threads."""
+        v = Uint32(0)
+        if tid < SEGS * self.nsplit:
+            g = tid // self.nsplit
+            c = tid - g * self.nsplit
+            v = Uint32(cand[Int64(c) * cs + Int64(row) * region_words(self.seg_cap) + g])
+        return v
+
+    @cute.jit
+    def meta(self, cnt_a, slot):
+        """(entries to stage, overflow) of the row whose counts are in ``slot``: a
+        segment summed over the copies reaching seg_cap overflows (nothing staged;
+        the row is recomputed), so a staged row holds fewer than CAP entries."""
+        total = Uint32(0)
         ovf = Uint32(0)
-        if c >= Uint32(SLOTS):
-            ovf = Uint32(1)
-            c = Uint32(SLOTS)
-        st_shared_u32(cnt_a + (slot * TILE + tid) * 4, c)
-        sm = c
-        mx = c
-        for i in cutlass.range_constexpr(5):
-            sm += cute.arch.shuffle_sync_bfly(sm, 1 << i)
-            mx = cutlass.max(mx, cute.arch.shuffle_sync_bfly(mx, 1 << i))
-            ovf = cutlass.max(ovf, cute.arch.shuffle_sync_bfly(ovf, 1 << i))
-        if lane == 0:
-            p = part_a + (slot * 4 + w) * 16
-            st_shared_u32(p, sm)
-            st_shared_u32(p + 4, mx)
-            st_shared_u32(p + 8, ovf)
+        for g in cutlass.range_constexpr(SEGS):
+            sg = Uint32(0)
+            for c in cutlass.range_constexpr(self.nsplit):
+                sg += ld_shared_u32(cnt_a + (slot * 16 + g * self.nsplit + c) * 4)
+            if sg >= Uint32(self.seg_cap):
+                ovf = Uint32(1)
+            total += sg
+        if ovf != Uint32(0):
+            total = Uint32(0)
+        return total, ovf
+
+    @cute.jit
+    def place(self, buf_a, slot, total):
+        """Staging address of a row: its half (slot) of the buffer, or the whole
+        buffer for a row of more than CAP / 2 entries."""
+        dst = buf_a
+        if total <= Uint32(CAP // 2):
+            dst = buf_a + slot * (CAP // 2 * 8)
+        return dst
+
+    @cute.jit
+    def stage(self, cand_a, cs, row, slot, cnt_a, buf_a, tid):
+        """cp.async every entry of ``row`` (counts in ``slot``) into its staging
+        place in (segment, copy, entry) order, as one commit group."""
+        total, ovf = self.meta(cnt_a, slot)
+        dst = self.place(buf_a, slot, total)
+        if ovf == Uint32(0):
+            off = Int32(0)
+            for g in cutlass.range_constexpr(SEGS):
+                for c in cutlass.range_constexpr(self.nsplit):
+                    n = Int32(ld_shared_u32(cnt_a + (slot * 16 + g * self.nsplit + c) * 4))
+                    src = (cand_a + (Int64(c) * cs + Int64(row) * region_words(self.seg_cap)
+                                     + HDR) * 4 + g * seg_bytes(self.seg_cap))
+                    for i in cutlass.range(tid, n, CS_THREADS, unroll=1):
+                        cp_async8(dst + (off + i) * 8, src + Int64(i) * 8)
+                    off += n
+        cp_async_commit()
 
     @cute.kernel
     def kernel(self, cand, row_len, row_bin, out):
         K = self.topk
         G = self.ctas
         WARPS = CS_THREADS // 32
+        HALF = CAP // 2
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         w = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         q = tid % 32
         smem = utils.SmemAllocator()
+        # CAP staged 8-byte entries: two halves, or one row of more than CAP / 2
         buf = smem.allocate_tensor(Uint32, cute.make_layout(2 * CAP), 128)
         buf_a = buf.iterator.toint()
         hist = smem.allocate_tensor(Uint32, cute.make_layout(STAGE), 16)
         hist_a = hist.iterator.toint()  # the threshold ties alias it after the scan
-        cnts = smem.allocate_tensor(Uint32, cute.make_layout(2 * TILE), 16)
+        cnts = smem.allocate_tensor(Uint32, cute.make_layout(2 * 16), 16)
         cnt_a = cnts.iterator.toint()
-        part = smem.allocate_tensor(Uint32, cute.make_layout(2 * 4 * 4), 16)
-        part_a = part.iterator.toint()
         # 0..7 warp scan totals, 8..10 scan result, 11 boundary-tile ties, 12 -,
         # 13 tie slot, 14 key min, 15 key max
         scr = smem.allocate_tensor(Uint32, cute.make_layout(16), 16)
         scr_a = scr.iterator.toint()
-        bars = smem.allocate_tensor(Int64, cute.make_layout(2), 8)
-        bar = bars.iterator
         cand_a = cand.iterator.toint()
         n_rows = row_len.shape[0]
-        if tid == 0:
-            cute.arch.mbarrier_init(bar, 1)
-            cute.arch.mbarrier_init(bar + 1, 1)
-            cute.arch.mbarrier_init_fence()
+        # one PUBLISH range copy: n_rows + 1 row regions
+        cs = Int64(n_rows + 1) * region_words(self.seg_cap)
         cute.arch.griddepcontrol_wait()
         nxt = Uint32(0)
-        if tid < TILE and bid < n_rows:
-            nxt = Uint32(cand[Int64(bid) * REGION + tid])
-        if tid < TILE:
-            self.stage_counts(nxt, 0, cnt_a, part_a, tid, w, lane)
+        if bid < n_rows:
+            nxt = self.load_counts(cand, cs, bid, tid)
+        if tid < 16:
+            st_shared_u32(cnt_a + tid * 4, nxt)
         cute.arch.sync_threads()
-        if tid == 0 and bid < n_rows:
-            mc = Uint32(0)
-            for k in cutlass.range_constexpr(4):
-                mc = cutlass.max(mc, ld_shared_u32(part_a + k * 16 + 4))
-            cute.arch.mbarrier_arrive_and_expect_tx(bar, Int32(mc) * (TILE * 4))
-            if mc != Uint32(0):
-                bulk_g2s(buf_a, cand_a + (Int64(bid) * REGION + TILE) * 4, bar,
-                         Int32(mc) * (TILE * 4))
-        if tid < TILE and bid + G < n_rows:
-            nxt = Uint32(cand[Int64(bid + G) * REGION + tid])
+        if bid < n_rows:
+            self.stage(cand_a, cs, bid, 0, cnt_a, buf_a, tid)
+        if bid + G < n_rows:
+            nxt = self.load_counts(cand, cs, bid + G, tid)
         # row length and PUBLISH threshold, one row ahead (their loads stay off
         # the row's critical path)
         n_nx = Int32(0)
@@ -2337,8 +2402,6 @@ class CandSelect2:
             n_nx = row_len[bid]
             thr_nx = Uint32(row_bin[3 * bid])
         lt_mask = lanemask_lt()
-        # this lane quad's key-lane base (rotated columns: _quad_code)
-        pb0 = Uint32((4 * lane) % 32) | (Uint32(lane // 8) << Uint32(8))
         out_base = Int64(out.iterator.toint())
         n_it = (n_rows - bid + G - 1) // G
         for it in cutlass.range(n_it, unroll=1):
@@ -2347,44 +2410,43 @@ class CandSelect2:
             nb = 1 - b
             n = n_nx
             thr_row = thr_nx & Uint32(0xFFFF)
-            if row + G < n_rows:
+            has_next = row + G < n_rows
+            if has_next:
                 n_nx = row_len[row + G]
                 thr_nx = Uint32(row_bin[3 * (row + G)])
-            # next row: counts -> shared, then its bulk copy into the other buffer
-            if tid < TILE:
-                self.stage_counts(nxt, nb, cnt_a, part_a, tid, w, lane)
+            # next row's counts -> shared; this row's entries have landed
+            if tid < 16:
+                st_shared_u32(cnt_a + (nb * 16 + tid) * 4, nxt)
             self.zero_hist(hist_a, tid)
             if tid == 0:
                 st_shared_u32(scr_a + 44, Uint32(0))
                 st_shared_u32(scr_a + 52, Uint32(0))
                 st_shared_u32(scr_a + 56, Uint32(0xFFFF))
                 st_shared_u32(scr_a + 60, Uint32(0))
+            cp_async_wait_all()
             cute.arch.sync_threads()
-            if tid == 0 and row + G < n_rows:
-                mcn = Uint32(0)
-                for k in cutlass.range_constexpr(4):
-                    mcn = cutlass.max(mcn, ld_shared_u32(part_a + (nb * 4 + k) * 16 + 4))
-                fence_async_shared()
-                cute.arch.mbarrier_arrive_and_expect_tx(bar + nb, Int32(mcn) * (TILE * 4))
-                if mcn != Uint32(0):
-                    bulk_g2s(buf_a + nb * (CAP * 4),
-                             cand_a + (Int64(row + G) * REGION + TILE) * 4, bar + nb,
-                             Int32(mcn) * (TILE * 4))
-            if tid < TILE and row + 2 * G < n_rows:
-                nxt = Uint32(cand[Int64(row + 2 * G) * REGION + tid])
+            total, ovf = self.meta(cnt_a, b)
+            # the next row is staged now when both rows fit a half, else after
             # this row
-            total = Uint32(0)
-            ovf = Uint32(0)
-            mcu = Uint32(0)
+            early = Int32(0)
+            if has_next:
+                t_nx, _o = self.meta(cnt_a, nb)
+                if total <= Uint32(HALF) and t_nx <= Uint32(HALF):
+                    early = Int32(1)
+            if early != 0:
+                self.stage(cand_a, cs, row + G, nb, cnt_a, buf_a, tid)
+            if row + 2 * G < n_rows:
+                nxt = self.load_counts(cand, cs, row + 2 * G, tid)
+            # this row: entry e = 128 s + 4 q + k is valid iff s < cnt4[k]
+            mc = Int32((total + Uint32(TILE - 1)) >> Uint32(7))
+            cnt4 = []
             for k in cutlass.range_constexpr(4):
-                total += ld_shared_u32(part_a + (b * 4 + k) * 16)
-                mcu = cutlass.max(mcu, ld_shared_u32(part_a + (b * 4 + k) * 16 + 4))
-                ovf = cutlass.max(ovf, ld_shared_u32(part_a + (b * 4 + k) * 16 + 8))
-            mc = Int32(mcu)
-            cnt4 = lds_v4(cnt_a + (b * TILE + 4 * q) * 4)
-            rb_a = buf_a + b * (CAP * 4)
+                ck = Uint32(0)
+                if total > Uint32(4 * q + k):
+                    ck = (total - Uint32(4 * q + k) + Uint32(TILE - 1)) >> Uint32(7)
+                cnt4.append(ck)
+            rb_a = self.place(buf_a, b, total)
             orow = Int64(row) * K
-            cute.arch.mbarrier_wait(bar + b, (it // 2) % 2)
             kk = cutlass.min(n, Int32(K))
             bad = Int32(0)
             if ovf != Uint32(0) or Int32(total) < kk:
@@ -2435,7 +2497,7 @@ class CandSelect2:
                         else:
                             if fast != Uint32(0):
                                 for s in cutlass.range(w, mc, WARPS, unroll=2):
-                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    wd, kw = self.quad_words(rb_a, q, s)
                                     hist4_pos(hist_a, s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
                                               wd[0], wd[1], wd[2], wd[3], thr)
                             else:
@@ -2494,12 +2556,12 @@ class CandSelect2:
                             cnt = Uint32(0)
                             if all_ties != Uint32(0):
                                 for s in cutlass.range(w, mc, WARPS, unroll=1):
-                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    wd, kw = self.quad_words(rb_a, q, s)
                                     cnt = count4_all(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
                                                      wd[0], wd[1], wd[2], wd[3], t16, cnt)
                             else:
                                 for s in cutlass.range(w, mc, WARPS, unroll=1):
-                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    wd, kw = self.quad_words(rb_a, q, s)
                                     cnt = count4(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
                                                  wd[0], wd[1], wd[2], wd[3], t16, cnt)
                             incl = warp_inclusive(cnt, lane)
@@ -2519,16 +2581,16 @@ class CandSelect2:
                             te = Int32(tie_a + (pre >> Uint32(16)) * 4)
                             if all_ties != Uint32(0):
                                 for s in cutlass.range(w, mc, WARPS, unroll=1):
-                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    wd, kw = self.quad_words(rb_a, q, s)
                                     tk, te = write4_all(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
                                                         wd[0], wd[1], wd[2], wd[3], t16,
-                                                        Uint32(0), tk, te, pb0)
+                                                        Uint32(0), tk, te, kw[0], kw[1], kw[2], kw[3])
                             else:
                                 for s in cutlass.range(w, mc, WARPS, unroll=1):
-                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    wd, kw = self.quad_words(rb_a, q, s)
                                     tk, te = write4(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
                                                     wd[0], wd[1], wd[2], wd[3], t16,
-                                                    Uint32(0), tk, te, pb0)
+                                                    Uint32(0), tk, te, kw[0], kw[1], kw[2], kw[3])
                             cute.arch.sync_threads()
                             if all_ties == Uint32(0):
                                 # the need lowest key indices of the m ties: tie of
@@ -2682,10 +2744,12 @@ class CandSelect2:
                                 if rank < need - below:
                                     out[orow + Int64(above + below + rank)] = Int32(p)
             cute.arch.sync_threads()
+            if has_next and early == 0:
+                self.stage(cand_a, cs, row + G, nb, cnt_a, buf_a, tid)
 
 
 @functools.cache
-def _cand_select2_kernel(topk, ctas, skeleton=False):
+def _cand_select2_kernel(topk, ctas, skeleton=False, nsplit=1, seg_cap=SEG_CAP):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
@@ -2698,7 +2762,9 @@ def _cand_select2_kernel(topk, ctas, skeleton=False):
         fake((cute.sym_int(),), dtype=cutlass.Int32),
         make_fake_stream(),
     )
-    return cute.compile(CandSelect2(topk, ctas, skeleton), *args, options="--enable-tvm-ffi")
+    return cute.compile(
+        CandSelect2(topk, ctas, skeleton, nsplit, seg_cap), *args, options="--enable-tvm-ffi"
+    )
 
 
 SAMPLES = 1024  # keys per request sampled for the PUBLISH thresholds
@@ -3095,7 +3161,9 @@ class SelectivePlan:
             ((last + TILE - 1) // TILE * TILE for last in row_lens_last), default=TILE
         ) // 32
         # candidate regions: row r at r * REGION words (int16 units here), dummy row t
-        self.cand_base = torch.arange(t + 1, dtype=torch.int64, device=device) * (REGION * 2)
+        self.cand_base = torch.arange(t + 1, dtype=torch.int64, device=device) * (
+            region_words(SEG_CAP) * 2
+        )
         # sampled keys of each request, all of a request's rows see all of them
         sidx, s_items, rank = [], [], []
         token = 0
@@ -3131,8 +3199,8 @@ class SelectivePlan:
         # PUBLISH work units: with fewer items than a whole number of waves of the
         # persistent grid, each item's key tiles split into ``pub_split`` ranges
         # (newest first), each publishing into its own candidate region copy; the
-        # copies are concatenated per key lane in range order (= the unsplit
-        # order) before the select. Exact: the same keys pass the same thresholds.
+        # select stages each segment's copies in range order (= the unsplit
+        # segment). Exact: the same keys pass the same thresholds.
         self.pub_split, self.pub_items = _publish_units(
             self.items.cpu().tolist(), t, device
         )
@@ -3148,8 +3216,8 @@ def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None
     row, for tests)."""
     args = (sp, q, q_scale, keys, key_scale, weights_bf16)
     thresholds(*args, ctas=ctas)
-    cand = publish(*args, ctas=ctas, mode=mode)
-    cand_select(sp, cand, out)
+    cand, nsplit = publish(*args, ctas=ctas, mode=mode)
+    cand_select(sp, cand, out, nsplit)
     # the candidate regions are dead: free them before the recovery's scratch
     del cand
     recover(*args, out, ctas=ctas, recover_all=recover_all)
@@ -3172,11 +3240,10 @@ def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
 
 
 # Key-tile splits of the PUBLISH pass (each one more candidate region copy of
-# (T + 1) x REGION words). The copies are freed before the recovery allocates its
-# logits scratch, so the transient peak is the larger of the two phases
-# (indexer_step.group_bytes): 4 copies stay below the recovery's scratch at long
-# rows.
-PUB_SPLIT_MAX = 4
+# (T + 1) x REGION words, 100 KB per row). The copies are freed before the
+# recovery allocates its logits scratch, so the transient peak is the larger of
+# the two phases (indexer_step.group_bytes): 3 copies = 617 MB at 2048 rows.
+PUB_SPLIT_MAX = 3
 
 
 def _publish_units(items, t, device, ctas=None):
@@ -3193,7 +3260,7 @@ def _publish_units(items, t, device, ctas=None):
             best, split = span, s
     if split == 1 or n == 0:
         return 1, torch.tensor(items, dtype=torch.int32, device=device).view(-1, 4)
-    region = (t + 1) * REGION * 2
+    region = (t + 1) * region_words(SEG_CAP) * 2
     units = []
     for tok0, ntok, key0, ntiles in items:
         npairs = (ntiles + (ntiles & 1)) // 2
@@ -3208,82 +3275,32 @@ def _publish_units(items, t, device, ctas=None):
     return split, torch.tensor(units, dtype=torch.int32, device=device).view(-1, 7)
 
 
-@triton.jit
-def _concat_regions_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
-                           slots: tl.constexpr, tile: tl.constexpr, sb: tl.constexpr):
-    """Program (row, k), k >= 1: copy k's slots of every key lane appended after the
-    slots of copies 0 .. k - 1 in copy 0's column (copy order = the unsplit order);
-    slots past ``slots`` are dropped (that column counts as overflowed below).
-    Programs of one row write disjoint slots and only read count words."""
-    row = tl.program_id(0)
-    k = tl.program_id(1) + 1
-    lane = tl.arange(0, tile)
-    sl = tl.arange(0, sb)[:, None]
-    base = cand_ptr + row.to(tl.int64) * row_words
-    off = tl.zeros([tile], dtype=tl.int32)
-    for j in tl.static_range(0, n_split - 1):
-        if j < k:
-            off += tl.load(base + j * region_words + lane).to(tl.int32)
-    src = base + k * region_words
-    c = tl.load(src + lane).to(tl.int32)
-    cmax = tl.minimum(tl.max(c, axis=0), slots)
-    for s0 in range(0, cmax, sb):
-        s = s0 + sl
-        dst = off[None, :] + s
-        m = (s < c[None, :]) & (dst < slots)
-        v = tl.load(src + (1 + s) * tile + lane[None, :], mask=m)
-        tl.store(base + (1 + dst) * tile + lane[None, :], v, mask=m)
-
-
-@triton.jit
-def _concat_counts_kernel(cand_ptr, region_words, row_words, n_split: tl.constexpr,
-                          slots: tl.constexpr, tile: tl.constexpr):
-    """Copy 0's count words := the concatenated counts; a column whose copies reach
-    ``slots`` keeps count ``slots`` (overflowed: the select flags the row and the
-    exact full path recomputes it). After _concat_regions_kernel (it reads them)."""
-    row = tl.program_id(0)
-    lane = tl.arange(0, tile)
-    base = cand_ptr + row.to(tl.int64) * row_words
-    total = tl.zeros([tile], dtype=tl.int32)
-    ovf = tl.zeros([tile], dtype=tl.int1)
-    for j in tl.static_range(0, n_split):
-        c = tl.load(base + j * region_words + lane).to(tl.int32)
-        ovf = ovf | (c >= slots)
-        total += c
-    ovf = ovf | (total >= slots)
-    tl.store(base + lane, tl.where(ovf, slots, total).to(tl.int32))
-
-
 def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLISH):
-    """Scores of every row, keeping the keys at or above its threshold (returns the
-    candidate regions)."""
+    """Scores of every row, keeping the keys at or above its threshold. Returns
+    (candidate region copies, number of copies): copy k holds the entries of
+    PUBLISH range k (sp.pub_split ranges, newest first)."""
     split = getattr(sp, "pub_split", 1)
-    cand = torch.empty(split * (sp.t + 1) * REGION, dtype=torch.int32, device=q.device)
+    region = region_words(SEG_CAP)
+    cand = torch.empty(split * (sp.t + 1) * region, dtype=torch.int32, device=q.device)
     if split == 1:
         score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items,
               sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas,
               mode=mode, n_items=sp.n_items)
-        return cand
+        return cand, 1
     # a range with no tiles of a row (short rows: range 0 can be empty too) never
-    # writes that row's counts in its copy
-    cand.view(split, sp.t + 1, REGION)[:, :, :TILE].zero_()
+    # writes that row's segment counts in its copy
+    cand.view(split, sp.t + 1, region)[:, :, :HDR].zero_()
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.pub_items,
           sp.cand_base, cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
           n_items=sp.n_pub_items)
-    _concat_regions_kernel[(sp.t, split - 1)](
-        cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, 8, num_warps=4,
-    )
-    _concat_counts_kernel[(sp.t,)](
-        cand, (sp.t + 1) * REGION, REGION, split, SLOTS, TILE, num_warps=4,
-    )
-    return cand[: (sp.t + 1) * REGION]
+    return cand, split
 
 
-def cand_select(sp, cand, out):
-    """Exact top-k of every row from its candidates; flags the rows it cannot
-    settle (row_bin[3 r + 1])."""
+def cand_select(sp, cand, out, nsplit=1):
+    """Exact top-k of every row from its candidates (``nsplit`` region copies);
+    flags the rows it cannot settle (row_bin[3 r + 1])."""
     ctas = CS2_CTAS_PER_SM * torch.cuda.get_device_properties(out.device).multi_processor_count
-    _cand_select2_kernel(out.shape[1], ctas)(
+    _cand_select2_kernel(out.shape[1], ctas, nsplit=nsplit, seg_cap=SEG_CAP)(
         cand, sp.row_len, sp.row_bin, out.view(-1),
         torch.cuda.current_stream(out.device).cuda_stream,
     )
@@ -3368,7 +3385,7 @@ def plan(row_counts, row_lens_last, key_bases, device):
 
 
 @functools.cache
-def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False):
+def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False, seg_cap=SEG_CAP):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
@@ -3390,7 +3407,8 @@ def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False):
         make_fake_stream(),
     )
     return cute.compile(
-        IndexerScore(ctas, mode, topk, epi, split), *args, options="--enable-tvm-ffi"
+        IndexerScore(ctas, mode, topk, epi, split, seg_cap), *args,
+        options="--enable-tvm-ffi",
     )
 
 
@@ -3448,7 +3466,7 @@ def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
     split = items.shape[1] == 7
     if ghist is None:
         ghist = row_bin  # unused without splits
-    _score_kernel(ctas, mode, topk, epi, split)(
+    _score_kernel(ctas, mode, topk, epi, split, SEG_CAP if mode == PUBLISH else 0)(
         q.view(t * HEADS, DIM // 2),
         q_scale.reshape(-1),
         keys,
