@@ -174,7 +174,7 @@ class SplitKGemm:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         dtid = cute.arch.thread_idx()[0]  # DIAG (never merge)
         dblk = bidx + cute.arch.grid_dim()[0] * block_idx[1]
-        d0, d1 = rd.buffer("skg")
+        d0, d1 = rd.buffer(f"skg{self.cta_m}.{self.cta_n}.{self.split_k}.{self.num_ab_stage}")
         rd.begin(d0, d1, dblk, dtid == 0)  # DIAG: entry + smid
 
         shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
@@ -240,7 +240,7 @@ class SplitKGemm:
                 cute.arch.thread_idx()[0] - 128, mC.element_type,
                 utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
             )  # fmt: skip
-            e0, e1 = rd.buffer("skg.e")
+            e0, e1 = rd.buffer(f"skg{self.cta_m}.{self.cta_n}.{self.split_k}.{self.num_ab_stage}.e")
             rd.begin(e0, e1, dblk, dtid == 128)  # DIAG: epilogue end (thread 128)
 
     @cute.experimental.jit
