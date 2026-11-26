@@ -96,6 +96,16 @@ def _gridid():
     return "mov.u64 $0, %gridid;", "=l", ()
 
 
+@asm(Uint64)
+def _now():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+@asm()
+def _red64(pointer, value):
+    return "red.global.add.u64 [$0], $1;", "l,l,~{memory}", (pointer, value)
+
+
 @asm()
 def _st64x2(pointer, a, b):
     return "st.global.v2.u64 [$0], {$1, $2};", "l,l,l,~{memory}", (pointer, a, b)
@@ -287,6 +297,19 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             stamp_at(self.diag_row(), slot)
 
     @cute.jit
+    def dnow(self):
+        t = Uint64(0)
+        if cutlass.const_expr(self.diag_ring != 0):
+            t = _now()
+        return t
+
+    @cute.jit
+    def dwait(self, offset: cutlass.Constexpr[int], t0):
+        """DIAG (GRPSTAMP g2): add (now - t0) ns at ring row + offset (accumulated waits)."""
+        if cutlass.const_expr(self.diag_ring != 0):
+            _red64(self.diag_row() + offset, Uint64(_now() - t0))
+
+    @cute.jit
     def diag_meta(self, distinct, call_count):
         if cutlass.const_expr(self.diag_ring != 0):
             word = Int64(distinct) | (Int64(call_count) << 32)
@@ -354,7 +377,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         sm, barriers, metadata = ring[:3]
         desc, scales, row, chunk, offset, size = tma
         if issued >= self.stages:
+            t0 = self.dnow()
             self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            self.dwait(432 if fc2 else 440, t0)  # DIAG (GRPSTAMP g2)
         if cutlass.const_expr(meta is not None):
             for i in cutlass.range_constexpr(4):
                 metadata[4 * slot + i] = meta[i]
@@ -598,7 +623,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ks = lo % 14
             for s in cutlass.range(lo, hi, unroll=1):
                 slot = count % stages
+                t0 = self.dnow()
                 self.sync(full.iterator + slot, count // stages & 1, True)
+                if lane == 0:
+                    self.dwait(504, t0)  # DIAG (GRPSTAMP g2): MMA FC1 full wait
                 weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
                 released = shared_address(empty.iterator + slot)
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
@@ -641,13 +669,19 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         for g in cutlass.range_constexpr(2):
             end = ranges[g, 5] - (zone if g == 1 else 0)
             for j in cutlass.range(ranges[g, 4], end, unroll=1):
+                t0 = self.dnow()
                 self.sync(full.iterator + state[0], state[1], True)
+                if lane == 0:
+                    self.dwait(496, t0)  # DIAG (GRPSTAMP g2): MMA FC2 full wait
                 state = self.fc2_mma(state, mma, j // self.jobs)
         accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
         pmeta = view(sm.iterator, self.off_misc + self.bar_pmeta, Uint64, 16)
         ended = False
         while not ended:
+            t0 = self.dnow()
             self.sync(full.iterator + state[0], state[1], True)
+            if lane == 0:
+                self.dwait(496, t0)  # DIAG (GRPSTAMP g2): MMA FC2 full wait (pool)
             kind, a, b = (meta[4 * state[0] + i] for i in range(3))
             if kind != 1:  # the end marker
                 ended = True
@@ -688,7 +722,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             hbuffer = ordinal & 1
             if (lane == 0) & (ordinal == 0):
                 self.stamp(7)
+            t0 = self.dnow()
             self.sync(hfull.iterator + hbuffer, ordinal >> 1 & 1, True)
+            if lane == 0:
+                self.dwait(480, t0)  # DIAG (GRPSTAMP g2): FC2 hidden-image wait
             if (lane == 0) & (ordinal == 0):
                 self.stamp(8)
             copy_scales = Uint32(1)
