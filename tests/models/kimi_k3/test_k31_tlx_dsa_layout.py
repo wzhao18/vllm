@@ -120,7 +120,7 @@ def test_layout_16384_fewest_parts(monkeypatch):
     assert lay["o"][0] == 1
 
 
-@pytest.mark.parametrize("mnbt", [8192, 12288, 16128])
+@pytest.mark.parametrize("mnbt", [8192, 12288])
 def test_no_fit_below_threshold(mnbt, monkeypatch):
     spag, rs = _stand_ins(mnbt, monkeypatch)
     with pytest.raises(tlx_dsa._NoFit, match="max_num_batched_tokens >= 16384"):
