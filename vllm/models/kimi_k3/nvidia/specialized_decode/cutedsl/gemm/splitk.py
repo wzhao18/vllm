@@ -23,6 +23,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
+
+from ..common import routediag as rd  # DIAG (never merge)
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
@@ -170,6 +172,10 @@ class SplitKGemm:
         n_idx = block_idx[1] // self.split_k
         l_idx = block_idx[2]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        dtid = cute.arch.thread_idx()[0]  # DIAG (never merge)
+        dblk = bidx + cute.arch.grid_dim()[0] * block_idx[1]
+        d0, d1 = rd.buffer("skg")
+        rd.begin(d0, d1, dblk, dtid == 0)  # DIAG: entry + smid
 
         shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         sA = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*shape))
@@ -234,6 +240,8 @@ class SplitKGemm:
                 cute.arch.thread_idx()[0] - 128, mC.element_type,
                 utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
             )  # fmt: skip
+            e0, e1 = rd.buffer("skg.e")
+            rd.begin(e0, e1, dblk, dtid == 128)  # DIAG: epilogue end (thread 128)
 
     @cute.experimental.jit
     def weight_warp(
