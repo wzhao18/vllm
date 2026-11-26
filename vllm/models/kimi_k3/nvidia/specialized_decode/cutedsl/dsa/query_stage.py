@@ -158,15 +158,24 @@ def compile_norm(batch, heads, pitch):
     )
 
 
+# QueryWait CTAs per SM: one poll pass (at most 8 polled 16 B chunks per thread) up to
+# SMs x 2048 chunks, as dsa.wide's publish-only rows. A fixed 32 CTAs took 4 serial
+# passes at a DCP16 B8 mailbox (64 rows x 96 heads x 36 chunks); 1-node DSA chain
+# (W4, 96 gathered heads, M64, ABBA): 55.30 -> 54.49 us/layer, outputs bitwise equal.
+WAIT_CTAS_PER_SM = 1
+
+
 @cache
-def compile_wait(batch, heads, dcp, q_heads, fp8, cap=64):
+def compile_wait(batch, heads, dcp, q_heads, fp8, cap=64, sms=148):
     """QueryWait of one batch of rows under DCP (else None; ``cap``: the q mailbox
-    rows). Shared by every DSA layer: the mailbox is a launch argument."""
+    rows; ``sms``: the device's SMs, WAIT_CTAS_PER_SM each). Shared by every DSA
+    layer: the mailbox is a launch argument."""
     if not dcp:
         return None
     q_bytes = 1 if fp8 else 2
     mailbox = fake((cap, q_heads, 576 * q_bytes), None, torch.uint8)
-    wait = QueryWait(batch, dcp * heads, q_heads, q_bytes)
+    ctas = WAIT_CTAS_PER_SM * sms
+    wait = QueryWait(batch, dcp * heads, q_heads, q_bytes, ctas=ctas)
     return cute.compile(wait, mailbox, make_fake_stream())
 
 
