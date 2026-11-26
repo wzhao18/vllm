@@ -170,7 +170,7 @@ HOME_SHIFT = 21 + HOME_RUN
 # K31EX_W2_DENSE=1: the experts kernels read the routed w2 as dense rows of its data
 # bytes, without the row padding of the parameter (``experts_runtime.dense_w2``). The
 # w2 descriptors and the FC2 home dies use this row pitch.
-W2_DENSE = os.environ.get("K31EX_W2_DENSE", "0") == "1"
+W2_DENSE = os.environ.get("K31EX_W2_DENSE", "1") == "1"  # EXB probe: dense w2 by default
 W2_PITCH = 96 if W2_DENSE else 128
 
 
