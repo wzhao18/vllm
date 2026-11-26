@@ -237,6 +237,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         # previous one (1) / dev order (0); first claim's lead in static jobs (dev 3).
         self.ahead = int(_os.environ.get("GRPFC2_AHEAD", "0"))
         self.lead = int(_os.environ.get("GRPFC2_LEAD", str(POOL_LEAD)))
+        # DIAG (GRPFC2 f3): static FC2 jobs acquire their own accumulator (1) / eight
+        # at a time (0, dev).
+        self.acq = int(_os.environ.get("GRPFC2_ACQ", "0"))
         # RubinExpertsKernel.encode_maps' packed maps.
         self.packed, self.parts, self.grid_maps = True, 1, True
         self.stages = stages
@@ -831,7 +834,12 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         hd = h0 + hbuffer * (self.h_image_bytes // 16)
         hs = hsf0 + hbuffer * (self.h_scale_bytes // 16)
         sfbc = tmem + 128 + 8 * stages + hbuffer * self.w2_scale_columns
-        if cutlass.const_expr(pool is None):
+        if cutlass.const_expr((pool is None) and (self.acq != 0)):
+            t1 = self.dnow()
+            self.acquire(accempty, acc, uses)
+            if lane == 0:
+                self.dwait(784, t1)  # DIAG (GRPFC2): MMA FC2 accumulator wait
+        elif cutlass.const_expr(pool is None):
             if ahead == 0:
                 t1 = self.dnow()
                 for i in cutlass.range_constexpr(6, 8):
@@ -891,7 +899,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 start = ranges[g, 4]
                 count = ranges[g, 5] - start - (zone if g == 1 else 0)
             for i in cutlass.range((eg ^ offset) & 1, count, 2, unroll=1):
+                t9 = self.dnow()
                 values = self.accumulator(tmem, (full, empty), acc, phase)
+                if cutlass.const_expr(k >= 2):  # DIAG (GRPFC2 f3): epilogue FC2 acc wait
+                    if (thread()[2] == 0) & (thread()[1] == 4):
+                        self.dwait(896, t9)
                 acc += 2
                 if acc >= 16:
                     acc -= 16
@@ -922,7 +934,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             if kind != 1:  # this group's end marker
                 ended = True
             else:
+                t9 = self.dnow()
                 values = self.accumulator(tmem, (full, empty), acc, phase)
+                if (thread()[2] == 0) & (thread()[1] == 4):
+                    self.dwait(896, t9)  # DIAG (GRPFC2 f3): epilogue pool acc wait
                 acc += 2
                 if acc >= 16:
                     acc -= 16
