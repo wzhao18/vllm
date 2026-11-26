@@ -18,6 +18,7 @@ fold), so no CTA still reads them. Everything else is the stock heads' code.
 
 import cutlass
 import cutlass.cute as cute
+from ..common import diagstamp as ds
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
@@ -153,6 +154,13 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
         token, partition = rank // 2, rank % 2  # hop 1: this CTA's token inputs
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        # DIAG (KDAP): phase stamps, kt 0 (tid 128) ring kdap1, gate warp (tid 96) ring kdap1g, warp 1 (tid 32) kdap1w
+        dbase, dctr = ds.buffer("kdap1", 0)
+        saddr = ds.begin(dbase, dctr, head * CLUSTER + rank, tid == 128)
+        gbase, gctr = ds.buffer("kdap1g", 0)
+        gaddr = ds.begin(gbase, gctr, head * CLUSTER + rank, tid == 96)
+        wbase, wctr = ds.buffer("kdap1w", 0)
+        waddr = ds.begin(wbase, wctr, head * CLUSTER + rank, tid == 32)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles if staged else stages)
@@ -233,10 +241,13 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                cute.arch.griddepcontrol_wait()
+                ds.stamp(waddr, 1)  # PDL wait return (warp 1)
                 if cutlass.const_expr(staged):
                     self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
                 else:
                     self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+                ds.stamp(waddr, 2)  # x tiles issued (warp 1)
                 if cutlass.const_expr(self.polled_out):  # after the PDL wait above
                     self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
             elif cutlass.const_expr(staged):
@@ -256,22 +267,31 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             self.verify_gate(
                 gate_args, (head, rank, slot), shared_decay, shared_beta, bar_gate
             )
+            ds.stamp(gaddr, 2)  # gate warp done (decays pushed)
             cute.arch.cluster_arrive_relaxed()
         else:
             kt = tid - 128
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset)
             early = self.verify_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            ds.stamp(saddr, 1)  # early loads / fold done
             cute.arch.cluster_wait()
+            cute.arch.griddepcontrol_wait()
+            ds.stamp(saddr, 2)  # PDL wait return (kt warps)
             if cutlass.const_expr(staged):  # the other B_ISSUERS - 1 warps of x's tiles
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
                 self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+            ds.stamp(saddr, 3)  # x tiles issued
+            cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+            ds.stamp(saddr, 4)  # in-proj MMAs committed
             self.push_partials(
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
+            ds.stamp(saddr, 5)  # partials pushed (hop 1 issued)
             wait(bar_in)
+            ds.stamp(saddr, 6)  # hop 1 landed
             inputs, gate_in = self.read_inputs(kt, x_in)
             # this CTA's rounded token inputs, then hop 2
             mine[kt] = inputs[0]
@@ -281,6 +301,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             mine[320 + kt] = gate_in
             named_barrier(1, 128)
             self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
+            ds.stamp(saddr, 7)  # hop 2 issued
             cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
             if kda_cta:
                 rows = (
@@ -296,9 +317,11 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 raws = (raw_qk, raw_v, raw_g, bar_hop)
                 bars = (bar_gate, bar_out, shared_beta, bar_qk)
                 self.verify_main(
-                    kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+                    kt, early, raws, rows, bars, tensors, coords, slots, scale, eps, saddr
                 )
+        ds.stamp(saddr, 16)  # before the exit cluster barrier
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+        ds.stamp(saddr, 17)  # exit
 
 
     @cute.jit
@@ -356,7 +379,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
 
     @cute.jit
     def verify_main(
-        self, kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+        self, kt, early, raws, rows, bars, tensors, coords, slots, scale, eps, saddr
     ):
         """``KdaSplit``'s verify main threads (B1 schedule) on the hop-2 inputs."""
         T: cutlass.Constexpr = self.tokens
@@ -382,6 +405,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
         else:
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
+            ds.stamp(saddr, 8)  # hop 2 landed
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
             for t in cutlass.range_constexpr(T):
                 inputs[3 * t] = raw_qk[t * 128 + kt]
@@ -434,9 +458,12 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 push_float(k_ptr, k_n, bar_qk, dest)
             if kt < T:  # the tokens' checkpoint slots, for the rolled loop
                 slot_rows[kt] = slots[0, kt]
+            ds.stamp(saddr, 9)  # conv + norm done, q / k pushed (hop 3 issued)
             named_barrier(1, 128)  # shared_v, slot_rows
             wait(bar_qk)
+            ds.stamp(saddr, 10)  # hop 3 (q / k all-gather) landed
             wait(bar_gate)
+            ds.stamp(saddr, 11)  # gate (decays / betas) landed
             # every KDA CTA's q / k arrived (each sends after its fold): partition 0
             # writes the k / decay records (async stores, drained under the loop)
             if (partition == 0) & live:
@@ -483,12 +510,14 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
                 local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
+            ds.stamp(saddr, 12)  # token loop done
             # The outputs of every token: thread kt pushes row kt % 16 of token kt // 16
             # to that token's owner (one remote store per thread instead of eight
             # dependent ones per row lane inside the loop).
             named_barrier(1, 128)
             position = self.vkda.output_position(value_base + kt % ROWS)
             push_float(shared_o.iterator + position, local_o[kt], bar_out, kt // ROWS)
+            ds.stamp(saddr, 13)  # outputs pushed (hop 4 issued)
             if kt < ROWS:
                 channel = 2 * dim + value_channel
                 window = (
@@ -500,6 +529,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                     conv_put(conv_page, (channel, i), value)
             if partition < T:  # token ``partition``: the gated RMS norm
                 wait(bar_out)
+                ds.stamp(saddr, 14)  # hop 4 landed
                 raw_o = shared_o[self.vkda.output_position(kt)]
                 sums = cute.make_rmem_tensor(4, Float32)
                 for g in cutlass.range_constexpr(4):
@@ -514,6 +544,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                     store_bf16_canonical(at(output, partition, qk_channel), result)
                 else:
                     output[partition, qk_channel] = BFloat16(result)
+                ds.stamp(saddr, 15)  # output stored
                 if partition == 0:
                     for s in cutlass.range_constexpr(2):
                         channel = s * dim + qk_channel
@@ -554,6 +585,13 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         request, block = rank // KDA_CTAS, rank % KDA_CTAS  # this CTA's KDA role
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tid, _, _ = cute.arch.thread_idx()
+        # DIAG (KDAP): phase stamps, kt 0 (tid 128) ring kdap2, gate warp (tid 96) ring kdap2g, warp 1 (tid 32) kdap2w
+        dbase, dctr = ds.buffer("kdap2", 0)
+        saddr = ds.begin(dbase, dctr, head * CLUSTER + rank, tid == 128)
+        gbase, gctr = ds.buffer("kdap2g", 0)
+        gaddr = ds.begin(gbase, gctr, head * CLUSTER + rank, tid == 96)
+        wbase, wctr = ds.buffer("kdap2w", 0)
+        waddr = ds.begin(wbase, wctr, head * CLUSTER + rank, tid == 32)
 
         a_shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
         b_shape = (tiled_mma, mnk_tiler, ab_dtype, self.k_tiles)
@@ -630,7 +668,11 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             elif warp_idx == 1:
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
                 b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
-                self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
+                cute.arch.griddepcontrol_wait()
+                ds.stamp(waddr, 1)  # PDL wait return (warp 1)
+                if cutlass.const_expr(True):
+                    self.resident_b(b_full, b_tile, sB, b_map, tiles[0], 0)
+                ds.stamp(waddr, 2)  # x tiles issued (warp 1)
                 if cutlass.const_expr(self.polled_out):  # after the PDL wait above
                     self.rearm_out(out_rearm, output.shape[0], head * CLUSTER + rank)
             else:
@@ -643,28 +685,38 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             gate_args = (fa_beta, a_log, dt_bias, f_b, lower_bound, counter, target)
             coords = (head, rank, slot, request, block)
             self.multi_gate(gate_args, coords, shared_decay, shared_beta, bar_gate)
+            ds.stamp(gaddr, 2)  # gate warp done (decays pushed)
             cute.arch.cluster_arrive_relaxed()
         else:
             kt = tid - 128
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset, request, block)
             early = self.multi_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            ds.stamp(saddr, 1)  # early loads / fold done
             cute.arch.cluster_wait()
+            cute.arch.griddepcontrol_wait()
+            ds.stamp(saddr, 2)  # PDL wait return (kt warps)
             # the other B_ISSUERS - 1 warps of x's tiles
             b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
             self.resident_b(b_full, b_tile, sB, b_map, tiles[0], warp_idx - 3)
+            ds.stamp(saddr, 3)  # x tiles issued
+            cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+            ds.stamp(saddr, 4)  # in-proj MMAs committed
             self.push_tokens(
                 kt, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, partial,
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
+            ds.stamp(saddr, 5)  # partials pushed (hop 1 issued)
             if cutlass.const_expr(self.rows_total == CLUSTER):  # one row per CTA
                 wait(bar_in)
+                ds.stamp(saddr, 6)  # hop 1 landed
                 self.round_owned(kt, x_in, mine)
                 named_barrier(1, 128)
                 self.multi_hop(
                     kt, request, rank % KDA_CTAS, mine, raw_qk, raw_v, bar_hop
                 )
+                ds.stamp(saddr, 7)  # hop 2 issued
             elif rank < self.rows_total:  # CTAs past the token rows own none
                 wait(bar_in)
                 self.round_owned(kt, x_in, mine)
@@ -678,13 +730,15 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             raws = (raw_qk, raw_v, mine, bar_hop)
             bars = (bar_gate, bar_out, shared_beta, bar_qk)
             self.multi_main(
-                kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+                kt, early, raws, rows, bars, tensors, coords, slots, scale, eps, saddr
             )
             if cutlass.const_expr(T < KDA_CTAS):  # noqa: SIM102 (owners: the norm)
                 if rank < self.rows_total:
                     owned = (mine, shared_o, bar_out, output, norm_w, accepted)
                     self.owned_norm(kt, owned, slots, head, rank, eps)
+        ds.stamp(saddr, 16)  # before the exit cluster barrier
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+        ds.stamp(saddr, 17)  # exit
 
 
     @cute.jit
@@ -737,7 +791,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
 
     @cute.jit
     def multi_main(
-        self, kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
+        self, kt, early, raws, rows, bars, tensors, coords, slots, scale, eps, saddr
     ):
         """``KdaHeadVerify.verify_main`` for this CTA's request and row block; at q = 8
         also the gated RMS norm of token row ``rank`` (the same request's position
@@ -766,6 +820,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
         else:
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
+            ds.stamp(saddr, 8)  # hop 2 landed
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
             for t in cutlass.range_constexpr(T):
                 inputs[3 * t] = raw_qk[t * 128 + kt]
@@ -832,9 +887,12 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                     push_float(k_ptr, k_n, bar_qk, first + dest)
             if kt < T:
                 slot_rows[kt] = slots[request, kt]
+            ds.stamp(saddr, 9)  # conv + norm done, q / k pushed (hop 3 issued)
             named_barrier(1, 128)  # shared_v, slot_rows
             wait(bar_qk)
+            ds.stamp(saddr, 10)  # hop 3 (q / k all-gather) landed
             wait(bar_gate)
+            ds.stamp(saddr, 11)  # gate (decays / betas) landed
             # the request's KDA CTAs' q / k arrived (each sends after its fold): its
             # block-0 CTA writes the k / decay records under the loop
             if (block == 0) & live:
@@ -872,6 +930,7 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
                 local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
+            ds.stamp(saddr, 12)  # token loop done
             # thread kt pushes row kt % 16 of token kt // 16 to that token row's owner
             named_barrier(1, 128)
             position = self.vkda.output_position(value_base + kt % ROWS)
@@ -896,8 +955,11 @@ class KdaHeadMultiDefer(HeadRecords, KdaHeadMulti):
                     conv_put(conv_page, (channel, i), value)
             if cutlass.const_expr(T == KDA_CTAS):
                 # token row ``rank`` (position ``block`` of this CTA's request)
+                ds.stamp(saddr, 13)  # outputs pushed (hop 4 issued)
                 wait(bar_out)
+                ds.stamp(saddr, 14)  # hop 4 landed
                 self.norm_row(kt, shared_o, output, rank, qk_channel, nw, out_gate, eps)
+                ds.stamp(saddr, 15)  # output stored
             if block == 0:
                 for s in cutlass.range_constexpr(2):
                     channel = s * dim + qk_channel
