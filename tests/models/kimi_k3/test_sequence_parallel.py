@@ -180,6 +180,8 @@ def test_kimi_attn_residual_states_stay_sequence_sharded(monkeypatch):
     layer.block_write_idx = 0
     layer.is_block_write_layer = False
     layer._aux_prefix_out = None  # no DSpark aux capture this forward
+    # Not a KDA layer: the SP AttnRes gather stays BF16 (_sp_mxfp8_gather_capable).
+    layer.self_attn = nn.Identity()
     layer.input_layernorm = _IdentityNorm()
     layer.post_attention_layernorm = _IdentityNorm()
     layer.self_attention_res_norm = _IdentityNorm()
