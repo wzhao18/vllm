@@ -2558,7 +2558,7 @@ class TokenCommDedup(KernelComponent):
                             completed_slot_prefix, total_slots, fc1_done, Int32(0)
                         )
                     if completed_slot_prefix < expert_slot_end:
-                        if metadata.dst_token_cnt < Int32(self.topk):
+                        if cutlass.const_expr(False):
                             iket.range_push("token_back.wait_block_copies")
                             self._wait_block_copies(
                                 metadata,
