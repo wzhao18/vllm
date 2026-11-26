@@ -62,6 +62,7 @@ from ..gemm.splitk import (
     _fence_tcgen05,
     _smem,
     _tma_load_box3_evict_first,
+    _tma_load_evict_first,
 )
 from .head import (
     A_DESC_HIGH,
@@ -123,6 +124,8 @@ def _align(offset, alignment):
 
 
 class KdaHeadMulti(KdaHeadVerify):
+    diag_nocp = False  # DIAG (KDAH-1): skip the smem -> TMEM copies (NOT exact)
+
     """``KdaHeadVerify`` for ``requests`` x ``tokens`` verify rows (request-major);
     ``accepted`` [requests], ``slots`` [requests, >= tokens]. Ring ``stages`` (K tile
     slots) shrink so the resident x tiles of every token fit beside an AttnRes CTA.
@@ -375,6 +378,44 @@ class KdaHeadMulti(KdaHeadVerify):
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
 
     @cute.experimental.jit
+    def weight_warp(
+        self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
+        row0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
+    ):  # fmt: skip
+        """DIAG (KDAH-1): ``KdaHeadWide.weight_warp`` + per-tile issue stamps."""
+        stages = self.num_ab_stage
+        stage_bytes = cute.size_in_bytes(
+            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
+        )
+        early = self.k_tiles if self.early_loads is None else self.early_loads
+        w_rank, w_head, _ = cute.arch.block_idx()
+        w_tid, _, _ = cute.arch.thread_idx()
+        wtb, wtc = ds.tbuffer("kdatw")
+        waddr = ds.tbegin(wtb, wtc, w_head * 16 + w_rank, w_tid == 0)
+        _acquire_tensor_map(a_map)
+        empty_phase = cutlass.Int32(1)
+        for k_tile in cutlass.range(k_tile_count, unroll=1):
+            stage = k_tile % stages
+            if k_tile == early:
+                cute.arch.griddepcontrol_wait()
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            ds.tstamp(waddr, 2 + k_tile)  # DIAG: slot empty (issue of tile k)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
+            with cute.arch.elect_one():
+                k0 = (k_tile_start + k_tile) * self.cta_k
+                tile = s_tile[None, None, None, stage].iterator
+                for atom in cutlass.range_constexpr(self.cta_k // ATOM_K):
+                    box, mbar = tile + atom * self.cta_m * ATOM_K, bar_full + stage
+                    k = k0 + atom * ATOM_K
+                    _tma_load_evict_first(box, mbar, a_map, k, row0)
+            if stage == stages - 1:
+                empty_phase = empty_phase ^ 1
+        self.drain(bar_empty, empty_phase, k_tile_count)
+        ds.tstamp(waddr, 40)
+        ds.tgstamp(waddr, 41)
+
+    @cute.experimental.jit
     def box_weight_warp(
         self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
         row0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
@@ -387,6 +428,10 @@ class KdaHeadMulti(KdaHeadVerify):
         tile_bytes = cute.size_in_bytes(
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
+        w_rank, w_head, _ = cute.arch.block_idx()
+        w_tid, _, _ = cute.arch.thread_idx()
+        wtb, wtc = ds.tbuffer("kdatw")
+        waddr = ds.tbegin(wtb, wtc, w_head * 16 + w_rank, w_tid == 0)
         _acquire_tensor_map(a_map)
         empty_phase = cutlass.Int32(1)
         for step in cutlass.range(k_tile_count // st, unroll=1):
@@ -394,6 +439,7 @@ class KdaHeadMulti(KdaHeadVerify):
             if step == self.early_loads // st:
                 cute.arch.griddepcontrol_wait()
             cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            ds.tstamp(waddr, 2 + step)  # DIAG: stage step's slot empty (issue)
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     bar_full + stage, tile_bytes * st
@@ -409,6 +455,8 @@ class KdaHeadMulti(KdaHeadVerify):
             cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
+        ds.tstamp(waddr, 40)
+        ds.tgstamp(waddr, 41)
 
     @cute.experimental.jit
     def staged_mma_multi(
@@ -431,6 +479,8 @@ class KdaHeadMulti(KdaHeadVerify):
         d_tid, _, _ = cute.arch.thread_idx()
         mbase, mctr = ds.buffer("kdamma", 0)
         maddr = ds.begin(mbase, mctr, d_head * 16 + d_rank, d_tid == 64)
+        tbase, tctr = ds.tbuffer("kdatm")
+        taddr = ds.tbegin(tbase, tctr, d_head * 16 + d_rank, d_tid == 64)
         cute.arch.alloc_tmem(512, tmem_base_ptr, is_two_cta=False)
         _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -444,15 +494,19 @@ class KdaHeadMulti(KdaHeadVerify):
             if cutlass.const_expr(k % st == 0):  # the stage's first K tile
                 cute.arch.mbarrier_wait(bar_full + stage, phase)
                 _fence_tcgen05()
+            ds.tstamp(taddr, 2 + k)  # DIAG: weight tile k full
             with cute.arch.elect_one():
-                for kb in cutlass.range_constexpr(k_blocks):
-                    source = a_desc + (stage * st + k % st) * a_step + 2 * kb
-                    _copy_to_tmem(base + N + columns * k + 8 * kb, source)
+                if cutlass.const_expr(not self.diag_nocp):
+                    for kb in cutlass.range_constexpr(k_blocks):
+                        source = a_desc + (stage * st + k % st) * a_step + 2 * kb
+                        _copy_to_tmem(base + N + columns * k + 8 * kb, source)
                 if cutlass.const_expr(k % st == st - 1):  # the stage's last K tile
                     tcgen05.commit(bar_empty + stage, None, self.cta_group)
+            ds.tstamp(taddr, 34 + k)  # DIAG: tile k copies + commit issued
         ds.stamp(maddr, 1)  # weight tiles 0 .. staged - 1 landed (copies issued)
         for k in cutlass.range_constexpr(staged):  # A from tensor memory
             cute.arch.mbarrier_wait(b_full + k, 0)
+            ds.tstamp(taddr, 66 + k)  # DIAG: x tile k landed
             if cutlass.const_expr(k == 0):
                 ds.stamp(maddr, 2)  # x tile 0 landed
             _fence_tcgen05()
@@ -466,11 +520,13 @@ class KdaHeadMulti(KdaHeadVerify):
             for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
                 ring_stage, ring_phase = k % stages, (k // stages) % 2
                 cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
+                ds.tstamp(taddr, 2 + k)  # DIAG: weight tile k full
                 if k == self.early_loads:
                     ds.stamp(maddr, 4)  # first post-wait weight tile landed
                 if k == self.k_tiles - 1:
                     ds.stamp(maddr, 5)  # last weight tile landed
                 cute.arch.mbarrier_wait(b_full + k, 0)
+                ds.tstamp(taddr, 66 + k)  # DIAG: x tile k landed
                 if k == self.k_tiles - 1:
                     ds.stamp(maddr, 6)  # last x tile landed
                 _fence_tcgen05()
@@ -479,16 +535,19 @@ class KdaHeadMulti(KdaHeadVerify):
                         a_ring = a_desc + ring_stage * a_step + 2 * kb
                         mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
                     tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
+                ds.tstamp(taddr, 34 + k)  # DIAG: tile k MMAs + commit issued
         else:  # a stage is waited on at its first K tile (above, if staged began it)
             for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
                 ring_stage, ring_phase = k // st % stages, (k // st // stages) % 2
                 if k % st == 0:
                     cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
+                ds.tstamp(taddr, 2 + k)  # DIAG: weight tile k full
                 if k == self.early_loads:
                     ds.stamp(maddr, 4)  # first post-wait weight tile landed
                 if k == self.k_tiles - 1:
                     ds.stamp(maddr, 5)  # last weight tile landed
                 cute.arch.mbarrier_wait(b_full + k, 0)
+                ds.tstamp(taddr, 66 + k)  # DIAG: x tile k landed
                 if k == self.k_tiles - 1:
                     ds.stamp(maddr, 6)  # last x tile landed
                 _fence_tcgen05()
@@ -499,9 +558,12 @@ class KdaHeadMulti(KdaHeadVerify):
                         mma_smem(base, a_ring, b_desc + k * b_step + 2 * kb, Int32(1))
                     if k % st == st - 1:
                         tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
+                ds.tstamp(taddr, 34 + k)  # DIAG: tile k MMAs (+ commit) issued
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
         ds.stamp(maddr, 7)  # last MMAs committed
+        ds.tstamp(taddr, 98)
+        ds.tgstamp(taddr, 99)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)  # the release lands in phase 1
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)

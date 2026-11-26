@@ -93,3 +93,47 @@ def stamp(addr, slot: cutlass.Constexpr):
     if addr != Int64(0):
         st64(addr + slot * 8, gtimer())
 
+
+
+# DIAG (KDAH-1): per-tile %clock64 rings, TSLOTS per CTA per call (slot 0 = %globaltimer
+# at begin, slot 1 = %clock64 at begin; the caller numbers the rest).
+TSLOTS = 128
+
+
+@asm(Int64)
+def clk():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
+def tbuffer(tag):
+    key = (tag, -2)
+    if key not in _BUFS:
+        dev = torch.cuda.current_device()
+        ring = torch.zeros(RING, CTAS, TSLOTS, dtype=torch.int64, device=dev)
+        ctr = torch.zeros(CTAS, dtype=torch.int32, device=dev)
+        _BUFS[key] = (ring, ctr)
+    ring, ctr = _BUFS[key]
+    return ring.data_ptr(), ctr.data_ptr()
+
+
+@cute.jit
+def tbegin(base: cutlass.Constexpr, ctr: cutlass.Constexpr, cta, leader):
+    addr = Int64(0)
+    if leader & (cta < CTAS):
+        call = atom_inc(Int64(ctr) + Int64(cta) * 4) % RING
+        addr = Int64(base) + (Int64(call) * CTAS + Int64(cta)) * (TSLOTS * 8)
+        st64(addr, gtimer())
+        st64(addr + 8, clk())
+    return addr
+
+
+@cute.jit
+def tstamp(addr, slot):
+    if addr != Int64(0):
+        st64(addr + Int64(slot) * 8, clk())
+
+
+@cute.jit
+def tgstamp(addr, slot):
+    if addr != Int64(0):
+        st64(addr + Int64(slot) * 8, gtimer())
