@@ -23,6 +23,10 @@ enqueued, layer ``o + 1`` expands on a side stream, after that kernel (its slot 
 last read by layer ``o - 1``, so the expansion overlaps the next layer's attention,
 not a MegaMoE kernel); the current stream waits for it before layer ``o + 1``'s
 kernel.
+Under a breakable (piecewise) CUDA graph capture, layer ``o + 1`` expands on the
+current stream right after layer ``o``'s kernel instead: the attention between them
+is an eager break that ends the capture segment, and a side-stream fork may not
+outlive its segment.
 
 Policy (``additional_config["megamoe_compact_scales"]``): ``"auto"`` (default)
 compacts on P/D prefill workers only (``pd_prefill_worker``: KV-bound, and a
@@ -110,6 +114,12 @@ def expand(compact: torch.Tensor, out: torch.Tensor) -> None:
     )
 
 
+def _breakable_capture_active() -> bool:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    return BreakableCUDAGraphCapture.is_active()
+
+
 class ScaleStaging:
     """Every MoE layer's compact planes (module order), the two staging slots and the
     per-step expansion state."""
@@ -153,7 +163,12 @@ class ScaleStaging:
         if self.pending == nxt or self.held[nxt % 2] == nxt:
             return
         assert self.pending is None, f"layer {self.pending} was expanded, never used"
-        if self.stream is None:
+        if self.stream is None or _breakable_capture_active():
+            # Under a breakable (piecewise) capture the side-stream fork would be
+            # captured in this layer's segment and joined only in layer o + 1's,
+            # after an eager break: the segment ends with unjoined work. Expand on
+            # the current stream instead (same launch, no overlap), as
+            # maybe_execute_in_parallel does.
             self._expand(nxt)
             return
         self.go.record()
