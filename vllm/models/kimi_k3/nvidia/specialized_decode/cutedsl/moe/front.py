@@ -45,6 +45,12 @@ def shared_add(address, value):
     return code, "=r,r,r,~{memory}", (address, Int32(value))
 
 
+@asm(Int32)
+def shared_min(address, value):
+    code = "atom.shared.min.u32 $0,[$1],$2;"
+    return code, "=r,r,r,~{memory}", (address, Uint32(value))
+
+
 @cute.jit
 def ordered(score):
     """Monotone uint32 key of a float; NaN maps to 0 (below every number)."""
@@ -109,6 +115,16 @@ class RouteSitu:
         token, role = cta % self.batch, cta // self.batch
         if c.const_expr(self.halves):  # CTAs [B, 3B): the two copy halves of each token
             role = Int32(cta >= self.batch)
+        # The route role's bias (a weight) before any PDL wait: with the release after
+        # the front GEMM the wait is here, and the loads overlap the front's runtime.
+        offsets = cute.make_rmem_tensor(4, c.Float32)
+        for i in c.range_constexpr(4):
+            offsets[i] = c.Float32(0)
+        if c.const_expr("route" in self.roles):
+            if role == self.roles.index("route"):
+                for i in c.range_constexpr(4):
+                    if self.expert(tid, i) < self.experts:
+                        offsets[i] = bias[self.expert(tid, i)]
         if c.const_expr(self.early == "front"):
             # Release the experts once this rank's front GEMM has completed: their
             # launch then never overlaps it (they still wait for this kernel's end).
@@ -119,7 +135,7 @@ class RouteSitu:
         for r in c.range_constexpr(len(self.roles)):
             if role == r:
                 if c.const_expr(self.roles[r] == "route"):
-                    work = (logits, bias, ids, weights, scale, token, tid, mailbox)
+                    work = (logits, offsets, ids, weights, scale, token, tid, mailbox)
                     self.route(*work, signal)
                 elif c.const_expr(self.roles[r] == "copy"):
                     # Lamport: no dependency wait; the sentinel poll is the barrier.
@@ -303,10 +319,11 @@ class RouteSitu:
 
     @cute.jit
     def route(
-        self, logits, bias, ids, weights, scale, token, tid, mailbox, signal=None
+        self, logits, offsets, ids, weights, scale, token, tid, mailbox, signal=None
     ):
         """Exact top16 by threads [0, 256): candidates at or above the 16th largest
-        lane-group maximum are compacted and ranked by an unrolled 64-way compare."""
+        lane-group maximum are compacted and ranked by an unrolled 64-way compare.
+        ``offsets``: this thread's four experts' bias (``kernel`` loads it)."""
         warp, lane = tid // 32, tid % 32
         smem = c.utils.SmemAllocator()
         km = alloc(smem, Uint32, (8, 32))
@@ -318,11 +335,6 @@ class RouteSitu:
         if c.const_expr(self.lean):  # candidate count; the chosen experts' sigmoids
             found, picked = alloc(smem, Int32, 1), alloc(smem, c.Float32, 16)
         # Thread t owns experts t + 256 i, or 4 t + i when polling 16-byte chunks.
-        offsets = cute.make_rmem_tensor(4, c.Float32)
-        for i in c.range_constexpr(4):  # bias is a weight: load before the wait
-            offsets[i] = c.Float32(0)
-            if self.expert(tid, i) < self.experts:
-                offsets[i] = bias[self.expert(tid, i)]
         raw = cute.make_rmem_tensor(4, c.Float32)
         key, top = cute.make_rmem_tensor(4, Uint32), Uint32(0)
         for i in c.range_constexpr(4):
@@ -358,22 +370,28 @@ class RouteSitu:
                     key[i] = ordered(score + offsets[i])
             top = max(top, key[i])
         km[warp, lane] = top
-        if c.const_expr(self.lean):  # noqa: SIM102
-            if tid == 0:
+        if tid == 0:
+            cutoff[0] = Uint32(0xFFFFFFFF)
+            if c.const_expr(self.lean):
                 found[0] = Int32(0)
         cute.arch.sync_threads()
-        if warp == 0:
-            group = km[0, lane]
-            for w in c.range_constexpr(1, 8):
-                group = max(group, km[w, lane])
-            km[0, lane] = group
-            cute.arch.sync_warp()
-            rank = Int32(0)
-            for j in c.range_constexpr(32):
-                rank += Int32(km[0, j] > group)
-            low = redux(group if rank < 16 else Uint32(0xFFFFFFFF))
-            if lane == 0:
-                cutoff[0] = low
+        # Cutoff = the smallest of the lane-group maxima with fewer than 16 groups above
+        # it, on all eight warps: each holds the 32 group maxima (lane l: group l) and
+        # ranks four of them, eight lanes per group, four compares per lane.
+        group = km[0, lane]
+        for w in c.range_constexpr(1, 8):
+            group = max(group, km[w, lane])
+        part = lane % 8
+        mine = Uint32(cute.arch.shuffle_sync(group, warp * 4 + lane // 8))
+        rank = Int32(0)
+        for k in c.range_constexpr(4):  # unsigned keys: compare as Uint32
+            other = Uint32(cute.arch.shuffle_sync(group, part + 8 * k))
+            rank += Int32(other > mine)
+        for shift in c.range_constexpr(3):
+            rank += cute.arch.shuffle_sync_bfly(rank, 1 << shift)
+        low = redux(mine if rank < 16 else Uint32(0xFFFFFFFF))
+        if lane == 0:
+            shared_min(cutoff.iterator, low)
         cute.arch.sync_threads()
         if c.const_expr(self.lean):
             dense = view(cand.iterator, 0, Uint64, (1024,))
@@ -527,6 +545,9 @@ EARLY_WEIGHTS_WIDE = {288: "3-8:1"}
 # clusters placed first keep three tiles; the late ones get two or one (57 / 29 KB per
 # CTA, 64 CTAs). Same K split and summation order per row: bitwise-identical outputs.
 FRONT_TILES_WIDE = {288: "8:3.3.3.2.2.2.2.1"}
+# Those batches (``FRONT_TILES_WIDE``): each warp loads its x fragments from global
+# after the PDL wait (``WsGemm.direct_x``) instead of warp 0's bulk copy + mbarrier.
+DIRECT_X_WIDE = {288: "8:1"}
 WIDTH = 3584 + 2 * 896  # front mailbox row: BF16 latent, then FP32 logit words
 # Batches whose shared expert is the fused kernel (``SharedUmma``), not the split-K
 # chain; of those, split batches run gate/up + SiTU beside the front and the down rows
@@ -692,11 +713,12 @@ def compile_publish(n, split, valid, batch, device, ks, geometry=None, wide=Fals
     rt, kq, staged, tg, ch = geometry or front_geometry(batch, n, ks, wide=wide)
     early = batch_table(EARLY_WEIGHTS_WIDE.get(n, "") if wide else "").get(batch)
     early = bool(early and tg)
-    tiles = None
+    tiles, direct = None, False
     if wide and tg and geometry is None:
         tiles = batch_table(FRONT_TILES_WIDE.get(n, "")).get(batch)
+        direct = bool(batch_table(DIRECT_X_WIDE.get(n, "")).get(batch))
     kernel = WsGemm(
-        n, 7168, batch, rt, kq, staged, split, valid, ks, tg, ch, early, tiles
+        n, 7168, batch, rt, kq, staged, split, valid, ks, tg, ch, early, tiles, direct
     )
     args: tuple = (fake((batch, 7168)), fake((n, 7168)), fake((1, 64, WIDTH)))
     args += (c.Int64(0), c.Int32(0), c.Int32(0), fake((batch, 896), None, c.Float32))
