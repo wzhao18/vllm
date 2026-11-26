@@ -34,8 +34,8 @@ completion, one release add per source and rank).
 
 Memory (no new allocation): the staging region and the row buffers alias the
 GEMM-RS ``partial`` workspace and the dead tails of the SP all-gather slots
-(``TlxDsa``: lifetimes and layout). Fits at MNBT >= 16384 at TP8; raises at
-init otherwise.
+(``TlxDsa``: lifetimes and layout). Fits at MNBT >= 16384 at TP8; selected at
+init: TLX-S is on only when it fits (one INFO line either way).
 
 WAR safety: a peer pushes into my staging / row buffers for DSA layer D' only
 after it started D', i.e. finished every layer before, including the MoE of
@@ -327,6 +327,10 @@ def _module():
     return _ext
 
 
+class _NoFit(RuntimeError):
+    pass
+
+
 class _Region:
     """A dead byte range of a symmetric buffer: buffer index (0 = SP all-gather storage, 1 = GEMM-RS partial),
     byte offset in the buffer, size; ``used`` bytes allocated from its start."""
@@ -356,7 +360,8 @@ class TlxDsa:
     Layout (``_pack``): W_o (contiguous, K-major, written by the 3D tensor-store push), W_qb, W_g (split along N at
     shard boundaries when no region holds it whole; each part is its own GEMM writing a column block of the output,
     cuBLAS ldc), and the three row planes, first fit over the regions. Fits at MNBT >= 16384 (partial 234.9 MB +
-    two tails of 113.7 MB at TP8); raises at init otherwise (no silent fallback)."""
+    two tails of 113.7 MB at TP8). Selected at init by capability: off (one INFO line with the shortfall) when it does
+    not fit; never a mid-run fallback."""
 
     def __init__(self, spag, rs) -> None:
         self.spag = spag
@@ -396,9 +401,8 @@ class TlxDsa:
         m.tlx_push([], [], [], [], self.bases, 0, 0, [], self.ctr, self.done, self.freew, self.pushed,
                    self.rank, W, 1, _SPIN_NS)
         m.tlx_release(torch.zeros(W, dtype=torch.int64, device=dev))
-        logger.info(
-            "Kimi K3.1 DSA TLX-S staging (no new memory, max_rows %d): %s", self.max_rows,
-            "; ".join(f"{r.name} {r.used / 1e6:.1f} of {r.size / 1e6:.1f} MB" for r in regions),
+        self.layout_desc = f"no new memory, max_rows {self.max_rows}: " + "; ".join(
+            f"{r.name} {r.used / 1e6:.1f} of {r.size / 1e6:.1f} MB" for r in regions
         )
 
     def _view(self, buf: int, off: int, nbytes: int) -> torch.Tensor:
@@ -415,8 +419,8 @@ class TlxDsa:
                 if o is not None:
                     return r.buf, o
             free = sum(r.size - r.used for r in regions)
-            raise RuntimeError(
-                f"Kimi K3.1 DSA TLX-S: {name} ({nbytes / 1e6:.1f} MB) fits no dead region "
+            raise _NoFit(
+                f"{name} ({nbytes / 1e6:.1f} MB) fits no dead region "
                 f"(free {[(r.name, round((r.size - r.used) / 1e6, 1)) for r in regions]} MB, {free / 1e6:.1f} in "
                 f"all) at max_rows {self.max_rows}; TLX-S needs max_num_batched_tokens >= 16384 at TP8"
             )
@@ -435,7 +439,7 @@ class TlxDsa:
                         res.append((j * step, (j + 1) * step, buf, off,
                                     self._view(buf, off, step * k * 2).view(bf).view(step, k)))
                     return res
-                except RuntimeError:
+                except _NoFit:
                     for r, u in zip(regions, saved):
                         r.used = u
                     if parts == n // shard:
@@ -552,12 +556,16 @@ def enable(dsa_layers: list) -> bool:
         return False
     bad = [i for i, a in enumerate(dsa_layers) if not layer_ok(a)]
     if bad:
-        raise RuntimeError(
-            f"Kimi K3.1 DSA TLX-S: {len(bad)} DSA layers lack the supported form (BF16 q_b / g / o shards of the TP8 "
-            "shapes, fused indexer insert, 160-wide wkv_index, NoPE, ShardQ)"
+        logger.info(
+            "Kimi K3.1 DSA TLX-S: off on this instance (%d DSA layers lack the supported form: BF16 q_b / g / o "
+            "shards of the TP8 shapes, fused indexer insert, 160-wide wkv_index, NoPE, ShardQ).", len(bad),
         )
+        shardq.TOKEN_LOCAL_MIN_ROWS = None
+        return False
     shardq.TOKEN_LOCAL_MIN_ROWS = MIN_ROWS
-    logger.info("Kimi K3.1 DSA TLX-S enabled for prefill steps of >= %d rows per rank.", MIN_ROWS)
+    logger.info(
+        "Kimi K3.1 DSA TLX-S: on for prefill steps of >= %d rows per rank (staging: %s).", MIN_ROWS, t.layout_desc,
+    )
     return True
 
 
@@ -577,7 +585,7 @@ def step_token_local(attn) -> bool:
 
 def get() -> TlxDsa | None:
     """The process's TLX-S DSA state (None when the instance has no SP all-gather buffer / GEMM-RS workspace, or
-    steps never reach MIN_ROWS rows per rank). Raises when TLX-S applies but its staging fits no dead region."""
+    steps never reach MIN_ROWS rows per rank, or the zero-allocation staging does not fit: one INFO line)."""
     global _tlx, _tlx_init_done
     if not _tlx_init_done:
         _tlx_init_done = True
@@ -593,7 +601,12 @@ def get() -> TlxDsa | None:
             and spag.world == 8
             and spag.hidden_size == 7168
             and rs.N == 7168
-            and spag.max_rows >= MIN_ROWS
         ):
-            _tlx = TlxDsa(spag, rs)
+            if spag.max_rows < MIN_ROWS:
+                logger.info("Kimi K3.1 DSA TLX-S: off (steps of %d rows per rank < %d).", spag.max_rows, MIN_ROWS)
+                return None
+            try:
+                _tlx = TlxDsa(spag, rs)
+            except _NoFit as e:
+                logger.info("Kimi K3.1 DSA TLX-S: off on this instance (zero-allocation staging does not fit: %s).", e)
     return _tlx
