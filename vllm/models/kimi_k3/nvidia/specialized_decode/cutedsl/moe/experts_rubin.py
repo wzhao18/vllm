@@ -614,7 +614,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 armed = armed | (mine[2] == -1) | (mine[3] == -1)
                 ready = cute.arch.vote_all_sync((not valid) | (not armed))
                 if not ready:
-                    sleep_ns(32)
+                    sleep_ns(128)
                 sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             if not valid:
                 for j in cutlass.range_constexpr(4):
@@ -1490,7 +1490,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 while not ready:
                     ready = load_acquire(source + 128) == Uint32(2 * self.capacity - 1)
                     if not ready:
-                        sleep_ns(64)
+                        sleep_ns(128)
                     sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 xcount = view(sm.iterator, self.off_misc + self.bar_xcount, Uint64, 1)
                 cute.arch.mbarrier_arrive(xcount.iterator)
