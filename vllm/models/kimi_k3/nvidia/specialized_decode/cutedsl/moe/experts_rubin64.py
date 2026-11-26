@@ -68,7 +68,7 @@ from .experts_rubin import (
 shuffle = cute.arch.shuffle_sync
 
 # DIAG (GRPSTAMP, never merge): in-step phase stamps of RubinGroupedExpertsKernel into a
-# %gridid-keyed ring [DIAG_RING, 256 CTAs, 512 B] (32 slots of 16 B: {%globaltimer, 0}
+# %gridid-keyed ring [DIAG_RING, 256 CTAs, 1024 B] (64 slots of 16 B: {%globaltimer, 0}
 # + %smid at +8; slot 15 = {gridid, distinct | call_count << 32}). Plain stores only.
 # On when GRPSTAMP_RING=1 at compile time; the ring per device is DIAG_RINGS[device].
 import os as _os  # noqa: E402
@@ -86,7 +86,7 @@ def diag_ring(device):
     if device not in DIAG_RINGS:
         with _torch.accelerator.device_index(device):
             DIAG_RINGS[device] = _torch.zeros(
-                DIAG_RING * 256 * 64, dtype=_torch.int64, device=f"cuda:{device}"
+                DIAG_RING * 256 * 128, dtype=_torch.int64, device=f"cuda:{device}"
             )
     return DIAG_RINGS[device].data_ptr()
 
@@ -231,6 +231,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         # 16 slots of 16 B per CTA at trace + 512 cta.
         self.trace = trace
         self.diag_ring = 0  # DIAG (GRPSTAMP): ring base or 0
+        # DIAG (GRPFC2): FC1(A) / FC2(A) share of the units in % (dev 50).
+        self.split = int(_os.environ.get("GRPFC2_SPLIT", "50"))
         # RubinExpertsKernel.encode_maps' packed maps.
         self.packed, self.parts, self.grid_maps = True, 1, True
         self.stages = stages
@@ -288,13 +290,19 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         """DIAG (GRPSTAMP): this CTA's 512 B row of the gridid-keyed ring."""
         gid = Int64(_gridid())
         row = (gid & (DIAG_RING - 1)) * 256 + Int64(thread()[3])
-        return Int64(self.diag_ring) + row * 512
+        return Int64(self.diag_ring) + row * 1024
 
     @cute.jit
     def dstamp(self, slot):
         """DIAG (GRPSTAMP): a stamp at a runtime slot (ring only)."""
         if cutlass.const_expr(self.diag_ring != 0):
             stamp_at(self.diag_row(), slot)
+
+    @cute.jit
+    def dstamp_at(self, slot: cutlass.Constexpr[int], t):
+        """DIAG (GRPFC2): store time ``t`` at ``slot`` (ring only)."""
+        if cutlass.const_expr(self.diag_ring != 0):
+            _st64x2(self.diag_row() + 16 * slot, Int64(t), Int64(0))
 
     @cute.jit
     def dnow(self):
@@ -423,6 +431,71 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         return zone // self.pool_grain * self.pool_grain
 
     @cute.jit
+    def load_hidden(self, sm, workspace, ranges, parity):
+        """``ExpertsKernel.load_hidden`` (steal: the producer's unit queue) with DIAG
+        (GRPFC2) stamps: first unit and first FC2(B) unit popped / image landed (slots
+        32-33 / 36-37), accumulated poll (800), pop (816) and buffer (832) waits."""
+        lane = thread()[2]
+        full = view(sm.iterator, self.off_misc + self.bar_hfull, Uint64, 2)
+        empty = view(sm.iterator, self.off_misc + self.bar_hempty, Uint64, 2)
+        mid = ranges[1, 0]
+        ordinal, previous = (Int32(-1), Int32(-1))
+        t0 = self.dnow()
+        unit = self.pop_unit(sm, Int32(0))
+        if lane == 0:
+            self.dwait(816, t0)
+        while unit >= 0:
+            ordinal += 1
+            buffer = ordinal & 1
+            first_b = (unit >= mid) & (previous < mid)
+            if lane == 0:
+                if ordinal == 0:
+                    self.dstamp(32)
+                if first_b:
+                    self.dstamp(36)
+            if ordinal >= 2:
+                t1 = self.dnow()
+                self.sync(empty.iterator + buffer, (ordinal >> 1) - 1 & 1)
+                if lane == 0:
+                    self.dwait(832, t1)
+                cute.arch.fence_proxy("async.shared", space="cta")  # MMA read it
+            image = self.image(workspace, parity, unit)
+            t2 = self.dnow()
+            self.poll_hidden(sm, image, buffer)
+            if lane == 0:
+                self.dwait(800, t2)
+                if ordinal == 0:
+                    self.dstamp(33)
+                if first_b:
+                    self.dstamp(37)
+                cute.arch.mbarrier_arrive(full.iterator + buffer)
+            previous = unit
+            t0 = self.dnow()
+            unit = self.pop_unit(sm, ordinal + 1)
+            if lane == 0:
+                self.dwait(816, t0)
+
+    @cute.jit
+    def partition(self, distinct: Int32, cta: Int32):
+        """``ExpertsKernel.partition`` with FC1(A) / FC2(A) taking ``split`` % of the
+        units (above 40 distinct)."""
+        middle = distinct
+        if distinct > 40:
+            middle = (distinct * self.split + 99) // 100
+        ranges = cute.make_rmem_tensor((2, 6), Int32)
+        for group in cutlass.range_constexpr(2):
+            start, end = (Int32(0), middle) if group == 0 else (middle, distinct)
+            count = end - start
+            size = self.tiles * 14 * count
+            ranges[group, 0], ranges[group, 1] = (start, size)
+            ranges[group, 2] = cta * size // self.grid
+            ranges[group, 3] = (cta + 1) * size // self.grid
+            n = self.jobs
+            ranges[group, 4] = n * start + cta * n * count // self.grid
+            ranges[group, 5] = n * start + (cta + 1) * n * count // self.grid
+        return ranges
+
+    @cute.jit
     def rank_ranges(self, sm, units, rank):
         """``partition`` of ``rank`` (a subclass may take its FC2 ranges from shared
         tables: ``home_bits``, ``matched_ranges`` and ``claims`` come here)."""
@@ -495,7 +568,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             cute.arch.mbarrier_arrive(bars.iterator + 2)
         taken, ended = (Int32(0), False)
         while not ended:
+            t0 = self.dnow()
             self.sync(bars.iterator, taken & 1)
+            self.dwait(768, t0)  # DIAG (GRPFC2): producer waits for a pool grain
             first = base[0]
             cute.arch.mbarrier_arrive(bars.iterator + 1)
             taken += 1
@@ -662,7 +737,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         # FC2: the static jobs (FC2(A), then FC2(B) less its pooled zone), walked;
         # then the pool's jobs as the producer claimed them (stage metadata).
         bars = (full, empty, accempty, accfull, hfull, hempty)
-        mma = (tmem, a0, asf0, h0, hsf0, bars)
+        mma = (tmem, a0, asf0, h0, hsf0, bars, ranges[1, 0])
         slot, phase = (count % stages, count // stages & 1)
         state = (slot, phase, uses, acc, current, ordinal, hbuffer, Int32(0))
         zone = self.zone_jobs(ranges)
@@ -708,7 +783,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         barriers, the job's tile): one at a time, the job's metadata released to the
         epilogue."""
         slot, phase, uses, acc, current, ordinal, hbuffer, ahead = state
-        tmem, a0, asf0, h0, hsf0, bars = mma
+        tmem, a0, asf0, h0, hsf0, bars, mid = mma
         full, empty, accempty, accfull, hfull, hempty = bars
         lane, stages = (thread()[2], self.stages)
         weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
@@ -717,6 +792,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if unit != current:
             if (current >= 0) & (hbuffer < 2):
                 release = shared_address(hempty.iterator + hbuffer)
+            previous = current  # DIAG (GRPFC2)
             current = unit
             ordinal += 1
             hbuffer = ordinal & 1
@@ -726,6 +802,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.sync(hfull.iterator + hbuffer, ordinal >> 1 & 1, True)
             if lane == 0:
                 self.dwait(480, t0)  # DIAG (GRPSTAMP g2): FC2 hidden-image wait
+                if (unit >= mid) & (previous < mid):
+                    self.dstamp_at(34, t0)  # DIAG (GRPFC2): first B unit hfull wait
+                    self.dstamp(35)  # DIAG (GRPFC2): first B unit hfull got
             if (lane == 0) & (ordinal == 0):
                 self.stamp(8)
             copy_scales = Uint32(1)
@@ -734,12 +813,18 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         sfbc = tmem + 128 + 8 * stages + hbuffer * self.w2_scale_columns
         if cutlass.const_expr(pool is None):
             if ahead == 0:
+                t1 = self.dnow()
                 for i in cutlass.range_constexpr(6, 8):
                     self.acquire(accempty, (uses + i) % 16, uses + i)
+                if lane == 0:
+                    self.dwait(784, t1)  # DIAG (GRPFC2): MMA FC2 accumulator wait
                 ahead = Int32(8)
             ahead -= 1
         else:
+            t1 = self.dnow()
             self.acquire(accempty, acc, uses)
+            if lane == 0:
+                self.dwait(784, t1)  # DIAG (GRPFC2): MMA FC2 accumulator wait (pool)
         slot16 = self.slot_bytes // 16
         stage16(
             (tmem + acc * 8, a0 + slot * slot16, hd),
@@ -800,6 +885,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     unit, tile = (item // self.jobs, item % self.jobs)
                     self.fc2(sm, workspace, output, values, unit, tile, ranges)
             offset += count
+            if cutlass.const_expr(k == 0):  # DIAG (GRPFC2): FC1(A) accumulators done
+                if (thread()[2] == 0) & (thread()[1] % 4 == 0):
+                    self.dstamp(38 + eg)
             if cutlass.const_expr(k == 1):  # DIAG (GRPSTAMP): FC1 hidden stored
                 if (thread()[2] == 0) & (thread()[1] % 4 == 0):
                     self.dstamp(28 + eg)
