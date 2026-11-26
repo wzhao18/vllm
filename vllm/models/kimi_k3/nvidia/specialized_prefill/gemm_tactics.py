@@ -63,7 +63,52 @@ PINS: dict[tuple[str, int, int], str] = {
         "000001b3000000420000000100000023000000000000000000030000000000010001"
         "fef0000000010000000e0000000e00000044000e000e0000000000000000"
     ),
+    # Tile 192x128 (cuBLASLt tile 31, cluster 2x2) for the K = 7168 BF16 projections
+    # that stay BF16 on the MXFP4 checkpoint. Sustained 100-call blocks at the power
+    # cap, cold weights, A B B A vs the heuristic pick (per-call interleaved in
+    # brackets); output bitwise equal to F.linear at every searched row count:
+    # KDA in_proj_qkvgfab (TP8): 16384 rows 0.874 (0.885), 32768 rows 0.993 (0.952)
+    ("bf16", 6288, 7168): (
+        "0000001f000000420000000100000023000000000000000000050000000000000001"
+        "fef1083d00010000000e0000000e00000044000e000e0000000000000000"
+    ),
+    # shared expert gate_up (replicated, SP rows): 2048 rows 0.838 (0.914),
+    # 4096 rows 0.892 (0.930)
+    ("bf16", 12288, 7168): (
+        "0000001f000000420000000100000023000000000000000000050000000000000001"
+        "fef1083d00010000000e0000000e00000044000e000e0000000000000000"
+    ),
+    # DSA fused_qkv_a_proj: 16384 rows 0.904 (0.932), 32768 rows 0.936 (0.936)
+    ("bf16", 2112, 7168): (
+        "0000001f000000420000000100000023000000000000000000050000000000000001"
+        "fef1083d00010000000e0000000e00000044000e000e0000000000000000"
+    ),
+    # DSA g_proj (TP8): 16384 rows 0.850 (0.930), 32768 rows 0.955 (0.963)
+    ("bf16", 1536, 7168): (
+        "0000001f000000420000000100000023000000000000000000050000000000000001"
+        "fef1083d00010000000e0000000e00000044000e000e0000000000000000"
+    ),
 }
+
+# Pins that only a P/D prefill worker (model.pd_prefill_worker) takes, with the
+# fewest rows a call runs on each: the tile-192x128 set was searched and measured at
+# prefill row counts only. Elsewhere (decode instances, aggregated serving) these
+# shapes keep the stock dispatch, so decode steps and decode CUDA graph captures
+# (max_num_seqs x (k + 1) rows reach 2048 per rank) never run them. The shared
+# expert gate_up runs on one rank's SP rows (2048 at 16384 batched tokens over
+# TP8), hence its lower floor.
+PREFILL_WORKER_PINS: dict[tuple[str, int, int], int] = {
+    ("bf16", 6288, 7168): MIN_ROWS,
+    ("bf16", 12288, 7168): 2048,
+    ("bf16", 2112, 7168): MIN_ROWS,
+    ("bf16", 1536, 7168): MIN_ROWS,
+}
+
+
+def min_rows(dtype: str, n: int, k: int) -> int:
+    """Fewest rows a call of an [N, K] ``dtype`` weight runs on its pinned tactic."""
+    return PREFILL_WORKER_PINS.get((dtype, n, k), MIN_ROWS)
+
 
 _CPP_SRC = r"""
 #include <torch/extension.h>
@@ -286,9 +331,10 @@ def mm(
 
 
 class _PinnedBf16Method(UnquantizedLinearMethod):
-    """A BF16 linear on its pinned tactic at >= ``MIN_ROWS`` rows."""
+    """A BF16 linear on its pinned tactic at >= ``min_rows`` rows."""
 
     plan_id: int
+    min_rows: int
 
     def apply(
         self,
@@ -297,16 +343,17 @@ class _PinnedBf16Method(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         rows = x.numel() // x.shape[-1]
-        if rows >= MIN_ROWS and bias is None and x.dtype == torch.bfloat16:
+        if rows >= self.min_rows and bias is None and x.dtype == torch.bfloat16:
             x2 = x.reshape(rows, x.shape[-1]).contiguous()
             out = mm(self.plan_id, x2, layer.weight)
             return out.view(*x.shape[:-1], out.shape[-1])
         return super().apply(layer, x, bias)
 
 
-def enable(model: torch.nn.Module) -> int:
+def enable(model: torch.nn.Module, prefill_worker: bool) -> int:
     """Put every BF16 linear whose weight shape has a pin on its pinned tactic
-    (prefill row counts only). Returns the number switched."""
+    (prefill row counts only; the PREFILL_WORKER_PINS shapes only when
+    ``prefill_worker``). Returns the number switched."""
     switched = 0
     for module in model.modules():
         method = getattr(module, "quant_method", None)
@@ -317,6 +364,9 @@ def enable(model: torch.nn.Module) -> int:
             continue
         if weight.dtype != torch.bfloat16 or weight.dim() != 2:
             continue
+        key = ("bf16", weight.shape[0], weight.shape[1])
+        if key in PREFILL_WORKER_PINS and not prefill_worker:
+            continue
         if not weight.is_contiguous():
             continue
         plan_id = plan("bf16", weight.shape[0], weight.shape[1])
@@ -325,6 +375,7 @@ def enable(model: torch.nn.Module) -> int:
         pinned = object.__new__(_PinnedBf16Method)
         pinned.__dict__.update(method.__dict__)
         pinned.plan_id = plan_id
+        pinned.min_rows = min_rows("bf16", weight.shape[0], weight.shape[1])
         module.quant_method = pinned
         switched += 1
     return switched
