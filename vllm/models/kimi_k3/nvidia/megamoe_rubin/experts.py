@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -136,6 +137,19 @@ RUBIN_WIDE_EP_DECODE_TOKENS = 128
 # 65.6 us at 32 / 96 / 128 tokens per rank (rel-L2 vs the bf16 reference 0.166 both).
 # EP28 keeps the inference kernel (not measured).
 RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
+
+# EP sizes whose NVFP4 decode servers add the EP32 wide-EP decode bucket (GenPhase,
+# RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank, fused shared expert under specialized
+# decode) below their larger decode bucket (select_rubin_buckets). EP16 (56 experts/GPU)
+# and EP64 (14) otherwise run the inference kernel at every decode step, with a separate
+# router, the plain top-k reduce and the side-stream shared expert. Same math (the
+# shared expert's MXFP8 operands; the routed kernels' fp32 accumulation per tile).
+# VLLM_K31_EP_FUSED_DECODE=0 restores the previous buckets (A/B).
+RUBIN_FUSED_DECODE_EP_SIZES = (16, 64)
+
+
+def _fused_decode_enabled() -> bool:
+    return os.environ.get("VLLM_K31_EP_FUSED_DECODE", "1") != "0"
 
 # Prefill-sized NVFP4 inference buckets (at least RUBIN_DEDUP_MIN_TOKENS tokens per rank:
 # the P3-16 8192-token sub-call) run the refreshed inference kernel with the deduplicated
@@ -313,6 +327,26 @@ def select_rubin_buckets(
     if problem.quant_kind == "nvfp4":
         buckets = [_prefill_dedup(b) for b in buckets]
         main = _prefill_dedup(main)
+    if (
+        problem.quant_kind == "nvfp4"
+        and not prefill_worker
+        and world_size in RUBIN_FUSED_DECODE_EP_SIZES
+        and (buckets[0] if buckets else main).max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS
+        and (buckets[0] if buckets else main).variant != "genphase"
+        and _fused_decode_enabled()
+    ):
+        # EP16 / EP64 inference-kernel decode (a GenPhase server gets the bucket from
+        # enable_fused_shared instead): the EP32 wide-EP decode bucket (GenPhase, decode
+        # scheduler, RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank) below the existing
+        # ones, so SP decode shards of at most that many tokens run the src_gp kernel
+        # (ll-encoded combine + fused RMSNorm reduce, and the MXFP8 shared expert fused
+        # in by enable_fused_shared) as EP32 does. Larger steps keep their buckets.
+        buckets = [
+            RubinBucket(
+                "genphase", RUBIN_WIDE_EP_DECODE_TOKENS, RUBIN_GENPHASE_DECODE_KNOBS
+            ),
+            *buckets,
+        ]
     for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
