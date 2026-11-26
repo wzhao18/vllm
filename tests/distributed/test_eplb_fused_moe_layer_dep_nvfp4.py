@@ -65,6 +65,9 @@ def make_fused_moe_layer(
         activation="silu",
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
+        # Served models pass parallel_config.enable_eplb; the factory then gives
+        # the router the EplbLayerState that set_eplb_state() registers into.
+        enable_eplb=True,
     )
 
     # The factory builds the RoutedExperts with its own ModelOptNvFp4FusedMoE
@@ -102,6 +105,30 @@ def make_fused_moe_layer(
     nvfp4_fused_moe.process_weights_after_loading(re)
 
     return fml
+
+
+def register_eplb_state(
+    fml_layers: list[MoERunner], logical_to_physical_map: torch.Tensor
+) -> None:
+    """Register EPLB maps in every layer, as EplbState.add_model does when
+    serving (before the first forward) and after each rearrangement."""
+    num_layers, num_experts = logical_to_physical_map.shape[:2]
+    device = logical_to_physical_map.device
+    for lidx, fml in enumerate(fml_layers):
+        # enable_eplb: the factory gave the router an EplbLayerState.
+        assert fml.eplb_state is not None
+        fml.set_eplb_state(
+            lidx,
+            torch.zeros((num_layers, num_experts), dtype=torch.int32, device=device),
+            logical_to_physical_map,
+            torch.ones((num_layers, num_experts), dtype=torch.int32, device=device),
+        )
+        fml.router.eplb_state.should_record_tensor = torch.ones(
+            (), dtype=torch.bool, device=device
+        )
+        fml.router.eplb_state.num_unpadded_tokens_tensors = [
+            torch.tensor(0, dtype=torch.int32, device=device)
+        ]
 
 
 def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
@@ -150,6 +177,14 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
                     device=device,
                 )
             )
+
+        # Identity placement before the rearrangement.
+        register_eplb_state(
+            fml_layers,
+            torch.arange(test_config.num_experts, dtype=torch.int32, device=device)
+            .reshape(1, test_config.num_experts, 1)
+            .repeat(test_config.num_layers, 1, 1),
+        )
 
         out_before_shuffle = []
         with set_forward_context(
@@ -208,30 +243,7 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
 
         logical_to_physical_map = torch.stack(logical_to_physical_map_list)
 
-        for lidx, fml in enumerate(fml_layers):
-            logical_replica_count = torch.ones(
-                (test_config.num_layers, num_global_experts),
-                dtype=torch.int32,
-                device=device,
-            )
-            # enable_eplb: the factory gave the router an EplbLayerState.
-            assert fml.eplb_state is not None
-            fml.set_eplb_state(
-                lidx,
-                torch.zeros(
-                    (test_config.num_layers, num_global_experts),
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                logical_to_physical_map,
-                logical_replica_count,
-            )
-            fml.router.eplb_state.should_record_tensor = torch.ones(
-                (), dtype=torch.bool, device=device
-            )
-            fml.router.eplb_state.num_unpadded_tokens_tensors = [
-                torch.tensor(0, dtype=torch.int32, device=device)
-            ]
+        register_eplb_state(fml_layers, logical_to_physical_map)
 
         out_after_shuffle = []
         with set_forward_context(
@@ -253,16 +265,6 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
             )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Rotted through upstream MoE refactors (dc68bd8c41 #41184 MoERunner "
-        "inversion, 373fe8b83e #51078 legacy removal): with enable_eplb the "
-        "MoERunner built here has no router EplbLayerState to register. "
-        "Owner: bnellnm / upstream MoERunner refactor. Production NVFP4 MoE "
-        "is unaffected."
-    ),
-    strict=True,
-)
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("num_layers", [8])
 @pytest.mark.parametrize("num_experts", [32])
