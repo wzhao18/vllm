@@ -2454,9 +2454,10 @@ class TokenCommDedup(KernelComponent):
 
         Readiness is per (expert, token tile) (``_wait_block_copies``): the copies' pool rows come from the copy
         mailbox the dispatch fills (``copy_mailbox_offset``), and a tile is done when its FC1-done counter reaches
-        FC1 + FC2 completions. A block with K copies has no free mailbox slot and waits for the ``fc2_done`` prefix
-        of every expert up to its last copy's (the previous rule). The release point moves; the reduction order and
-        the pushed bytes do not."""
+        FC1 + FC2 completions. Any block is ready at once when every token tile of the experts up to its last copy's
+        is done (``_advance_slot_prefix``); a block with K copies has no free mailbox slot and waits for that prefix
+        (the previous rule at tile granularity). The release point moves; the reduction order and the pushed bytes
+        do not."""
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         if cutlass.const_expr(not self.token_back_enabled):
