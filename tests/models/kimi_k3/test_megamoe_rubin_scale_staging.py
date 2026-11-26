@@ -184,8 +184,10 @@ def test_native_nvfp4_checkpoint_with_generic_scales_keeps_full_planes(one_rank)
         ("kv_producer", {"megamoe_compact_scales": False}, False),
     ],
 )
-def test_auto_policy_is_prefill_role_only(role, extra, on):
-    """Auto compacts on P/D prefill workers and never on a decode instance."""
+def test_auto_policy_is_prefill_role_only(role, extra, on, monkeypatch):
+    """The previous auto policy (K31_COMPACT_SCALES_AUTO_PREFILL=1) compacts on
+    P/D prefill workers and never on a decode instance; the default auto keeps
+    full planes everywhere (PF-P3: the expansion is not hidden on DEP prefill)."""
     from types import SimpleNamespace
 
     from vllm.models.kimi_k3.nvidia.model import pd_prefill_worker
@@ -198,6 +200,10 @@ def test_auto_policy_is_prefill_role_only(role, extra, on):
             is_kv_consumer=role in ("kv_consumer", "kv_both"),
         )
     cfg = SimpleNamespace(additional_config=extra, kv_transfer_config=kv)
+    forced = "megamoe_compact_scales" in extra
+    monkeypatch.delenv("K31_COMPACT_SCALES_AUTO_PREFILL", raising=False)
+    assert S.wanted(cfg, pd_prefill_worker(cfg)) is (on if forced else False)
+    monkeypatch.setenv("K31_COMPACT_SCALES_AUTO_PREFILL", "1")
     assert S.wanted(cfg, pd_prefill_worker(cfg)) is on
 
 

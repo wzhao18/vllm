@@ -29,19 +29,22 @@ is an eager break that ends the capture segment, and a side-stream fork may not
 outlive its segment.
 
 Policy (``additional_config["megamoe_compact_scales"]``): ``"auto"`` (default)
-compacts on P/D prefill workers only (``pd_prefill_worker``: KV-bound, and a
-prefill step is long against the expansion), never on a decode instance: off for a
-``kv_consumer`` and for the specialized decode backend (``decode_backend:
-latency_specialized``, also when launched ``kv_both``), where ~17 us per layer is a
-few percent of a decode step. ``true`` / ``false`` force it (``true`` is not
-recommended for decode; a ``kv_both`` instance decoding on the stock backend
-should pass ``false``). Every MoE layer on
+keeps the full planes resident everywhere (PF-P3 11-26: on a DEP prefill worker
+the per-layer expansion is not hidden: +1.52 ms per 24-layer step at every chunk
+size, +4.3 % at 2k tokens per rank; it saves ~4.1 GiB per 24 layers of an EP16
+slice, ~16 GiB per GPU at 93 layers, for KV). ``true`` compacts (a P/D prefill
+worker short of KV; not for decode, where ~17 us per layer is a few percent of a
+step), ``false`` forces full planes. Set ``K31_COMPACT_SCALES_AUTO_PREFILL=1`` for
+the previous auto policy (compact on P/D prefill workers only: not for a
+``kv_consumer`` or the specialized decode backend). Every MoE layer on
 every EP rank compacts, or none (EPLB sizes one buffer per expert tensor from the
 first layer and moves rows between ranks): an unequal pair anywhere keeps the full
 planes, logged. Not under expert DWDP (its copies move the full planes).
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -66,6 +69,8 @@ def wanted(vllm_config, prefill_worker: bool) -> bool:
     extra = extra if isinstance(extra, dict) else {}
     value = extra.get(CONFIG_KEY, "auto")
     if value == "auto":
+        if os.environ.get("K31_COMPACT_SCALES_AUTO_PREFILL", "0") != "1":
+            return False
         kv = getattr(vllm_config, "kv_transfer_config", None)
         return (
             prefill_worker
