@@ -236,7 +236,10 @@ WIDE_POOL = {16: "257-:48"}
 
 # Wide rows' epilogue groups (``RubinVWExpertsKernel`` epi_groups: four warps each), by
 # rows; other wide rows keep 2. Same work per accumulator slot and per row: bitwise.
-WIDE_EPI = {16: ""}
+# 1 GPU, W16, real q8 routes, 4 ABAB rounds x 20 calls, exit max us 2 -> 3: M128 48.6 ->
+# 48.9, M256 71.5 -> 71.7, M384 86.5 -> 84.4, M512 98.4 -> 95.9 (grouping head on 512
+# threads -0.3..-1.0, finalize drain on 14 warps -0.3..-0.8; the FC2 phase is unchanged).
+WIDE_EPI = {16: "257-:3"}
 
 
 def wide_capacity(rows):
