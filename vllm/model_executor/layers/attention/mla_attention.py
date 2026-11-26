@@ -968,7 +968,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output
 
     def forward_tlx(
-        self, q: torch.Tensor, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output: torch.Tensor,
     ) -> torch.Tensor:
         """A token-local ShardQ step (TLX-S, ``ShardQSplit.token_local``):
         ``q`` [R, H, P + R_pe] is this rank's own rows' query with all heads,
@@ -976,10 +980,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         [T, 1, R_pe], as the replicated projections give them today). The new
         rows go into the local cache and the workspace as in ``forward``; the
         rank's rows then run W_UK, the sparse MQA and W_UV with all heads (the
-        body of ``forward_mqa_shardq_proj`` without its two exchanges).
-        Returns the value [R, H * V]. Eager only (as the ShardQ attention)."""
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata[self.layer_name]  # type: ignore[index]
+        body of ``forward_mqa_shardq_proj`` without its two exchanges), into
+        ``output`` [R, H * V]. An eager break under a breakable CUDA graph
+        capture, as the stock attention op."""
+        tlx_mla_attention_with_output(
+            q, kv_c_normed, k_pe, output, _encode_layer_name(self.layer_name)
+        )
+        return output
+
+    def _forward_tlx_impl(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
+        kv_cache: torch.Tensor,
+    ) -> None:
         shardq = getattr(attn_metadata, "shardq", None)
         if (
             not self.use_shardq
@@ -989,12 +1006,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             or shardq.num_decode_tokens
             or self.W_UK_T_shardq is None
             or self.W_UV_shardq is None
-            or torch.cuda.is_current_stream_capturing()
         ):
             raise RuntimeError("MLA forward_tlx: not a token-local DCP ShardQ step")
-        slot_mapping = forward_context.slot_mapping
+        slot_mapping = get_forward_context().slot_mapping
         assert isinstance(slot_mapping, dict)
-        kv_cache = self.kv_cache
         self.prepare_kv_cache_update(attn_metadata)
         self.update_kv_cache(
             kv_c_normed,
@@ -1028,7 +1043,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_metadata,
             self,
         )
-        return value.view(q.shape[0], -1)
+        output.view(value.shape).copy_(value)
 
     def _shardq_insert_new_rows(
         self,
@@ -2195,6 +2210,20 @@ direct_register_custom_op(
     op_func=unified_mla_kv_cache_update,
     fake_impl=unified_mla_kv_cache_update_fake,
 )
+
+
+@eager_break_during_capture
+def tlx_mla_attention_with_output(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """MLAAttention.forward_tlx's body (TLX-S token-local ShardQ step)."""
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    layer._forward_tlx_impl(q, kv_c_normed, k_pe, output, attn_metadata, kv_cache)
 
 
 @eager_break_during_capture

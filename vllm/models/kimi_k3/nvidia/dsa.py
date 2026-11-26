@@ -958,7 +958,8 @@ class KimiK3DSAAttention(nn.Module):
         indexer._fused_k_insert(wkv_all[:, : indexer.index_head_dim], W * R)
         indexer.score(kv_c_all, index_q, index_weights, None)
         wrapper.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
-        value = wrapper.mla_attn.forward_tlx(q, kv_c_all, k_pe_all.unsqueeze(1))
+        value = q.new_empty((R, q.shape[1] * self.v_head_dim))
+        wrapper.mla_attn.forward_tlx(q, kv_c_all, k_pe_all.unsqueeze(1), value)
         gate = torch.mm(hidden_states, tlx.w_g.t())
         if wrapper.gate_sigmoid_mul is not None:
             attn_out = wrapper.gate_sigmoid_mul(value, gate)
