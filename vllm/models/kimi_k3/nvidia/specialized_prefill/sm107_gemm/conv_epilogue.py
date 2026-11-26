@@ -21,6 +21,8 @@ import cutlass.pipeline as pipeline
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
+
+from . import dgs0
 from cutlass.utils.gemm.sm100 import (
     epilogue_tmem_copy_and_partition,
     transform_partitioned_tensor_layout,
@@ -1343,6 +1345,7 @@ def epilogue_kda_conv_t2(
     smem_x: Int32,
     acc_consumer_state: pipeline.PipelineState,
     acc_pipeline: pipeline.PipelineAsync,
+    dgs0_st=None,
 ) -> pipeline.PipelineState:
     """``epilogue_kda_conv_t`` without inverse norms, branch-free per 16-row
     chunk: the drain thread saves its pre-conv row when it is a block or
@@ -1402,6 +1405,8 @@ def epilogue_kda_conv_t2(
     pk = ck_on * b2i(ck >= 3) * b2i(hj >= 0) * b2i(hj < 3)
 
     acc_pipeline.consumer_wait(acc_consumer_state)
+    if cutlass.const_expr(dgs0_st is not None):
+        dgs0.st64lo(dgs0_st[0], dgs0.clk(), dgs0_st[1])
     xs_all = []
     for ni in cutlass.range_constexpr(epi_n):
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
@@ -1410,6 +1415,8 @@ def epilogue_kda_conv_t2(
     with cute.arch.elect_one():
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()
+    if cutlass.const_expr(dgs0_st is not None):
+        dgs0.st64lo(dgs0_st[0] + 4, dgs0.clk(), dgs0_st[1])
 
     pb0 = b2i(rb < 3)
     pb1 = b2i(rb >= 125)
@@ -1473,4 +1480,6 @@ def epilogue_kda_conv_t2(
                 _t2_chunk(rc - 4, r0 - 64, *args)
         else:
             _t2_chunk(rc, r0, *args)
+    if cutlass.const_expr(dgs0_st is not None):
+        dgs0.st64lo(dgs0_st[0] + 8, dgs0.clk(), dgs0_st[1])
     return acc_consumer_state

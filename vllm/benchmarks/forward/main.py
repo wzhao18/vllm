@@ -219,6 +219,10 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        if os.environ.get("DGS0_DIR"):  # DG-SOL probe S0, EXPERIMENT ONLY
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import dgs0
+
+            dgs0.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:

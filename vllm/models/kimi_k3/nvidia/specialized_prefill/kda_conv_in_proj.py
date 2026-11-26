@@ -90,10 +90,16 @@ def unsupported_reason(layer) -> str | None:
 class PrefillKdaConvInProj:
     """Fused q|k|v in_proj + conv of one KDA layer (``unsupported_reason`` None)."""
 
+    #: DG-SOL probe S0 (EXPERIMENT ONLY): construction ordinal of KDA layers.
+    _ORDINAL = [0]
+
     def __init__(self, layer) -> None:
         self.layer = layer
         self.p = layer.local_projection_size
         self._gemm = None
+        self.dgs0_ordinal = PrefillKdaConvInProj._ORDINAL[0]
+        PrefillKdaConvInProj._ORDINAL[0] += 1
+        self.dgs0_buf = None
 
     def prepare(self, max_num_seqs: int) -> None:
         """After weight loading, before any forward: views of the q|k|v and
@@ -127,6 +133,9 @@ class PrefillKdaConvInProj:
             w[:nq], s[:cut], self.conv_w, self.p, tactic=tactic_for(nq)
         )
         dev = w.device
+        from .sm107_gemm import dgs0
+
+        self.dgs0_buf = dgs0.buffer(self.dgs0_ordinal, dev)
         rows = MIN_ROWS
         x = torch.zeros((rows, k), dtype=torch.float8_e4m3fn, device=dev)
         sx = torch.full((rows * k // 32,), 127, dtype=torch.uint8, device=dev)
@@ -212,6 +221,7 @@ class PrefillKdaConvInProj:
             null_block_id=NULL_BLOCK_ID,
             checkpoint_offsets=ckpt.checkpoint_offsets if ckpt is not None else None,
             halo=halo,
+            stamps=self.dgs0_buf,
         )  # fmt: skip
         rest = torch._scaled_mm(
             qa.data,

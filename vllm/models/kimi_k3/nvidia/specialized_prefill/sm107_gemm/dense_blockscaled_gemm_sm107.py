@@ -52,6 +52,7 @@ from .conv_epilogue import (
     setmaxnreg,
 )
 from . import die_sched
+from . import dgs0
 from .situ_epilogue import epilogue_situ_mxfp8, epilogue_situ_mxfp8_drain
 from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
@@ -1496,6 +1497,21 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
+        # DG-SOL probe S0 (EXPERIMENT ONLY): per-CTA stamp record.
+        dg = cutlass.const_expr(getattr(self, "dgs0", False))
+        dg_rec = sched_die_map
+        dg_on = cutlass.Int32(0)
+        if cutlass.const_expr(dg):
+            dg_gx, dg_gy, _ = cute.arch.grid_dim()
+            dg_rec = dgs0.rec_addr(sched_die_map, bidx, bidy, bidz, dg_gx, dg_gy)
+            dg_on = cutlass.Int32(sched_die_map != cutlass.Int64(0))
+            if warp_idx == self.mma_warp_id:
+                dg_l = dg_on * cutlass.Int32(tidx % 32 == 0)
+                dgs0.st64lo(dg_rec + 4 * dgs0.W_ENTRY_GT, dgs0.gtime(), dg_l)
+                dgs0.st64lo(dg_rec + 4 * dgs0.W_ENTRY_CLK, dgs0.clk(), dg_l)
+                dgs0.st32(dg_rec + 4 * dgs0.W_SMID, dgs0.smid(), dg_l)
+                dgs0.st32(dg_rec + 4 * dgs0.W_LEADER, cutlass.Int32(is_leader_cta), dg_l)
+
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
@@ -2079,6 +2095,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     if is_leader_cta:
                         acc_pipeline.producer_acquire(acc_producer_state)
+                    if cutlass.const_expr(dg):
+                        dg_ml = dg_on * cutlass.Int32(tidx % 32 == 0) * cutlass.Int32(is_leader_cta)
+                        dg_mt = dg_rec + cutlass.Int64(4) * cutlass.Int64(
+                            dgs0.W_MMA + 4 * dgs0.tile_slot(tile_sched.num_tiles_executed)
+                        )
+                        dgs0.st64lo(dg_mt, dgs0.clk(), dg_ml)
 
                     # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or 64
                     tCtSFB_mma = tCtSFB
@@ -2102,6 +2124,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         if is_leader_cta:
                             # Conditionally wait for AB buffer full
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                            if cutlass.const_expr(dg):
+                                dg_c = dgs0.clk()
+                                dgs0.st64lo(dg_mt + 4, dg_c, dg_ml * cutlass.Int32(k_tile == 0))
+                                dgs0.st64lo(
+                                    dg_mt + 8, dg_c, dg_ml * cutlass.Int32(k_tile == k_tile_cnt - 1)
+                                )
                             tCtSFA_k = tCtSFA
                             tCtSFB_k = tCtSFB_mma
                             sfa_s2t_k = sfa_s2t_bundle
@@ -2229,6 +2257,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     if is_leader_cta:
                         acc_pipeline.producer_commit(acc_producer_state)
+                    if cutlass.const_expr(dg):
+                        dgs0.st64lo(dg_mt + 12, dgs0.clk(), dg_ml)
                     acc_producer_state.advance()
 
                     #
@@ -2246,12 +2276,24 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Wait for accumulator buffer empty
                 #
                 acc_pipeline.producer_tail(acc_producer_state)
+                if cutlass.const_expr(dg):
+                    dg_l = dg_on * cutlass.Int32(tidx % 32 == 0)
+                    dgs0.st32(
+                        dg_rec + 4 * dgs0.W_MMA_TILES,
+                        cutlass.Int32(tile_sched.num_tiles_executed),
+                        dg_l,
+                    )
+                    dgs0.st32(dg_rec + 4 * dgs0.W_KTILES, cutlass.Int32(k_tile_cnt), dg_l)
         #
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
             if cutlass.const_expr(getattr(self, "reg_split", None) is not None):
                 setmaxnreg(True, self.reg_split[0])
+            if cutlass.const_expr(dg):
+                dgs0.st64lo(
+                    dg_rec + 4 * dgs0.W_EPI_ENTRY_CLK, dgs0.clk(), dg_on * cutlass.Int32(tidx == 0)
+                )
             #
             # Alloc tensor memory buffer
             #
@@ -2316,6 +2358,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         and getattr(self, "conv_t2", False)
                         and not self.conv_norms
                     ):
+                        dg_st = None
+                        if cutlass.const_expr(dg):
+                            dg_st = (
+                                dg_rec + cutlass.Int64(4) * cutlass.Int64(
+                                    dgs0.W_EPI
+                                    + 3 * dgs0.tile_slot(tile_sched.num_tiles_executed - 1)
+                                ),
+                                dg_on * cutlass.Int32(tidx == 0),
+                            )
                         acc_consumer_state = epilogue_kda_conv_t2(
                             self,
                             tidx,
@@ -2334,6 +2385,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             conv_smem,
                             acc_consumer_state,
                             acc_pipeline,
+                            dgs0_st=dg_st,
                         )  # fmt: skip
                     elif cutlass.const_expr(getattr(self, "conv_drain", False)):
                         acc_consumer_state = epilogue_kda_conv_t(
@@ -2516,6 +2568,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         c_pipeline,
                     )
 
+            if cutlass.const_expr(dg):
+                dg_e = dg_on * cutlass.Int32(tidx == 0)
+                dgs0.st64lo(dg_rec + 4 * dgs0.W_EPI_END_CLK, dgs0.clk(), dg_e)
+                dgs0.st32(
+                    dg_rec + 4 * dgs0.W_EPI_TILES, cutlass.Int32(tile_sched.num_tiles_executed), dg_e
+                )
             c_pipeline.producer_tail()
 
             #
@@ -2523,6 +2581,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
+            if cutlass.const_expr(dg):
+                dgs0.st64lo(dg_rec + 4 * dgs0.W_EXIT_GT, dgs0.gtime(), dg_e)
+                dgs0.st64lo(dg_rec + 4 * dgs0.W_EXIT_CLK, dgs0.clk(), dg_e)
         if cutlass.const_expr(die):
             # Peers signal the leader's claim barriers until their last
             # claim: no CTA of the cluster may exit before all are done.

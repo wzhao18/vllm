@@ -82,6 +82,9 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         )
         self.conv_norms = norms
         self.conv_drain = conv and drain
+        # DG-SOL probe S0 (EXPERIMENT ONLY): stamps in the conv GEMM; the
+        # record pointer rides in sched_die_map (unused without die_sched).
+        self.dgs0 = conv and not self.die_sched
         if self.conv_drain or self.epi_drain:
             # Two warp groups drain the two M blocks of the B-reuse tile.
             self.epilog_warp_id = tuple(range(8))
@@ -247,7 +250,7 @@ class KdaConvGemm:
         self._compiled = {}
 
     def _kernel(self, norms, args, problem, tail, conv, stream):
-        key = ("conv", self.tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
+        key = ("conv-dgs0", self.tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
         fn = self._compiled.get(key) or _COMPILED.get(key)
         if fn is None:
             gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
@@ -278,6 +281,7 @@ class KdaConvGemm:
     def __call__(
         self, x, x_scale, conv_state, qsl, lines, has_init, with_norms=False,
         null_block_id: int | None = None, checkpoint_offsets=None, halo=None,
+        stamps=None,
     ):  # fmt: skip
         """``checkpoint_offsets`` (int32, one per sequence, 0 = none) with
         ``halo`` (BF16 ``(nseq, 3, N)``): the epilogue also writes the three
@@ -327,9 +331,10 @@ class KdaConvGemm:
             cutlass.Int32(nseq),
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
-            # sched_ctr, sched_die_map (unused), then the checkpoint halo.
+            # sched_ctr, sched_die_map (DG-SOL S0 stamp records), then the
+            # checkpoint halo.
             cutlass.Int64(0),
-            cutlass.Int64(0),
+            cutlass.Int64(stamps.data_ptr() if stamps is not None else 0),
             cutlass.Int64(ckpt_ptr),
             cutlass.Int64(halo_ptr),
         )
