@@ -110,6 +110,41 @@ def test_persistent_prefill_matches_flashkda(lens, heads):
     assert _rel_rms(state, fs) < 2e-2
 
 
+@pytest.mark.parametrize("lens,heads", [([2048] * 8, 12), ([300, 1, 1029], 12)])
+def test_persistent_prefill_beta_view_bitwise(lens, heads):
+    """The KDA layer hands the persistent core its beta as a column view of
+    the fused prefill in_proj output (row stride 1680 at the TP8 shard: q|k|v
+    planes aside, g | f_a | beta | pad) instead of a dense copy: output and
+    final state bitwise equal to the dense beta."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.persistent_supported(torch.device("cuda")):
+        pytest.skip("CuTe DSL not installed")
+    torch.manual_seed(3)
+    T, N, H = sum(lens), len(lens), heads
+    bf = torch.bfloat16
+    offs = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    cu_cpu = torch.tensor(offs, dtype=torch.int32)
+    cu = cu_cpu.cuda()
+    q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+    v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+    rest = torch.randn(T, H * D + D + H + 4, device="cuda").to(bf)
+    beta_view = rest[:, H * D + D : H * D + D + H].unsqueeze(0)
+    assert not beta_view.is_contiguous()
+    A_log = torch.randn(H, device="cuda") * 0.5
+    dt_bias = torch.randn(H * D, device="cuda") * 0.1
+    h0 = torch.randn(N, H, D, D, device="cuda") * 0.1
+    o_ref, fs_ref = sp_kda.persistent_prefill(
+        q, k, v, g, beta_view.contiguous(), A_log, dt_bias, -5.0, h0, cu, cu_cpu
+    )
+    o, fs = sp_kda.persistent_prefill(
+        q, k, v, g, beta_view, A_log, dt_bias, -5.0, h0, cu, cu_cpu
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(o, o_ref)
+    assert torch.equal(fs, fs_ref)
+
+
 @pytest.mark.parametrize(
     "lens,heads", [([300, 1, 1029], 8), ([5461] * 3, 96), ([300, 1, 1029], 12)]
 )

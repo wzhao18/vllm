@@ -149,6 +149,17 @@ def warm_persistent(H: int, device: torch.device, lower_bound: float) -> None:
 _persistent_warmed: set = set()
 
 
+def _beta_rows(beta: torch.Tensor, T: int, H: int) -> torch.Tensor:
+    """beta for the persistent kernel: its per-element loads (H % 8 != 0, e.g.
+    the TP8 shard's 12 heads) read any row stride, so a row-strided view (the
+    KDA in_proj output's beta columns) goes in uncopied; the beta TMA path
+    (H % 8 == 0) takes dense rows."""
+    beta = beta.reshape(1, T, H)
+    if H % 8 == 0 or beta.stride(-1) != 1:
+        beta = beta.contiguous()
+    return beta
+
+
 def persistent_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -259,7 +270,7 @@ def persistent_prefill(
         k.contiguous(),
         v.contiguous(),
         g.contiguous(),
-        beta.reshape(1, T, H).contiguous(),
+        _beta_rows(beta, T, H),
         D**-0.5,
         out,
         A_log,
@@ -363,7 +374,7 @@ def _persistent_prefill_cut(
         k.contiguous(),
         v.contiguous(),
         g.contiguous(),
-        beta.reshape(1, T, H).contiguous(),
+        _beta_rows(beta, T, H),
         D**-0.5,
         out,
         A_log,

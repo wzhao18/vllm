@@ -116,6 +116,14 @@ def _get_compiled(
             mode=0
         )
 
+        def beta_rows_fake():
+            return cute.runtime.make_fake_tensor(
+                cutlass.BFloat16,
+                shape=(cute.sym_int(), H),
+                stride=(cute.sym_int64(), 1),
+                assumed_align=2,
+            )
+
         def qkv_fake():
             return cute.runtime.make_fake_tensor(
                 cutlass.BFloat16,
@@ -188,7 +196,9 @@ def _get_compiled(
                 qkv_fake(),
                 qkv_fake(),
                 mk(g),
-                mk(beta, 4),
+                # The per-element beta loads (no TMA) take any row stride: a
+                # column view of the KDA in_proj output goes in uncopied.
+                mk(beta, 4) if beta_tma else beta_rows_fake(),
                 from_dlpack(alog, assumed_align=16),
                 from_dlpack(dtb, assumed_align=16),
                 mk(st),

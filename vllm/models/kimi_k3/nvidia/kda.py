@@ -1066,6 +1066,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
         checkpoint_rows = None
+        beta_view = False
         if (
             qa is None
             and 0 < num_tokens <= self._projection_overlap_max_tokens
@@ -1100,7 +1101,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 [self.local_projection_size, self.head_dim, self.local_num_heads],
                 dim=-1,
             )[:3]
-            beta = contiguous_rows(beta)
+            # beta stays a column view of the fused in_proj output: the
+            # persistent prefill kernel reads it in place, every other core
+            # gets a dense copy (_forward dense_beta).
+            beta_view = not beta.is_contiguous()
             g1 = self.f_b_proj(f_a)[0]
         else:
             projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
@@ -1142,6 +1146,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
             o_mxfp8=o_mxfp8,
             checkpoint_rows=checkpoint_rows,
+            beta_view=beta_view,
         )
         if resid_prefix is not None:
             gemm = attn_res_resid.gemm_for(self.o_proj)
@@ -1299,6 +1304,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         o_mxfp8: Mxfp8Buffer | None = None,
         checkpoint_rows: CheckpointRows | None = None,
+        beta_view: bool = False,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1343,6 +1349,22 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
+
+        def dense_beta(b: torch.Tensor) -> torch.Tensor:
+            # beta_view: the fused prefill in_proj's beta columns (a row-strided
+            # view). The persistent prefill kernel reads them in place (any row
+            # stride); every other core takes the dense copy forward() made
+            # before.
+            return contiguous_rows(b[0]).unsqueeze(0) if beta_view else b
+
+        if beta_view and not (
+            self._kda_persistent
+            and m.num_prefills > 0
+            and m.num_decodes == 0
+            and not has_spec_decode
+        ):
+            beta = dense_beta(beta)
+            beta_view = False
 
         conv_state, recurrent_state = self.kv_cache[:2]
         # The convolution kernels consume (..., dim, width - 1).
@@ -1719,7 +1741,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             k=k_ns,
                             v=v_ns,
                             g=g1_ns,
-                            beta=beta_ns,
+                            beta=dense_beta(beta_ns),
                             A_log=self.A_log,
                             dt_bias=self.dt_bias,
                             lower_bound=self.gate_lower_bound,
@@ -1755,7 +1777,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             k=k_ns,
                             v=v_ns,
                             g=g1_ns,
-                            beta=beta_ns,
+                            beta=dense_beta(beta_ns),
                             A_log=self.A_log,
                             dt_bias=self.dt_bias,
                             lower_bound=self.gate_lower_bound,
@@ -1837,7 +1859,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     k=k_ns,
                                     v=v_ns,
                                     g=g1_ns,
-                                    beta=beta_ns,
+                                    beta=dense_beta(beta_ns),
                                     A_log=self.A_log,
                                     dt_bias=self.dt_bias,
                                     lower_bound=self.gate_lower_bound,
@@ -1865,7 +1887,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             k=k_ns,
                             v=v_ns,
                             g=g1_ns,
-                            beta=beta_ns,
+                            beta=dense_beta(beta_ns),
                             A_log=self.A_log,
                             dt_bias=self.dt_bias,
                             lower_bound=self.gate_lower_bound,
@@ -1897,7 +1919,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         k=k_ns,
                         v=v_ns,
                         raw_g=g1_ns,
-                        raw_beta=beta_ns,
+                        raw_beta=dense_beta(beta_ns),
                         A_log=self.A_log,
                         dt_bias=self.dt_bias,
                         lower_bound=self.gate_lower_bound,
@@ -1915,7 +1937,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         k=k_ns,
                         v=v_ns,
                         raw_g=g1_ns,
-                        raw_beta=beta_ns,
+                        raw_beta=dense_beta(beta_ns),
                         A_log=self.A_log,
                         g_bias=self.dt_bias,
                         lower_bound=self.gate_lower_bound,
@@ -1956,7 +1978,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ) = fused_recurrent_kda_packed_decode(
                     mixed_qkv=mixed_qkv_ns,
                     raw_g=g1_ns,
-                    raw_beta=beta_ns,
+                    raw_beta=dense_beta(beta_ns),
                     A_log=self.A_log,
                     dt_bias=self.dt_bias,
                     lower_bound=self.gate_lower_bound,
