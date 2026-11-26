@@ -902,6 +902,73 @@ class KimiK3DSAAttention(nn.Module):
             return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
         return self._o_proj(_gate_sigmoid_mul(attn_out, gate))
 
+    def forward_tlx(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """TLX-S (``ops/tlx_dsa.py``): the layer on this rank's own SP rows
+        ``hidden_states`` [R, hidden] of a token-local ShardQ step -> its output
+        rows [R, hidden] (no SP all-gather before, no reduce-scatter after).
+
+        Same math as the stock layer on these rows: the replicated q_a | kv_a
+        and wkv_index projections on R rows, the new rows of every rank
+        exchanged (BF16, as computed) and inserted with the stock kernels, q_b /
+        g_proj / o_proj with the full (staged) weights; o_proj accumulates its
+        K = 12288 in FP32 in one GEMM (stock: per-rank BF16 partials + reduce).
+        """
+        from vllm.models.common.ops import fused_q_kv_rmsnorm
+        from vllm.models.kimi_k3.nvidia.ops import tlx_dsa
+
+        tlx = tlx_dsa.get()
+        assert tlx is not None
+        wrapper = self.mla_attn
+        indexer = self.dsa_indexer
+        R = hidden_states.shape[0]
+        W = tlx.world
+        send_kv, send_pe, send_wkv = tlx.send_rows(R)
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if wrapper.fuse_qkv_rmsnorm:
+            q_c, kv_c_normed = fused_q_kv_rmsnorm(
+                q_c,
+                kv_c,
+                self.q_a_layernorm.weight.data,
+                self.kv_a_layernorm.weight.data,
+                self.q_a_layernorm.variance_epsilon,
+            )
+        else:
+            kv_c_normed = self.kv_a_layernorm(kv_c)
+            q_c = self.q_a_layernorm(q_c)
+        send_kv.copy_(kv_c_normed)
+        send_pe.copy_(k_pe)
+        wkv = indexer.wkv_index.weight
+        if wkv.dtype == hidden_states.dtype and tuple(wkv.shape) == tuple(send_wkv.shape[::-1]):
+            torch.mm(hidden_states, wkv.t(), out=send_wkv)
+        else:
+            send_wkv.copy_(indexer.wkv_index(hidden_states)[0])
+        # Weights + every rank's new rows; returns once all landed here.
+        tlx.push(self.q_b_proj.weight, self.g_proj.weight, self.o_proj.weight, R)
+        kv_c_all, k_pe_all, wkv_all = tlx.recv_rows(R)
+        q = tlx.gemm("qb", q_c, q_c.new_empty((R, tlx_dsa.QB_N))).view(R, -1, self.qk_head_dim)
+        # Indexer: this rank's query rows, every rank's keys (fused insert).
+        index_q = indexer.wq_index(q_c)[0].view(
+            -1, indexer.index_num_heads, indexer.index_head_dim
+        )
+        index_weights = send_wkv[:, indexer.index_head_dim :]
+        indexer._fused_k_insert(wkv_all[:, : indexer.index_head_dim], W * R)
+        indexer.score(kv_c_all, index_q, index_weights, None)
+        wrapper.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+        value = q.new_empty((R, q.shape[1] * self.v_head_dim))
+        wrapper.mla_attn.forward_tlx(q, kv_c_all, k_pe_all.unsqueeze(1), value)
+        gate = tlx.gemm("g", hidden_states, hidden_states.new_empty((R, tlx_dsa.G_N)))
+        if wrapper.gate_sigmoid_mul is not None:
+            attn_out = wrapper.gate_sigmoid_mul(value, gate)
+        else:
+            attn_out = _gate_sigmoid_mul(value, gate)
+        out = torch.mm(attn_out, tlx.w_o.t())
+        tlx.release()
+        return out
+
     def _fused_o_proj(self, attn_out: torch.Tensor) -> bool:
         return self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out)
 
