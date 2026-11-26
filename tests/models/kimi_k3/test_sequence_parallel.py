@@ -67,6 +67,13 @@ def _mock_sequence_parallel_collectives(monkeypatch):
         "sp_all_gather",
         lambda tensor: torch.cat([tensor, tensor], dim=0),
     )
+    # The decoder layer gathers through the Kimi SP all-gather (symmetric-memory
+    # push, else the stock all-gather), not the module-level sp_all_gather.
+    monkeypatch.setattr(
+        kimi_model.sp_ag,
+        "kimi_sp_all_gather",
+        lambda tensor: torch.cat([tensor, tensor], dim=0),
+    )
 
 
 @pytest.mark.parametrize(
@@ -122,6 +129,7 @@ def test_moe_sequence_parallel_requires_data_parallel(
 def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
     layer = object.__new__(kimi_model.KimiDecoderLayer)
     nn.Module.__init__(layer)
+    layer.layer_idx = 0  # AttnRes call index (2 * layer_idx [+ 1])
     layer.use_attn_res = False
     layer.use_sequence_parallel = True
     layer.input_layernorm = _IdentityNorm()
@@ -130,7 +138,10 @@ def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
     monkeypatch.setattr(
         layer,
         "_run_self_attn",
-        MethodType(lambda self, positions, hidden_states: hidden_states, layer),
+        MethodType(
+            lambda self, positions, hidden_states, resid_prefix=None: hidden_states,
+            layer,
+        ),
     )
 
     _mock_sequence_parallel_collectives(monkeypatch)
@@ -162,11 +173,13 @@ def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
 def test_kimi_attn_residual_states_stay_sequence_sharded(monkeypatch):
     layer = object.__new__(kimi_model.KimiDecoderLayer)
     nn.Module.__init__(layer)
+    layer.layer_idx = 0  # AttnRes call index (2 * layer_idx [+ 1])
     layer.use_attn_res = True
     layer.use_sequence_parallel = True
     layer.prev_valid_blocks = 0
     layer.block_write_idx = 0
     layer.is_block_write_layer = False
+    layer._aux_prefix_out = None  # no DSpark aux capture this forward
     layer.input_layernorm = _IdentityNorm()
     layer.post_attention_layernorm = _IdentityNorm()
     layer.self_attention_res_norm = _IdentityNorm()
@@ -177,7 +190,10 @@ def test_kimi_attn_residual_states_stay_sequence_sharded(monkeypatch):
     monkeypatch.setattr(
         layer,
         "_run_self_attn",
-        MethodType(lambda self, positions, hidden_states: hidden_states, layer),
+        MethodType(
+            lambda self, positions, hidden_states, resid_prefix=None: hidden_states,
+            layer,
+        ),
     )
 
     _mock_sequence_parallel_collectives(monkeypatch)
