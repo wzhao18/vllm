@@ -455,8 +455,9 @@ __global__ void __launch_bounds__(32, 1) px_a2a_kernel(
   asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" :: "l"(own), "r"(0u - target) : "memory");
 }
 
-// PX arm D marker: an empty kernel that tags the stand-in GEMMs after it in the trace (px_an.py).
-__global__ void px_mark_kernel(int id) {}
+// PX arm D marker: an empty kernel whose name (px_mark_kernel<ID>) tags the stand-in GEMMs after it in the trace.
+template <int ID>
+__global__ void px_mark_kernel() {}
 
 typedef CUresult (*PxEncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                                const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
@@ -516,7 +517,14 @@ void px_a2a(int64_t src, int64_t src_sf, int64_t R, int64_t gh, std::vector<int6
 }
 
 void px_mark(int64_t id) {
-  px_mark_kernel<<<1, 32, 0, tp_cur()>>>((int)id);
+  switch (id) {
+    case 1: px_mark_kernel<1><<<1, 32, 0, tp_cur()>>>(); break;
+    case 2: px_mark_kernel<2><<<1, 32, 0, tp_cur()>>>(); break;
+    case 3: px_mark_kernel<3><<<1, 32, 0, tp_cur()>>>(); break;
+    case 4: px_mark_kernel<4><<<1, 32, 0, tp_cur()>>>(); break;
+    case 5: px_mark_kernel<5><<<1, 32, 0, tp_cur()>>>(); break;
+    default: px_mark_kernel<0><<<1, 32, 0, tp_cur()>>>(); break;
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
