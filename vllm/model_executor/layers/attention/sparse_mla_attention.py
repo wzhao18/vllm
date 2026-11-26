@@ -1214,7 +1214,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         q = shard_q(
             q[num_decode_tokens:],
             shardq.split,
-            padded_heads=self.shardq_query_heads(num_heads),
+            padded_heads=self.shardq_query_heads(num_heads, shardq.split.num_local),
         )
         out = self._attend_shardq(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         out = unshard_out(
@@ -1288,17 +1288,14 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             # The token slice's output goes straight back to the head shards:
             # the LSE (and the empty-row masking that comes with it) is never
             # read.
-            out, _ = self._forward_mqa_kernel(
+            return self.attend_shardq_rows(
                 q[rows],
                 kv_c_and_k_pe_cache,
                 physical_topk,
                 valid_counts,
                 layer=layer,
                 block_size=block_size,
-                is_decode=False,
-                return_lse=False,
             )
-            return out
 
         if context is None or context.num_groups == 1:
             out = attend(slice(None))
@@ -1366,7 +1363,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         num_local = q.shape[0]
         ql_nope = q.new_empty((num_local, num_heads, lora))
         torch.bmm(q[..., :nope].transpose(0, 1), w_uk_t, out=ql_nope.transpose(0, 1))
-        padded_heads = self.shardq_query_heads(num_heads)
+        padded_heads = self.shardq_query_heads(num_heads, num_local)
         mqa_q = _shardq_query_quant_pad(ql_nope, q[..., nope:], q_scale, padded_heads)
         del ql_nope
         out = self._attend_shardq(mqa_q, kv_c_and_k_pe_cache, attn_metadata, layer)
@@ -1393,10 +1390,36 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         """``return_lse`` None means ``need_to_return_lse_for_decode``."""
         raise NotImplementedError
 
-    def shardq_query_heads(self, num_heads: int) -> int:
-        """Heads the MQA kernel runs a ShardQ token slice of ``num_heads``
-        query heads with; ShardQ receives the query zero-padded to them."""
+    def shardq_query_heads(self, num_heads: int, num_rows: int = 0) -> int:
+        """Heads the MQA kernel runs a ShardQ token slice of ``num_rows`` rows
+        and ``num_heads`` query heads with; ShardQ receives the query
+        zero-padded to them (``num_rows`` 0: the largest padding)."""
         return num_heads
+
+    def attend_shardq_rows(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        physical_topk: torch.Tensor,
+        valid_counts: torch.Tensor,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+    ) -> torch.Tensor:
+        """The sparse MQA of ShardQ token rows ``q`` [T, H_kernel, D] over their
+        physical top-k slots: the latent [T, H_kernel, L]. The output goes
+        straight back to the head shards, so no LSE."""
+        out, _ = self._forward_mqa_kernel(
+            q,
+            kv_cache,
+            physical_topk,
+            valid_counts,
+            layer=layer,
+            block_size=block_size,
+            is_decode=False,
+            return_lse=False,
+        )
+        return out
 
     @staticmethod
     def masked_mha_workspace_fits(prefill: MLACommonPrefillMetadata) -> bool:
