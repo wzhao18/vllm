@@ -785,6 +785,22 @@ class SymmSpAllGather:
             assert need <= self.px_tail_bytes, f"K31_PX: shadow {need} B > slot tail {self.px_tail_bytes} B"
             logger.warning("K31_PX=%s: slot tail %d B from byte %d (max_rows %d), allocates nothing",
                            ",".join(sorted(_PX)), self.px_tail_bytes, self.px_tail, max_rows)
+            if "dgemm" in _PX:
+                # Compile + load the D-arm KDA o_proj stand-in now (128 rows on tail garbage): not inside a step.
+                from types import SimpleNamespace
+
+                from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_resid
+
+                a = self._px_raw(0, _PX_A2A_OFF, 128 * 12288 + 128 * 384)
+                wsf = self._px_raw(0, self.px_tail_bytes - _PX_WSF_OFF_FROM_END, _PX_WSF_BYTES)
+                wsf.fill_(119)
+                w = self._px_raw(0, 0, 7168 * 12288).view(torch.float8_e4m3fn).view(7168, 12288)
+                rg = self.px_rg[0] = attn_res_resid.ResidGemm.from_rows(w, wsf)
+                rg.store_into(
+                    SimpleNamespace(data=a[: 128 * 12288].view(torch.float8_e4m3fn).view(128, 12288),
+                                    scale=a[128 * 12288 :]),
+                    self._px_raw(1, 0, 128 * 7168 * 2).view(torch.bfloat16).view(128, 7168),
+                )
         torch.accelerator.synchronize()
         self.handle.barrier()
 
