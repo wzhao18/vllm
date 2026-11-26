@@ -54,6 +54,7 @@ from ..common.primitives import (
     redux,
     shared_address,
     situ,
+    sleep_ns,
     smem_desc,
     smem_words,
     store_shared_words,
@@ -610,9 +611,9 @@ class RubinExpertsKernel(ExpertsKernel):
                     mine[j] = Int32(words[j])
                 armed = (mine[0] == -1) | (mine[1] == -1)
                 armed = armed | (mine[2] == -1) | (mine[3] == -1)
-                # No sleep between polls (HT-EXPERTS I1): the ids land mid-sleep and
-                # a sleep adds its residue to the head; one warp's 512 B of L2 reads.
                 ready = cute.arch.vote_all_sync((not valid) | (not armed))
+                if not ready:
+                    sleep_ns(32)
                 sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
             if not valid:
                 for j in cutlass.range_constexpr(4):
@@ -1483,8 +1484,9 @@ class RubinExpertsKernel(ExpertsKernel):
                 ready = False
                 sgn, sgt = spin_start()
                 while not ready:
-                    # No sleep between polls (HT-EXPERTS I2), as the ids poll.
                     ready = load_acquire(source + 128) == Uint32(2 * self.capacity - 1)
+                    if not ready:
+                        sleep_ns(64)
                     sgn, sgt = spin_tick(sgn, sgt, observed=0, target=0)
                 xcount = view(sm.iterator, self.off_misc + self.bar_xcount, Uint64, 1)
                 cute.arch.mbarrier_arrive(xcount.iterator)
