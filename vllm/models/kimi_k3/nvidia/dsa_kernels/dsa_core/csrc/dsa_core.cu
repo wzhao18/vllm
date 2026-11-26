@@ -278,7 +278,18 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   float* sLp = sMp + HG;
   float* sAp = sLp + HG;
   __shared__ int s_n;
-  long long* dbg = p.dbg ? p.dbg + ((int64_t)(t * G + grp) * S + sp) * 24 : nullptr;
+  // DIAG (DSTAMP arm, never merge): dbg is a device call ring [DSAC_RING, DSAC_MAXC, 24]
+  // + [DSAC_MAXC] u32 counters (common/dsadiag.py); CTA c's call = counter[c]++ % RING.
+  long long* dbg = nullptr;
+  if (p.dbg && tid == 0) {
+    constexpr int DSAC_RING = 64, DSAC_MAXC = 2048;
+    const int64_t c = (int64_t)(t * G + grp) * S + sp;
+    if (c < DSAC_MAXC) {
+      unsigned* ctr = reinterpret_cast<unsigned*>(p.dbg + (int64_t)DSAC_RING * DSAC_MAXC * 24) + c;
+      const unsigned call = atomicAdd(ctr, 1u) % DSAC_RING;
+      dbg = p.dbg + ((int64_t)call * DSAC_MAXC + c) * 24;
+    }
+  }
   if (dbg && tid == 0) dbg[0] = now_ns();
 
   // ---- query tile [HG, 576] FP8 from the q mailbox (polled: no PDL dependency). Split
@@ -507,7 +518,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       const int nh = min(2, nchunks - c);  // chunks of this tile
       cp_wait<0>();
       __syncthreads();
-      if (dbg && tid == 0 && c == 0) dbg[10] = clock64();
+      if (dbg && tid == 0 && c == 0) { dbg[10] = clock64(); dbg[14] = now_ns(); }
       // ---- S = Q K^T of the tile's chunks (FP8, FP32 accumulation, 3 chains; fragments
       // loaded 2 steps ahead) into S columns [64 h, +64); HG = 32: warp (m-tile w >> 3,
       // n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3)
@@ -548,7 +559,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
       cast_v(c);  // (chunk c's V while the softmax waits for every warp's S)
       __syncthreads();
-      if (dbg && tid == 0 && c == 0) dbg[11] = clock64();
+      if (dbg && tid == 0 && c == 0) { dbg[11] = clock64(); dbg[15] = now_ns(); }
       // ---- softmax of the tile's 128 keys (base 2), one running max step of the piece
       // (trtllm-gen's KV CTA): m = max(m_piece, tile max), P = E4M3(448 x 2^(s - m)),
       // the piece's sum from the unquantized P (l_p = l_p 2^(m_old - m) + sum, P V
@@ -599,7 +610,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         }
       }
       __syncthreads();
-      if (dbg && tid == 0 && c == 0) dbg[12] = clock64();
+      if (dbg && tid == 0 && c == 0) { dbg[12] = clock64(); dbg[16] = now_ns(); }
       // the piece's P V: zero at its first tile, else rescaled to the new running max
       if (!P || jt == 0) {
 #pragma unroll
@@ -631,7 +642,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       // (trtllm-gen's multi-CTA partial; kv_ctas == 1: no split, no rounding), joins the
       // row's FP32 O at its running max
       if (piece_end) acc_fold(sA, sB);
-      if (dbg && tid == 0 && c == 0) dbg[13] = clock64();
+      if (dbg && tid == 0 && c == 0) { dbg[13] = clock64(); dbg[17] = now_ns(); }
     }
   };
   // ---- the one-pass form of S = 2 solo rows (dsplit, kp == 1, <= 3 chunks); HG = 16
@@ -660,7 +671,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     cp_commit();
     cp_wait<0>();
     __syncthreads();
-    if (dbg && tid == 0) dbg[10] = clock64();
+    if (dbg && tid == 0) { dbg[10] = clock64(); dbg[14] = now_ns(); }
     // ---- S = Q K^T of every chunk: warp (n-tile w & 7, k-half w >> 3), as the loop
     {
       const int nt = warp & 7, kh = warp >> 3;
@@ -696,7 +707,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
     }
     __syncthreads();
-    if (dbg && tid == 0) dbg[11] = clock64();
+    if (dbg && tid == 0) { dbg[11] = clock64(); dbg[15] = now_ns(); }
     // ---- softmax of tile 0 (chunks 0, 1) and tile 1 (chunk 2), each its own piece:
     // warp w head w, lane l keys l + 32 k (the loop's per-tile arithmetic)
     {
@@ -793,7 +804,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
     }
     __syncthreads();
-    if (dbg && tid == 0) dbg[12] = clock64();
+    if (dbg && tid == 0) { dbg[12] = clock64(); dbg[16] = now_ns(); }
     // ---- P V: tile 0 then tile 1, each folded into the row as the loop does
     auto pv1 = [&](int c, const __half* pb, int pstr) {
       if ((warp >> 3) != sp) return;  // (the other CTA's latent dims)
@@ -839,7 +850,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       pv1(2, sP1, kP1Str);
       acc_fold(sMp, sLp);
     }
-    if (dbg && tid == 0) dbg[13] = clock64();
+    if (dbg && tid == 0) { dbg[13] = clock64(); dbg[17] = now_ns(); }
   };
   // S = 2 solo rows of at most 3 chunks (2 tiles; each its own piece, kp == 1, or one
   // piece, kp == 2: trtllm-gen's single KV CTA): one pass instead of the per-tile loop.

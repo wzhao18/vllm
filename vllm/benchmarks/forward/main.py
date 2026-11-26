@@ -239,6 +239,12 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         _rank = _os.environ.get("SLURM_PROCID", _os.environ.get("RANK", "0"))
         routediag.dump(f"{_d}/{_run}/{case.name}.rank{_rank}.route.pt")
         routediag.reset()
+        # DIAG (DSTAMP, never merge): cross-rank clock sync + anchor + DSA chain rings
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            dsadiag,
+        )
+
+        dsadiag.dump(case.name)
         if fixture is not None:
             fixture.check_applied()
     finally:

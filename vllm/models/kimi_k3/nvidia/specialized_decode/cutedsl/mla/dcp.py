@@ -25,6 +25,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from vllm.logger import init_logger
 
+from ..common import dsadiag as dd  # DIAG (DSTAMP arm, never merge)
 from ..common.host import check_residency, fake
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -1084,6 +1085,15 @@ class DcpValue:
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         v = 32 * (warp // 4) + 8 * (warp % 4) + group
+        # DIAG (DSTAMP): per-CTA ring "dcpv" (pushed only: the DSA core's tail). Slots:
+        # 0 entry, 1 PDL wait returned, 2 polled-split wait, 3 trigger, 4 LSEs landed,
+        # 5 partials polled + merged, 6 %smid, 7 end.
+        dctas = self.grid[0] * self.grid[1] * self.grid[2]
+        dcta = (pusher * self.grid[1] + tile) * H + head
+        daddr = Int64(0)
+        if cutlass.const_expr(self.pushed):
+            dbase, dctr = dd.ring_buffer("dcpv%d" % B, dctas)
+            daddr = dd.ring_begin(dbase, dctr, dctas, dcta, tid == 0)
         if cutlass.const_expr(self.lpc is not None):
             # this step's LPC prefix and range (lpc_table, as the core): built after the
             # PDL wait below, read by every thread's valid_splits (lpc_filled)
@@ -1131,6 +1141,7 @@ class DcpValue:
                 prefetch_bytes(at(w_uv, head, 0, tid), 1024)
         if cutlass.const_expr(not self.polled_split):
             cute.arch.griddepcontrol_wait()
+            dd.ring_stamp(daddr, 1)
         if cutlass.const_expr(self.lpc is not None):
             # (after the wait: the step's lengths are read like the push loop's, never
             # through a line an earlier step may have left in L1; ~1 us: one warp scan
@@ -1175,6 +1186,7 @@ class DcpValue:
             # Polled split partials: the core's grid is waited for only here, before
             # re-arming the q mailbox it read (and before the merge reads the gate).
             cute.arch.griddepcontrol_wait()
+            dd.ring_stamp(daddr, 2)
         if cutlass.const_expr(self.polled_out):
             # Arm / consume / re-arm (POLLED_OUTPUT): the other parity's output
             # buffer is armed here, after this kernel's PDL wait. Its last reader,
@@ -1193,27 +1205,29 @@ class DcpValue:
         # ``prewait`` reads the q mailbox and writes the split workspace before its
         # own wait, relying on the next core starting only after this.
         cute.arch.griddepcontrol_launch_dependents()
+        dd.ring_stamp(daddr, 3)
         R = self.merge_rows
         if cutlass.const_expr(self.tile_stride > 0 and self.spread):  # above one wave
             for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
                 if 16 * y + R * pusher < self.batch:
-                    self.merge_spread(args, latent, scales, tid, y)
+                    self.merge_spread(args, latent, scales, tid, y, daddr)
                     self.rearm_rows(mailbox, 16 * y + R * pusher, R, head, tid)
         elif cutlass.const_expr(self.tile_stride > 0):  # the per-head merge, strided
             if pusher == 0:
                 for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
-                    self.merge(args, latent, scales, wb, tid, y)
+                    self.merge(args, latent, scales, wb, tid, y, daddr)
                     self.rearm_rows(mailbox, 16 * y, 16, head, tid)
         elif self.merges(pusher):
             if cutlass.const_expr(self.spread):
-                self.merge_spread(args, latent, scales, tid)
+                self.merge_spread(args, latent, scales, tid, None, daddr)
                 self.rearm_rows(mailbox, 16 * tile + R * pusher, R, head, tid)
             elif cutlass.const_expr(self.wide):
                 self.merge_row(args, latent, scales, wb, tid, bar)
                 self.rearm_rows(mailbox, pusher, 1, head, tid)
             else:
-                self.merge(args, latent, scales, wb, tid)
+                self.merge(args, latent, scales, wb, tid, None, daddr)
                 self.rearm_rows(mailbox, 16 * tile, 16, head, tid)
+        dd.ring_stamp(daddr, 7)
 
     @cute.jit
     def rearm_rows(self, mailbox, first, rows, head, tid):
@@ -1545,7 +1559,7 @@ class DcpValue:
         return value
 
     @cute.jit
-    def merge(self, args, latent, scales, wb, tid, row_tile=None):
+    def merge(self, args, latent, scales, wb, tid, row_tile=None, daddr=None):
         """The owner's merge of request rows t0.. of this head, then W_UV + gate.
         ``row_tile``: the 16-row tile (``tile_stride``), else the CTA's own.
         Back-to-back calls need no barrier: the next call writes the scales after
@@ -1599,6 +1613,8 @@ class DcpValue:
             if lane < D:
                 scales[warp, lane] = scale
         cute.arch.sync_threads()
+        if cutlass.const_expr(daddr is not None):  # DIAG (DSTAMP)
+            dd.ring_stamp(daddr, 4)
         chunk = tid % 64
         for half in cutlass.range_constexpr(2):  # rows r and r + 8, 16 B chunk
             r = tid // 64 + 8 * half
@@ -1628,6 +1644,8 @@ class DcpValue:
             )
             store_shared_words(latent.iterator + r * 544 + 8 * chunk, pairs)
         cute.arch.sync_threads()
+        if cutlass.const_expr(daddr is not None):  # DIAG (DSTAMP)
+            dd.ring_stamp(daddr, 5)
         parts = zeros((2, 4), Float32)  # two accumulation chains
         for c in cutlass.range_constexpr(16):
             x, y = (
@@ -1657,7 +1675,7 @@ class DcpValue:
                 store_words(at(output, t, col), (bf16x2(lo, hi),))
 
     @cute.jit
-    def merge_spread(self, args, latent, scales, tid, row_tile=None):
+    def merge_spread(self, args, latent, scales, tid, row_tile=None, daddr=None):
         """spread: CTA z of (head, row tile y) merges rows 16 y + R z + r (r < R) into
         rows r of its latent tile, then warp w projects output tile w of them: the
         weights, sums and per-tile MMAs of merge() (MMA rows are independent, so the
@@ -1713,6 +1731,8 @@ class DcpValue:
             if lane < D:
                 scales[warp, lane] = scale
         cute.arch.sync_threads()
+        if cutlass.const_expr(daddr is not None):  # DIAG (DSTAMP)
+            dd.ring_stamp(daddr, 4)
         chunk = tid % 64  # 16 B chunk of row t0 + r
         for h in cutlass.range_constexpr((R + 7) // 8):  # r = tid // 64 (+ 8: R = 16)
             r = tid // 64 if h == 0 else tid // 64 + 8
@@ -1742,6 +1762,8 @@ class DcpValue:
             for c in range(16)
         ]
         cute.arch.sync_threads()
+        if cutlass.const_expr(daddr is not None):  # DIAG (DSTAMP)
+            dd.ring_stamp(daddr, 5)
         parts = zeros((2, 4), Float32)  # two accumulation chains; rows >= R unused
         for c in cutlass.range_constexpr(16):
             x, y = (

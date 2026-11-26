@@ -153,6 +153,12 @@ class DsaCore:
             raise ValueError(f"DsaCore: splits {splits} not 1, 2, 4 or 8 (<= max)")
         if kv_ctas is None:
             kv_ctas = trtllm_kv_ctas(rows, q_box.shape[1], sel.shape[1], self.sms)
+        if dbg is None:  # DIAG (DSTAMP arm, never merge): the device call ring
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+                dsadiag,
+            )
+
+            dbg = dsadiag.dsac_dbg()
         self.ext.run(
             q_box,
             sel,

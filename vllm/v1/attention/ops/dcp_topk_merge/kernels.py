@@ -466,6 +466,21 @@ def _st_i64(addr: Int64, v: Int64, *, loc=None, ip=None) -> None:
     _asm_void([Int64(addr), Int64(v)], "st.global.u64 [$1], $2;", "l,l", loc=loc, ip=ip)
 
 
+# DIAG (DSTAMP arm, never merge): the select's ``stamps`` buffer is a device call ring
+# [_SEL_RING, _SEL_MAXR, 8] int64 + [_SEL_MAXR] u32 counters (common/dsadiag.py).
+_SEL_RING, _SEL_MAXR = 64, 256
+
+
+@dsl_user_op
+def _atom_inc_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        _asm(
+            T.i32(), [Int64(addr)], "atom.global.add.u32 $0, [$1], 1;", "=r,l",
+            loc=loc, ip=ip,
+        )
+    )
+
+
 @dsl_user_op
 def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
     i32 = T.i32()
@@ -1482,6 +1497,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             tid, _, _ = cute.arch.thread_idx()
             lane = cute.arch.lane_idx()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if cutlass.const_expr(stamps):  # DIAG: this call's ring slot (tid 0 only)
+                if tid == Int32(0) and row < Int32(_SEL_MAXR):
+                    ctr = dbg + Int64(_SEL_RING * _SEL_MAXR * 64) + Int64(row) * Int64(4)
+                    call = _atom_inc_u32(ctr) % Uint32(_SEL_RING)
+                    dbg = dbg + Int64(call) * Int64(_SEL_MAXR * 64)
             dbg_row = dbg + Int64(row) * Int64(64)
             if cutlass.const_expr(stamps):  # noqa: SIM102
                 if tid == Int32(0):
@@ -2755,6 +2775,10 @@ def dcp_topk_select(
         and rows is not None
         and gathered.shape[1] <= _num_sms(gathered.device)
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+        dsadiag,  # DIAG (DSTAMP arm, never merge)
+    )
+
     _DCP_TOPK_SELECT_KERNEL(
         gathered,
         topk_indices,
@@ -2766,6 +2790,7 @@ def dcp_topk_select(
         early=early and not fold,
         fold=fold,
         hold=fold and not release,
+        stamps=dsadiag.select_stamps(),
     )
     if exact is not None and not fold:
         _DCP_TOPK_RESCUE_KERNEL(
