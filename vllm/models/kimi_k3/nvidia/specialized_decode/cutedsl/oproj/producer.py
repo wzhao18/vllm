@@ -33,6 +33,7 @@ from ..common.primitives import (
     mma_bf16_block,
     mma_into,
     multicast_words,
+    named_barrier,
     pack_pair,
     prefetch_bytes,
     published,
@@ -508,18 +509,17 @@ class OprojUmma(OprojProducer):
         tile in the drained ring -> 8-row BF16 chunks to the mailbox / partials."""
         x, _, mailbox, mc, slot = args[:5]
         M: Constexpr = x.shape[0]
-        _, warp, lane, _ = thread()
+        tid, warp, lane, _ = thread()
         values = load_tmem(tmem + (32 * warp << 16), self.geometry(M)[3])
         tile = view(ring.iterator, 0, Float32, (n, 68), (68, 1))  # [token, row]
         if lane < 16:
             for t in cutlass.range_constexpr(M):
                 tile[t, 16 * warp + lane] = values[t]
-        # Each warp publishes its own 16 rows (column parts 2 warp, 2 warp + 1): a
-        # warp sync, not a CTA barrier, before the pushes. Same words.
-        cute.arch.sync_warp()
-        for i in cutlass.range_constexpr((M + 15) // 16):
-            token, part = lane % 16 + 16 * i, 2 * warp + lane // 16
-            if token < M:
+        named_barrier(1, 128)
+        for i in cutlass.range_constexpr((M * 8 + 127) // 128):
+            c = tid + 128 * i
+            if c < M * 8:
+                token, part = c // 8, c % 8
                 reduced = cute.make_rmem_tensor(8, Float32)
                 for h in cutlass.range_constexpr(2):
                     words = smem_words(at(tile, token, part * 8 + h * 4))
@@ -829,11 +829,10 @@ class OprojUmmaRows(OprojUmma):
             if lane < 16:
                 for t in cutlass.range_constexpr(N):
                     tiles[a, t, 16 * warp + lane] = values[t]
-            # Each warp pushes its own 16 rows (``OprojUmma.epilogue``): a warp sync.
-            cute.arch.sync_warp()
+            named_barrier(1, 128)
             valid = M - c * N  # tokens of this chunk (more past the last)
-            for i in cutlass.range_constexpr(N // 16):
-                token, part = lane % 16 + 16 * i, 2 * warp + lane // 16
+            for i in cutlass.range_constexpr(N * 8 // 128):
+                token, part = (tid + 128 * i) // 8, (tid + 128 * i) % 8
                 if token < valid:
                     reduced = cute.make_rmem_tensor(8, Float32)
                     for h in cutlass.range_constexpr(2):
