@@ -597,8 +597,8 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         sfbc = tmem + self.col_h + hbuffer * self.w2_scale_columns
         b = uses % self.big
         if cutlass.const_expr(pool is None):
-            if ahead == 0:
-                for i in cutlass.range_constexpr(6, 8):
+            if ahead == 0:  # one acquire per group: each frees its slots in order
+                for i in cutlass.range_constexpr(8 - self.epi_groups, 8):
                     self.acquire_big(accempty, (uses + i) % self.big, uses + i)
                 ahead = Int32(8)
             ahead -= 1
