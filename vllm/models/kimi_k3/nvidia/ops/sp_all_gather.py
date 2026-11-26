@@ -52,12 +52,11 @@ from byte 0, scales from byte ``world * max_rows * hidden``.
 
 TMA push of BF16 shards (the DSA layers' gather; SM 10.x GPUs): every SM
 TMA-loads 32 KiB chunks of the shard into shared memory and bulk-stores each
-into one rank's slot (chunk-major, ranks rotated), at 1.17 TB/s per GPU at 8
-ranks on 2 nodes against 0.86 for the Triton BF16 push. Each CTA, once its
-stores completed, adds 1 (release, system scope) to the slot's arrival counter
-of every rank, a word at the end of each rank's signal pad (no new memory);
-CTA 0 waits until its own counter holds world x grid and takes that back off,
-so the push returns with the gather complete and no barrier follows. Every
+into one rank's slot (chunk-major, ranks rotated). The last CTA to finish (a
+local count) adds 1 (release, system scope) to the slot's arrival counter of
+every rank, a word at the end of each rank's signal pad (no new memory), then
+waits until its own counter holds world and takes that back off, so the push
+returns with the gather complete and no barrier follows. Every
 value is device-side and the counter returns to 0, so CUDA graphs capture it.
 The slot reuse rule below holds as with the barrier: a rank's wait on gather
 n - 1 returned only after every peer started its push of it, which its stream
@@ -193,12 +192,13 @@ __device__ __forceinline__ uint32_t tp_ld_acq(uint64_t a) {
 
 // One issuing thread per CTA. Unit u = (chunk u / W of this rank's shard, destination rank (rank + 1 + u) % W): TMA-load
 // the chunk into smem, bulk-store it into that rank's slot. Unit u runs on CTA u % G (NS-stage smem ring). Once all of
-// its stores completed, a CTA adds 1 (release, system scope) to the slot's arrival counter of every rank. CTA 0 then
-// waits until its own counter holds W * G (every CTA of every rank, itself included) and takes W * G back off it.
+// its stores completed, a CTA counts itself done.
+// The last CTA to finish (a local count) then adds 1 to the slot's arrival counter of every rank (release, system
+// scope), waits until its own counter holds W (every rank, itself included) and takes W back off it.
 template <int NS>
 __global__ void __launch_bounds__(32, 1) sp_ag_tma_push_kernel(
     const uint8_t* __restrict__ src, const int64_t* __restrict__ dst_slot, int64_t dst_off, int64_t nbytes,
-    const int64_t* __restrict__ ctr, int rank, int W, int chunk, uint64_t limit) {
+    const int64_t* __restrict__ ctr, uint64_t done, int rank, int W, int chunk, uint64_t limit) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ __align__(8) uint64_t bar[NS];
   if (threadIdx.x != 0 || nbytes == 0) return;
@@ -238,17 +238,24 @@ __global__ void __launch_bounds__(32, 1) sp_ag_tma_push_kernel(
   }
   asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");  // every store of this CTA performed
   asm volatile("fence.proxy.async.global;" ::: "memory");
+  __threadfence_system();
+  // The last CTA of this grid (local count) signals every rank once: W remote adds per rank instead of W x G (a
+  // single word takes them one at a time).
+  uint32_t prev;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(done) : "memory");
+  if (prev != (uint32_t)(G - 1)) return;
+  *(volatile uint32_t*)done = 0u;  // every CTA of this grid has added
+  __threadfence_system();
   for (int i = 0; i < W; ++i) {
-    const uint64_t c = (uint64_t)ctr[(rank + 1 + g + i) % W];
+    const uint64_t c = (uint64_t)ctr[(rank + 1 + i) % W];
     asm volatile("red.release.sys.global.add.u32 [%0], 1;" :: "l"(c) : "memory");
   }
-  if (g != 0) return;
   const uint64_t own = (uint64_t)ctr[rank];
-  const uint32_t target = (uint32_t)(W * G);
+  const uint32_t target = (uint32_t)W;
   const uint64_t t0 = tp_now();
   uint32_t v;
   while ((int32_t)((v = tp_ld_acq(own)) - target) < 0) {
-    __nanosleep(64);
+    __nanosleep(32);
     if (tp_now() - t0 > limit) {
       printf("K31_SPIN_TIMEOUT kernel=sp_ag_tma_push rank=%d target=%u seen=%u\n", rank, target, v);
       __trap();
@@ -261,7 +268,7 @@ __global__ void __launch_bounds__(32, 1) sp_ag_tma_push_kernel(
 
 static cudaStream_t tp_cur() { return c10::cuda::getCurrentCUDAStream().stream(); }
 
-void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, torch::Tensor ctr, int64_t rank,
+void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, torch::Tensor ctr, int64_t done, int64_t rank,
                     int64_t W, int64_t chunk, int64_t grid, int64_t limit) {
   TORCH_CHECK(src.is_cuda() && src.is_contiguous(), "sp_ag_tma_push: contiguous CUDA source");
   const int64_t nbytes = src.numel() * src.element_size();
@@ -277,7 +284,7 @@ void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, 
     smem_set = smem;
   }
   k<<<(unsigned)grid, 32, smem, tp_cur()>>>((const uint8_t*)src.data_ptr(), dst_slot.data_ptr<int64_t>(), dst_off,
-                                            nbytes, ctr.data_ptr<int64_t>(), (int)rank, (int)W, (int)chunk,
+                                            nbytes, ctr.data_ptr<int64_t>(), (uint64_t)done, (int)rank, (int)W, (int)chunk,
                                             (uint64_t)limit);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -285,7 +292,8 @@ void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, 
 
 _TMA_CPP = r"""
 #include <torch/extension.h>
-void sp_ag_tma_push(torch::Tensor, torch::Tensor, int64_t, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t);
+void sp_ag_tma_push(torch::Tensor, torch::Tensor, int64_t, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t,
+                    int64_t);
 """
 
 _tma_lock = threading.Lock()
@@ -377,10 +385,14 @@ class SymmSpAllGather:
                 dtype=torch.int64,
                 device=self.storage.device,
             )
+            # Per slot, this rank's count of push CTAs done (the two words
+            # below the counters; only this rank touches them).
+            own_pad = pads[self.rank] + pad_size
+            self.done_ptrs = [own_pad - 4 * (2 * _NUM_SLOTS - slot) for slot in range(_NUM_SLOTS)]
             # Build and load the kernel now (an empty push): CUDA lazy loading
             # would load it at its first launch, inside a step.
             _tma_module().sp_ag_tma_push(
-                self.storage[:0], self.peer_ptrs[0], 0, self.ctr_ptrs[0],
+                self.storage[:0], self.peer_ptrs[0], 0, self.ctr_ptrs[0], self.done_ptrs[0],
                 self.rank, self.world, _TMA_CHUNK, 1, _TMA_SPIN_NS,
             )  # fmt: skip
         torch.accelerator.synchronize()
@@ -480,12 +492,12 @@ class SymmSpAllGather:
         numel = rows * hidden
         nbytes = numel * x.element_size()
         if self.tma and nbytes % 16 == 0 and x.data_ptr() % 16 == 0:
-            # Every rank's every CTA adds to this rank's slot counter once its
-            # bytes landed: the push returns with the gather complete, and no
+            # Every rank adds to this rank's slot counter once all its bytes
+            # landed: the push returns with the gather complete, and no
             # barrier is needed (module docstring).
             _tma_module().sp_ag_tma_push(
                 x, self.peer_ptrs[slot], self.rank * nbytes, self.ctr_ptrs[slot],
-                self.rank, self.world, _TMA_CHUNK,
+                self.done_ptrs[slot], self.rank, self.world, _TMA_CHUNK,
                 min(self.num_sms, cdiv(nbytes, _TMA_CHUNK) * self.world), _TMA_SPIN_NS,
             )  # fmt: skip
             start = slot * self.slot_numel

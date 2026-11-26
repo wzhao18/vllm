@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--modes", default="tri16,tri32,tma")
     ap.add_argument("--skew-us", type=float, default=0.0)
     ap.add_argument("--graph", action="store_true", help="also time the tma gather replayed from a CUDA graph")
+    ap.add_argument("--chunk-kib", type=int, default=0, help="tma chunk override (diagnostic)")
     ap.add_argument("--out", default="")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
@@ -54,9 +55,10 @@ def main():
     peer_ptrs = torch.tensor([[b + s * slot_numel * 2 for b in bases] for s in range(2)], dtype=torch.int64, device=dev)
     pads, pad_size = handle.signal_pad_ptrs, handle.signal_pad_size
     ctr_ptrs = torch.tensor([[p + pad_size - 4 * (2 - s) for p in pads] for s in range(2)], dtype=torch.int64, device=dev)
+    done_ptrs = [pads[me] + pad_size - 4 * (4 - s) for s in range(2)]
     nsm = torch.cuda.get_device_properties(dev).multi_processor_count
     ext = m._tma_module()
-    ext.sp_ag_tma_push(storage[:0], peer_ptrs[0], 0, ctr_ptrs[0], me, W, m._TMA_CHUNK, 1, m._TMA_SPIN_NS)
+    ext.sp_ag_tma_push(storage[:0], peer_ptrs[0], 0, ctr_ptrs[0], done_ptrs[0], me, W, m._TMA_CHUNK, 1, m._TMA_SPIN_NS)
     torch.cuda.synchronize()
     handle.barrier()
 
@@ -65,12 +67,13 @@ def main():
     ref = torch.empty(W * R, H, dtype=torch.bfloat16, device=dev)
     dist.all_gather_into_tensor(ref, x)
     nbytes = R * H * 2
+    chunk = (args.chunk_kib << 10) or m._TMA_CHUNK
     sleep_cycles = int(args.skew_us * 1.9e3) if me == W - 1 else 0  # ~1.9 GHz
 
     def gather(mode, slot):
         if mode == "tma":
-            ext.sp_ag_tma_push(x, peer_ptrs[slot], me * nbytes, ctr_ptrs[slot], me, W, m._TMA_CHUNK,
-                               min(nsm, -(-nbytes // m._TMA_CHUNK) * W), m._TMA_SPIN_NS)
+            ext.sp_ag_tma_push(x, peer_ptrs[slot], me * nbytes, ctr_ptrs[slot], done_ptrs[slot], me, W, chunk,
+                               min(nsm, -(-nbytes // chunk) * W), m._TMA_SPIN_NS)
             return
         if mode == "tri16":
             src, blk = x.reshape(-1), m._BLOCK
@@ -110,7 +113,7 @@ def main():
         if me == 0:
             meds = [a[0] for a in allm]
             ingress = (W - 1) * nbytes / 1e6
-            rec = dict(tag=args.tag, rows=R, mode=mode, skew_us=args.skew_us, rank_median_us=statistics.median(meds),
+            rec = dict(tag=args.tag, rows=R, mode=mode, chunk=chunk, skew_us=args.skew_us, rank_median_us=statistics.median(meds),
                        rank_max_us=max(meds), worst_iter_us=max(a[1] for a in allm), per_rank_med=meds,
                        ingress_mb=ingress, tbps=ingress / statistics.median(meds))
             print(f"PR3B {args.tag} rows {R} {mode}: rank med {rec['rank_median_us']:.1f} max {rec['rank_max_us']:.1f} "
