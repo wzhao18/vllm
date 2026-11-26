@@ -226,6 +226,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         if tid == 0:
             self.stamp(0)
         tmem_base = self.initialize(sm, maps, batch)
+        self.clear(sm)  # route-independent: before the dependency wait (HT-EXPERTS I3)
         cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
@@ -347,7 +348,6 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
             mine[k] = Int32(0)
             if tid + threads * k < batch * 16:
                 mine[k] = ids[tid + threads * k]
-        self.clear(sm)  # while the ids are in flight
         if tid == 0:
             scalars[1], scalars[2] = (calls, grouped)
         cute.arch.sync_threads()
