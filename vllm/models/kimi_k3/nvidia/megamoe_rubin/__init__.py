@@ -26,6 +26,7 @@ _EXPORTS = {
     "tuned_capacity": "config",
     "bench_capacity": "config",
     "nvfp4_norm_const_from_amax": "config",
+    "nvfp4_fc1_norm_const": "config",
     "merge_knob_files": "config",
     "SHIPPED_KNOBS": "config",
     # weights.py (CPU-safe)

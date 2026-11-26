@@ -254,3 +254,79 @@ def test_native_nvfp4_kernel_uses_per_expert_alphas(build):
     moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out)
     torch.cuda.synchronize()
     assert _rel(out, stock) < 5e-3
+
+
+def _stock_trtllm_nvfp4_moe(hidden, ids, wts, layer, problem, W, R):
+    """Stock NVFP4 MoE as vLLM ModelOpt -> FlashInfer TRT-LLM-Gen runs it for unit
+    input scales: FC2 input ``SiTU(fc1)`` requantized with ``a2_gscale = 1`` and the
+    routing weight applied after FC2 (finalize), not before the requantization."""
+    q13, s13, q2, s2, g13, g2 = layer
+    inter = problem.intermediate
+
+    def dq(codes, sf):
+        return W.unpack_fp4_to_f32(codes) * W.e4m3_to_f32(sf).repeat_interleave(
+            W.NV_BLOCK, dim=-1
+        )
+
+    x = dq(*W.quantize_nvfp4_block16(hidden.float(), 1.0))
+    out = torch.zeros_like(x)
+    idx = ids.to(torch.int64)
+    for e in range(problem.num_experts):
+        t, k = (idx == e).nonzero(as_tuple=True)
+        if t.numel() == 0:
+            continue
+        u = _situ(R, (x[t] @ dq(q13[e], s13[e]).t()) * g13[e], inter)
+        a = dq(*W.quantize_nvfp4_block16(u, 1.0))
+        term = (a @ dq(q2[e], s2[e]).t()) * g2[e] * wts[t, k].float().unsqueeze(-1)
+        out.index_add_(0, t, term.to(torch.bfloat16).float())
+    return out
+
+
+def test_fc1_norm_const_keeps_real_scale_wires(build):
+    """At the K3.1 MoE input scale (hidden RMS ~0.08, routing weights ~1/16) the
+    routing-weighted FC1->FC2 wire is ~1e-3: FlashInfer's fc1_norm_const 1.0 flushes
+    its E4M3 block scales to zero, the served constant (nvfp4_fc1_norm_const = 16 at
+    top-16) keeps them and matches stock TRT-LLM-Gen NVFP4 MoE accuracy."""
+    C, R, W, problem, moe, bucket, layer, weights = build("ep32_decode")
+    n_served = C.nvfp4_fc1_norm_const(top_k=TOP_K, **SITU)
+    assert n_served == 16.0
+    device = torch.device("cuda", 0)
+    n = 128
+    gen = torch.Generator(device=device).manual_seed(11)
+    hidden = (torch.randn(n, problem.hidden, generator=gen, device=device) * 0.08).to(
+        torch.bfloat16
+    )
+    ids, wts = _routes(n, problem.num_experts, device, seed=12)
+    w13 = _dequant(layer[0], layer[1], layer[4], W)
+    w2 = _dequant(layer[2], layer[3], layer[5], W)
+    full = torch.zeros(n, problem.hidden, device=device)
+    wire = []
+    for e in range(problem.num_experts):
+        t, k = (ids.to(torch.int64) == e).nonzero(as_tuple=True)
+        if t.numel() == 0:
+            continue
+        act = _situ(R, hidden[t].float() @ w13[e].t(), problem.intermediate)
+        act = act * wts[t, k].unsqueeze(-1)
+        wire.append(act)
+        full.index_add_(0, t, act @ w2[e].t())
+    wire = torch.cat(wire)
+    # The regime of the bug: most 16-blocks of the wire below the E4M3 flush at n = 1.
+    blocks = wire.abs().reshape(-1, 16).amax(-1)
+    assert float((blocks / 6.0 < 2.0**-10).float().mean()) > 0.5
+
+    errs = {}
+    for norm in (1.0, n_served):
+        _, fc2_alpha, fc1_norm = W.nvfp4_checkpoint_alphas(
+            layer[4], layer[5], 1.0, norm
+        )
+        w = weights._replace(fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm)
+        out = torch.empty((n, problem.hidden), dtype=torch.bfloat16, device=device)
+        moe.forward(hidden, ids, wts, w, bucket=bucket, out=out)
+        torch.cuda.synchronize()
+        errs[norm] = _rel(out, full)
+    stock = _rel(_stock_trtllm_nvfp4_moe(hidden, ids, wts, layer, problem, W, R), full)
+    print(f"rel L2 vs full precision: n=1 {errs[1.0]:.4f} n=16 {errs[n_served]:.4f} "
+          f"stock TRT-LLM-Gen {stock:.4f}")  # fmt: skip
+    assert errs[1.0] > 0.3
+    assert errs[n_served] < 1.25 * stock + 0.01
+    assert errs[n_served] < errs[1.0] / 3
