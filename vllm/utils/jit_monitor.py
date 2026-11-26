@@ -1019,7 +1019,8 @@ def _setup_cpp_extension_hook() -> None:
 
 class _DeepGemmCacheWatch:
     """DeepGEMM compiles and caches its kernels in C++ (no Python hook): watch
-    its cache directory (``DG_JIT_CACHE_DIR``/cache, else ~/.deep_gemm/cache)
+    its cache directory (``DG_JIT_CACHE_DIR``/cache, else
+    ``VLLM_CACHE_ROOT``/deep_gemm/cache, as vllm.utils.deep_gemm sets it)
     instead. A new ``<kernel>.<hash>/.committed`` is a build (its duration:
     from the entry's oldest file to the commit); a newer ``.committed`` mtime
     on an existing entry is a load (DeepGEMM touches it). The directory is
@@ -1105,7 +1106,12 @@ def _setup_deepgemm_watch() -> None:
     global _deepgemm_watch
     if _deepgemm_watch is not None:
         return
-    base = os.environ.get("DG_JIT_CACHE_DIR") or os.path.expanduser("~/.deep_gemm")
+    from vllm import envs
+
+    # The directory vllm.utils.deep_gemm points DeepGEMM at when unset.
+    base = os.environ.get("DG_JIT_CACHE_DIR") or os.path.join(
+        envs.VLLM_CACHE_ROOT, "deep_gemm"
+    )
     # Watched even before DeepGEMM creates it (a scan of a missing dir is empty).
     _deepgemm_watch = _DeepGemmCacheWatch(os.path.join(base, "cache"))
 
