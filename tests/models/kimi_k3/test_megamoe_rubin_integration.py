@@ -240,6 +240,11 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
     )
     main, _ = X.select_rubin_bucket(problem, world, tokens)
     nv = problem.quant_kind == "nvfp4"
+    if nv and world in X.RUBIN_FUSED_DECODE_EP_SIZES:
+        # EP16 / EP64 NVFP4 decode: the EP32 128-token GenPhase decode bucket first
+        gp, *buckets = buckets
+        assert (gp.variant, gp.max_tokens) == ("genphase", X.RUBIN_WIDE_EP_DECODE_TOKENS)
+        assert gp.knobs == X.RUBIN_GENPHASE_DECODE_KNOBS
     assert [b.max_tokens for b in buckets] == [256, tokens]
     # prefill-sized NVFP4 buckets run the dedup combine (same tile knobs)
     assert buckets[-1] == (X._prefill_dedup(main) if nv else main)
@@ -284,6 +289,10 @@ def test_decode_bucket_admits_every_shipped_inference_record(world, kind, tokens
         if world in X.RUBIN_INFERENCE_ONLY_EP_SIZES
         else 256
     )
+    if kind == "nvfp4" and world in X.RUBIN_FUSED_DECODE_EP_SIZES:
+        gp, *buckets = buckets
+        assert (gp.variant, gp.max_tokens) == ("genphase", X.RUBIN_WIDE_EP_DECODE_TOKENS)
+        C.RubinMoeConfig.make(problem, gp, rank=0, world_size=world)
     assert [b.max_tokens for b in buckets] == [decode, tokens]
     C.RubinMoeConfig.make(problem, buckets[0], rank=0, world_size=world)
 

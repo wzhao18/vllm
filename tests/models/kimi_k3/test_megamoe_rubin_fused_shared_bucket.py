@@ -105,3 +105,26 @@ def test_inserted_bucket_keeps_placement():
     layer.buckets, layer.bucket = (placed,), placed
     _enable(layer)
     assert layer.buckets[0].die_sm_mask32 == placed.die_sm_mask32
+
+
+@pytest.mark.parametrize("world", [16, 64])
+@pytest.mark.parametrize("tokens", [2048, 4096])
+def test_ep16_ep64_inference_server_gets_gp_decode_bucket(world, tokens):
+    """EP16 / EP64 NVFP4 decode servers above the GenPhase limit (inference kernel)
+    add the EP32 128-token GenPhase decode bucket in select_rubin_buckets; with the
+    fused shared expert enabled it becomes the fused-shared bucket (as on EP32)."""
+    layer = _layer(tokens, world)
+    small, *rest = layer.buckets
+    assert (small.variant, small.max_tokens) == ("genphase", X.RUBIN_WIDE_EP_DECODE_TOKENS)
+    assert small.knobs == X.RUBIN_GENPHASE_DECODE_KNOBS
+    assert all(b.variant != "genphase" for b in rest)
+    assert _enable(layer)
+    small, *rest2 = layer.buckets
+    assert small.shared == (HIDDEN, INTER) and rest2 == rest
+
+
+def test_ep16_gp_decode_bucket_opt_out(monkeypatch):
+    monkeypatch.setenv("VLLM_K31_EP_FUSED_DECODE", "0")
+    layer = _layer(2048, 16)
+    assert [b.max_tokens for b in layer.buckets] == [256, 2048]
+    assert not _enable(layer)
