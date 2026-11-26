@@ -2099,7 +2099,7 @@ def _quad_code(ties: bool, write: bool) -> str:
 @asm(Uint32)
 def count4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
     """n + this lane quad's takes + (ties << 16) (ties = ties not all taken)."""
-    return _quad_code(True, False), "=&r," + ",".join(["r"] * 11), (
+    return _quad_code(True, False), "=r," + ",".join(["r"] * 11), (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
 
@@ -2107,7 +2107,7 @@ def count4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
 @asm(Uint32)
 def count4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
     """n + this lane quad's takes when every tie is taken."""
-    return _quad_code(False, False), "=&r," + ",".join(["r"] * 11), (
+    return _quad_code(False, False), "=r," + ",".join(["r"] * 11), (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
 
@@ -2115,7 +2115,7 @@ def count4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
 @asm()
 def write4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, k0, k1, k2, k3):
     """Stage this entry quad's takes at tk and ties at te; returns both advanced."""
-    return _quad_code(True, True), "=&r,=&r," + ",".join(["r"] * 17) + ",~{memory}", (
+    return _quad_code(True, True), "=r,=r," + ",".join(["r"] * 17) + ",~{memory}", (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
         Int32(tk), Int32(te), Uint32(k0), Uint32(k1), Uint32(k2), Uint32(k3)), (Int32, Int32)
@@ -2124,7 +2124,7 @@ def write4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, k0, k1, k2, k3):
 @asm()
 def write4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, k0, k1, k2, k3):
     """Stage this entry quad's takes (every tie taken) at tk; returns tk advanced."""
-    return _quad_code(False, True), "=&r,=&r," + ",".join(["r"] * 17) + ",~{memory}", (
+    return _quad_code(False, True), "=r,=r," + ",".join(["r"] * 17) + ",~{memory}", (
         Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
         Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
         Int32(tk), Int32(te), Uint32(k0), Uint32(k1), Uint32(k2), Uint32(k3)), (Int32, Int32)
