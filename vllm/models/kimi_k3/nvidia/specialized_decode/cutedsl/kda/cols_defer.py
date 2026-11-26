@@ -6,8 +6,8 @@ bulk-copied into shared memory and folded into the registers before the PDL wait
 with ``cols_update``'s two instructions (so bit for bit the checkpoint the stock
 protocol stores); the state after token 0 to slot 0 (one store instead of q), the
 warp's rows' corrections of tokens 1 .. q - 1 to slot 1 (lane 0), and the head's k /
-decay rows by partition 0 once its token's outputs arrived from every CTA of the
-cluster (each pushes after its fold)."""
+decay rows of token p by partition p > 0 once its token's outputs arrived from every
+CTA of the cluster (each pushes after its fold)."""
 
 import cutlass
 import cutlass.cute as cute
@@ -170,15 +170,18 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                 operands = (thread, lane, nw, out_gate)
                 self.cols_norm(shared_o, barrier, operands, args)
                 # every CTA's outputs of this CTA's token arrived (each pushed after
-                # its fold): the head's k / decay records may be overwritten
-                if (partition == 0) & live:
-                    for u in cutlass.range_constexpr(1, T):
-                        record_page[head, u - 1, thread] = shared_k[128 * u + thread]
-                        record_page[head, DECAY_ROW + u - 1, thread] = shared_decay[
-                            128 * u + thread
-                        ]
-                    if thread == 0:
-                        put_tag(record_page, head)
+                # its fold): the head's k / decay records may be overwritten. Each CTA
+                # p > 0 writes token p's rows (every CTA holds every token's k and
+                # decays), so no CTA's tail stores more than two rows; CTA 0 the tag.
+                if (partition > 0) & live:
+                    record_page[head, partition - 1, thread] = shared_k[
+                        128 * partition + thread
+                    ]
+                    record_page[head, DECAY_ROW + partition - 1, thread] = shared_decay[
+                        128 * partition + thread
+                    ]
+                if (partition == 0) & live & (thread == 0):
+                    put_tag(record_page, head)
 
     @cute.jit
     def cols_fold(self, history, rec, pending, value_base, warp, lane):

@@ -253,7 +253,10 @@ class KdaVerifyHalfDefer(DeferTokens, KdaVerifyHalfStock):
             if warp == MESSENGER:
                 self.exchange(scratch, counters, item, half, lane, shared_o)
             cute.arch.sync_threads()  # the other half's rows merged; both past the taps
-            if (thread < GROUP) & (half == 0) & (records > 0):  # k / decay records
+            # The tail stores split over the two halves (both computed every token's
+            # k, decays and conv inputs with the same operations): half 1 the k /
+            # decay records and the V window, half 0 the Q / K windows.
+            if (thread < GROUP) & (half == 1) & (records > 0):  # k / decay records
                 record_page = state[Int64(records), None, None, None]
                 for t in cutlass.range_constexpr(1, T):
                     record_page[head, t - 1, thread] = shared_k[128 * t + thread]
@@ -262,15 +265,16 @@ class KdaVerifyHalfDefer(DeferTokens, KdaVerifyHalfStock):
                     ]
                 if thread == 0:
                     put_tag(record_page, head)
-            if (thread < GROUP) & (half == 0):  # the conv window (one writer)
+            if thread < GROUP:  # the conv window (one writer per section)
                 conv_state = args[3]
                 conv_page = conv_state[Int64(conv_slot), None, None]
                 dim: cutlass.Constexpr = H * 128
                 taps, inputs = window
                 for s in cutlass.range_constexpr(3):
-                    values = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
-                    for i, value in enumerate(values):
-                        conv_put(conv_page, (s * dim + head * 128 + thread, i), value)
+                    if half == (1 if s == 2 else 0):
+                        values = (taps[s, 1], taps[s, 2], *(inputs[3 * t + s] for t in range(T)))
+                        for i, value in enumerate(values):
+                            conv_put(conv_page, (s * dim + head * 128 + thread, i), value)
             if thread < HALF_THREADS:  # this half's tokens: the gated RMS norm
                 first: cutlass.Constexpr = (T + 1) // 2
                 nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
