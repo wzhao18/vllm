@@ -131,9 +131,9 @@ def test_one_printer_per_rank_and_site():
     (injected-hang check, 2026-11-22): every dedup guard elects one printer through the per-rank flag word."""
     src = (PKG / "src_gp/sources/communication/nvlink_domain/token_comm_dedup.py").read_text()
     sites = re.findall(r"spin_guard(?:_value|_ranks)?\(\s*spin_start_ns, (2\d),", src)
-    assert sorted(set(sites)) == [str(s) for s in range(20, 28)]
+    assert sorted(set(sites)) == [str(s) for s in range(20, 30)]
     calls = re.findall(r"spin_guard(?:_value|_ranks)?\(\s*spin_start_ns, 2\d,", src)
-    assert len(calls) == src.count("print_flag=") == 8
+    assert len(calls) == src.count("print_flag=") == 10
     guard = (PKG / "src_gp/common/spin_guard.py").read_text()
     assert guard.count("if _elect_printer(site, print_flag):") == 3
 

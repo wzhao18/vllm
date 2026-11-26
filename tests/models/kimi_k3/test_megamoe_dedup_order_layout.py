@@ -38,6 +38,7 @@ def _token_comm(world_size: int, expert_count: int, topk: int, tokens: int, hidd
             "sf_padding_block": 128,
             "tokens_per_fc1_ready_slot": 128,
             "fc2_done_signals_per_token_tile": 1,
+            "fc1_done_signals_per_token_tile": 24,
             "promised_launchable_sm_count": 148,
             "token_in_flag_batch": 1,
             "token_back_mode": "standalone_warps",
@@ -87,3 +88,22 @@ def test_production_ep16_order_bytes():
     assert order_bytes == 14 * 2**30  # was 16 GiB with every row padded to 4 whole chunks
     # No smaller exact bound exists: E/R = 56 >= K, so one rank can receive every route of every token.
     assert tc.experts_per_rank >= tc.topk
+
+
+@pytest.mark.parametrize(
+    "world_size,expert_count,hidden,topk",
+    [(16, 896, 3584, 16), (8, 896, 3584, 16), (8, 448, 3584, 8), (4, 224, 3712, 16), (8, 64, 256, 2)],
+)
+def test_copy_mailbox_sits_in_the_unused_last_slot(world_size, expert_count, hidden, topk):
+    """Combine readiness: the copy mailbox ((K-1) Int32 pool rows) lives in chunk 0 of copy slot K-1, which a block
+    with cnt < K never writes (FC2 stores copies 0..cnt-1) and never reads (the reduce loads copies 0..cnt-1)."""
+    tc = _token_comm(world_size, expert_count, topk, 8192, hidden)
+    begin = tc.copy_mailbox_offset
+    end = begin + (topk - 1) * 4
+    slot_k1_chunk0 = ((topk - 1) * _chunk_size(tc, 0), topk * _chunk_size(tc, 0))
+    assert slot_k1_chunk0[0] == begin and end <= slot_k1_chunk0[1]
+    for c in range(tc.order_chunks_per_row):
+        size = _chunk_size(tc, c)
+        for k in range(topk - 1):
+            start = c * topk * tc.order_chunk_bytes + k * size
+            assert start + size <= begin or start >= end, "mailbox overlaps a copy slot used when cnt < K"

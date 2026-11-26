@@ -54,6 +54,7 @@ from ......common.ptx_helpers import (
     cvt_f32_to_fp8_to_f32,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
+    red_async_add_release_gpu_s32,
     sigmoid_pair_tanh_approx,
     situ_pair_tanh_approx,
 )
@@ -982,6 +983,9 @@ class SwapABGatedActEpilogue(KernelComponent):
     # state without this __init__ and keeps these.
     epilogue_warpgroups = 1
     two_epilogue_warpgroups = False
+    # Dedup combine readiness: every FC2 tile also adds one completion to its (expert, token tile) FC1-done slot,
+    # which the combine waits on per copy (token_comm_dedup._wait_block_copies).
+    combine_tile_ready = False
     fc1_splits_token_halves = False
     use_tanh_sigmoid = False
     # vLLM-local S3 SiTU core (VENDOR.md): the prefill dedup epilogue only; GenPhase decode keeps upstream.
@@ -1610,11 +1614,13 @@ class SwapABGatedActEpilogue(KernelComponent):
                             flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                         else:
                             flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                            self._signal_fc2_tile_ready(prev_work_tile_info, fc1_done_counter, tidx)
                 else:
                     if prev_is_fc1:
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                        self._signal_fc2_tile_ready(prev_work_tile_info, fc1_done_counter, tidx)
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
@@ -1728,6 +1734,21 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "SwapABFc1Epilogue":
         assert len(values) == 0
         return self
+
+    @cute.jit
+    def _signal_fc2_tile_ready(self, work_tile_info, fc1_done_counter, tidx):
+        """Dedup combine readiness: after the tile's stores have completed (the caller's bulk wait + tile-end
+        barrier), warp 0 of the publishing warpgroup adds one FC2 completion to the tile's FC1-done slot. FC2 of a
+        slot runs only once every FC1 completion has landed, so the slot then reads FC1 + FC2 completions."""
+        if cutlass.const_expr(self.combine_tile_ready):
+            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear2):
+                epilogue_warp = cute.arch.make_warp_uniform(
+                    (tidx % cutlass.Int32(self._EpilogueWarpCnt * 32)) // cutlass.Int32(32)
+                )
+                if epilogue_warp == cutlass.Int32(0):
+                    slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                    with cute.arch.elect_one():
+                        red_async_add_release_gpu_s32(fc1_done_counter.iterator + slot, cutlass.Int32(1))
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):

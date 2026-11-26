@@ -1557,6 +1557,10 @@ class TokenCommDedup(KernelComponent):
     fc1_activation_region = "nvlink.token_comm_dedup.fc1_activation"
     fc1_activation_sf_region = "nvlink.token_comm_dedup.fc1_activation_sf"
     fc2_done_region = "nvlink.token_comm_dedup.fc2_done"
+    # Combine readiness per token tile: the kernel's FC1-done counter (one Int32 per (expert, token tile), reset
+    # by the tail) also counts that tile's FC2 completions once FC1 is done (FC2 epilogue, ``combine_tile_ready``).
+    # Registered by BlockScaledSwapAbMegaMoeKernel (``fc1_done_counter_region``) in the same DeviceWorkspace.
+    fc1_done_region = "rubin.mega_moe.fc1_done_counter"
     # Order buffer the FC2 epilogue scatters into at [src_token, src_rank, dst_order_id].
     fc2_order_output_region = "nvlink.token_comm_dedup.fc2_order_output"
     pre_reduced_activation_region = "nvlink.token_comm_dedup.pre_reduced_activation"
@@ -1594,6 +1598,7 @@ class TokenCommDedup(KernelComponent):
             "sf_padding_block": int,
             "tokens_per_fc1_ready_slot": int,
             "fc2_done_signals_per_token_tile": int,
+            "fc1_done_signals_per_token_tile": int,
             "promised_launchable_sm_count": int,
             "token_in_flag_batch": int,
             "token_back_mode": str,
@@ -1619,6 +1624,7 @@ class TokenCommDedup(KernelComponent):
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.tokens_per_fc1_ready_slot = impl_desc["tokens_per_fc1_ready_slot"]
         self.fc2_done_signals_per_token_tile = impl_desc["fc2_done_signals_per_token_tile"]
+        self.fc1_done_signals_per_token_tile = impl_desc["fc1_done_signals_per_token_tile"]
         self.promised_launchable_sm_count = impl_desc["promised_launchable_sm_count"]
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode: TokenBackMode = impl_desc["token_back_mode"]
@@ -1680,6 +1686,8 @@ class TokenCommDedup(KernelComponent):
             raise ValueError("tokens_per_fc1_ready_slot must be divisible by token_padding_block.")
         if self.token_back_enabled and self.fc2_done_signals_per_token_tile <= 0:
             raise ValueError("fc2_done_signals_per_token_tile must be positive when token-back is enabled.")
+        if self.token_back_enabled and self.fc1_done_signals_per_token_tile <= 0:
+            raise ValueError("fc1_done_signals_per_token_tile must be positive when token-back is enabled.")
         if self.combine_format.is_quantized or self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("Combine dedup supports the BF16 combine format only.")
         if self.hidden_size % 128 != 0:
@@ -1790,6 +1798,15 @@ class TokenCommDedup(KernelComponent):
         """Bytes of one copy in the order buffer: the output row rounded up to the 256 B granule only (the row's last
         chunk is stored at its own size, not padded to a whole chunk)."""
         return round_up(self.output_token_bytes, self.order_chunk_granule_bytes)
+
+    @property
+    def copy_mailbox_offset(self) -> int:
+        """Byte offset, inside an order block, of the copy mailbox: chunk 0 of copy slot K-1, which no copy writes
+        when the block has fewer than K copies (``dst_token_cnt < topk``). Word j holds the pool row of copy j,
+        written by the dispatch each launch and validated against that row's metadata by the combine (stale or
+        foreign bytes never pass: only this launch's pool row of copy j carries (src_token, src_rank, order j)).
+        (topk - 1) words <= 124 B fit in the >= 256 B chunk (router_max_topk 32, order_chunk_granule_bytes)."""
+        return (self.topk - 1) * min(self.order_chunk_bytes, self.order_row_bytes)
 
     @property
     def order_block_bytes(self) -> int:
@@ -2310,6 +2327,7 @@ class TokenCommDedup(KernelComponent):
         done_sf_begin = Int32(0)
         done_ready_slot_begin = Int32(0)
         pull_phase_mask = Int32(0)
+        order_base = self._device_workspace.ptr(self.fc2_order_output_region).toint()
         while done_row < total_rows:
             while (issued - done_count < Int32(depth)) and (issue_row < total_rows):
                 while issue_row >= issue_expert_begin + owned_sizes[issue_expert]:
@@ -2320,6 +2338,19 @@ class TokenCommDedup(KernelComponent):
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(issue_pool_token) * Int64(TokenSrcMetadata.nbytes)
                 )
+                if cutlass.const_expr(self.token_back_enabled):
+                    # Copy mailbox (combine readiness, ``copy_mailbox_offset``): every non-last copy of a block with
+                    # 1 < cnt < K records its pool row for the last copy's combine wait.
+                    if (metadata.dst_token_cnt > Int32(1)) and (metadata.dst_token_cnt < Int32(self.topk)):
+                        if (metadata.dst_order_id < metadata.dst_token_cnt - Int32(1)) and (lane_idx == Int32(0)):
+                            mailbox_block = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
+                            _st_gpu_s32(
+                                order_base
+                                + mailbox_block * Int64(self.order_block_bytes)
+                                + Int64(self.copy_mailbox_offset)
+                                + Int64(metadata.dst_order_id) * Int64(4),
+                                issue_pool_token,
+                            )
                 peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
                 remote_activation_address = (
                     self._token_comm_args.activation.iterator.toint()
@@ -2418,9 +2449,16 @@ class TokenCommDedup(KernelComponent):
 
     @cute.jit
     def token_back(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
-        """Combine warps: walk the pool metadata in expert order, wait for the ``fc2_done`` prefix up to the current
-        expert, and for every last copy (``order == cnt - 1``) reduce the block's copies in fp32 (order 0..cnt-1),
-        round once to bf16 and push it to the source rank. Single-copy rows are pushed by the FC2 epilogue."""
+        """Combine warps: walk the pool metadata in expert order and, for every last copy (``order == cnt - 1``),
+        wait until the FC2 tiles holding the block's own copies are done, then reduce the copies in fp32 (order
+        0..cnt-1), round once to bf16 and push the row to the source rank. Single-copy rows are pushed by the FC2
+        epilogue.
+
+        Readiness is per (expert, token tile) (``_wait_block_copies``): the copies' pool rows come from the copy
+        mailbox the dispatch fills (``copy_mailbox_offset``), and a tile is done when its FC1-done counter reaches
+        FC1 + FC2 completions. A block with K copies has no free mailbox slot and waits for the ``fc2_done`` prefix
+        of every expert up to its last copy's (the previous rule). The release point moves; the reduction order and
+        the pushed bytes do not."""
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         if cutlass.const_expr(not self.token_back_enabled):
@@ -2464,8 +2502,35 @@ class TokenCommDedup(KernelComponent):
         pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
         fc2_done = self._device_workspace.ptr(self.fc2_done_region)
+        fc1_done = self._device_workspace.ptr(self.fc1_done_region)
         order_pointer = self._device_workspace.ptr(self.fc2_order_output_region)
         output_token_bytes = self.output_token_bytes
+        # Per-lane expert tables for the mailbox lookup: lane l of round r covers local expert 32 r + l (pool rows
+        # [base, end) and its first FC1-done slot, the token_in / scheduler slot order).
+        expert_rounds: cutlass.Constexpr[int] = ceil_div(self.experts_per_rank, 32)
+        slot_tokens = Int32(self.tokens_per_fc1_ready_slot)
+        lane_pool_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
+        lane_pool_end = cute.make_rmem_tensor((expert_rounds,), Int32)
+        lane_slot_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
+        slot_carry = Int32(0)
+        for expert_round in cutlass.range_constexpr(expert_rounds):
+            round_expert = Int32(expert_round * 32) + lane_idx
+            round_begin = Int32(0)
+            round_size = Int32(0)
+            if round_expert < Int32(self.experts_per_rank):
+                round_begin = pool_expert_bases[round_expert]
+                round_size = owned_sizes[round_expert]
+            round_tiles = (round_size + slot_tokens - Int32(1)) // slot_tokens
+            inclusive_tiles = round_tiles
+            for step_log in cutlass.range_constexpr(5):
+                step = Int32(1 << step_log)
+                previous_tiles = Int32(cute.arch.shuffle_sync(inclusive_tiles, lane_idx - step))
+                if lane_idx >= step:
+                    inclusive_tiles = inclusive_tiles + previous_tiles
+            lane_pool_begin[expert_round] = round_begin
+            lane_pool_end[expert_round] = round_begin + round_size
+            lane_slot_begin[expert_round] = slot_carry + inclusive_tiles - round_tiles
+            slot_carry = slot_carry + Int32(cute.arch.shuffle_sync(inclusive_tiles, Int32(31)))
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
 
@@ -2488,35 +2553,30 @@ class TokenCommDedup(KernelComponent):
                 )
                 # Single-copy rows were pushed straight from the FC2 epilogue; only multi-copy blocks are reduced here.
                 if (metadata.is_last_copy != Int32(0)) and (metadata.dst_token_cnt > Int32(1)):
-                    iket.range_push("token_back.wait_fc2_warp_prefix")
-                    wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
-                    spin_start_ns = globaltimer_ns()
-                    while completed_expert_prefix <= local_expert:
-                        prefix_base = (completed_expert_prefix // Int32(32)) * Int32(32)
-                        checked_expert = prefix_base + Int32(31) - lane_idx
-                        lane_ready = checked_expert >= Int32(self.experts_per_rank)
-                        if checked_expert < Int32(self.experts_per_rank):
-                            checked_count = owned_sizes[checked_expert]
-                            checked_target = ((checked_count + Int32(self.tokens_per_fc1_ready_slot - 1))
-                                // Int32(self.tokens_per_fc1_ready_slot)) * Int32(self.fc2_done_signals_per_token_tile)
-                            lane_ready = cute.arch.load(fc2_done + checked_expert, Int32,
-                                                        sem="acquire", scope="gpu") >= checked_target
-                        ready_mask = cute.arch.vote_ballot_sync(lane_ready)
-                        completed_expert_prefix = cutlass.min(
-                            prefix_base + Int32(cute.arch.clz(~ready_mask)), Int32(self.experts_per_rank))
-                        if completed_expert_prefix <= local_expert:
-                            nanosleep(wait_sleep_ns)
-                            wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
-                            spin_guard_value(
-                                spin_start_ns, 27, completed_expert_prefix, local_expert + Int32(1),
-                                print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
-                    record=self._device_workspace.ptr(self._call_tail.record_region),
-                            )
-                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
-                    cute.arch.sync_warp()
-                    iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)
+                    if metadata.dst_token_cnt < Int32(self.topk):
+                        iket.range_push("token_back.wait_block_copies")
+                        self._wait_block_copies(
+                            metadata,
+                            local_expert,
+                            token_in_expert,
+                            block_address,
+                            token_metadata_pointer,
+                            fc1_done,
+                            lane_pool_begin,
+                            lane_pool_end,
+                            lane_slot_begin,
+                        )
+                        iket.range_pop()
+                    else:
+                        iket.range_push("token_back.wait_fc2_warp_prefix")
+                        completed_expert_prefix = self._wait_fc2_prefix(
+                            completed_expert_prefix, local_expert, owned_sizes, fc2_done
+                        )
+                        iket.range_pop()
+                    # Order every lane's acquire before the TMA that reads the completed copies.
+                    cute.arch.sync_warp()
                     fill_sequence = self._reduce_and_push(
                         block_address,
                         metadata.dst_token_cnt,
@@ -2532,6 +2592,120 @@ class TokenCommDedup(KernelComponent):
             expert_valid_begin = expert_valid_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()
+
+    @cute.jit
+    def _wait_fc2_prefix(
+        self, completed_expert_prefix: Int32, local_expert: Int32, owned_sizes: cute.Tensor, fc2_done: cute.Pointer
+    ) -> Int32:
+        """Wait until the ``fc2_done`` prefix covers every expert <= ``local_expert`` (blocks with K copies)."""
+        lane_idx = self._lane_idx
+        wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
+        spin_start_ns = globaltimer_ns()
+        while completed_expert_prefix <= local_expert:
+            prefix_base = (completed_expert_prefix // Int32(32)) * Int32(32)
+            checked_expert = prefix_base + Int32(31) - lane_idx
+            lane_ready = checked_expert >= Int32(self.experts_per_rank)
+            if checked_expert < Int32(self.experts_per_rank):
+                checked_count = owned_sizes[checked_expert]
+                checked_target = ((checked_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                    // Int32(self.tokens_per_fc1_ready_slot)) * Int32(self.fc2_done_signals_per_token_tile)
+                lane_ready = cute.arch.load(fc2_done + checked_expert, Int32,
+                                            sem="acquire", scope="gpu") >= checked_target
+            ready_mask = cute.arch.vote_ballot_sync(lane_ready)
+            completed_expert_prefix = cutlass.min(
+                prefix_base + Int32(cute.arch.clz(~ready_mask)), Int32(self.experts_per_rank))
+            if completed_expert_prefix <= local_expert:
+                nanosleep(wait_sleep_ns)
+                wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
+                spin_guard_value(
+                    spin_start_ns, 27, completed_expert_prefix, local_expert + Int32(1),
+                    print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region),
+                )
+        return completed_expert_prefix
+
+    @cute.jit
+    def _wait_block_copies(
+        self,
+        metadata: TokenSrcMetadata,
+        local_expert: Int32,
+        token_in_expert: Int32,
+        block_address: Int64,
+        token_metadata_pointer: cute.Pointer,
+        fc1_done: cute.Pointer,
+        lane_pool_begin: cute.Tensor,
+        lane_pool_end: cute.Tensor,
+        lane_slot_begin: cute.Tensor,
+    ) -> None:
+        """Last copy of a block with 1 < cnt < K: wait until the (expert, token tile) of every copy has finished
+        FC2. Copy j < cnt - 1 is found through mailbox word j (its pool row, written by the dispatch this launch);
+        a value is used only if that row lies in an earlier expert's pool this launch and its metadata names this
+        block and order j, otherwise the word is re-read (the dispatch of copy j has not run yet). A tile is done
+        when its FC1-done counter holds every FC1 and FC2 completion of the tile."""
+        lane_idx = self._lane_idx
+        expert_rounds: cutlass.Constexpr[int] = ceil_div(self.experts_per_rank, 32)
+        slot_tokens = Int32(self.tokens_per_fc1_ready_slot)
+        tile_done_target = Int32(self.fc1_done_signals_per_token_tile + self.fc2_done_signals_per_token_tile)
+        own_slot_begin = Int32(0)
+        for expert_round in cutlass.range_constexpr(expert_rounds):
+            round_slot_begin = Int32(cute.arch.shuffle_sync(lane_slot_begin[expert_round], local_expert % Int32(32)))
+            if local_expert // Int32(32) == Int32(expert_round):
+                own_slot_begin = round_slot_begin
+        own_slot = own_slot_begin + token_in_expert // slot_tokens
+        mailbox = cute.make_ptr(
+            Int32, block_address + Int64(self.copy_mailbox_offset), AddressSpace.gmem, assumed_align=4
+        )
+        copy_count = metadata.dst_token_cnt
+        for copy_idx in cutlass.range(copy_count, unroll=1):
+            slot = own_slot
+            if copy_idx < copy_count - Int32(1):
+                found = Int32(0)
+                wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
+                spin_start_ns = globaltimer_ns()
+                while found == Int32(0):
+                    copy_row = cute.arch.load(mailbox + copy_idx, Int32, sem="relaxed", scope="gpu")
+                    for expert_round in cutlass.range_constexpr(expert_rounds):
+                        round_expert = Int32(expert_round * 32) + lane_idx
+                        owns_row = (
+                            (lane_pool_begin[expert_round] <= copy_row)
+                            & (copy_row < lane_pool_end[expert_round])
+                            & (round_expert < local_expert)
+                        )
+                        owner_mask = Int32(cute.arch.vote_ballot_sync(owns_row))
+                        if owner_mask != Int32(0):
+                            owner_lane = Int32(cute.arch.popc((owner_mask & (Int32(0) - owner_mask)) - Int32(1)))
+                            owner_begin = Int32(cute.arch.shuffle_sync(lane_pool_begin[expert_round], owner_lane))
+                            owner_slot_begin = Int32(cute.arch.shuffle_sync(lane_slot_begin[expert_round], owner_lane))
+                            copy_metadata = TokenSrcMetadata.load(
+                                token_metadata_pointer.toint() + Int64(copy_row) * Int64(TokenSrcMetadata.nbytes)
+                            )
+                            if (
+                                (copy_metadata.src_token == metadata.src_token)
+                                and (copy_metadata.src_rank == metadata.src_rank)
+                                and (copy_metadata.dst_order_id == copy_idx)
+                            ):
+                                found = Int32(1)
+                                slot = owner_slot_begin + (copy_row - owner_begin) // slot_tokens
+                    if found == Int32(0):
+                        nanosleep(wait_sleep_ns)
+                        wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
+                        spin_guard_value(
+                            spin_start_ns, 28, copy_row, copy_idx,
+                            print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                            record=self._device_workspace.ptr(self._call_tail.record_region),
+                        )
+            wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
+            spin_start_ns = globaltimer_ns()
+            tile_count = cute.arch.load(fc1_done + slot, Int32, sem="acquire", scope="gpu")
+            while tile_count < tile_done_target:
+                nanosleep(wait_sleep_ns)
+                wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
+                spin_guard_value(
+                    spin_start_ns, 29, tile_count, tile_done_target,
+                    print_flag=self._device_workspace.ptr(self._call_tail.printed_region),
+                    record=self._device_workspace.ptr(self._call_tail.record_region),
+                )
+                tile_count = cute.arch.load(fc1_done + slot, Int32, sem="acquire", scope="gpu")
 
     @cute.jit
     def _issue_fill(

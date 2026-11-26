@@ -339,6 +339,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 "token_back_ready_granularity": self.token_back_ready_granularity,
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
+                # FC1 completions per (expert, token tile): the FC2 wait threshold (``fc2_spin_threshold``).
+                "fc1_done_signals_per_token_tile": ceil_div(self.intermediate_gateup_size, self.cta_tile_m),
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
                 "token_back_schedule_mode": self.token_back_schedule_mode,
                 "router_smem_limit_bytes": utils.get_smem_capacity_in_bytes(self.architecture),
@@ -349,6 +351,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.token_comm = (TokenCommDedup if self.combine_dedup else TokenCommNonDeterministic)(
             problem_desc, token_comm_impl_desc
         )
+        if self.combine_dedup and self.token_comm.fc1_done_region != self.fc1_done_counter_region:
+            raise ValueError("The dedup combine waits on the kernel's FC1-done counter region; the names must match.")
         self.max_tokens = self.token_comm.worst_case_token_count
 
         fc12_problem_desc = ProblemDesc({**problem_desc, "expert_count": self.local_expert_count})
@@ -850,7 +854,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             "_dlb_v1"
             + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")
-            + f"_{'dedup' if self.combine_dedup else 'nodedup'}"
+            + f"_{'dedup_crtile_v1' if self.combine_dedup else 'nodedup'}"
             # Only the non-default value changes the name, so existing compiled kernels keep their keys.
             + ("_epiwarpgroups2" if self.two_epilogue_warpgroups else "")
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
