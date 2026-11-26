@@ -1514,6 +1514,8 @@ class RubinExpertsKernel(ExpertsKernel):
                             stamp_at(trace, 6)
             if warp == 1:
                 self.consume(sm, tmem, trace, ranges)
+                m0, m1 = rd.buffer("m8m", self.grid)
+                rd.begin(m0, m1, cta, tid == 32)  # DIAG RT2: MMA warp done
                 fence_tmem(before=True)
                 named_barrier(TMEM_DONE, 320, arrive=True)
             elif warp == 2:
@@ -1551,6 +1553,8 @@ class RubinExpertsKernel(ExpertsKernel):
                 self.epilogue(
                     sm, workspace, output, tmem, ranges, batch, own & 1, scalars
                 )
+                q0, q1 = rd.buffer("m8e", self.grid)
+                rd.begin(q0, q1, cta, tid == 128)  # DIAG RT2: epilogue warp 4 done
         if cutlass.const_expr(self.stamp > 0):
             if (lane == 0) & ((warp < 2) | (warp == 4)):
                 stamp_at(trace, 1 + warp - 2 * Int32(warp == 4))
