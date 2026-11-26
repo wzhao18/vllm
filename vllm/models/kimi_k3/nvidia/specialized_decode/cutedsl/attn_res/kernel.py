@@ -92,7 +92,7 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False, out_mx=None, delta_parts=0,
+        out_mc=False, out_mx=None, delta_parts=0, warp_push=False,
     ):  # fmt: skip
         # ``delta_parts`` (slots 0): the delta is the beta-add GEMM's output left as
         # FP32 split-K partials: ``post`` takes (partials [parts * n, 7168] FP32,
@@ -128,6 +128,14 @@ class ClusterAttnRes:
         # ``spread_push``: the exchange's 7 x count DSMEM pushes come from 7 x count
         # threads (one each) instead of count threads pushing to every peer.
         self.spread_push = spread_push
+        # ``warp_push`` (Rubin): after the exchanges that follow the delta landing
+        # (post statistics, final norm) every warp forms the totals itself from the
+        # peers' values and shuffles them to its lanes (``exchange_warps``), so the
+        # totals barrier is not on the output path. The same sums in the same order:
+        # bitwise. (Pushing each warp's partial instead of the CTA sum, which would
+        # also drop the barrier before the pushes, measured slower: 4x the DSMEM
+        # pushes cost +0.06 us/call at 8 rows and +0.25-0.48 at 64, 1 GPU.)
+        self.warp_push = warp_push
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -170,6 +178,38 @@ class ClusterAttnRes:
                 sums[peer % 2] += peer_buf[peer * 16 + tid]
             total[tid] = sums[0] + sums[1]
         group_barrier(0)
+
+    @cute.jit
+    def exchange_warps(
+        self, values, count: cutlass.Constexpr, kpad: cutlass.Constexpr, bufs, r, ids
+    ):
+        """``exchange`` (``warp_push``) returning the ``count`` totals in every
+        thread's registers: lanes < count of each warp sum the peers' values (the same
+        two alternating accumulators) and shuffle them, instead of threads < count
+        storing them for a CTA barrier."""
+        wb, peer_buf, _, bars = bufs
+        peer_buf, bar = peer_buf[r, None], bars.iterator + r
+        rank, _, tid = ids
+        lane, warp = tid % 32, tid // 32
+        reduced, index = scatter_reduce(values, lane, kpad)
+        if (lane & (32 // kpad - 1)) == 0 and index < count:
+            wb[warp * 16 + index] = reduced
+        group_barrier(0)
+        if tid < 7 * count:
+            i, peer = tid % count, tid // count
+            value = (wb[i] + wb[16 + i]) + (wb[32 + i] + wb[48 + i])
+            push_float(peer_buf.iterator + rank * 16 + i, value, bar, peer)
+        wait(bar)
+        mine = Float32(0)
+        if lane < count:
+            sums = [Float32(0), Float32(0)]
+            for p in cutlass.range_constexpr(7):
+                sums[p % 2] += peer_buf[p * 16 + lane]
+            mine = sums[0] + sums[1]
+        totals = cute.make_rmem_tensor(count, Float32)
+        for k in cutlass.range_constexpr(count):
+            totals[k] = cute.arch.shuffle_sync(mine, k)
+        return totals
 
     @cute.kernel
     def kernel(self, args):
@@ -351,16 +391,20 @@ class ClusterAttnRes:
             row0 = output[1]
         if cutlass.const_expr(self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
-        self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
+        if cutlass.const_expr(self.warp_push):
+            t1 = self.exchange_warps(values, self.npost, self.kpost, bufs, 1, ids)
+        else:
+            self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
+            t1 = total[1, None]
         if cutlass.const_expr(not self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         result = cute.make_rmem_tensor((1, 8), Float32)
         if cutlass.const_expr(self.nb == 0):
-            scale = rstd(total[1, 0], out_eps)
+            scale = rstd(t1[0], out_eps)
             for i in cutlass.range_constexpr(8):
                 result[0, i] = v[NEW, i] * scale * v[G, i]
         else:
-            ss, dot = total[1, 0], total[1, 1]
+            ss, dot = t1[0], t1[1]
             logit = dot * rstd(ss, eps)
             top = cute.arch.fmax(maximum, logit)
             alpha = cute.math.exp(maximum - top, fastmath=True)
@@ -376,14 +420,18 @@ class ClusterAttnRes:
                     round_pair(result, 0, j)
                 fin = cute.make_rmem_tensor(1, Float32)
                 fin[0] = dot8(result, 0, result, 0)
-                self.exchange(fin, 1, 1, bufs, 2, ids)
-                scale = rstd(total[2, 0], out_eps)
+                if cutlass.const_expr(self.warp_push):
+                    t2 = self.exchange_warps(fin, 1, 1, bufs, 2, ids)
+                else:
+                    self.exchange(fin, 1, 1, bufs, 2, ids)
+                    t2 = total[2, None]
+                scale = rstd(t2[0], out_eps)
                 for i in cutlass.range_constexpr(8):
                     result[0, i] = result[0, i] * scale * v[G, i]
             else:
-                a2, t3 = alpha * alpha, total[1, 3]
+                a2, t3 = alpha * alpha, t1[3]
                 ae2 = Float32(2) * alpha * ep
-                quad = fma(a2, t3, fma(ae2, total[1, 2], ep * ep * ss))
+                quad = fma(a2, t3, fma(ae2, t1[2], ep * ep * ss))
                 scale = rstd(quad, out_eps * denominator * denominator)
                 ca, cp = alpha * scale, ep * scale
                 for i in cutlass.range_constexpr(8):
