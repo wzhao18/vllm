@@ -468,28 +468,36 @@ def px_set_shadow(module: torch.nn.Module | None, kind: str) -> None:
     cache = getattr(module, "_px_shadow_cache", None)
     if cache is None:
         keys = ("o_proj",) if kind == "kda" else ("q_b", "wq_b", "g_proj", "gate", "o_proj")
-        params = [(n, t) for n, t in list(module.named_parameters()) + list(module.named_buffers())
-                  if t.is_cuda and t.is_contiguous() and any(k in n for k in keys)]
-        if sum(t.numel() * t.element_size() for _, t in params) < 4096:
-            params = [(n, t) for n, t in module.named_parameters() if t.is_cuda and t.is_contiguous()]
-        params.sort(key=lambda x: -x[1].numel() * x[1].element_size())
+        # Real bytes of the layer's tensors, by storage (packed / non-contiguous weights included), key matches first,
+        # then the largest; one storage is cycled only if the module holds fewer bytes than the target.
+        seen, spans = set(), []
+        for n, t in list(module.named_parameters()) + list(module.named_buffers()):
+            if not t.is_cuda:
+                continue
+            st = t.untyped_storage()
+            if st.data_ptr() in seen or st.nbytes() < 4096:
+                continue
+            seen.add(st.data_ptr())
+            spans.append((not any(k in n for k in keys), -st.nbytes(), n, st.data_ptr(), st.nbytes(), tuple(t.shape)))
+        spans.sort()
+        params = [(x[2], x[5]) for x in spans]
         segs, left, i = [], target, 0
         while left > 0:
-            n, t = params[i % len(params)]
-            addr = (t.data_ptr() + 15) // 16 * 16
-            nb = min(left, (t.data_ptr() + t.numel() * t.element_size() - addr) // 16 * 16)
+            _, _, n, p0, nbytes, _ = spans[i % len(spans)]
+            addr = (p0 + 15) // 16 * 16
+            nb = min(left, (p0 + nbytes - addr) // 16 * 16)
             if nb >= 16:
                 segs.append((addr, nb))
                 left -= nb
             i += 1
-            assert i < 64, "PX shadow: no usable parameter bytes"
+            assert len(segs) <= 6, f"PX shadow {kind}: {target} B needs > 6 segments from {params[:6]}"
         cache = segs
         module._px_shadow_cache = cache
         if kind not in _px_logged:
             _px_logged.add(kind)
             logger.warning(
                 "K31_PX shadow %s: %d B per source from %s", kind, sum(b for _, b in segs),
-                [(n, tuple(t.shape), str(t.dtype)) for n, t in params[:6]],
+                params[:6],
             )
     _px_src = cache
 
