@@ -69,8 +69,8 @@ G_N, G_K = 12288, 7168
 O_N, O_K = 7168, 12288
 SHARD_QB, SHARD_G, SHARD_O = QB_N // 8, G_N // 8, O_K // 8
 W_BYTES = (QB_N * QB_K + G_N * G_K + O_N * O_K) * 2
-# Bytes per new row pushed: kv_c (512) + k_pe (64) + wkv_index (128 + 64), BF16.
-KV_C, K_PE, WKV = 512, 64, 192
+# Bytes per new row pushed: kv_c (512) + k_pe (64) + wkv_index (index head 128 + 32 index-head weights), BF16.
+KV_C, K_PE, WKV = 512, 64, 160
 ROW_BYTES = (KV_C + K_PE + WKV) * 2
 
 _CUDA = r"""
@@ -414,11 +414,11 @@ class TlxDsa:
         return self.raw[o : o + n * rb].view(torch.bfloat16).view(n, widths[i])
 
     def send_rows(self, R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This rank's send rows: (kv_c [R, 512], k_pe [R, 64], wkv [R, 192]) BF16."""
+        """This rank's send rows: (kv_c [R, 512], k_pe [R, 64], wkv [R, 160]) BF16."""
         return tuple(self._plane(i, R, self.world) for i in range(3))  # type: ignore[return-value]
 
     def recv_rows(self, R: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Every rank's rows in rank order (= the step's token order): ([W R, 512], [W R, 64], [W R, 192])."""
+        """Every rank's rows in rank order (= the step's token order): ([W R, 512], [W R, 64], [W R, 160])."""
         return tuple(self._plane(i, R, -1) for i in range(3))  # type: ignore[return-value]
 
     def push(self, w_qb: torch.Tensor, w_g: torch.Tensor, w_o: torch.Tensor, R: int) -> None:
@@ -464,6 +464,7 @@ def layer_ok(attn) -> bool:
         return (
             all(w.dtype == torch.bfloat16 and w.is_contiguous() and tuple(w.shape) == sh for w, sh in zip(ws, shapes))
             and attn.dsa_indexer.use_fused_k_insert
+            and attn.dsa_indexer.wkv_index.weight.shape[0] == WKV
             and attn.mla_attn.rotary_emb is None
             and attn.mla_attn.mla_attn.use_shardq
         )
