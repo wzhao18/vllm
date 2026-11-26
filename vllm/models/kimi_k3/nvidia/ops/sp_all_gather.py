@@ -706,8 +706,9 @@ class SymmSpAllGather:
         x = x.contiguous()
         numel = rows * hidden
         nbytes = numel * x.element_size()
+        if self.world * nbytes > self.px_tail:
+            _px_take()  # a gather this large (init-time profile run at MNBT rows) reaches the tail: no shadow bytes
         if self.tma and nbytes % 16 == 0 and x.data_ptr() % 16 == 0 and _px_src:
-            assert self.world * nbytes <= self.px_tail, "K31_PX: BF16 gather reaches the slot tail"
             self._px_push(slot, [(x.data_ptr(), nbytes, self.rank * nbytes)])
             start = slot * self.slot_numel
             return self.storage[start : start + self.world * numel].view(
