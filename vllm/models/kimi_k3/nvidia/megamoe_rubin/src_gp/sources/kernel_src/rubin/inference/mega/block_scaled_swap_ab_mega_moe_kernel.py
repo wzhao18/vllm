@@ -854,7 +854,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             "_dlb_v1"
             + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")
-            + f"_{'dedup_crtile_v4' if self.combine_dedup else 'nodedup'}"
+            + f"_{'dedup_crtile_v5' if self.combine_dedup else 'nodedup'}"
             # Only the non-default value changes the name, so existing compiled kernels keep their keys.
             + ("_epiwarpgroups2" if self.two_epilogue_warpgroups else "")
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
