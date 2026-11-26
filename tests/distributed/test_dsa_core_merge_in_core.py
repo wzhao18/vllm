@@ -116,7 +116,7 @@ class _Boxes:
         ]
 
 
-def _check(group, ws, n) -> None:
+def _check(group, ws, n, TOPK) -> None:
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer_stage import (  # noqa: E501
         MicInputs,
@@ -252,7 +252,9 @@ def _check(group, ws, n) -> None:
             assert all(torch.equal(every[r], every[0]) for r in range(world))
 
 
-def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None:
+def run_worker(
+    rank: int, world: int, local_rank: int, init_method: str, TOPK: int
+) -> None:
     from types import SimpleNamespace
 
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -303,7 +305,7 @@ def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None
             ws = get_dcp_topk_rescue_workspace(TOPK, n)
             assert ws is not None and ws.mailbox is not None
             assert ws.max_rows >= max(VARIANTS)
-            _check(group, ws, n)
+            _check(group, ws, n, TOPK)
         finally:
             cleanup_dist_env_and_memory()
 
@@ -320,11 +322,15 @@ def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None
         for w in (4, 8)  # (IndexerLocalTopk: N < 1024)
     ],
 )
-def test_dsa_core_merge_in_core(world: int):
+# top-k 2048 (N 768 / 384 at W 4 / 8); and the DCP16 rank's N = 192 (top-k 512 / 1024 at
+# W 4 / 8): the core's speculative gather + Q K of the own candidates (2x16s3 rows)
+@pytest.mark.parametrize("topk", [TOPK, "n192"])
+def test_dsa_core_merge_in_core(world: int, topk):
+    topk = topk if topk != "n192" else 128 * world
     init_method = f"tcp://127.0.0.1:{get_open_port()}"
     ctx = mp.get_context("spawn")
     procs = [
-        ctx.Process(target=run_worker, args=(r, world, r, init_method))
+        ctx.Process(target=run_worker, args=(r, world, r, init_method, topk))
         for r in range(world)
     ]
     for p in procs:

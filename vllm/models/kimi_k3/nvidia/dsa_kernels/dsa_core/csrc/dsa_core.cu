@@ -91,6 +91,20 @@ struct Plan {
   static constexpr int kQPer = (kQChunks + kThreads - 1) / kThreads;
   static_assert(kSmem + 2048 <= 227 * 1024, "dsa_core shared memory");
   static_assert(HG * 512 * 4 <= 2 * kChunk * kRowS, "FP32 O staging over the KV buffers");
+  // merge in core at HG = 16 (``mic``), past the plan: its round-1 stage (W x box words),
+  // the saturated push's B' row, the bins, the block-table cache + tie keys, and the
+  // speculative gather's candidate KV rows, position -> candidate map and a zero V row
+  static constexpr int kMx = (kSmem + 127) & ~127;
+  static constexpr int kMxStageWords = 4416;                    // W x box_words (W x N <= 4096)
+  static constexpr int kMxStage = kMx;
+  static constexpr int kMxPush = kMxStage + kMxStageWords * 4;  // [K + K / 32 <= 2112] u32
+  static constexpr int kMxHist = kMxPush + 2112 * 4;            // [512] bins
+  static constexpr int kMxTab = kMxHist + kThreads * 4;         // [1024] table + [512] u64 ties
+  static constexpr int kMxCand = kMxTab + 1024 * 4 + 512 * 8;   // [256] candidate KV rows
+  static constexpr int kMxMap = kMxCand + 256 * 4;              // [256] position -> candidate
+  static constexpr int kMxZero = kMxMap + 256 * 4;              // [256] FP16 zeros
+  static constexpr int kSmemMic = kMxZero + 512;
+  static_assert(HG != 16 || kSmemMic + 4096 <= 227 * 1024, "dsa_core mic shared memory");
 };
 
 struct Params {
@@ -492,8 +506,17 @@ __device__ void mic_push(const Params& p, int t, int slot, int expected, uint32_
 
 // The merge in the core (see above): this rank's selected slots of row t -> sIdx [0, n)
 // (-1 after), returns n. Waits on the PDL predecessor (and triggers the dependents) itself.
-__device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, uint8_t* kvbuf,
-                         uint8_t* scratch, int* sIdx, long long* dbg) {
+// ``cand`` (speculation, HG = 16 one-pass rows): the CTA polls this rank's own slot first,
+// waits on its PDL predecessor, writes the own N candidates' KV rows in the select's
+// emission order (cand[q], -1: empty / past the table) and runs ``spec`` (their gather +
+// Q K) before it polls the other W - 1 slots; when round 1 stands (no saturated rank)
+// ``smap[pos]`` is the candidate of selected position pos (0 past the count) and
+// ``*spec_ok`` is set: the core's arithmetic then reads S / V through the map (the
+// same keys in the same order: bitwise the core on sIdx).
+template <class SpecF>
+__device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, uint32_t* stage,
+                         uint32_t* pbuf, int* hist, int* tab, int* sIdx, long long* dbg,
+                         int* cand, int* smap, SpecF spec, bool* spec_ok) {
   __shared__ int wt[kThreads / 32];
   __shared__ int sc[8];
   __shared__ int notsat[16], owner[16];
@@ -501,10 +524,6 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
   __shared__ unsigned long long s_cut;
   const int W = p.W, N = p.nloc, K = p.topk, BW = p.box_words, gb = p.gid_bits;
   const uint64_t gmask = (1ull << gb) - 1;
-  uint32_t* stage = reinterpret_cast<uint32_t*>(kvbuf);
-  uint32_t* pbuf = stage + W * BW;  // the push's B' row (W * BW: a multiple of 4)
-  int* hist = reinterpret_cast<int*>(scratch);  // [512]
-  int* tab = hist + kThreads;                   // [kTab]
   const int nreaders = gridDim.x * gridDim.y;
   const int ordinal = ld_cg(p.ordinals + t);
   const int seq = ld_cg(p.seq2 + t);
@@ -515,7 +534,7 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
   // ---- round 1: the row's W slots (Lamport: no word is the armed 0xFFFFFFFF)
   const uint32_t* base = p.box + ((int64_t)(ordinal & 1) * p.max_rows + t) * (int64_t)W * BW;
   const int chunks = W * BW / 4;
-  for (int c = tid; c < chunks; c += kThreads) {
+  auto poll = [&](int c) {
     uint4 v = ld_sys_v4(base + 4 * c);
     if (armed(v)) {
       const long long ts = now_ns();
@@ -526,6 +545,53 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
       } while (armed(v));
     }
     reinterpret_cast<uint4*>(stage)[c] = v;
+  };
+  // ---- round-1 keys (ord16 << gid_bits) | ~gid of slot j of rank r; 0: empty
+  auto r1 = [&](int i) -> uint64_t {
+    const int r = i / N, j = i - r * N;
+    const uint32_t* s = stage + r * BW;
+    const uint32_t w = s[j];
+    if (w == 0) return 0;
+    const uint32_t* pl = s + N + 2 * (j >> 5);
+    const uint32_t hi = (pl[0] & 0xFFFFu) | (pl[1] << 16);
+    const uint32_t local = (0xFFFFu - (w & 0xFFFFu)) | (((hi >> (j & 31)) & 1u) << 16);
+    const uint64_t gid = (uint64_t)local * W + r;
+    return ((uint64_t)(w >> 16) << gb) | (gmask - gid);
+  };
+  // a key -> its flat KV row (-1: empty, or a block past the table: dropped, as the select)
+  auto row_of = [&](uint64_t k) -> int {
+    if (k == 0) return -1;
+    const uint32_t gid = (uint32_t)(gmask - (k & gmask));
+    const int local = (int)(gid / (uint32_t)W);
+    const int blk = local / p.block_size;
+    if (blk >= p.bt_width) return -1;
+    const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
+    return e * p.stride_rows + (local - blk * p.block_size);
+  };
+  // the own flats [ob, ob + N) in the select's emission order (thread-major: with N <=
+  // 512 a thread holds at most one of them; flats past the next multiple of 512, on
+  // threads 0 .. wrap - 1, come first): candidate q <-> flat
+  const int ob = p.rank * N, nb = ob - ob % kThreads + kThreads, wrap = ob + N - nb;
+  auto flat_of = [&](int q) { return wrap > 0 ? (q < wrap ? nb + q : ob + q - wrap) : ob + q; };
+  auto cand_of = [&](int f) { return wrap > 0 ? (f >= nb ? f - nb : wrap + f - ob) : f - ob; };
+  const bool spec_on = cand != nullptr;
+  const int c0 = p.rank * BW / 4, c1 = c0 + BW / 4;  // (BW: a multiple of 4)
+  if (spec_on) {
+    for (int c = c0 + tid; c < c1; c += kThreads) poll(c);
+    __syncthreads();
+    if (dbg && tid == 0) dbg[14] = now_ns();
+    pdl_wait();
+    // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
+    pdl_launch();
+    if (dbg && tid == 0) dbg[5] = now_ns();
+    for (int q = tid; q < N; q += kThreads) cand[q] = row_of(r1(flat_of(q)));
+    __syncthreads();
+    spec();  // (gather + Q K of the candidates; ends with a barrier)
+    if (dbg && tid == 0) dbg[15] = now_ns();
+    for (int c = tid; c < chunks; c += kThreads)
+      if (c < c0 || c >= c1) poll(c);
+  } else {
+    for (int c = tid; c < chunks; c += kThreads) poll(c);
   }
   __syncthreads();
   if (tid == 0) {
@@ -540,23 +606,13 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
     if (tid == 0) p.readers[t] = 0;
   }
   if (dbg && tid == 0) dbg[19] = now_ns();
-  pdl_wait();
-  // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
-  pdl_launch();
-  if (dbg && tid == 0) dbg[5] = now_ns();
+  if (!spec_on) {
+    pdl_wait();
+    // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
+    pdl_launch();
+    if (dbg && tid == 0) dbg[5] = now_ns();
+  }
   if (last && tid == 0) p.ordinals[t] = ordinal + 1;
-  // ---- round-1 keys (ord16 << gid_bits) | ~gid of slot j of rank r; 0: empty
-  auto r1 = [&](int i) -> uint64_t {
-    const int r = i / N, j = i - r * N;
-    const uint32_t* s = stage + r * BW;
-    const uint32_t w = s[j];
-    if (w == 0) return 0;
-    const uint32_t* pl = s + N + 2 * (j >> 5);
-    const uint32_t hi = (pl[0] & 0xFFFFu) | (pl[1] << 16);
-    const uint32_t local = (0xFFFFu - (w & 0xFFFFu)) | (((hi >> (j & 31)) & 1u) << 16);
-    const uint64_t gid = (uint64_t)local * W + r;
-    return ((uint64_t)(w >> 16) << gb) | (gmask - gid);
-  };
   const int n1 = W * N;
   // Round 1, decoded once into registers (flat key f in register f / 512 of thread
   // f % 512, the select's layout). The cut: the K-th key's score tau16 by two 8-bit
@@ -578,7 +634,10 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
       const int o = (int)(k >> gb);
       const int m = __reduce_min_sync(~0u, f < n1 ? o : 0x10000);
       if (lane == 0 && f < n1) atomicMin(&notsat[f / N], m);
-      if (k != 0) atomicAdd(&h1[o >> 8], 1);
+      // (warp-aggregated: a row's scores share few of the 256 sign + exponent bins)
+      const int b = k != 0 ? o >> 8 : -1;
+      const unsigned peers = __match_any_sync(~0u, b);
+      if (b >= 0 && lane == __ffs(peers) - 1) atomicAdd(&h1[b], __popc(peers));
     }
   }
   __syncthreads();
@@ -719,12 +778,7 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
   auto own_row = [&](int f) -> int {  // flat key f -> its KV row if selected, else -1
     const uint64_t k = mask ? r2(f) : r1(f);
     if (k == 0 || k < c) return -1;
-    const uint32_t gid = (uint32_t)(gmask - (k & gmask));
-    const int local = (int)(gid / (uint32_t)W);
-    const int blk = local / p.block_size;
-    if (blk >= p.bt_width) return -1;  // (a block past the table: dropped, as the select)
-    const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
-    return e * p.stride_rows + (local - blk * p.block_size);
+    return row_of(k);
   };
   int total;
   if (!mask) {  // round 1 stands: the own keys are in registers
@@ -735,14 +789,8 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
       rws[i] = -1;
       const uint64_t k = keys[i];
       if (f >= obase && f < oend && k != 0 && k >= c) {
-        const uint32_t gid = (uint32_t)(gmask - (k & gmask));
-        const int local = (int)(gid / (uint32_t)W);
-        const int blk = local / p.block_size;
-        if (blk < p.bt_width) {
-          const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
-          rws[i] = e * p.stride_rows + (local - blk * p.block_size);
-          ++mine;
-        }
+        rws[i] = row_of(k);
+        if (rws[i] >= 0) ++mine;
       }
     }
     int pos = block_scan(mine, wt, lane, warp, &total) - mine;
@@ -750,6 +798,7 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
     for (int i = 0; i < kMicKpt; ++i)
       if (rws[i] >= 0) {
         if (pos < kMaxK) sIdx[pos] = rws[i];
+        if (spec_on) smap[pos] = cand_of(tid + i * kThreads);  // (pos < N)
         ++pos;
       }
   } else {
@@ -769,6 +818,9 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
   }
   const int n = min(total, kMaxK);
   for (int k = n + tid; k < kMaxK; k += kThreads) sIdx[k] = -1;
+  if (spec_on && !mask)
+    for (int k = n + tid; k < 3 * kChunk; k += kThreads) smap[k] = 0;
+  *spec_ok = spec_on && !mask;
   __syncthreads();
   if (mask && tid == 0) {  // the row's second round is over on this CTA
     __threadfence();
@@ -849,10 +901,95 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     sL[tid] = 0.f;
   }
   if (dbg && tid == 0) dbg[1] = now_ns();
+  // ---- Q K of one-pass chunks 0 .. nch - 1 (cnt keys; chunk 2 in the V buffer's space):
+  // warp (n-tile w & 7, k-half w >> 3), HG = 16
+  constexpr int kS2Str = kChunk + 4;  // chunk 2's S [32][kS2Str] floats
+  constexpr int kP1Str = kChunk + 8;  // tile 1's P [16][kP1Str] halves
+  uint8_t* const xb = reinterpret_cast<uint8_t*>(sVh);  // chunk 2's KV, S, tile 1's P
+  float* const sS2 = reinterpret_cast<float*>(xb + kChunk * kRowS);
+  __half* const sP1 = reinterpret_cast<__half*>(xb + kChunk * kRowS + 32 * kS2Str * 4);
+  auto bufc = [&](int c) { return c < 2 ? sKV + c * kChunk * kRowS : xb; };
+  auto qk_chunks = [&](int nch, int cnt) {
+    const int nt = warp & 7, kh = warp >> 3;
+    constexpr int KS = kRowB / 64;
+    for (int h = 0; h < nch; ++h) {
+      if (8 * nt >= min(kChunk, cnt - h * kChunk)) continue;
+      const uint8_t* buf = bufc(h);
+      float sacc[3][4] = {};
+      const uint8_t* qa = sQ + (lane & 15) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
+      const uint8_t* kb = buf + (8 * nt + (lane & 7)) * kRowS + ((lane >> 3) & 1) * 16 + kh * KS * 32;
+      uint32_t fa[3][4], fb[3][2];
+      ldsm_x4(fa[0][0], fa[0][1], fa[0][2], fa[0][3], qa);
+      ldsm_x2(fb[0][0], fb[0][1], kb);
+      ldsm_x4(fa[1][0], fa[1][1], fa[1][2], fa[1][3], qa + 32);
+      ldsm_x2(fb[1][0], fb[1][1], kb + 32);
+#pragma unroll
+      for (int ks = 0; ks < KS; ++ks) {
+        if (ks + 2 < KS) {
+          ldsm_x4(fa[(ks + 2) % 3][0], fa[(ks + 2) % 3][1], fa[(ks + 2) % 3][2],
+                  fa[(ks + 2) % 3][3], qa + 32 * (ks + 2));
+          ldsm_x2(fb[(ks + 2) % 3][0], fb[(ks + 2) % 3][1], kb + 32 * (ks + 2));
+        }
+        mma_fp8(sacc[ks % 3], fa[ks % 3][0], fa[ks % 3][1], fa[ks % 3][2], fa[ks % 3][3],
+                fb[ks % 3][0], fb[ks % 3][1]);
+      }
+      float* sS = h < 2 ? sSall + kh * 16 * kSStr + h * kChunk : sS2 + kh * 16 * kS2Str;
+      const int str = h < 2 ? kSStr : kS2Str;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = 8 * nt + 2 * q4 + (i & 1);
+        sS[(g8 + 8 * (i >> 1)) * str + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
+      }
+    }
+  };
+  // speculation (HG = 16, mic, S = 2 rows of at most split_min <= 3 chunks: the
+  // one-pass form): the merge's own N candidates' KV rows, gathered and multiplied while
+  // the other ranks' round-1 slots fly; the core then reads S and V through smap
+  int* const cand = reinterpret_cast<int*>(smem + (HG == 16 ? PL::kMxCand : 0));
+  int* const smap = reinterpret_cast<int*>(smem + (HG == 16 ? PL::kMxMap : 0));
+  const uint8_t* const zrow = smem + (HG == 16 ? PL::kMxZero : 0);
+  bool spec_ok = false;
   int n;
   if (p.mic) {
     // the merge in the core: round 1 polled before the PDL wait, this rank's slots
-    n = mic_front(p, t, tid, lane, warp, sKV, reinterpret_cast<uint8_t*>(sVh), sIdx, dbg);
+    if constexpr (HG == 16) {
+      const int nch = (p.nloc + kChunk - 1) / kChunk;
+      const bool spec_on = S == 2 && nch <= 3 && nch <= p.split_min;
+      if (tid < 32) reinterpret_cast<uint4*>(smem + PL::kMxZero)[tid] = make_uint4(0, 0, 0, 0);
+      auto spec = [&]() {
+        const int N = p.nloc;
+        for (int c = 0; c < nch; ++c) {
+          uint8_t* buf = bufc(c);
+          for (int i = tid; i < kChunk * (kRowB / 16); i += kThreads) {
+            const int r = i / (kRowB / 16), pc = i % (kRowB / 16);
+            const int q = c * kChunk + r;
+            const int slot = q < N ? cand[q] : -1;
+            if (slot >= 0) {
+              cp_async16(buf + r * kRowS + 16 * pc, p.kv + (int64_t)slot * kRowB + 16 * pc);
+            } else {
+              *reinterpret_cast<uint4*>(buf + r * kRowS + 16 * pc) = make_uint4(0, 0, 0, 0);
+            }
+          }
+        }
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
+        qk_chunks(nch, N);
+        __syncthreads();
+      };
+      n = mic_front(p, t, tid, lane, warp, reinterpret_cast<uint32_t*>(smem + PL::kMxStage),
+                    reinterpret_cast<uint32_t*>(smem + PL::kMxPush),
+                    reinterpret_cast<int*>(smem + PL::kMxHist),
+                    reinterpret_cast<int*>(smem + PL::kMxTab), sIdx, dbg, spec_on ? cand : nullptr,
+                    spec_on ? smap : nullptr, spec, &spec_ok);
+    } else {
+      // (HG = 32: the stage and the push's B' row in the KV buffers, bins and table in
+      // the FP16 V buffer; no speculation)
+      uint32_t* stage = reinterpret_cast<uint32_t*>(sKV);
+      int* hist = reinterpret_cast<int*>(sVh);
+      n = mic_front(p, t, tid, lane, warp, stage, stage + p.W * p.box_words, hist, hist + kThreads,
+                    sIdx, dbg, nullptr, nullptr, [] {}, &spec_ok);
+    }
   } else {
     // ---- the top-k slots / counts and the KV insert of this step are ours from here
     pdl_wait();
@@ -1176,16 +1313,20 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     }
   };
   // ---- the one-pass form of S = 2 solo rows (dsplit, kp == 1, <= 3 chunks); HG = 16
-  auto one_pass = [&]() {
-    constexpr int kS2Str = kChunk + 4;  // chunk 2's S [32][kS2Str] floats
-    constexpr int kP1Str = kChunk + 8;  // tile 1's P [16][kP1Str] halves
-    uint8_t* const xb = reinterpret_cast<uint8_t*>(sVh);  // chunk 2's KV, S, tile 1's P
-    float* const sS2 = reinterpret_cast<float*>(xb + kChunk * kRowS);
-    __half* const sP1 = reinterpret_cast<__half*>(xb + kChunk * kRowS + 32 * kS2Str * 4);
+  auto one_pass = [&](auto speculated) {
+    // SP: the chunks were gathered and multiplied in candidate order by the merge's
+    // speculation; position pos (the selected keys' order, as sIdx) is candidate smap[pos]
+    constexpr bool SP = decltype(speculated)::value;
     static_assert(kChunk * kRowS + 32 * kS2Str * 4 + 16 * kP1Str * 2 <= kChunk * kVStr * 2,
                   "one-pass chunk 2 in the V buffer's space");
-    auto bufc = [&](int c) { return c < 2 ? sKV + c * kChunk * kRowS : xb; };
     auto validc = [&](int c) { return min(kChunk, n - c * kChunk); };
+    auto rowp = [&](int q) { return bufc(q / kChunk) + (q % kChunk) * kRowS; };  // candidate q's row
+    // S of (S row r, position pos)
+    auto sv = [&](int r, int pos) -> float {
+      const int c = SP ? smap[pos] : pos;
+      return c < 2 * kChunk ? sSall[r * kSStr + c] : sS2[r * kS2Str + c - 2 * kChunk];
+    };
+    if constexpr (!SP) {
     for (int c = 0; c < nchunks; ++c) {
       uint8_t* buf = bufc(c);
       for (int i = tid; i < kChunk * (kRowB / 16); i += kThreads) {
@@ -1203,40 +1344,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     __syncthreads();
     if (dbg && tid == 0) dbg[10] = clock64();
     // ---- S = Q K^T of every chunk: warp (n-tile w & 7, k-half w >> 3), as the loop
-    {
-      const int nt = warp & 7, kh = warp >> 3;
-      constexpr int KS = kRowB / 64;
-      for (int h = 0; h < nchunks; ++h) {
-        if (8 * nt >= validc(h)) continue;
-        const uint8_t* buf = bufc(h);
-        float sacc[3][4] = {};
-        const uint8_t* qa = sQ + (lane & 15) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
-        const uint8_t* kb = buf + (8 * nt + (lane & 7)) * kRowS + ((lane >> 3) & 1) * 16 + kh * KS * 32;
-        uint32_t fa[3][4], fb[3][2];
-        ldsm_x4(fa[0][0], fa[0][1], fa[0][2], fa[0][3], qa);
-        ldsm_x2(fb[0][0], fb[0][1], kb);
-        ldsm_x4(fa[1][0], fa[1][1], fa[1][2], fa[1][3], qa + 32);
-        ldsm_x2(fb[1][0], fb[1][1], kb + 32);
-#pragma unroll
-        for (int ks = 0; ks < KS; ++ks) {
-          if (ks + 2 < KS) {
-            ldsm_x4(fa[(ks + 2) % 3][0], fa[(ks + 2) % 3][1], fa[(ks + 2) % 3][2],
-                    fa[(ks + 2) % 3][3], qa + 32 * (ks + 2));
-            ldsm_x2(fb[(ks + 2) % 3][0], fb[(ks + 2) % 3][1], kb + 32 * (ks + 2));
-          }
-          mma_fp8(sacc[ks % 3], fa[ks % 3][0], fa[ks % 3][1], fa[ks % 3][2], fa[ks % 3][3],
-                  fb[ks % 3][0], fb[ks % 3][1]);
-        }
-        float* sS = h < 2 ? sSall + kh * 16 * kSStr + h * kChunk : sS2 + kh * 16 * kS2Str;
-        const int str = h < 2 ? kSStr : kS2Str;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const int r = 8 * nt + 2 * q4 + (i & 1);
-          sS[(g8 + 8 * (i >> 1)) * str + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
-        }
-      }
-    }
+    qk_chunks(nchunks, n);
     __syncthreads();
+    }  // (!SP)
     if (dbg && tid == 0) dbg[11] = clock64();
     // ---- softmax of tile 0 (chunks 0, 1) and tile 1 (chunk 2), each its own piece:
     // warp w head w, lane l keys l + 32 k (the loop's per-tile arithmetic)
@@ -1246,8 +1356,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       float x[4];
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
-        x[k] = sSall[h * kSStr + 32 * k + lane];
-        x[k] += sSall[(16 + h) * kSStr + 32 * k + lane];
+        x[k] = sv(h, 32 * k + lane);
+        x[k] += sv(16 + h, 32 * k + lane);
         x[k] *= p.s2scale;
         if ((k >> 1) >= nh0 || sIdx[(k >> 1) * kChunk + 32 * (k & 1) + lane] < 0) x[k] = -INFINITY;
       }
@@ -1271,8 +1381,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         float y[2];
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
-          y[k] = sS2[h * kS2Str + 32 * k + lane];
-          y[k] += sS2[(16 + h) * kS2Str + 32 * k + lane];
+          y[k] = sv(h, 2 * kChunk + 32 * k + lane);
+          y[k] += sv(16 + h, 2 * kChunk + 32 * k + lane);
           y[k] *= p.s2scale;
           if (sIdx[2 * kChunk + 32 * k + lane] < 0) y[k] = -INFINITY;
         }
@@ -1315,8 +1425,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     for (int i = 0; i < 3 * kChunk / 32; ++i) {
       const int rr = 2 * warp + (lane >> 4) + 32 * i, c = rr / kChunk, r = rr % kChunk;
       const int j = lane & 15;
-      const bool on = c < nchunks && r < ((validc(c) + 15) & ~15);
-      uint8_t* row = on ? bufc(c) + r * kRowS : nullptr;
+      // (SP: only the selected rows; the PV of positions past the count reads the zero row)
+      const bool on = SP ? rr < n : c < nchunks && r < ((validc(c) + 15) & ~15);
+      uint8_t* row = on ? (SP ? rowp(smap[rr]) : bufc(c) + r * kRowS) : nullptr;
       uint4 w = make_uint4(0, 0, 0, 0);
       if (on) w = *reinterpret_cast<const uint4*>(row + 256 * sp + 16 * j);
       __syncwarp();
@@ -1339,15 +1450,21 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     auto pv1 = [&](int c, const __half* pb, int pstr) {
       if ((warp >> 3) != sp) return;  // (the other CTA's latent dims)
       const int valid = validc(c);
-      const __half* vb = reinterpret_cast<const __half*>(bufc(c)) +
-                         (((lane >> 3) & 1) * 8 + (lane & 7)) * (kRowS / 2) + 32 * (warp & 7) +
-                         (lane >> 4) * 8;
+      const int lr = ((lane >> 3) & 1) * 8 + (lane & 7);  // this lane's ldmatrix row
+      const __half* vb = reinterpret_cast<const __half*>(bufc(c)) + lr * (kRowS / 2) +
+                         32 * (warp & 7) + (lane >> 4) * 8;
 #pragma unroll
       for (int ks = 0; ks < kChunk / 16; ++ks) {
         if (16 * ks >= valid) break;
+        const __half* v = vb + 16 * ks * (kRowS / 2);
+        if constexpr (SP) {
+          const int pos = c * kChunk + 16 * ks + lr;
+          v = reinterpret_cast<const __half*>(pos < n ? rowp(smap[pos]) : zrow) + 32 * (warp & 7) +
+              (lane >> 4) * 8;
+        }
         uint32_t b[8];
-        ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * (kRowS / 2));
-        ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * (kRowS / 2) + 16);
+        ldsm_x4_t(b[0], b[1], b[2], b[3], v);
+        ldsm_x4_t(b[4], b[5], b[6], b[7], v + 16);
         uint32_t a0, a1, a2, a3;
         ldsm_x4(a0, a1, a2, a3, pb + (lane & 15) * pstr + 16 * ks + (lane >> 4) * 8);
         mma_f16(tacc[0], a0, a1, a2, a3, b[0], b[1]);
@@ -1391,7 +1508,11 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // with its arithmetic: bitwise the per-tile loop's partial and LSE.
   if constexpr (HG == 16) {
     if (dsplit && kp <= 2 && nchunks >= 1 && nchunks <= 3) {
-      one_pass();
+      if (spec_ok) {
+        one_pass(std::true_type{});
+      } else {
+        one_pass(std::false_type{});
+      }
     } else if (kp > 1) {
       mainloop(std::true_type{});
     } else {
@@ -1633,6 +1754,8 @@ void run_mic(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tenso
   // and the radix bins in the FP16 V buffer
   TORCH_CHECK((int64_t)W * box_words + topk + topk / 32 <= 2 * kChunk * kRowS / 4,
               "dsa_core mic: round-1 rows do not fit the KV buffers");
+  TORCH_CHECK(heads_per_cta != 16 || (int64_t)W * box_words <= Plan<16>::kMxStageWords,
+              "dsa_core mic: round-1 rows do not fit the stage");
   TORCH_CHECK(block_table.dtype() == torch::kInt32 && block_table.stride(1) == 1);
   TORCH_CHECK(req_id.dtype() == torch::kInt32 && req_id.numel() >= T);
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1 && logits.size(0) >= T);
@@ -1706,12 +1829,13 @@ void launch(const Params& p, int heads, int64_t heads_per_cta, int64_t pdl) {
   const int64_t splits = p.splits;
   const int HG = (int)heads_per_cta;
   auto kernel = HG == 16 ? dsac_kernel<16> : dsac_kernel<32>;
-  const int smem_bytes = HG == 16 ? Plan<16>::kSmem : Plan<32>::kSmem;
+  const int smem_bytes =
+      HG == 16 ? (p.mic ? Plan<16>::kSmemMic : Plan<16>::kSmem) : Plan<32>::kSmem;
   static bool attr16 = false, attr32 = false;
   bool& attr = HG == 16 ? attr16 : attr32;
   if (!attr) {
-    C10_CUDA_CHECK(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        HG == 16 ? Plan<16>::kSmemMic : smem_bytes));
     attr = true;
   }
   cudaLaunchConfig_t cfg = {};
@@ -1734,7 +1858,7 @@ void launch(const Params& p, int heads, int64_t heads_per_cta, int64_t pdl) {
 // Shared-memory opt-ins of every variant, outside any CUDA graph capture.
 void prepare() {
   C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      Plan<16>::kSmem));
+                                      Plan<16>::kSmemMic));
   C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       Plan<32>::kSmem));
 }
