@@ -3088,9 +3088,12 @@ class KimiLinearForCausalLM(
             )
         from .specialized_prefill import gemm_tactics
 
-        if pinned := gemm_tactics.enable(self):
+        if pinned := gemm_tactics.enable(
+            self, prefill_worker=pd_prefill_worker(self.vllm_config)
+        ):
             logger.info_once(
-                "Kimi K3: %d BF16 linears use pinned cuBLASLt tactics at >= %d rows.",
+                "Kimi K3: %d BF16 linears use pinned cuBLASLt tactics at prefill row "
+                "counts (>= %d rows; per-pin floors on P/D prefill workers).",
                 pinned,
                 gemm_tactics.MIN_ROWS,
             )

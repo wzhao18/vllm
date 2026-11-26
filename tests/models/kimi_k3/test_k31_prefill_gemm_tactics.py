@@ -78,16 +78,28 @@ def test_bf16_dispatch_routes_prefill_rows_only():
     bf16 = [key for key in gemm_tactics.PINS if key[0] == "bf16"]
     if not bf16:
         pytest.skip("no BF16 pins")
-    # One pin on the default floor and one on its own (lower) floor.
-    for key in {bf16[0], *(key for key in bf16 if key in gemm_tactics.PIN_MIN_ROWS)}:
+    # One pin on the default floor and every prefill-worker pin on its own floor.
+    for key in {
+        bf16[0],
+        *(key for key in bf16 if key in gemm_tactics.PREFILL_WORKER_PINS),
+    }:
         _check_dispatch(*key[1:])
 
 
-def _check_dispatch(n, k):
+def test_prefill_worker_pins_stay_off_elsewhere():
+    """Decode / aggregated instances keep the stock dispatch for the prefill-worker
+    pins at every row count (decode graph captures reach 2048 rows)."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.models.kimi_k3.nvidia.specialized_prefill import gemm_tactics
 
-    floor = gemm_tactics.min_rows("bf16", n, k)
+    for _, n, k in gemm_tactics.PREFILL_WORKER_PINS:
+        lin = _lin(n, k)
+        assert gemm_tactics.enable(lin, prefill_worker=False) == 0
+        assert type(lin.quant_method) is UnquantizedLinearMethod
+
+
+def _lin(n, k):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     class Lin(torch.nn.Module):
         def __init__(self):
@@ -98,8 +110,16 @@ def _check_dispatch(n, k):
             )
             self.quant_method = UnquantizedLinearMethod()
 
-    lin = Lin()
-    assert gemm_tactics.enable(lin) == 1
+    return Lin()
+
+
+def _check_dispatch(n, k):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import gemm_tactics
+
+    floor = gemm_tactics.min_rows("bf16", n, k)
+    lin = _lin(n, k)
+    assert gemm_tactics.enable(lin, prefill_worker=True) == 1
     method = lin.quant_method
     assert isinstance(method, UnquantizedLinearMethod)
     calls = []

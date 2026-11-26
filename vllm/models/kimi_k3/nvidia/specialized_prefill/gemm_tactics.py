@@ -90,16 +90,24 @@ PINS: dict[tuple[str, int, int], str] = {
     ),
 }
 
-# Pins searched down to fewer rows than MIN_ROWS (the replicated shared expert runs
-# on one rank's SP rows: 2048 at 16384 batched tokens over TP8).
-PIN_MIN_ROWS: dict[tuple[str, int, int], int] = {
+# Pins that only a P/D prefill worker (model.pd_prefill_worker) takes, with the
+# fewest rows a call runs on each: the tile-192x128 set was searched and measured at
+# prefill row counts only. Elsewhere (decode instances, aggregated serving) these
+# shapes keep the stock dispatch, so decode steps and decode CUDA graph captures
+# (max_num_seqs x (k + 1) rows reach 2048 per rank) never run them. The shared
+# expert gate_up runs on one rank's SP rows (2048 at 16384 batched tokens over
+# TP8), hence its lower floor.
+PREFILL_WORKER_PINS: dict[tuple[str, int, int], int] = {
+    ("bf16", 6288, 7168): MIN_ROWS,
     ("bf16", 12288, 7168): 2048,
+    ("bf16", 2112, 7168): MIN_ROWS,
+    ("bf16", 1536, 7168): MIN_ROWS,
 }
 
 
 def min_rows(dtype: str, n: int, k: int) -> int:
     """Fewest rows a call of an [N, K] ``dtype`` weight runs on its pinned tactic."""
-    return PIN_MIN_ROWS.get((dtype, n, k), MIN_ROWS)
+    return PREFILL_WORKER_PINS.get((dtype, n, k), MIN_ROWS)
 
 
 _CPP_SRC = r"""
@@ -342,9 +350,10 @@ class _PinnedBf16Method(UnquantizedLinearMethod):
         return super().apply(layer, x, bias)
 
 
-def enable(model: torch.nn.Module) -> int:
+def enable(model: torch.nn.Module, prefill_worker: bool) -> int:
     """Put every BF16 linear whose weight shape has a pin on its pinned tactic
-    (prefill row counts only). Returns the number switched."""
+    (prefill row counts only; the PREFILL_WORKER_PINS shapes only when
+    ``prefill_worker``). Returns the number switched."""
     switched = 0
     for module in model.modules():
         method = getattr(module, "quant_method", None)
@@ -354,6 +363,9 @@ def enable(model: torch.nn.Module) -> int:
         ):
             continue
         if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            continue
+        key = ("bf16", weight.shape[0], weight.shape[1])
+        if key in PREFILL_WORKER_PINS and not prefill_worker:
             continue
         if not weight.is_contiguous():
             continue
