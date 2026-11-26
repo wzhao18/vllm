@@ -73,6 +73,8 @@ def test_lean_top16_matches_non_lean(batch, kind, rcp):
     elif kind == "flat":  # every key equal: all 896 experts are candidates
         logits.fill_(-1.25)
         bias.zero_()
+    # the front never publishes -0.0 (the mailbox sentinel): round() makes some
+    logits = logits + 0.0
     lean = _route(batch, logits, bias, True, rcp)
     ref = _route(batch, logits, bias, False, False)
     assert torch.equal(lean[0], ref[0]), (lean[0] != ref[0]).nonzero()[:4].tolist()
