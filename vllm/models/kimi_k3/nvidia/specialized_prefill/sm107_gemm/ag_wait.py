@@ -17,16 +17,18 @@ into this rank's gathered operand. Two pieces:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Int32, Int64, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op, extract_mlir_values, new_from_mlir_values
+from vllm.models.kimi_k3.nvidia.k31_spin_guard import globaltimer_ns
 from cutlass.utils.static_persistent_tile_scheduler import (
     StaticPersistentTileScheduler,
     WorkTileInfo,
 )
 
-# ~2^30 polls x >= 64 ns: >= 60 s before the trap (a hang, not a late peer).
-SPIN_LIMIT = 1 << 30
+# 20 s on the clock before the trap (a hang, not a late peer), with the tile,
+# the target and the count seen printed.
+SPIN_LIMIT_NS = 20_000_000_000
 
 
 @dsl_user_op
@@ -73,13 +75,17 @@ def wait_rows(ctr: Int64, cl_idx: Int32, target: Int32, lo: Int32, hi: Int32):
     if cl_idx < lo or cl_idx >= hi:
         addr = ctr + Int64(cl_idx) * Int64(4)
         v = _ld_acquire_sys_u32(addr)
-        n = Int32(0)
-        while (v - target) < Int32(0):
-            _nanosleep()
-            n = n + Int32(1)
-            if n >= Int32(SPIN_LIMIT):
-                _trap()
-            v = _ld_acquire_sys_u32(addr)
+        if (v - target) < Int32(0):
+            t0 = globaltimer_ns()
+            while (v - target) < Int32(0):
+                _nanosleep()
+                if globaltimer_ns() - t0 > Uint64(SPIN_LIMIT_NS):
+                    cute.printf(
+                        "K31_SPIN_TIMEOUT kernel=sp_ag_gemm tile={} target={} count={}",
+                        cl_idx, target, v,
+                    )
+                    _trap()
+                v = _ld_acquire_sys_u32(addr)
         _fence_proxy_async_global()
 
 

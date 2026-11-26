@@ -181,7 +181,7 @@ _WORD_BLOCK = _BLOCK // 2  # 32-bit words per tile (16 KiB, as the BF16 tiles)
 
 _AG_CHUNK = 64 << 10  # pusher TMA chunk (64 KiB, 3-slot ring = 192 KiB smem)
 _AG_NS = 3
-_AG_SPIN_NS = 60_000_000_000  # 60 s: a hang traps (a peer late by host work is not one)
+_AG_SPIN_NS = 30_000_000_000  # 30 s: a hang traps with its values printed (not a late peer)
 _AG_FLAG_WORDS = 1024  # [0] arrival word, [64:] per-cluster-tile counters
 
 _AG_CUDA = r"""
@@ -196,9 +196,14 @@ __device__ __forceinline__ uint32_t ag_ld_acq(uint64_t a) { uint32_t v; asm vola
 
 __device__ __forceinline__ void ag_spin_ge(uint64_t addr, uint32_t target, uint64_t limit) {
   const uint64_t t0 = ag_now();
-  while ((int32_t)(ag_ld_acq(addr) - target) < 0) {
+  uint32_t v;
+  while ((int32_t)((v = ag_ld_acq(addr)) - target) < 0) {
     __nanosleep(128);
-    if (ag_now() - t0 > limit) { printf("K31_SPIN_TIMEOUT kernel=sp_ag_push site=arrival\n"); __trap(); }
+    if (ag_now() - t0 > limit) {
+      printf("K31_SPIN_TIMEOUT kernel=sp_ag site=arrival block=%d addr=%llx target=%u seen=%u\n",
+             (int)blockIdx.x, (unsigned long long)addr, target, v);
+      __trap();
+    }
   }
 }
 
@@ -301,7 +306,11 @@ __global__ void sp_ag_wait_kernel(uint64_t own_flags, int64_t ncl, int64_t lo, i
       const uint64_t t0 = ag_now();
       while ((int32_t)(ag_ld_acq(a) - target) < 0) {
         __nanosleep(128);
-        if (ag_now() - t0 > limit) { printf("K31_SPIN_TIMEOUT kernel=sp_ag_wait site=tile\n"); __trap(); }
+        if (ag_now() - t0 > limit) {
+          printf("K31_SPIN_TIMEOUT kernel=sp_ag_wait site=tile tile=%lld target=%u seen=%u\n", (long long)c, target,
+                 ag_ld_acq(a));
+          __trap();
+        }
       }
     }
   __threadfence_system();
