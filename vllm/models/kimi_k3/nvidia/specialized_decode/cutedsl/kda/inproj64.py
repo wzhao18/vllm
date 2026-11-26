@@ -5,9 +5,7 @@
 
 ``SplitKTmemGemm64`` (128-row tiles split over K by 6, weights staged in tensor memory
 before the PDL wait, one-hop DSMEM reduce-scatter to 4 owners of 32 rows each) stores
-the F_A / beta rows of the projection as before (BF16 rows, polled by the prepared
-verify's gate warp); at q = 8 the Q / K / V / output-gate rows are not published (no
-prepared verify reads them: their operands are ``prepared``). Each owner thread then holds
+the projection as before (BF16 rows, the published ``x``). Each owner thread then holds
 one channel (lane = channel within the owner's 32 rows) of 16 tokens (warp g: tokens
 16 g .. 16 g + 15, two requests), which is ``KdaSplit``'s verify mapping (thread =
 channel, warp w = channels 32 w .. 32 w + 31), so it runs that prologue with the same
@@ -222,14 +220,9 @@ class KdaInProj64(SplitKTmemGemm64):
             for t in cutlass.range_constexpr(16):
                 totals[t] = _canonical(totals[t])
         if cutlass.const_expr(self.tokens == TOKENS):
-            # Only the F_A / beta rows (section 4) are published: every prepared
-            # verify reads q, k, v and the output gate from ``prepared`` and F_A /
-            # beta from these rows, so the Q / K / V / gate tiles skip the BF16
-            # transpose, its barrier and stores at the end of the epilogue.
-            if row0 // dim == 4:
-                SplitKTmemGemm64.finish(
-                    self, epi_tid, totals, tile, (mC,), row0, col0, l_idx
-                )
+            SplitKTmemGemm64.finish(
+                self, epi_tid, totals, tile, (mC,), row0, col0, l_idx
+            )
         else:
             self.publish(epi_tid, totals, tile, mC, row0, col0, l_idx)
         lane, g = epi_tid % SHARE, epi_tid // SHARE
