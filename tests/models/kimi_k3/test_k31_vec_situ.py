@@ -70,3 +70,13 @@ def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
         assert torch.equal(_bits(ours), _bits(fast))
     else:
         assert torch.equal(_bits(ours), _bits(cuda_op))
+
+
+def test_bf16_and_mxfp8_shared_situ_share_the_prefill_threshold():
+    """The BF16 SiTU MLP (dense layer; the MXFP4 checkpoint's BF16 shared expert)
+    switches to the MUFU-light prefill form at the same row count as the MXFP8
+    shared expert: 2048 sequence-parallel rows per rank take it on both."""
+    from vllm.models.kimi_k3.nvidia.model import KimiVecSituAndMul
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+    assert KimiVecSituAndMul._FAST_MIN_ROWS == mxfp8_act.SITU_FAST_MIN_ROWS == 2048

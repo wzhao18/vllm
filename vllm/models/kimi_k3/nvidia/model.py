@@ -540,13 +540,16 @@ class KimiVecSituAndMul(nn.Module):
     math, one BF16 rounding).
 
     Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 33792
-    at F16K) use the routed experts' MUFU-light SiTU form, as the shared experts'
-    MXFP8 SiTU does at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``): the
-    precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the
-    fast form stays within one BF16 ulp of it."""
+    at F16K) use the routed experts' MUFU-light SiTU form, from the same row count
+    as the shared experts' MXFP8 SiTU at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``):
+    the precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the
+    fast form stays within one BF16 ulp of it. That includes the BF16 shared expert
+    of checkpoints that keep it unquantized (MXFP4: 2048 sequence-parallel rows per
+    rank at 16K-token prefill steps), which takes the same SiTU form as the MXFP8
+    shared expert of the other checkpoints at the same row count."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
-    _FAST_MIN_ROWS = 4096
+    _FAST_MIN_ROWS = mxfp8_act.SITU_FAST_MIN_ROWS
 
     def __init__(self, beta: float, linear_beta: float | None):
         super().__init__()
