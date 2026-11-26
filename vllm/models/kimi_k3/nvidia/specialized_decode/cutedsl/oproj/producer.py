@@ -33,6 +33,7 @@ from ..common.primitives import (
     mma_bf16_block,
     mma_into,
     multicast_words,
+    named_barrier,
     pack_pair,
     prefetch_bytes,
     published,
@@ -829,11 +830,10 @@ class OprojUmmaRows(OprojUmma):
             if lane < 16:
                 for t in cutlass.range_constexpr(N):
                     tiles[a, t, 16 * warp + lane] = values[t]
-            # Each warp pushes its own 16 rows (``OprojUmma.epilogue``): a warp sync.
-            cute.arch.sync_warp()
+            named_barrier(1, 128)
             valid = M - c * N  # tokens of this chunk (more past the last)
-            for i in cutlass.range_constexpr(N // 16):
-                token, part = lane % 16 + 16 * i, 2 * warp + lane // 16
+            for i in cutlass.range_constexpr(N * 8 // 128):
+                token, part = (tid + 128 * i) // 8, (tid + 128 * i) % 8
                 if token < valid:
                     reduced = cute.make_rmem_tensor(8, Float32)
                     for h in cutlass.range_constexpr(2):
