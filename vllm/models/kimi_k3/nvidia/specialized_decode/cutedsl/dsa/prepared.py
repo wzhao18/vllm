@@ -92,6 +92,14 @@ from .r1 import DsaBox, fi_buffers
 
 logger = init_logger(__name__)
 
+# Rubin-class devices: DSA sparse core rows whose DcpValue(pushed) spreads its merge
+# (mla.dcp ``spread``: 16 / R CTAs per (head, 16-row tile), each merging R rows over
+# the 16 sources and projecting them through W_UV) instead of one merge CTA per
+# (head, 16 rows). Same weights, FP32 source order and per-row MMAs: bitwise.
+# DCP16 value bench (4 real + 12 emulated sources, q8, us per call, per-head ->
+# spread): see the L1 DCPV row in DECISIONS.md.
+CORE_SPREAD = batch_table("8:1,16:1")
+
 __all__ = [
     "QUERY_HEADS",
     "PreparedDsa",
@@ -615,7 +623,10 @@ class PreparedDsa:
         variant = self.dsac.variant(batch, q)
         if variant is None or self.overlaps[batch, q] in LATE:
             return
-        spread = False  # (the core's rows <= 16: one merge CTA per (head, 16 rows))
+        # Rubin: the spread merge (mla.dcp SPREAD: CTA z of a (head, 16-row tile)
+        # merges and projects its own rows, the core pushes the LSEs in the wide
+        # layout) at CORE_SPREAD rows; elsewhere one merge CTA per (head, 16 rows).
+        spread = q > 1 and sms > GB300_SMS and batch in CORE_SPREAD
         box = self.box
         args = self.heads, self.dcp, batch, uv, self.pitches[batch], self.device.index
         value = compile_core_value(*args, sms, q, box.q_heads, box.cap, spread)
