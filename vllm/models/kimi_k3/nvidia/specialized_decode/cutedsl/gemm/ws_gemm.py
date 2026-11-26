@@ -78,7 +78,7 @@ def positive_zero32(value):
 class WsGemm:
     def __init__(
         self, n, k, m, rt, kq, staged, split, valid, ks=1, tg=0, ch=0, early=False,
-        tiles=None,
+        tiles=None, direct_x=False,
     ):  # fmt: skip
         # tiles (token groups, one 8-token tile): the 16-row tiles of each CTA group
         # (cluster) in launch order, at most ``rt``; warps past their group's count
@@ -94,6 +94,11 @@ class WsGemm:
         # wait first and the loads after it; the setup's branch and CTA barrier keep
         # them in front.
         self.early = early
+        # direct_x (with tiles, 8 tokens): every warp loads its x fragments
+        # from global right after the PDL wait (as the single pass does) instead of
+        # warp 0's bulk copy of the CTA's K slice and its mbarrier. Same x values and
+        # MMAs: bitwise-identical outputs.
+        self.direct_x = bool(direct_x and self.tiles and m == 8)
         # ks: a cluster of ks CTAs splits K, so each CTA preloads 1/ks of the tile's
         # weights; ch: accumulator chains per 8-token tile (0: 4 / tiles per group).
         self.split, self.valid, self.ks = split, valid, ks
@@ -176,9 +181,13 @@ class WsGemm:
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         rd.stamp(daddr, 1)  # DIAG: PDL wait returned
+        xg = None
+        if cutlass.const_expr(self.direct_x):
+            xg = x.iterator + group * x.stride[0] + kofs
         if cutlass.const_expr(self.grouped):
-            if warp == 0:
-                self.stage_x(x, xs, bars, kpart, lane)
+            if cutlass.const_expr(not self.direct_x):
+                if warp == 0:
+                    self.stage_x(x, xs, bars, kpart, lane)
             cute.arch.cp_async_wait_group(0)
         else:
             cute.arch.cp_async_wait_group(0)
@@ -186,11 +195,12 @@ class WsGemm:
         for g in cutlass.range_constexpr(self.groups):
             acc = cute.make_rmem_tensor((self.ng, self.chains, 4), Float32)
             acc.fill(0)
-            if cutlass.const_expr(self.grouped):
+            if cutlass.const_expr(self.grouped and not self.direct_x):
                 wait(bars.iterator + g)
             if cutlass.const_expr(self.tiles):
                 if live != 0:  # warps past the group's row tiles skip their MMAs
-                    self.grouped_mmas(acc, wr, stage, xs, warp, lane, quarter, g)
+                    work = (acc, wr, stage, xs, warp, lane, quarter, g)
+                    self.grouped_mmas(*work, xg)
             else:
                 for j in cutlass.range_constexpr(self.kb):
                     if cutlass.const_expr(j < self.rb):
@@ -266,9 +276,14 @@ class WsGemm:
                     wr[j, h] = load_words(src, count=4, evict_first=True)
         return wr
 
-    def grouped_mmas(self, acc, wr, stage, xs, warp, lane, quarter, g):
-        """The token-group MMAs of one warp (``kernel``'s loop; x in shared memory)."""
+    def grouped_mmas(self, acc, wr, stage, xs, warp, lane, quarter, g, xg=None):
+        """The token-group MMAs of one warp (``kernel``'s loop; x in shared memory, or
+        with ``direct_x`` loaded from global at ``xg``, every fragment issued first)."""
         group, part = lane // 4, lane % 4
+        xd = {}
+        if cutlass.const_expr(self.direct_x):
+            for j in range(self.kb):  # traced unrolled; 8 tokens: every row valid
+                xd[j] = load_words(xg + j * 32, count=4, mutable=True)
         for j in range(self.kb):  # traced unrolled
             if j < self.rb:
                 wa, wb = wr[j, 0], wr[j, 1]
@@ -278,7 +293,10 @@ class WsGemm:
             for t in range(self.tiles_of(g)):
                 token = (g * self.ng + t) * 8 + group
                 col = (quarter * self.kb + j) * 16 + part * 4
-                xv = smem_words(at(xs, token, col))
+                if cutlass.const_expr(self.direct_x):
+                    xv = xd[j]
+                else:
+                    xv = smem_words(at(xs, token, col))
                 for h in range(2):
                     c = (j * 2 + h) % self.chains
                     a = (wa[2 * h], wb[2 * h], wa[2 * h + 1], wb[2 * h + 1])
