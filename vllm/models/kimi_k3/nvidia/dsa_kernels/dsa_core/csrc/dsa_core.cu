@@ -392,6 +392,7 @@ __device__ uint64_t radix_cut(F key, int n, int K, int gb, int* hist, int* wt, i
   }
 }
 
+constexpr int kMicKpt = 8;   // round-1 keys per thread (W x N <= 4096)
 constexpr int kTab = 1024;  // block-table entries of a row kept in shared memory (as the select)
 
 // The saturated rank's push (DCPTopkSelectKernel.push_local_topk): its local top-min(K,
@@ -496,7 +497,8 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
   __shared__ int wt[kThreads / 32];
   __shared__ int sc[8];
   __shared__ int notsat[16], owner[16];
-  __shared__ int s_last, s_tau;
+  __shared__ int s_last;
+  __shared__ unsigned long long s_cut;
   const int W = p.W, N = p.nloc, K = p.topk, BW = p.box_words, gb = p.gid_bits;
   const uint64_t gmask = (1ull << gb) - 1;
   uint32_t* stage = reinterpret_cast<uint32_t*>(kvbuf);
@@ -556,38 +558,108 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
     return ((uint64_t)(w >> 16) << gb) | (gmask - gid);
   };
   const int n1 = W * N;
-  bool full;
-  const uint64_t cut = radix_cut(r1, n1, K, gb, hist, wt, sc, tid, lane, warp, &full);
-  // tau16: the smallest selected score (0 when fewer than K were selected)
-  {
-    int mn = 0x10000;
-    if (full) {
-      for (int i = tid; i < n1; i += kThreads) {
-        const uint64_t k = r1(i);
-        if (k != 0 && k >= cut) mn = min(mn, (int)(k >> gb));
-      }
+  // Round 1, decoded once into registers (flat key f in register f / 512 of thread
+  // f % 512, the select's layout). The cut: the K-th key's score tau16 by two 8-bit
+  // histograms of ord16 (one warp scans each), then among the keys scoring tau16 the
+  // ``take`` largest keys (lowest gids). Same selected set as the select's radix.
+  // Per rank, the smallest round-1 ord16 (0: an empty slot) for the saturation test.
+  uint64_t keys[kMicKpt];
+  int* h1 = hist;
+  int* h2 = hist + 256;
+  if (tid < 16) notsat[tid] = 0x10000;  // (here: the rank's min ord16)
+  hist[tid] = 0;
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kMicKpt; ++i) {
+    const int f = tid + i * kThreads;
+    const uint64_t k = f < n1 ? r1(f) : 0;
+    keys[i] = k;
+    if (i * kThreads < n1) {  // (n1 is a multiple of 32: a warp's flats are one rank's)
+      const int o = (int)(k >> gb);
+      const int m = __reduce_min_sync(~0u, f < n1 ? o : 0x10000);
+      if (lane == 0 && f < n1) atomicMin(&notsat[f / N], m);
+      if (k != 0) atomicAdd(&h1[o >> 8], 1);
     }
-    mn = __reduce_min_sync(~0u, mn);
-    if (lane == 0) wt[warp] = mn;
-    if (tid < 16) notsat[tid] = 0;
-    __syncthreads();
-    if (tid == 0) {
-      int m = 0x10000;
-      for (int w = 0; w < kThreads / 32; ++w) m = min(m, wt[w]);
-      s_tau = full ? m : 0;
-    }
-    __syncthreads();
-  }
-  const int tau = s_tau;
-  // rank r is saturated iff all its N slots hold a key with ord16 > tau16
-  for (int i = tid; i < n1; i += kThreads) {
-    const uint64_t k = r1(i);
-    if (k == 0 || (int)(k >> gb) <= tau) notsat[i / N] = 1;
   }
   __syncthreads();
+  // warp 0: the bin (from the top) where the running count reaches ``need``
+  auto top_bin = [&](const int* h, int need, int* bin, int* above, int* total) {
+    int loc[8], sum = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      loc[j] = h[255 - 8 * lane - j];
+      sum += loc[j];
+    }
+    int inc = sum;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(~0u, inc, o);
+      if (lane >= o) inc += v;
+    }
+    const unsigned b = __ballot_sync(~0u, inc >= need);
+    if (lane == 31) *total = inc;
+    if (b == 0) {
+      if (lane == 0) *bin = -1;
+      return;
+    }
+    if (lane == __ffs(b) - 1) {
+      int acc = inc - sum;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        if (acc + loc[j] >= need) {
+          *bin = 255 - 8 * lane - j;
+          *above = acc;
+          break;
+        }
+        acc += loc[j];
+      }
+    }
+  };
+  if (warp == 0) top_bin(h1, K, &sc[0], &sc[1], &sc[2]);
+  __syncthreads();
+  const int b1 = sc[0], above1 = sc[1];
+  const bool full = b1 >= 0;  // else fewer than K keys: all of them
+  int tau = 0;
+  uint64_t cut = 1;
+  if (full) {
+#pragma unroll
+    for (int i = 0; i < kMicKpt; ++i) {
+      const uint64_t k = keys[i];
+      if (k != 0 && (int)(k >> (gb + 8)) == b1) atomicAdd(&h2[(int)(k >> gb) & 255], 1);
+    }
+    __syncthreads();
+    if (warp == 0) top_bin(h2, K - above1, &sc[3], &sc[4], &sc[5]);
+    __syncthreads();
+    tau = (b1 << 8) | sc[3];
+    const int above = above1 + sc[4];          // keys scoring above tau16
+    const int ties = h2[sc[3]], take = K - above;  // keys scoring tau16, how many selected
+    cut = (uint64_t)tau << gb;                // all the ties
+    if (take < ties && ties > kThreads) {  // a long tie (e.g. equal logits): radix passes
+      bool f2;
+      cut = radix_cut(r1, n1, K, gb, tab + kTab, wt, sc, tid, lane, warp, &f2);
+    } else if (take < ties) {
+      // the take-th largest key among the ties: its rank among them, by count
+      if (tid == 0) sc[6] = 0;
+      __syncthreads();
+      uint64_t* tk = reinterpret_cast<uint64_t*>(tab + kTab);  // (V buffer: n1 x 8 B fits)
+#pragma unroll
+      for (int i = 0; i < kMicKpt; ++i)
+        if (keys[i] != 0 && (int)(keys[i] >> gb) == tau) tk[atomicAdd(&sc[6], 1)] = keys[i];
+      __syncthreads();
+      for (int a = tid; a < ties; a += kThreads) {
+        const uint64_t ka = tk[a];
+        int gt = 0;
+        for (int b = 0; b < ties; ++b) gt += tk[b] > ka;
+        if (gt == take - 1) s_cut = ka;
+      }
+      __syncthreads();
+      cut = s_cut;
+    }
+  }
+  // rank r is saturated iff all its N slots hold a key with ord16 > tau16
   int mask = 0;
   for (int r = 0; r < W; ++r)
-    if (!notsat[r]) mask |= 1 << r;
+    if (notsat[r] > tau) mask |= 1 << r;
   // distinct keys bound the saturated ranks by the slots; else round 1 stands (select)
   if (__popc(mask) > p.num_slots) mask = 0;
   if (dbg && tid == 0) dbg[20] = now_ns();
@@ -654,18 +726,45 @@ __device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, ui
     const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
     return e * p.stride_rows + (local - blk * p.block_size);
   };
-  const int f0 = obase - obase % kThreads + tid;  // this thread's first flat >= obase - 511
-  int mine = 0;
-  for (int f = f0; f < oend; f += kThreads)
-    if (f >= obase && own_row(f) >= 0) ++mine;
   int total;
-  int pos = block_scan(mine, wt, lane, warp, &total) - mine;
-  for (int f = f0; f < oend && mine > 0; f += kThreads) {
-    if (f < obase) continue;
-    const int row = own_row(f);
-    if (row >= 0) {
-      if (pos < kMaxK) sIdx[pos] = row;
-      ++pos;
+  if (!mask) {  // round 1 stands: the own keys are in registers
+    int rws[kMicKpt], mine = 0;
+#pragma unroll
+    for (int i = 0; i < kMicKpt; ++i) {
+      const int f = tid + i * kThreads;
+      rws[i] = -1;
+      const uint64_t k = keys[i];
+      if (f >= obase && f < oend && k != 0 && k >= c) {
+        const uint32_t gid = (uint32_t)(gmask - (k & gmask));
+        const int local = (int)(gid / (uint32_t)W);
+        const int blk = local / p.block_size;
+        if (blk < p.bt_width) {
+          const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
+          rws[i] = e * p.stride_rows + (local - blk * p.block_size);
+          ++mine;
+        }
+      }
+    }
+    int pos = block_scan(mine, wt, lane, warp, &total) - mine;
+#pragma unroll
+    for (int i = 0; i < kMicKpt; ++i)
+      if (rws[i] >= 0) {
+        if (pos < kMaxK) sIdx[pos] = rws[i];
+        ++pos;
+      }
+  } else {
+    const int f0 = obase - obase % kThreads + tid;  // this thread's flats tid + 512 i
+    int mine = 0;
+    for (int f = f0; f < oend; f += kThreads)
+      if (f >= obase && own_row(f) >= 0) ++mine;
+    int pos = block_scan(mine, wt, lane, warp, &total) - mine;
+    for (int f = f0; f < oend && mine > 0; f += kThreads) {
+      if (f < obase) continue;
+      const int row = own_row(f);
+      if (row >= 0) {
+        if (pos < kMaxK) sIdx[pos] = row;
+        ++pos;
+      }
     }
   }
   const int n = min(total, kMaxK);
@@ -1522,8 +1621,9 @@ void run_mic(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tenso
               "dsa_core: q mailbox [rows, q_heads >= W * hpr, 576] bytes");
   TORCH_CHECK(T <= q.size(0) && T <= box_cap);
   TORCH_CHECK(kv.element_size() == 1 && kv.size(-1) == kRowB);
-  TORCH_CHECK(W <= 16 && nloc % 32 == 0 && nloc > 0 && topk % 32 == 0 && topk <= kMaxK,
-              "dsa_core mic: W <= 16, N and K multiples of 32, K <= 2048");
+  TORCH_CHECK(W <= 16 && nloc % 32 == 0 && nloc > 0 && topk % 32 == 0 && topk <= kMaxK &&
+                  W * nloc <= kMicKpt * kThreads,
+              "dsa_core mic: W <= 16, N and K multiples of 32, K <= 2048, W x N <= 4096");
   const int box_words = (int)(((nloc + 2 * (nloc / 32)) + 3) / 4 * 4);
   const int max_rows = (int)ordinals.numel();
   TORCH_CHECK(box.dtype() == torch::kInt32 && box.numel() == 2LL * max_rows * W * box_words,
