@@ -225,7 +225,6 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             mine[k] = Int32(0)
             if tid + threads * k < batch * 16:
                 mine[k] = ids[tid + threads * k]
-        self.clear(sm)  # while the ids are in flight
         if tid == 0:
             scalars[1], scalars[2] = (calls, grouped)
         cute.arch.sync_threads()

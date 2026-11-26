@@ -755,8 +755,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def clear(self, sm):
-        """Every thread: ``group``'s token masks to zero and the row words to -1 (the
-        caller's barrier follows)."""
+        """Every thread, before the dependency wait: ``group``'s token masks to zero
+        and the row words to -1 (``group``'s first CTA barrier follows)."""
         tid = thread()[0]
         masks = view(sm.iterator, self.off_masks, Uint32, 2 * self.experts)
         row_words = self.tables(sm)[2]
@@ -793,7 +793,6 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             mine[k] = Int32(0)
             if tid + threads * k < batch * 16:
                 mine[k] = ids[tid + threads * k]
-        self.clear(sm)  # while the ids are in flight
         for k in cutlass.range_constexpr(rounds):
             if tid + threads * k < batch * 16:
                 pairs[tid + threads * k] = mine[k]
@@ -1212,6 +1211,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         arrival = None
         if cutlass.const_expr(len(self.dies) > 0):
             arrival = self.ticket(workspace)
+        # The grouping's token masks and row words are route-independent: cleared
+        # before the dependency wait (HT-EXPERTS I3; ``group``'s first CTA barrier
+        # orders them before its mask atomics).
+        self.clear(sm)
         cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
