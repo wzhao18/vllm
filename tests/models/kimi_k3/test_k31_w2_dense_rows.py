@@ -11,8 +11,10 @@ padded parameter, now one shared padded copy refreshed per stock call.
   holds random bytes (a kernel reading the padding would differ), die-placed as
   ``runtime.decode`` does (``place``, then ``dense_w2`` with the die map); the routed
   experts at every TP16 k7 graph row count (8 x B, B = 1..32: the 8-row Rubin kernel,
-  the grouped kernel, the wide engines) on the padded parameter and on the dense rows,
-  compared bitwise.
+  the grouped kernel, the wide engines) and the tuned rows 1-7 (``ExpertsKernel``) on
+  the padded parameter and on the dense rows, compared bitwise.
+- ``test_tp8_layout_untouched``: TP8's 192 B rows are not admitted and its
+  ``PersistentExperts`` builds and prepares as before.
 - ``test_dense_rows_stock_path``: two production stock layers (``Mxfp4MoEMethod`` on
   the TRT-LLM-Gen MXFP4 x MXFP8 experts) converted to dense rows share one padded copy;
   after each layer's refresh its stock output equals the padded parameter's bitwise.
@@ -28,8 +30,9 @@ import torch
 from vllm.platforms import current_platform
 
 E, H, TOPK, Q = 896, 3584, 16, 8
-# TP16 k7 graph row counts: 8 x B for B = 1..32
-ROWS = tuple(8 * b for b in range(1, 33))
+# TP16 k7 graph row counts (8 x B for B = 1..32) and the tuned rows below 8
+# (``providers.BATCHES``: ``ExpertsKernel``)
+ROWS = (*range(1, 8), *(8 * b for b in range(1, 33)))
 
 rubin = pytest.mark.skipif(
     not current_platform.is_cuda()
@@ -42,7 +45,8 @@ rubin = pytest.mark.skipif(
 def routed_layer(w13, w2, unpadded=192):
     param = lambda t: torch.nn.Parameter(t, requires_grad=False)  # noqa: E731
     config = SimpleNamespace(intermediate_size_per_partition_unpadded=unpadded)
-    return SimpleNamespace(w13_weight=param(w13), w2_weight=param(w2), moe_config=config)
+    weights = dict(w13_weight=param(w13), w2_weight=param(w2))
+    return SimpleNamespace(**weights, moe_config=config)
 
 
 @rubin
@@ -187,3 +191,28 @@ def test_dense_rows_stock_path():
         built[i]["layer"]._dense_w2_refresh()
         after = stock[i](latent, topk_w, ids)
         assert torch.equal(after.view(torch.int16), before[i].view(torch.int16)), i
+
+
+@rubin
+def test_tp8_layout_untouched():
+    """TP8 (DFn TP8 = DCP8): w13 768 rows, w2 rows of 192 bytes (no padding). The
+    layout is not admitted (the parameter stays), and the TP8 experts build their
+    descriptors and prepare at the padded-free pitch as before."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime as er,
+    )
+
+    dev, u8 = torch.device("cuda", 0), torch.uint8
+    w13 = torch.zeros(E, 768, 1792, dtype=u8, device=dev)
+    w2 = torch.zeros(E, H, 192, dtype=u8, device=dev)
+    layer = routed_layer(w13, w2, unpadded=384)
+    assert not er.dense_w2_rows(layer)
+    assert er.place(layer) == ()
+    s13 = torch.full((E, 768, 112), 127, dtype=u8, device=dev)
+    s2 = torch.full((E, H, 12), 127, dtype=u8, device=dev)
+    experts = er.PersistentExperts(w13, s13, w2, s2, q=Q)
+    assert experts.tp == 8
+    buffers = er.scratch(8, dev)
+    for rows in (1, 8, 64):
+        out = torch.empty(rows * TOPK, H, dtype=torch.bfloat16, device=dev)
+        experts.prepare(rows, buffers, out, (), planned=True)
