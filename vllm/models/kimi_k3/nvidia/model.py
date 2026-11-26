@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1509,6 +1510,30 @@ class KimiMoE(nn.Module):
                 hidden_states, mxfp8_input, shared_input
             ).view(num_tokens, hidden_size)
         prefill_shared = self._prefill_shared_stream(num_tokens)
+        # EXPERIMENT ONLY (MM-SOL P1-IS, never for merge): K31_MMSOL_SE_SERIAL=1 = arm S1 neighbours: the same SE
+        # kernels run serially on this stream before the routing fork (B2 has no SE side stream).
+        se_serial_out = None
+        if prefill_shared is not None and _MMSOL_SE_SERIAL:
+            if resid_prefix is not None:
+                se_serial_out = self.shared_experts.forward_resid(shared_input, resid_prefix)
+            else:
+                se_serial_out = self.shared_experts(shared_input)
+        if prefill_shared is not None and _MMSOL_SKEL:
+            from .megamoe_rubin import mmsol_skel as _mms
+
+            _sin = getattr(shared_input, "data", shared_input)
+            if not isinstance(_sin, torch.Tensor):
+                _sin = hidden_states
+            _mms.SE_CTX = (self.shared_experts.gate_up_proj.weight, self.shared_experts.down_proj.weight, _sin)
+        if prefill_shared is not None and se_serial_out is not None:
+            shared_output = se_serial_out
+            routed_hidden_states, router_output, topk_ids = (
+                self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
+            )
+            assert self.routed_output_transform is not None
+            final_hidden_states = self._routed_experts(routed_hidden_states, router_output, topk_ids)
+            final_hidden_states = self.routed_output_transform(final_hidden_states, residual=shared_output)
+            return final_hidden_states.view(num_tokens, hidden_size)
         if prefill_shared is not None:
             # The shared experts run beside the router, its top-k and the
             # latent down GEMM and join before MegaMoE (whose persistent grid
@@ -1584,6 +1609,10 @@ class KimiMoE(nn.Module):
                 shared_experts_input=hidden_states,
             )
         return final_hidden_states.view(num_tokens, hidden_size)
+
+
+_MMSOL_SE_SERIAL = os.environ.get("K31_MMSOL_SE_SERIAL", "0") == "1"  # EXPERIMENT ONLY (P1-IS arm S1)
+_MMSOL_SKEL = os.environ.get("K31_MMSOL_SKEL", "0") == "1"  # EXPERIMENT ONLY (P1-IS skel)
 
 
 def warm_prefill_indexer(model: nn.Module) -> None:

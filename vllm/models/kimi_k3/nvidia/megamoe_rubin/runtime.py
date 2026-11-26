@@ -132,6 +132,11 @@ class RubinMegaMoE:
         from .mmsol_probe import MmsolPushProbe
 
         self.mmsol_probe = MmsolPushProbe(self.arena, self.rank, self.world)
+        # EXPERIMENT ONLY (MM-SOL P1-IS skel arms; never for merge): built + module-loaded in every arm, launched with
+        # K31_MMSOL_SKEL=1 after every 2K / 4K launch (mmsol_skel.py).
+        from .mmsol_skel import MmsolSkel
+
+        self.mmsol_skel = MmsolSkel(self.arena, self.rank, self.world)
         device = torch.device("cuda", torch.cuda.current_device())
         # Sticky route-id error flag [flag, offending id] + its async host mirror.
         self.route_error = torch.zeros(2, dtype=torch.int64, device=device)
@@ -458,6 +463,7 @@ class RubinMegaMoE:
             result = out[:n]
             session.launch(weights, result, ep_tokens, rmsnorm, shared)
             self.mmsol_probe(session, n)
+            self.mmsol_skel(session, n, weights)
             if unfused_norm is not None:
                 from vllm import _custom_ops as ops
 
