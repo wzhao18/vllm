@@ -117,14 +117,10 @@ def _load_ext():
         build = str(Path(build) / f"{digest}-s")
         Path(build).mkdir(parents=True, exist_ok=True)
         sources = stable_sources(build, [src])
-    # (infrastructure: extra nvcc flags for debug builds, e.g. -DK31_DCPX_DEBUG_PRINT)
-    extra = os.environ.get("K31_DCPX_EXTRA_CFLAGS", "").split()
-    if extra:
-        digest += "_" + hashlib.sha1(" ".join(extra).encode()).hexdigest()[:6]
     _EXT = load(
         name=f"k31_dcp_exchange_sm{arch}_{digest}",
         sources=sources,
-        extra_cuda_cflags=extra + [
+        extra_cuda_cflags=[
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
             "--use_fast_math",
