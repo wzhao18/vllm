@@ -109,6 +109,18 @@ WIDE_MAX_ROWS = 96
 # QueryWait at the publish-only rows: CTAs per SM (one pass of at most 8 polled
 # 16 B chunks per thread up to 4 x SMs x 2048 chunks: 1.24M at 360 rows, DCP16).
 WAIT_CTAS_PER_SM = 4
+# Where the forked rows' QueryWait runs (``wait_on_side``): "side" right after the
+# forked MlaQuery on the side stream (the joining stream then waits only for the side
+# stream's work), so the mailbox poll and the q's NVLink delivery run beside the
+# indexer chain; other rows: on the joining stream after the join, right before the
+# sparse decode. 16-rank B16 / B32 / B64 CUPTI (DCP16 q8, STAMP-1125a): the joined
+# QueryWait starts 24.7 / 16.4 / 18.4 us after MlaQuery ends (the q has landed) and
+# still takes 2.3 / 2.9 / 4.3 us on the critical path (one pass of the whole
+# gathered mailbox).
+WIDE_QUERY_WAIT = "65-:side"
+# The side QueryWait's poll passes (at most 8 polled 16 B chunks per thread each):
+# few CTAs, so its spin takes few of the chain's SMs while the q lands.
+WAIT_SIDE_PASSES = 4
 # Query overlap per rows (``OVERLAP_MODES``, the same idea as overlap.QUERY_OVERLAP
 # for PreparedDsa's rows). Under "serial" the indexer chain (wq_b -> DsaIndex ->
 # logits -> top-k -> merge, 15.4-17.7 us per layer at q8 M96-M176 / q4 M128-M220)
@@ -169,6 +181,16 @@ def chain_priority(batch, policy=None):
     if set(table.values()) - {"chain"}:
         raise ValueError(f"Kimi K3.1 WideDsa index priority {policy!r}: not chain")
     return table.get(batch) == "chain"
+
+
+def wait_on_side(batch, policy=None):
+    """Whether the forked QueryWait of ``batch`` rows runs on the side stream after
+    MlaQuery (``policy``: a "rows:side" table, default WIDE_QUERY_WAIT; "": never)."""
+    policy = WIDE_QUERY_WAIT if policy is None else policy
+    table = batch_table(policy) if policy else {}
+    if set(table.values()) - {"side"}:
+        raise ValueError(f"Kimi K3.1 WideDsa QueryWait policy {policy!r}: not side")
+    return table.get(batch) == "side"
 
 
 def query_publishes_only(batch, dcp, overlap="serial"):
@@ -310,18 +332,21 @@ def compile_core(
 
 @cache
 def compile_query_wait(
-    batch, heads, dcp, q_heads, sms, cap, fp8=True, overlap="serial"
+    batch, heads, dcp, q_heads, sms, cap, fp8=True, overlap="serial", side=False
 ):  # fmt: skip
     """QueryWait of ``batch`` publish-only rows (``query_publishes_only`` under the
     ``overlap`` mode; else None): every 16 B chunk of the DCP x ``heads`` gathered
     heads (rows of ``q_heads``) polled until published, over up to
-    WAIT_CTAS_PER_SM x ``sms`` CTAs. Shared by every DSA layer (the mailbox is a
-    launch argument)."""
+    WAIT_CTAS_PER_SM x ``sms`` CTAs (``side``: the side stream's, WAIT_SIDE_PASSES
+    passes). Shared by every DSA layer (the mailbox is a launch argument)."""
     if not query_publishes_only(batch, dcp, overlap):
         return None
     q_bytes = 1 if fp8 else 2
     mailbox = fake((cap, q_heads, 576 * q_bytes), None, torch.uint8)
     ctas = WAIT_CTAS_PER_SM * sms
+    if side:
+        chunks = batch * dcp * heads * 36 * q_bytes
+        ctas = min(ctas, -(-chunks // (256 * 8 * WAIT_SIDE_PASSES)))
     wait = QueryWait(batch, dcp * heads, q_heads, q_bytes, ctas=ctas)
     return cute.compile(wait, mailbox, make_fake_stream())
 
@@ -549,6 +574,10 @@ class WideDsa:
         )
         self.kernels = {}
         self.waits = {}  # QueryWait per batch (publish-only rows; else None)
+        # forked batches whose QueryWait runs on the side stream (WIDE_QUERY_WAIT)
+        self.side_waits = frozenset(
+            b for b, mode in self.overlaps.items() if mode == "fork" and wait_on_side(b)
+        )
         self.norms = {}  # QueryNorm per forked batch
         policies = index_policies(sorted(pitches), is_rubin(self.device))
         wq = self.indexer.wq_index.weight
@@ -630,7 +659,8 @@ class WideDsa:
                 overlap=mode,
             )
             w_args = batch, self.heads, self.dcp, box.q_heads, sms, cap, self.fp8
-            self.waits[batch] = compile_query_wait(*w_args, overlap=mode)
+            side = batch in self.side_waits
+            self.waits[batch] = compile_query_wait(*w_args, overlap=mode, side=side)
             if mode == "fork":
                 if self.waits[batch] is None:  # (WideDsa runs under DCP only)
                     raise RuntimeError(
@@ -922,11 +952,19 @@ class WideDsa:
         # the late query fork (overlap.QUERY_FORK_AT): MlaQuery launches once the
         # merge's logits are enqueued, else (no merge) at the join
         pending = []
+        # QueryWait after MlaQuery on the side stream (WIDE_QUERY_WAIT), else after
+        # the join
+        side_wait = batch in self.side_waits
+
+        def query():  # (on the side stream)
+            mq(*q_args, *publish, stream(self.device))
+            if side_wait:
+                query_wait(publish[0], stream(self.device))
 
         def fork():
             side.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(side):
-                mq(*q_args, *publish, stream(self.device))
+                query()
 
         def launch():
             if pending:
@@ -940,7 +978,7 @@ class WideDsa:
             side.wait_stream(main)
             norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
             with torch.cuda.stream(side):
-                mq(*q_args, *publish, stream(self.device))
+                query()
         mailbox = publish[0]
 
         def join():
@@ -948,7 +986,8 @@ class WideDsa:
             self.late_query = None
             joining = torch.cuda.current_stream(self.device)
             joining.wait_stream(side)
-            query_wait(mailbox, stream(self.device))
+            if not side_wait:
+                query_wait(mailbox, stream(self.device))
 
         def chain():
             self.run_index(q_args[0], index_slots, batch, index)

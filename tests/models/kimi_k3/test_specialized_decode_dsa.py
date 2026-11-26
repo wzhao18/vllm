@@ -709,6 +709,46 @@ def test_query_wait_polls_mailbox(batch, fp8):
     assert pending and finished, (pending, finished)
 
 
+@pytest.mark.parametrize("batch", [128, 256])
+def test_wide_side_query_wait_polls_mailbox(batch):
+    """WideDsa's side-stream QueryWait (WIDE_QUERY_WAIT, at the forked wide rows):
+    WAIT_SIDE_PASSES poll passes over a DCP16 q8 mailbox (96 gathered heads in rows of
+    128, FP8), returning only once the last published chunk is not the sentinel."""
+    import time
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+
+    assert wide.wait_on_side(batch) and not wide.wait_on_side(64)
+    assert wide.wait_on_side(batch, "") is False
+    dev, heads, dcp, q_heads = "cuda", 6, 16, 128
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    args = batch, heads, dcp, q_heads, sms, batch
+    wait = wide.compile_query_wait(*args, fp8=True, overlap="fork", side=True)
+    mailbox = torch.full((batch, q_heads, 576), 0xFF, device=dev, dtype=torch.uint8)
+    mailbox[:, : dcp * heads] = 0x11
+    mailbox[batch - 1, dcp * heads - 1, -16:] = 0xFF  # the last published chunk
+    polling, filling = torch.cuda.Stream(), torch.cuda.Stream()
+    done = torch.cuda.Event()
+    torch.accelerator.synchronize()
+    with torch.cuda.stream(polling):
+        wait(to_cute(mailbox), stream(dev))
+        done.record()
+    time.sleep(0.2)
+    pending = not done.query()
+    with torch.cuda.stream(filling):
+        mailbox[batch - 1, dcp * heads - 1, -16:] = 0x22
+    deadline = time.monotonic() + 10
+    while not done.query() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    finished = done.query()
+    torch.accelerator.synchronize()
+    assert pending and finished, (pending, finished)
+
+
 # 129-144: three 48-row tiles (no empty fourth tile).
 FRONT_BATCHES = [1, 2, 3, 5, 8, 16, 17, 40, 60, 64, 65, 80, 100, 128, 129, 130, 144]
 FRONT_BATCHES += [145, 160, 240, 320]
