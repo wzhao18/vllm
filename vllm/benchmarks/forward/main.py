@@ -219,6 +219,26 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
     )
     try:
         result = bench.run()
+        # DIAG (ROUTE, never merge): this case's last replays' MoE front-chain rings
+        # (nq_step leaves with os._exit, so an atexit dump never runs).
+        import os as _os
+
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            routediag,
+        )
+
+        _d = _os.environ.get(
+            "ROUTE_DIAG_DIR",
+            _os.environ.get(
+                "OA_DIAG_DIR",
+                "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/sol16/MOEFT/diag",
+            ),
+        )
+        _run = _os.environ.get("SLURM_JOB_ID", "j") + "." + _os.environ.get("SLURM_STEP_ID", "s")
+        _os.makedirs(f"{_d}/{_run}", exist_ok=True)
+        _rank = _os.environ.get("SLURM_PROCID", _os.environ.get("RANK", "0"))
+        routediag.dump(f"{_d}/{_run}/{case.name}.rank{_rank}.route.pt")
+        routediag.reset()
         if fixture is not None:
             fixture.check_applied()
     finally:
