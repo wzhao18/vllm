@@ -56,7 +56,7 @@ from .experts import PLAN_XSF, ExpertsKernel, claim, swizzled
 from .experts_rubin import (
     DESCRIPTOR_LIMIT,
     HOME_SHIFT,
-    W2_PITCH,
+    W2_ROW,
     RubinExpertsKernel,
     die_words,
     nth_set,
@@ -153,10 +153,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
-        dies=(), static_groups=False,
+        dies=(), static_groups=False, w2_pitch=W2_ROW,
     ):  # fmt: skip
         super().__init__(16, 64, experts, grid, publish, True, False, True, slots)
         self.static_groups = static_groups
+        # The routed w2's row bytes (``RubinExpertsKernel``'s ``w2_pitch``): the w2
+        # descriptor and the FC2 home dies.
+        self.w2_pitch = w2_pitch
         # FC2 tail pool (``fc2_pool``, ``claims``): (zone, grain) = the jobs at the end
         # of every FC2(B) range that go into the pool, and the jobs per claim. A claim
         # (~0.3 us) and a new unit's hidden image (~0.3 us) must hide under one grain,
@@ -247,7 +250,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     def encode_maps(self, w13, w2):
         # RubinExpertsKernel's packed descriptors: they read only experts, w13_rows,
-        # parts and packed, which this kernel sets the same way.
+        # parts, packed and w2_pitch, which this kernel sets the same way.
         return RubinExpertsKernel.encode_maps(self, w13, w2)  # type: ignore[arg-type]
 
     @cute.jit
@@ -974,7 +977,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         address = Int64(row) * 1792 + mid % 14 * 128
                     else:
                         row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                        address = Int64(row) * W2_PITCH
+                        address = Int64(row) * self.w2_pitch
                     live = (tid < self.grid) & (lo < hi)
                     dies.append(live & ((address >> HOME_SHIFT & 1) != 0))
             for p in cutlass.range_constexpr(4):

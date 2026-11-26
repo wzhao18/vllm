@@ -66,7 +66,7 @@ class StockExperts:
         [M, top_k] and ``topk_ids`` [M, top_k] from the stock router; returns the
         partial (copied into ``out`` [M, hidden] when given)."""
         routed = self.routed
-        refresh = getattr(routed, "_dense_w2_refresh", None)  # K31EX_W2_DENSE
+        refresh = getattr(routed, "_dense_w2_refresh", None)  # dense w2 rows
         if refresh is not None:
             refresh()
         partial = self.kernel.apply(

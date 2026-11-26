@@ -44,7 +44,7 @@ from ..common.primitives import (
     view,
 )
 from .experts import PLAN_XSF, has_ff_byte, swizzled
-from .experts_rubin import DESCRIPTOR_LIMIT
+from .experts_rubin import DESCRIPTOR_LIMIT, W2_ROW
 from .experts_wide import RubinWideExpertsKernel
 
 
@@ -109,6 +109,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,
         trace=0, pool=(12, 6), dies=(), static_groups=False, fc2_base=1,
+        w2_pitch=W2_ROW,
     ):  # fmt: skip
         assert width in (8, 16, 32)  # 8: the V2 machinery on 8-token units (a control)
         if stages is None:  # a 7th stage fits shared memory up to width 16
@@ -119,7 +120,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         self.fc2_base = fc2_base
         super().__init__(
             experts, grid, slots, capacity, publish, stages, trace, pool, dies,
-            static_groups, tables=False,
+            static_groups, tables=False, w2_pitch=w2_pitch,
         )  # fmt: skip
         self.wide, self.subs = (width, width // 8)
         # Accumulator big slots of ``width`` columns (one barrier pair each), then the

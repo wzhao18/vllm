@@ -68,6 +68,7 @@ from .experts import PLAN_BYTES, ExpertsGeometry, ExpertsPlanKernel, plan_chunk
 from .experts_rubin import (
     ROUTE_IDS,
     ROUTE_WORDS,
+    W2_ROW,
     generation_bytes,
     peers_bytes,
     peers_offset,
@@ -88,7 +89,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
 
     def __init__(
         self, experts, grid, slots, capacity, publish=False, stages=7, trace=0,
-        pool=(12, 6), dies=(), static_groups=False, tables=True,
+        pool=(12, 6), dies=(), static_groups=False, tables=True, w2_pitch=W2_ROW,
     ):  # fmt: skip
         """``tables`` False: a subclass lays out the shared-memory tables (and sizes
         the CTA) itself (``RubinVWExpertsKernel``)."""
@@ -99,8 +100,9 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         # does into the tuned tail's; the wide tail then only reduces.
         assert publish in (False, "local", "twoshot"), publish
         super().__init__(
-            experts, grid, slots, publish, stages, trace, pool, dies, static_groups
-        )
+            experts, grid, slots, publish, stages, trace, pool, dies, static_groups,
+            w2_pitch,
+        )  # fmt: skip
         self.capacity, self.blocks = (capacity, capacity // 64)
         self.words = capacity // 32  # token mask words per expert
         # Each expert's masks (and running counts) one word (count) apart beyond its

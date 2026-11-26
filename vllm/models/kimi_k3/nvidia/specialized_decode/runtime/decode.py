@@ -36,9 +36,9 @@ from ..cutedsl.mla.prepared import choose as mla_choose
 from ..cutedsl.mla.rows import compile_rows
 from ..cutedsl.moe.dense import PreparedDenseMLP
 from ..cutedsl.moe.experts_runtime import (
-    W2_DENSE,
     PersistentExperts,
     dense_w2,
+    dense_w2_rows,
     place,
     route_mailbox,
     rubin64,
@@ -507,6 +507,13 @@ class SpecializedDecode:
         # (the wide batches whose routed experts run on the wide engines, behind
         # FrontRows; the others run the stock router and experts into the wide tail)
         wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b, tp))
+        # Dense w2 rows (``experts_runtime.dense_w2``) where every captured shape reads
+        # the routed w2 through the experts kernels, which take its row pitch (tuned
+        # rows, wide rows on the wide engines): no captured shape then runs the stock
+        # routed experts (S4, or the wide tail behind the stock experts), which read
+        # the padded parameter. Per layer, the layout must be the padded TP16 one
+        # (``dense_w2_rows``).
+        stock_rows = sorted(set(batches) - set(tuned_moe) - set(wide_engines))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
             MoeTailBox(*owner) if packed else None,
@@ -571,8 +578,13 @@ class SpecializedDecode:
             w13, w2 = (
                 w.view(torch.uint8) for w in (routed.w13_weight, routed.w2_weight)
             )
-            if W2_DENSE:  # K31EX_W2_DENSE: the experts kernels read dense w2 rows
-                w2 = dense_w2(routed, dies)
+            if dense_w2_rows(routed) and not stock_rows:
+                w2 = dense_w2(routed, dies)  # the experts kernels read dense rows
+            elif dense_w2_rows(routed):
+                logger.info_once(
+                    "Kimi K3 MoE: routed w2 keeps its padded rows: captured rows %s "
+                    "run the stock routed experts", stock_rows, scope="process",
+                )  # fmt: skip
             weights = w13, routed.w13_weight_scale, w2, routed.w2_weight_scale
             experts = PersistentExperts(
                 *weights, beta=beta, linear_beta=linear_beta, dies=dies, q=self.q

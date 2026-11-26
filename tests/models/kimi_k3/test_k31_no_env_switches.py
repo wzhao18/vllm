@@ -54,11 +54,6 @@ ALLOWED = {
     # K31CH_FRONT_TMEM appends row ranges to the TP16 MoeFrontTmem64 decode front
     # table (specialized_decode/cutedsl/moe/front.py); unset keeps the stock table.
     "K31CH_FRONT_TMEM",
-    # Mi Sun Park; owner decides code policy; prefill does not use it.
-    # K31EX_W2_DENSE=1 gives the TP16 routed experts kernels dense w2 rows
-    # (specialized_decode/cutedsl/moe/experts_runtime.py, dense_w2); unset keeps
-    # the padded parameter and the stock path.
-    "K31EX_W2_DENSE",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are

@@ -246,6 +246,9 @@ class PreparedMoE:
         b = x.shape[0]
         if b in self.wide_batches:
             return self.run_wide_experts(x, out, consume)
+        if hasattr(self.module.experts.routed_experts, "_dense_w2_refresh"):
+            # (``runtime.decode`` keeps the padded w2 where a captured row runs here)
+            raise RuntimeError(f"M{b}: stock routed experts over dense w2 rows")
         shared, partial = stock_partials(self.module, x)
         with self.beside(lambda: self.rows.push(shared)) as join:
             self.rows.run(partial, b, join)

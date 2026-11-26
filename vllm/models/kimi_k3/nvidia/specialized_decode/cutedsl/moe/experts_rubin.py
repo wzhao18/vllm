@@ -17,8 +17,6 @@ weights land packed (plain bytes) and feed Rubin's K64 block-scaled MMAs, which 
 packed E2M1 from shared memory: half the slot bytes and half the MMAs of the K32
 ``mxf8f6f4`` steps on unpacked (16U4) weights."""
 
-import os
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -167,11 +165,13 @@ DESCRIPTOR_LIMIT = 262144 - 1024
 # die at 16-64 rows).
 HOME_RUN = 4
 HOME_SHIFT = 21 + HOME_RUN
-# K31EX_W2_DENSE=1: the experts kernels read the routed w2 as dense rows of its data
-# bytes, without the row padding of the parameter (``experts_runtime.dense_w2``). The
-# w2 descriptors and the FC2 home dies use this row pitch.
-W2_DENSE = os.environ.get("K31EX_W2_DENSE", "0") == "1"
-W2_PITCH = 96 if W2_DENSE else 128
+# The TP16 routed w2 row: the parameter's row (``W2_ROW`` bytes: the E2M1 data bytes,
+# then the stock kernel's padding) and its data bytes (``W2_DATA``). Where every
+# experts kernel of the deployment reads them (``experts_runtime.dense_w2_layout``),
+# the experts read dense rows of the data bytes (``experts_runtime.dense_w2``): the
+# kernels take the row pitch (``w2_pitch``) for the w2 descriptors and the FC2 home
+# dies; the padded pitch otherwise.
+W2_ROW, W2_DATA = 128, 96
 
 
 @asm(Uint32)
@@ -435,10 +435,13 @@ class RubinExpertsKernel(ExpertsKernel):
         self, experts, grid, slots, stages=None, early=False, rotate=True, stamp=0,
         grain=1, pool=1, planned=True, publish=False, grid_maps=False, halves=True,
         late_push=True, lean_route=True, xearly=0, polled=False, packed=True,
-        dies=(), static_groups=False, fast_exchange=False,
+        dies=(), static_groups=False, fast_exchange=False, w2_pitch=W2_ROW,
     ):  # fmt: skip
         assert publish != "twoshot"
         self.static_groups, self.fast_exchange = static_groups, fast_exchange
+        # w2_pitch: the routed w2's row bytes (``W2_ROW`` padded, ``W2_DATA`` dense)
+        assert w2_pitch in (W2_ROW, W2_DATA), w2_pitch
+        self.w2_pitch = w2_pitch
         super().__init__(16, 8, experts, grid, publish, True, False, False, slots)
         if fast_exchange:
             from .experts_rubin64 import CENSUS_BYTES
@@ -1195,7 +1198,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 if (rank < self.grid) & (lo < hi):
                     mid = (lo + hi) // 2
                     row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                    home = Int32(Int64(row) * W2_PITCH >> HOME_SHIFT & 1)
+                    home = Int32(Int64(row) * self.w2_pitch >> HOME_SHIFT & 1)
                 ballot = cute.arch.vote_ballot_sync(home != 0)
                 if lane == 0:
                     bits[g * words + i] = Uint32(ballot)
@@ -1368,14 +1371,15 @@ class RubinExpertsKernel(ExpertsKernel):
 
     def encode_maps(self, w13, w2):
         """``PersistentExperts``' TP16 w13 / w2 descriptors (same bytes)."""
-        assert self.packed or not W2_DENSE, "K31EX_W2_DENSE: packed maps only"
+        pitch = self.w2_pitch
+        assert self.packed or pitch == W2_ROW, "dense w2 rows: packed maps only"
         types, swizzles = (cuda.CUtensorMapDataType, cuda.CUtensorMapSwizzle)
         promotion = cuda.CUtensorMapL2promotion
         fp4 = types.CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
         swizzle = swizzles.CU_TENSOR_MAP_SWIZZLE_128B
         box = (128, 128, 3 - self.parts)  # FC1: one or two K128 boxes per stage
         rows = (self.experts * self.w13_rows, self.experts * 3584)
-        if cutlass.const_expr(self.packed):  # plain bytes: 128 B rows, w2 data only
+        if cutlass.const_expr(self.packed):  # plain bytes: w2 data only (pitch rows)
             u8 = types.CU_TENSOR_MAP_DATA_TYPE_UINT8
             return (
                 encode_map(
@@ -1383,8 +1387,9 @@ class RubinExpertsKernel(ExpertsKernel):
                     promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                 ),
                 encode_map(
-                    w2, u8, (W2_PITCH, rows[1], 1), (W2_PITCH, W2_PITCH * rows[1]),
-                    (96, 128, 1), swizzle, promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                    w2, u8, (pitch, rows[1], 1), (pitch, pitch * rows[1]),
+                    (W2_DATA, 128, 1), swizzle,
+                    promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
                 ),
             )  # fmt: skip
         return (

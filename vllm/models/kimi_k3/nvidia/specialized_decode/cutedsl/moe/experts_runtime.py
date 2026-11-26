@@ -30,8 +30,8 @@ from .experts_rubin import (
     HOME_RUN,
     ROUTE_IDS,
     ROUTE_WORDS,
-    W2_DENSE,
-    W2_PITCH,
+    W2_DATA,
+    W2_ROW,
     ImagePlanKernel,
     RubinExpertsKernel,
     generation_bytes,
@@ -168,7 +168,7 @@ def route_mailbox(workspace):
 @functools.cache
 def compile_rubin(
     experts, batch, grid, device, publish, slots, polled=False, dies=(), static=False,
-    fast=False,
+    fast=False, w2_pitch=W2_ROW,
 ):  # fmt: skip
     """``publish``: ``compile_experts``' modes False / True / "push" (not two-shot).
     The w13 / w2 descriptors are grid-constant parameters encoded at launch from the
@@ -176,12 +176,13 @@ def compile_rubin(
     the routing kernel signals the route mailbox (``polled``); ``dies``: the SMs' dies
     when w2 was ``place``d (FC2 die matching); ``static``: constant epilogue-group
     barrier ids (``RubinExpertsKernel.static_groups``); ``fast``: the peer-slot K-split
-    exchange (``RubinExpertsKernel.fast_exchange``)."""
+    exchange (``RubinExpertsKernel.fast_exchange``); ``w2_pitch``: the routed w2's row
+    bytes (``dense_w2``)."""
     assert batch == 8, "the image plan holds every token row only at capacity"
     assert publish != "twoshot"
     moe = RubinExpertsKernel(
         experts, grid, slots, publish=publish, grid_maps=True, polled=polled,
-        dies=dies, static_groups=static, fast_exchange=fast,
+        dies=dies, static_groups=static, fast_exchange=fast, w2_pitch=w2_pitch,
     )  # fmt: skip
     assert tensormap.AVAILABLE, "grid-constant descriptors need CuTe DSL >= 4.8"
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
@@ -285,16 +286,16 @@ def compile_wide_plan(batch, device):
 @functools.cache
 def compile_wide(
     experts, batch, grid, device, slots, dies=(), static=False, width=8,
-    publish="local", cap=0, pool=(12, 6),
+    publish="local", cap=0, pool=(12, 6), w2_pitch=W2_ROW,
 ):  # fmt: skip
     """The wide engine (``wide_kernel``) at ``batch`` rows: the plan (64-row blocks),
     ids, the maps, scales, workspace, the routing weights, the SiTU scalars, the
     partial latent's address (``publish`` "twoshot": the wide tail's receive slots
     [3 x 16, ``cap``, 224], the owners' bases and this rank's slot instead), then the
-    w13 / w2 addresses."""
+    w13 / w2 addresses; ``w2_pitch``: the routed w2's row bytes (``dense_w2``)."""
     moe = wide_kernel(
         experts, grid, slots, batch, width, publish=publish, dies=dies,
-        static_groups=static, pool=pool,
+        static_groups=static, pool=pool, w2_pitch=w2_pitch,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
@@ -386,29 +387,56 @@ def place(routed):
     return table
 
 
-# K31EX_W2_DENSE: the padded w2 the stock paths read, one per device and shape, shared
-# by the MoE layers (``dense_w2``).
+# Dense w2 rows (``dense_w2``): the padded w2 the stock MoE paths read, one per device
+# and shape, shared by the MoE layers.
 _STOCK_W2: dict = {}
 
 
+def dense_w2_rows(routed):
+    """Whether one MoE layer's routed w2 has the layout ``dense_w2`` removes the padding
+    of: the TP16 MXFP4 shard on Rubin (cc 10.7), uint8 rows of ``W2_ROW`` bytes over a
+    512-row w13 whose first ``W2_DATA`` bytes are the checkpoint's data (unpadded
+    intermediate 2 x ``W2_DATA``). Every other layout (TP8's 192-byte rows hold no
+    padding; other devices or formats) keeps the parameter. The caller also requires
+    that every captured decode shape reads the routed w2 through the experts kernels
+    (``runtime.decode``)."""
+    w13, w2 = routed.w13_weight, routed.w2_weight
+    device = w2.device
+    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (10, 7):
+        return False
+    if w13.dim() != 3 or w13.shape[1] != 512 or w2.dim() != 3 or w2.shape[1] != 3584:
+        return False
+    if w2.shape[-1] * w2.element_size() != W2_ROW:
+        return False
+    config = getattr(routed, "moe_config", None)
+    unpadded = getattr(config, "intermediate_size_per_partition_unpadded", None)
+    return unpadded == 2 * W2_DATA
+
+
 def dense_w2(routed, table=()):
-    """K31EX_W2_DENSE (``W2_DENSE``): one MoE layer's routed w2 (uint8 rows: the E2M1
-    data bytes, then padding) as dense rows of the data bytes for the experts kernels
-    (row pitch ``W2_PITCH``), placed like ``place``'s w2 when ``table`` (its die map)
-    is given. The same bytes reach the MMAs. The parameter then views one padded copy
-    per device shared by the layers (zero padding, as the checkpoint loader leaves
-    it); the stock paths (``forward_modular`` / ``forward_monolithic``,
-    ``StockExperts``) copy this layer's rows into it first
-    (``routed._dense_w2_refresh``)."""
+    """One MoE layer's routed w2 (uint8 rows of ``W2_ROW`` bytes: the E2M1 data bytes,
+    then padding; ``dense_w2_rows``) as dense rows of its ``W2_DATA`` data bytes for
+    the experts kernels (``PersistentExperts`` reads the pitch from the tensor), placed
+    like ``place``'s w2 when ``table`` (its die map) is given. The same bytes reach the
+    MMAs: bitwise the padded layout's outputs.
+
+    The stock MoE paths (``forward_modular`` / ``forward_monolithic``,
+    ``StockExperts``) cannot take a row pitch (the TRT-LLM-Gen kernel reads the padded
+    rows from the tensor's base): the parameter then views one padded copy per device
+    shared by the layers (zero padding, as the checkpoint loader leaves it), into which
+    a stock call first copies this layer's data bytes (``routed._dense_w2_refresh``).
+    Only steps outside the captured decode shapes run the stock MoE (eager or PIECEWISE
+    steps: the profile run, prefill chunks and recomputes on a decode instance);
+    ``runtime.decode`` enables dense rows only where no captured shape does. Returns
+    the dense tensor."""
     from ..common import dies
 
     weight = routed.w2_weight
     e, rows, width = weight.shape
-    shape = (tuple(weight.shape), weight.dtype)
-    assert W2_DENSE and width == 128 and weight.element_size() == 1, shape
+    assert dense_w2_rows(routed) and weight.element_size() == 1, weight.shape
     device = weight.device
     free0 = torch.cuda.mem_get_info(device)[0]
-    nbytes = e * rows * W2_PITCH
+    nbytes = e * rows * W2_DATA
     if table:
         run = 1 << HOME_RUN
         raw = dies.localized_empty(nbytes, [0] * run + [1] * run, device)
@@ -424,21 +452,26 @@ def dense_w2(routed, table=()):
             sms = 8 if attempt < 2 else 16
         if len(wrong) > PLACE_UNCLEAR:  # still correct; only the FC2 die match is off
             logger.warning(
-                "K31EX_W2_DENSE: dense w2 chunks %s of %s not homed as requested",
+                "Kimi K3 MoE: dense w2 chunks %s of %s not homed as requested",
                 wrong, sample,
             )  # fmt: skip
     else:
         raw = torch.empty(nbytes, dtype=torch.uint8, device=device)
-    dense = raw[:nbytes].view(e, rows, W2_PITCH)
-    flat = dense.view(e * rows, W2_PITCH)
-    flat.copy_(weight.data.view(torch.uint8).view(e * rows, width)[:, :W2_PITCH])
+    dense = raw[:nbytes].view(e, rows, W2_DATA)
+    flat = dense.view(e * rows, W2_DATA)
+    flat.copy_(weight.data.view(torch.uint8).view(e * rows, width)[:, :W2_DATA])
     key = (device, tuple(weight.shape), weight.dtype)
     if key not in _STOCK_W2:
         _STOCK_W2[key] = torch.zeros_like(weight.data)
     stock = _STOCK_W2[key]
-    data = stock.view(torch.uint8).view(e * rows, width)[:, :W2_PITCH]
+    data = stock.view(torch.uint8).view(e * rows, width)[:, :W2_DATA]
 
     def refresh():
+        logger.info_once(
+            "Kimi K3 MoE: a stock MoE step (outside the captured decode shapes) "
+            "copies each layer's dense w2 rows into the shared padded w2 (%.0f MB a "
+            "layer)", nbytes / 1e6, scope="process",
+        )  # fmt: skip
         data.copy_(flat)
 
     weight.data = stock  # the padded original goes (``place``'s copy or the loader's)
@@ -455,9 +488,11 @@ def dense_w2(routed, table=()):
         setattr(routed, name, call)
     torch.cuda.synchronize(device)
     logger.info_once(
-        "K31EX_W2_DENSE: routed w2 as dense rows (%.0f MB a layer, placed %s); "
-        "free memory %.2f -> %.2f GiB over the first layer",
-        nbytes / 1e6, bool(table), free0 / 2**30,
+        "Kimi K3 MoE: routed w2 as dense rows (%.0f MB a layer instead of %.0f, "
+        "placed %s; one shared padded w2 of %.0f MB for the stock MoE); free memory "
+        "%.2f -> %.2f GiB over the first layer",
+        nbytes / 1e6, e * rows * width / 1e6, bool(table),
+        stock.numel() * stock.element_size() / 1e6, free0 / 2**30,
         torch.cuda.mem_get_info(device)[0] / 2**30, scope="process",
     )  # fmt: skip
     return dense
@@ -465,16 +500,17 @@ def dense_w2(routed, table=()):
 
 @functools.cache
 def compile_rubin64(
-    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
+    experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12,
+    w2_pitch=W2_ROW,
 ):  # fmt: skip
     """``compile_experts``' arguments (plan, publish modes incl. two-shot) for
     ``RubinGroupedExpertsKernel``, then the w13 / w2 addresses; ``dies``: the SMs'
     dies when the weights were ``place``d; ``static``: constant epilogue-group
     barrier ids (``ExpertsKernel.static_groups``); ``zone``: the FC2 tail pool's
-    (``POOL_ZONE``)."""
+    (``POOL_ZONE``); ``w2_pitch``: the routed w2's row bytes (``dense_w2``)."""
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static,
+        static_groups=static, w2_pitch=w2_pitch,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
@@ -610,6 +646,11 @@ class PersistentExperts:
     ):  # fmt: skip
         experts, rows, _ = w13.shape
         self.tp = 8 if rows == 768 else 16
+        # TP16: w2 as the parameter (padded rows, ``W2_ROW`` bytes) or as dense rows of
+        # its data bytes (``dense_w2``: ``W2_DATA``); the kernels read either pitch.
+        self.w2_pitch = w2.shape[-1] * w2.element_size()
+        if self.tp == 16 and self.w2_pitch not in (W2_ROW, W2_DATA):
+            raise ValueError(f"TP16 routed w2 rows of {self.w2_pitch} bytes")
         self.device, self.experts = w13.device, experts
         self.grid, self.grids = grids(self.tp, self.device)
         self.dies = tuple(dies)  # the weights are ``place``d (M64 die-aware experts)
@@ -627,7 +668,7 @@ class PersistentExperts:
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster
         # experts use maps 2-4 (w13, w2 two-chunk and one-chunk boxes, promoted); TP8
         # FC2 pairs (B4-64) use map 5 (w2 chunk 2 of 256 rows).
-        w2_tile = (192, 3, 64) if self.tp == 8 else (W2_PITCH, 2, 32)
+        w2_tile = (192, 3, 64) if self.tp == 8 else (self.w2_pitch, 2, 32)
         specs = [(w13, rows, 1792, 28, 64, 2, True), (w2, 3584, *w2_tile, 2, False)]
         if self.tp == 8:
             specs += [specs[0]] + [(w2, 3584, 192, 3, 64, box, True) for box in (2, 1)]
@@ -692,7 +733,9 @@ class PersistentExperts:
                 need = peers_offset(need, CENSUS_BYTES) + peers_bytes(self.slots)
                 need += generation_bytes(self.slots)
                 assert buffers["workspace"].numel() >= need, "no peer slots (scratch)"
-            code = compile_rubin(*args, mode, self.slots, poll, dies, static, fast)
+            code = compile_rubin(
+                *args, mode, self.slots, poll, dies, static, fast, self.w2_pitch
+            )
             what = "Kimi K3 MoE experts"
             check_residency(code, self.device.index, args[2], 384, what)
             self.rubin.add(batch)
@@ -707,6 +750,7 @@ class PersistentExperts:
             code = compile_rubin64(
                 self.experts, batch, grid, self.device.index, mode, self.slots,
                 self.dies, bool(self.static.get(batch)), self.zones.get(batch, 12),
+                self.w2_pitch,
             )  # fmt: skip
             check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
             ws = tensor(buffers["workspace"])
@@ -804,7 +848,7 @@ class PersistentExperts:
         pool = (self.wide_pool.get(batch, 12), 6)
         code = compile_wide(
             self.experts, batch, grid, self.device.index, self.slots, self.dies, static,
-            self.wide[batch], mode, cap, pool,
+            self.wide[batch], mode, cap, pool, self.w2_pitch,
         )  # fmt: skip
         check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
         width, slots = (self.wide[batch], self.slots)
