@@ -935,6 +935,31 @@ def check_canonical_nvfp4(
     return experts
 
 
+def nvfp4_checkpoint_alphas(
+    w13_global: torch.Tensor,
+    w2_global: torch.Tensor,
+    input_norm_const: float,
+    fc1_norm_const: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-expert ``(fc1_alpha, fc2_alpha, fc1_norm_const)`` fp32 of a native NVFP4
+    checkpoint: ``weight_scale_2 / norm`` (stock's ``input_scale * weight_scale_2``
+    with ``input_scale = 1 / norm``). Power-of-two norms keep them exact; anything
+    else raises."""
+    g1 = w13_global.to(torch.float32)
+    g2 = w2_global.to(torch.float32)
+    norm1 = torch.as_tensor(fc1_norm_const, dtype=torch.float32, device=g2.device)
+    norm1 = norm1.expand_as(g2).contiguous()
+    norms = [float(input_norm_const), *norm1.unique().tolist()]
+    if not all(is_power_of_two(v) for v in norms):
+        raise ValueError(
+            f"NVFP4 norm constants must be positive powers of two (exact alpha "
+            f"folding), got {norms[:8]}."
+        )
+    fc1_alpha = (g1 / float(input_norm_const)).contiguous()
+    fc2_alpha = (g2 / norm1).contiguous()
+    return fc1_alpha, fc2_alpha, norm1
+
+
 def prepare_nvfp4_checkpoint_weights(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -945,13 +970,16 @@ def prepare_nvfp4_checkpoint_weights(
     *,
     hidden: int,
     intermediate: int,
+    input_norm_const: float = 1.0,
+    fc1_norm_const: float | torch.Tensor = 1.0,
 ) -> RubinMoeWeights:
     """A native NVFP4 checkpoint's experts, as stored, in the kernel layout.
 
     Codes and E4M3 block scales are only re-laid out. The per-expert epilogue
-    alphas are the checkpoint's ``weight_scale_2`` (activation global scale 1.0:
-    ``input_norm_const = fc1_norm_const = 1``), the stock NVFP4 MoE alphas
-    ``input_scale * weight_scale_2`` for the unit input scales the caller asserts.
+    alphas are the checkpoint's ``weight_scale_2`` over the activation norm
+    constants (:func:`nvfp4_checkpoint_alphas`): with ``input_norm_const = 1 /
+    w13_input_scale`` and the stored ``fc1_norm_const`` these are the stock NVFP4
+    MoE alphas ``input_scale * weight_scale_2``.
     """
     check_canonical_nvfp4(
         w13,
@@ -963,8 +991,9 @@ def prepare_nvfp4_checkpoint_weights(
         hidden=hidden,
         intermediate=intermediate,
     )
-    fc1_alpha = w13_global.to(torch.float32).contiguous()
-    fc2_alpha = w2_global.to(torch.float32).contiguous()
+    fc1_alpha, fc2_alpha, norm1 = nvfp4_checkpoint_alphas(
+        w13_global, w2_global, input_norm_const, fc1_norm_const
+    )
     return _nvfp4_kernel_weights(
         w13,
         w13_scale,
@@ -972,7 +1001,7 @@ def prepare_nvfp4_checkpoint_weights(
         w2_scale,
         fc1_alpha,
         fc2_alpha,
-        torch.ones_like(fc1_alpha),
+        norm1,
         intermediate=intermediate,
     )
 
