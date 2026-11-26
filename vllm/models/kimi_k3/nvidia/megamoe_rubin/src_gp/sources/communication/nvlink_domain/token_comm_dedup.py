@@ -2513,33 +2513,17 @@ class TokenCommDedup(KernelComponent):
         fc1_done = self._device_workspace.ptr(self.fc1_done_region)
         order_pointer = self._device_workspace.ptr(self.fc2_order_output_region)
         output_token_bytes = self.output_token_bytes
-        # Per-lane expert tables for the mailbox lookup: lane l of round r covers local expert 32 r + l (pool rows
-        # [base, end) and its first FC1-done slot, the token_in / scheduler slot order).
-        expert_rounds: cutlass.Constexpr[int] = ceil_div(self.experts_per_rank, 32)
+        # Token tiles (FC1-done slots) of this rank: slots of expert e follow those of experts < e (token_in /
+        # scheduler order). Only scalars stay live across the walk (the reduce keeps its registers).
         slot_tokens = Int32(self.tokens_per_fc1_ready_slot)
-        lane_pool_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
-        lane_pool_end = cute.make_rmem_tensor((expert_rounds,), Int32)
-        lane_slot_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
-        slot_carry = Int32(0)
-        for expert_round in cutlass.range_constexpr(expert_rounds):
+        lane_tiles = Int32(0)
+        for expert_round in cutlass.range_constexpr(ceil_div(self.experts_per_rank, 32)):
             round_expert = Int32(expert_round * 32) + lane_idx
-            round_begin = Int32(0)
-            round_size = Int32(0)
             if round_expert < Int32(self.experts_per_rank):
-                round_begin = pool_expert_bases[round_expert]
-                round_size = owned_sizes[round_expert]
-            round_tiles = (round_size + slot_tokens - Int32(1)) // slot_tokens
-            inclusive_tiles = round_tiles
-            for step_log in cutlass.range_constexpr(5):
-                step = Int32(1 << step_log)
-                previous_tiles = Int32(cute.arch.shuffle_sync(inclusive_tiles, lane_idx - step))
-                if lane_idx >= step:
-                    inclusive_tiles = inclusive_tiles + previous_tiles
-            lane_pool_begin[expert_round] = round_begin
-            lane_pool_end[expert_round] = round_begin + round_size
-            lane_slot_begin[expert_round] = slot_carry + inclusive_tiles - round_tiles
-            slot_carry = slot_carry + Int32(cute.arch.shuffle_sync(inclusive_tiles, Int32(31)))
-        total_slots = slot_carry
+                lane_tiles = lane_tiles + (owned_sizes[round_expert] + slot_tokens - Int32(1)) // slot_tokens
+        for step_log in cutlass.range_constexpr(5):
+            lane_tiles = lane_tiles + Int32(cute.arch.shuffle_sync_bfly(lane_tiles, offset=1 << step_log))
+        total_slots = lane_tiles
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
 
@@ -2552,20 +2536,14 @@ class TokenCommDedup(KernelComponent):
             next_dense_token = Int32(0)
         next_dense_token = self.next_token(next_dense_token)
         completed_slot_prefix = Int32(0)
+        expert_slot_begin = Int32(0)
         expert_valid_begin = Int32(0)
         local_expert = Int32(0)
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
             # Slots [0, expert_slot_end) = every token tile of the experts <= local_expert.
-            expert_slot_end = Int32(0)
-            for expert_round in cutlass.range_constexpr(expert_rounds):
-                round_slot_end = Int32(cute.arch.shuffle_sync(
-                    lane_slot_begin[expert_round]
-                    + (lane_pool_end[expert_round] - lane_pool_begin[expert_round] + slot_tokens - Int32(1)) // slot_tokens,
-                    local_expert % Int32(32)))
-                if local_expert // Int32(32) == Int32(expert_round):
-                    expert_slot_end = round_slot_end
+            expert_slot_end = expert_slot_begin + (expert_token_count + slot_tokens - Int32(1)) // slot_tokens
             while next_dense_token < expert_valid_end:
                 token_in_expert = next_dense_token - expert_valid_begin
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
@@ -2590,13 +2568,12 @@ class TokenCommDedup(KernelComponent):
                             self._wait_block_copies(
                                 metadata,
                                 local_expert,
-                                token_in_expert,
+                                expert_slot_begin + token_in_expert // slot_tokens,
                                 block_address,
                                 token_metadata_pointer,
                                 fc1_done,
-                                lane_pool_begin,
-                                lane_pool_end,
-                                lane_slot_begin,
+                                owned_sizes,
+                                pool_expert_bases,
                             )
                             iket.range_pop()
                         else:
@@ -2626,6 +2603,7 @@ class TokenCommDedup(KernelComponent):
                 next_dense_token = self.next_token(next_dense_token)
 
             expert_valid_begin = expert_valid_end
+            expert_slot_begin = expert_slot_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()
         if cutlass.const_expr(m1w is not None):
@@ -2671,13 +2649,12 @@ class TokenCommDedup(KernelComponent):
         self,
         metadata: TokenSrcMetadata,
         local_expert: Int32,
-        token_in_expert: Int32,
+        own_slot: Int32,
         block_address: Int64,
         token_metadata_pointer: cute.Pointer,
         fc1_done: cute.Pointer,
-        lane_pool_begin: cute.Tensor,
-        lane_pool_end: cute.Tensor,
-        lane_slot_begin: cute.Tensor,
+        owned_sizes: cute.Tensor,
+        pool_expert_bases: cute.Tensor,
     ) -> None:
         """Last copy of a block with 1 < cnt < K: wait until the (expert, token tile) of every copy has finished
         FC2, lane j for copy j (lane cnt - 1 for this copy). Copy j < cnt - 1 is found through mailbox word j (its
@@ -2690,12 +2667,31 @@ class TokenCommDedup(KernelComponent):
         slot_tokens = Int32(self.tokens_per_fc1_ready_slot)
         tile_done_target = Int32(self.fc1_done_signals_per_token_tile + self.fc2_done_signals_per_token_tile)
         other_copies = metadata.dst_token_cnt - Int32(1)
-        own_slot_begin = Int32(0)
+        lane_slot = own_slot  # lanes >= cnt - 1: this copy's own tile
+        # Expert tables of the experts before local_expert, lane l of round r = expert 32 r + l: pool rows
+        # [begin, end) and first slot (built here, on the slow path only).
+        lane_pool_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
+        lane_pool_end = cute.make_rmem_tensor((expert_rounds,), Int32)
+        lane_slot_begin = cute.make_rmem_tensor((expert_rounds,), Int32)
+        slot_carry = Int32(0)
         for expert_round in cutlass.range_constexpr(expert_rounds):
-            round_slot_begin = Int32(cute.arch.shuffle_sync(lane_slot_begin[expert_round], local_expert % Int32(32)))
-            if local_expert // Int32(32) == Int32(expert_round):
-                own_slot_begin = round_slot_begin
-        lane_slot = own_slot_begin + token_in_expert // slot_tokens  # lanes >= cnt - 1: this copy's own tile
+            round_expert = Int32(expert_round * 32) + lane_idx
+            round_begin = Int32(0)
+            round_size = Int32(0)
+            if round_expert < local_expert:
+                round_begin = pool_expert_bases[round_expert]
+                round_size = owned_sizes[round_expert]
+            round_tiles = (round_size + slot_tokens - Int32(1)) // slot_tokens
+            inclusive_tiles = round_tiles
+            for step_log in cutlass.range_constexpr(5):
+                step = Int32(1 << step_log)
+                previous_tiles = Int32(cute.arch.shuffle_sync(inclusive_tiles, lane_idx - step))
+                if lane_idx >= step:
+                    inclusive_tiles = inclusive_tiles + previous_tiles
+            lane_pool_begin[expert_round] = round_begin
+            lane_pool_end[expert_round] = round_begin + round_size
+            lane_slot_begin[expert_round] = slot_carry + inclusive_tiles - round_tiles
+            slot_carry = slot_carry + Int32(cute.arch.shuffle_sync(inclusive_tiles, Int32(31)))
         mailbox = cute.make_ptr(
             Int32, block_address + Int64(self.copy_mailbox_offset), AddressSpace.gmem, assumed_align=4
         )
@@ -2712,11 +2708,8 @@ class TokenCommDedup(KernelComponent):
             for copy_idx in cutlass.range(other_copies, unroll=1):
                 candidate_row = Int32(cute.arch.shuffle_sync(copy_row, copy_idx))
                 for expert_round in cutlass.range_constexpr(expert_rounds):
-                    round_expert = Int32(expert_round * 32) + lane_idx
-                    owns_row = (
-                        (lane_pool_begin[expert_round] <= candidate_row)
-                        & (candidate_row < lane_pool_end[expert_round])
-                        & (round_expert < local_expert)
+                    owns_row = (lane_pool_begin[expert_round] <= candidate_row) & (
+                        candidate_row < lane_pool_end[expert_round]
                     )
                     owner_mask = Int32(cute.arch.vote_ballot_sync(owns_row))
                     if owner_mask != Int32(0):
