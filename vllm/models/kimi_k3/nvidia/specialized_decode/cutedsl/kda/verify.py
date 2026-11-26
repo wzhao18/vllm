@@ -356,6 +356,10 @@ class KdaVerifyRows(KdaVerifyPrepared):
     bandwidth, and a warp's row groups load the same columns (Rubin TP16 B8 x q8: the
     loop without the per-token operand loads takes 3673 instead of 7808 cycles)."""
 
+    def _hts(self, what):
+        """DIAG (never merge): KDAHT phase stamp hook (no-op; patched by lanes/KDAHT/chain_ht.py)."""
+        return None
+
     def __init__(
         self,
         heads,
@@ -566,6 +570,7 @@ class KdaVerifyRows(KdaVerifyPrepared):
         else:
             cute.arch.cluster_arrive_relaxed()
             ar = self.finish_fa(f_a, token, quarter, values)
+            self._hts("g_fa")  # DIAG
             acc = zeros((chains, tiles, 4), Float32)
             for chunk in cutlass.range_constexpr(8):
                 chain: cutlass.Constexpr = chunk // 2 if mode == 1 else 0
@@ -575,6 +580,7 @@ class KdaVerifyRows(KdaVerifyPrepared):
             gates = (a, lower_bound, dt, features)
             targets = (shared_decay, gate_barrier, value_base)
             self.multicast(acc, gates, targets, lane)
+            self._hts("g_mc")  # DIAG
             self.release_fa(args, request, lane)
 
     @cute.jit

@@ -281,6 +281,10 @@ class KdaHead(SplitKGemm):
     """``heads`` KDA heads per rank. F_A / beta come from ``fa_beta`` once ``counter``
     reaches ``target`` (the producer's tile count; 0: complete at launch)."""
 
+    def _hts(self, what):
+        """DIAG (never merge): KDAHT phase stamp hook (no-op; patched by lanes/KDAHT/chain_ht.py)."""
+        return None
+
     def __init__(self, heads, *, stages=11, bf16_state=True, has_bias=False):
         super().__init__(tactic=SplitKTactic(64, 8, 2, stages))
         self.heads, self.dim, self.has_bias = heads, heads * 128, has_bias
@@ -1210,6 +1214,7 @@ class KdaHeadWide(KdaHead):
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         cute.arch.griddepcontrol_wait()
+        self._hts("h_pdl")  # DIAG
         for k_tile in cutlass.range(first, self.k_tiles, B_ISSUERS, unroll=1):
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(b_full + k_tile, tile_bytes)

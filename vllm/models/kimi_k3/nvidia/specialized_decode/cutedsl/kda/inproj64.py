@@ -96,6 +96,10 @@ class KdaInProj64(SplitKTmemGemm64):
     x / (1 + exp(-x)) and Triton's sigmoid, q / k scaled by 1 / sqrt.approx(n + eps)
     and then q by the query scale) for ``KdaVerifyPrepared(bf16_state=False)``."""
 
+    def _hts(self, what):
+        """DIAG (never merge): KDAHT phase stamp hook (no-op; patched by lanes/KDAHT/chain_ht.py)."""
+        return None
+
     def __init__(
         self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168, stock=False
     ):
@@ -225,6 +229,7 @@ class KdaInProj64(SplitKTmemGemm64):
             )
         else:
             self.publish(epi_tid, totals, tile, mC, row0, col0, l_idx)
+        self._hts("i_pub")  # DIAG
         lane, g = epi_tid % SHARE, epi_tid // SHARE
         section = row0 // dim  # 0 Q, 1 K, 2 V, 3 output gate, 4 F_A / beta
         channel = row0 % dim + lane  # within the section: head * 128 + 32 owner + lane
@@ -266,6 +271,7 @@ class KdaInProj64(SplitKTmemGemm64):
                     if cutlass.const_expr(self.kept(t)):
                         prepared[self.token_row(col0, g, t), 2 * dim + channel] = y[t]
             else:
+                self._hts("i_conv")  # DIAG
                 self.normalize(
                     y, section, channel, owner, lane, g, col0, prepared, scale
                 )
@@ -289,6 +295,7 @@ class KdaInProj64(SplitKTmemGemm64):
         parts = cute.make_rmem_tensor(16, Float32)
         for t in cutlass.range_constexpr(16):  # padding tokens (t % 8 >= q): unused
             parts[t] = warp_sum(y[t] * y[t]) if self.kept(t) else Float32(0)
+        self._hts("i_wsum")  # DIAG
         mine = parts[0]
         for t in cutlass.range_constexpr(1, 16):  # lane t sends token 16 g + t
             if lane == t:
@@ -300,6 +307,7 @@ class KdaInProj64(SplitKTmemGemm64):
             for peer in cutlass.range_constexpr(OWNERS):
                 push_float(slot, mine, self.norm_bar, peer)
         wait(self.norm_bar)
+        self._hts("i_nwait")  # DIAG
         for t in cutlass.range_constexpr(16):
             token = 16 * g + t
             if cutlass.const_expr(self.kept(t)):

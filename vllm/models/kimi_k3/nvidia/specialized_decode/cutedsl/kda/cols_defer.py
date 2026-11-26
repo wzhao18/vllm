@@ -81,6 +81,7 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                 cute.arch.cluster_arrive_relaxed()
             else:
                 self.setup(barrier, gate_barrier, partition, thread)
+                self._hts("c_setup")  # DIAG
                 page = state[Int64(slot), None, None, None]
                 record_page = state[Int64(records), None, None, None]
                 if (thread == 0) & (pending > 0):  # the head's records
@@ -97,11 +98,14 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                         history[r, e] = values[e]
                 nw = norm_weight[thread]
                 named_barrier(2, 128)  # rec_barrier armed
+                self._hts("c_armed")  # DIAG
                 if pending > 0:  # the fold, before the PDL wait
                     wait(rec_barrier, 0, scope="cta")
                     self.cols_fold(history, rec, pending, value_base, warp, lane)
 
+                self._hts("c_prewait")  # DIAG
                 cute.arch.griddepcontrol_wait()
+                self._hts("c_pdl")  # DIAG
                 for c in cutlass.range_constexpr(4):
                     index = thread + 128 * (c % 2)
                     t, column = index // 32, 4 * (index % 32)
@@ -118,12 +122,15 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                 if thread < T:
                     beta = prepared[token + thread, BETA * dim + head]
                 cute.arch.griddepcontrol_launch_dependents()
+                self._hts("c_issued")  # DIAG
                 shared_v[thread] = v_value
                 if thread < T:
                     shared_beta[thread] = beta
                 cute.arch.cp_async_wait_group(0)
                 named_barrier(1, 128)  # q, k, v, betas
+                self._hts("c_qkv")  # DIAG
                 wait(gate_barrier)
+                self._hts("c_gate")  # DIAG
 
                 buffers = (
                     cute.make_rmem_tensor((3, 4), Float32),
@@ -154,6 +161,7 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                                 record_page[
                                     head, V_ROW + t - 1, value_base + 4 * warp + r
                                 ] = v_news[r]
+                self._hts("c_loop")  # DIAG
                 q_last = [buffers[(T + 1) % 2][0, e] for e in range(4)]
                 dots = [
                     dot([history[r, e] for e in range(4)], q_last) for r in range(4)
@@ -164,9 +172,11 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                     local_o[(T - 1) * ROWS + 4 * warp + lane // 8] = out_last
                 named_barrier(1, 128)
                 cute.arch.cluster_wait()
+                self._hts("c_cw")  # DIAG
                 position = self.output_position(value_base + thread % ROWS)
                 owner = thread // ROWS
                 push_float(shared_o.iterator + position, local_o[thread], barrier, owner)
+                self._hts("c_pushed")  # DIAG
                 operands = (thread, lane, nw, out_gate)
                 self.cols_norm(shared_o, barrier, operands, args)
                 # every CTA's outputs of this CTA's token arrived (each pushed after
@@ -179,6 +189,7 @@ class KdaVerifyColsDefer(KdaVerifyCols):
                         ]
                     if thread == 0:
                         put_tag(record_page, head)
+                        self._hts("c_tag")  # DIAG
 
     @cute.jit
     def cols_fold(self, history, rec, pending, value_base, warp, lane):

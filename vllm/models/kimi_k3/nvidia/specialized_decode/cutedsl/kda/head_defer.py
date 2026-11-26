@@ -262,6 +262,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             tensors = (conv_w, bias, conv_state, state, output, norm_w)
             coords = (head, rank, slot, offset)
             early = self.verify_early(kt, tensors, coords, slots, (shared_q, shared_k))
+            self._hts("h_early")  # DIAG
             cute.arch.cluster_wait()
             if cutlass.const_expr(staged):  # the other B_ISSUERS - 1 warps of x's tiles
                 b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (0, None, 0))
@@ -272,6 +273,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 section, split_rank, x_in, bar_in,
             )  # fmt: skip
             wait(bar_in)
+            self._hts("h_xin")  # DIAG
             inputs, gate_in = self.read_inputs(kt, x_in)
             # this CTA's rounded token inputs, then hop 2
             mine[kt] = inputs[0]
@@ -281,6 +283,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             mine[320 + kt] = gate_in
             named_barrier(1, 128)
             self.hop(kt, token, partition, mine, raw_qk, raw_v, raw_g, bar_hop)
+            self._hts("h_hop")  # DIAG
             cute.arch.cluster_arrive_relaxed()  # hop 1 done; hop 2 issued
             if kda_cta:
                 rows = (
@@ -299,6 +302,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                     kt, early, raws, rows, bars, tensors, coords, slots, scale, eps
                 )
         cute.arch.cluster_wait()  # no CTA leaves while a peer may write it
+        self._hts("h_exit")  # DIAG
 
 
     @cute.jit
@@ -382,6 +386,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
         else:
             conv_page = conv_state[Int64(conv_slot), None, None]
             wait(bar_hop)
+            self._hts("h_hopin")  # DIAG
             inputs = cute.make_rmem_tensor(3 * T, BFloat16)
             for t in cutlass.range_constexpr(T):
                 inputs[3 * t] = raw_qk[t * 128 + kt]
@@ -402,6 +407,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             # KDA CTA r activates and normalizes only token r's Q / K channels (the
             # same operations as for every token before) and all-gathers them to the
             # eight KDA CTAs; its V rows stay local (threads kt < 16, every token).
+            self._hts("h_conv")  # DIAG
             pre_q, pre_k = accum[0], accum[1]
             for t in cutlass.range_constexpr(1, T):
                 pre_q = Float32(cutlass.select_(rank == t, accum[3 * t], pre_q))
@@ -420,6 +426,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 reductions[warp] = square_q
                 reductions[warp + 4] = square_k
             named_barrier(1, 128)
+            self._hts("h_red")  # DIAG
             pre_v = shared_v[kt]
             shared_v[kt] = self.silu_v(pre_v)
             qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
@@ -432,11 +439,14 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             for dest in cutlass.range_constexpr(KDA_CTAS):
                 push_float(q_ptr, q_n, bar_qk, dest)
                 push_float(k_ptr, k_n, bar_qk, dest)
+            self._hts("h_qkpush")  # DIAG
             if kt < T:  # the tokens' checkpoint slots, for the rolled loop
                 slot_rows[kt] = slots[0, kt]
             named_barrier(1, 128)  # shared_v, slot_rows
             wait(bar_qk)
+            self._hts("h_qk")  # DIAG
             wait(bar_gate)
+            self._hts("h_gate")  # DIAG
             # every KDA CTA's q / k arrived (each sends after its fold): partition 0
             # writes the k / decay records (async stores, drained under the loop)
             if (partition == 0) & live:
@@ -447,6 +457,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             # code evicts from the instruction caches (KDA layer proxy: 807 cycles per
             # token unrolled vs 505 in the bare chain). KdaSplit's operations in its
             # order, so the same states and outputs.
+            self._hts("h_keyrec")  # DIAG
             lanes = (group, group_lane)
             chunks: cutlass.Constexpr = self.vkda.chunks
             # Two operand buffers (q, k, decays of a token) alternate roles over a
@@ -480,6 +491,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                         record_page[head, V_ROW + t - 1, value_base + group % ROWS] = (
                             v_new
                         )
+            self._hts("h_loop")  # DIAG
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
                 local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
@@ -489,6 +501,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
             named_barrier(1, 128)
             position = self.vkda.output_position(value_base + kt % ROWS)
             push_float(shared_o.iterator + position, local_o[kt], bar_out, kt // ROWS)
+            self._hts("h_opush")  # DIAG
             if kt < ROWS:
                 channel = 2 * dim + value_channel
                 window = (
@@ -498,8 +511,10 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                 )
                 for i, value in enumerate(window):
                     conv_put(conv_page, (channel, i), value)
+            self._hts("h_vconv")  # DIAG
             if partition < T:  # token ``partition``: the gated RMS norm
                 wait(bar_out)
+                self._hts("h_out")  # DIAG
                 raw_o = shared_o[self.vkda.output_position(kt)]
                 sums = cute.make_rmem_tensor(4, Float32)
                 for g in cutlass.range_constexpr(4):
@@ -514,6 +529,7 @@ class KdaHeadVerifyDefer(HeadRecords, KdaHeadVerify):
                     store_bf16_canonical(at(output, partition, qk_channel), result)
                 else:
                     output[partition, qk_channel] = BFloat16(result)
+                self._hts("h_store")  # DIAG
                 if partition == 0:
                     for s in cutlass.range_constexpr(2):
                         channel = s * dim + qk_channel
