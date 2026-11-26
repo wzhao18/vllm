@@ -44,6 +44,12 @@ ALLOWED = {
     # set by no serving recipe
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
+    # Mi Sun Park 1408a90317: K31_SPIN_GUARD=0 traces the DSL poll loops without
+    # the bounded-spin hang detector (same polls, order and values; part of the
+    # cute_cache key). Adopted by the user on 2026-11-24 for every K3.1 decode
+    # measurement and checkpoint. It selects no compute path, only whether a hang
+    # traps. Open: replace it with a code policy (e.g. by role) and drop this entry.
+    "K31_SPIN_GUARD",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
