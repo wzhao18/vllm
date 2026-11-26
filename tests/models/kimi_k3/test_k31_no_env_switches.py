@@ -50,6 +50,10 @@ ALLOWED = {
     # measurement and checkpoint. It selects no compute path, only whether a hang
     # traps. Open: replace it with a code policy (e.g. by role) and drop this entry.
     "K31_SPIN_GUARD",
+    # Mi Sun Park, 214b7620ce; owner decides code policy; prefill does not use it.
+    # K31CH_FRONT_TMEM appends row ranges to the TP16 MoeFrontTmem64 decode front
+    # table (specialized_decode/cutedsl/moe/front.py); unset keeps the stock table.
+    "K31CH_FRONT_TMEM",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
