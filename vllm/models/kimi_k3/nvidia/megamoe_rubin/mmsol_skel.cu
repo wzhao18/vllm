@@ -323,16 +323,17 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NT, 1) mmsol_skel_ke
           uint8_t* A = aring + as_ * A_SLOT; uint8_t* B = bring + bs0 * B_SLOT;
           if (routed) {
             const int ncp = MMSOL_ABL == 1 ? 1 : (MMSOL_ABL == 6 || (MMSOL_ABL == 8 && s > 0)) ? 0 : 4;
-            for (int j = 0; j < ncp; ++j) sf_cp(tb + COL_SFA + 4 * j, desc_sf(sa(A + A_DATA) + 512 * j));
-            for (int j = 0; j < 2 * ncp; ++j) sf_cp(tb + COL_SFBA + 4 * j, desc_sf(sa(B + B_DATA) + 512 * j));
-            for (int j = 0; j < ncp; ++j) sf_cp(tb + COL_SFBB + 4 * j, desc_sf(sa(B + B_DATA) + 4096 + 512 * j));
+            const uint32_t sfo = (MMSOL_ABL == 9 && (s & 1)) ? (uint32_t)(352 - COL_SFA) : 0u;  // image 2 offset
+            for (int j = 0; j < ncp; ++j) sf_cp(tb + sfo + COL_SFA + 4 * j, desc_sf(sa(A + A_DATA) + 512 * j));
+            for (int j = 0; j < 2 * ncp; ++j) sf_cp(tb + sfo + COL_SFBA + 4 * j, desc_sf(sa(B + B_DATA) + 512 * j));
+            for (int j = 0; j < ncp; ++j) sf_cp(tb + sfo + COL_SFBB + 4 * j, desc_sf(sa(B + B_DATA) + 4096 + 512 * j));
             const uint64_t da = desc_sw128(sa(A)), dba = desc_sw128(sa(B)), dbb = desc_sw128(sa(B) + 104 * 128);
             const uint32_t acc_a = tb + (abuf ? COL_A1 : COL_A0);
             for (int i = 0; i < 2 && MMSOL_ABL != 7; ++i)
-              mma_nvf4(acc_a, da + 4 * i, dba + 4 * i, ida, tb + COL_SFA + 8 * i, tb + COL_SFBA + 16 * i, (s > 0 || i > 0));
+              mma_nvf4(acc_a, da + 4 * i, dba + 4 * i, ida, tb + sfo + COL_SFA + 8 * i, tb + sfo + COL_SFBA + 16 * i, (s > 0 || i > 0));
             if (s == 0) acquire(2);  // b turnaround: previous tile's b drained (only the stage-0 a-MMAs overlap it)
             for (int i = 0; i < 2 && MMSOL_ABL != 7; ++i)
-              mma_nvf4(tb + COL_B, da + 4 * i, dbb + 4 * i, idb, tb + COL_SFA + 8 * i, tb + COL_SFBB + 8 * i, (s > 0 || i > 0));
+              mma_nvf4(tb + COL_B, da + 4 * i, dbb + 4 * i, idb, tb + sfo + COL_SFA + 8 * i, tb + sfo + COL_SFBB + 8 * i, (s > 0 || i > 0));
           } else {
             uint8_t* B1 = bring + bs1 * B_SLOT;
             sf_cp(tb + COL_SE_SFB, desc_sf(sa(A + A_DATA))); sf_cp(tb + COL_SE_SFB + 4, desc_sf(sa(A + A_DATA) + 512));
