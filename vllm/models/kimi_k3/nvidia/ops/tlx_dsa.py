@@ -378,7 +378,8 @@ class TlxDsa:
             rs.partial_handle.get_buffer(p, list(rs.partial.shape), rs.partial.dtype, 0).data_ptr() for p in range(W)
         ]
         self.bases = sp_bases + pr_bases
-        self.raws = (spag.storage.view(torch.uint8), rs.partial.view(torch.uint8))
+        # flat byte views (the partial is [max_M, 7168]: a 2D uint8 view would slice rows, not bytes)
+        self.raws = (spag.storage.view(torch.uint8).view(-1), rs.partial.view(torch.uint8).view(-1))
         regions = [
             _Region(1, 0, rs.partial.numel() * rs.partial.element_size(), "gemm_rs_partial"),
             _Region(0, tail, self.slot_bytes - tail, "sp_ag_slot0_tail"),
