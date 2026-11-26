@@ -185,6 +185,10 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         lower_bound: Float32, scale: Float32, eps: Float32, counter: cutlass.Int64,
         target: Int32, out_rearm: cutlass.Int64, stream,
     ):  # fmt: skip
+        # A 24-CTA cluster is non-portable: the DSL verifies a static cluster shape
+        # against the portable 16, so the shape is a runtime value (launch-time
+        # cluster dims; the kernel sets non_portable_cluster_size_allowed).
+        cluster_x = target - target + R24_CLUSTER
         self.kernel(
             mA, mB, a_map, conv_w, bias, conv_state, fa_beta, a_log, dt_bias, slots,
             state, output, norm_w, f_b, accepted, lower_bound, scale, eps, counter,
@@ -192,7 +196,7 @@ class KdaHeadR24(HeadRecords, KdaHeadMulti):
         ).launch(
             grid=(R24_CLUSTER, self.heads, 1),
             block=(self.threads_per_cta, 1, 1),
-            cluster=self.cluster_shape,
+            cluster=(cluster_x, 1, 1),
             smem=cute.Int64(self.smem_bytes),
             stream=stream,
             use_pdl=True,
