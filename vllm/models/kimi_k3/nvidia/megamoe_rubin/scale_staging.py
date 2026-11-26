@@ -134,15 +134,6 @@ class ScaleStaging:
         expand(self.compact[o], self.slots[o % 2])
         self.held[o % 2] = o
 
-    def invalidate(self) -> None:
-        """The compact planes changed under the slots (EPLB moved expert rows):
-        forget what the slots hold, so the next forward expands every layer again.
-        An expansion still pending on the side stream is waited for first."""
-        if self.pending is not None and self.stream is not None:
-            torch.cuda.current_stream().wait_event(self.done)
-        self.pending = None
-        self.held = [-1, -1]
-
     def before_kernel(self, o: int) -> None:
         """Before layer ``o``'s kernel: its planes are in its slot, ordered before
         the current stream's next work."""

@@ -1021,7 +1021,6 @@ class EplbState:
                             eplb_model_state,
                             new_physical_to_logical_map=new_physical_to_logical_map,
                         )
-                        _notify_weights_moved(eplb_model_state.model)
 
                 if is_main_rank:
                     assert start_event is not None
@@ -1562,14 +1561,6 @@ def _commit_eplb_maps(
     dst.copy_(src, non_blocking=True)
 
 
-def _notify_weights_moved(model) -> None:
-    """Let a model drop state derived from expert rows EPLB just rewrote (e.g.
-    Rubin MegaMoE's expanded NVFP4 scale slots), if it keeps any."""
-    hook = getattr(model, "eplb_weights_moved", None)
-    if hook is not None:
-        hook()
-
-
 def _move_to_workspace(
     model_state: EplbModelState,
     ep_rank: int,
@@ -1592,7 +1583,6 @@ def _move_to_workspace(
             layer=result.layer_idx,
         )
 
-    _notify_weights_moved(model_state.model)
     if results[-1].layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False
 
