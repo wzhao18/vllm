@@ -127,6 +127,11 @@ class RubinMegaMoE:
             s = self.sessions[b]
             s.carve(self.arena, layout_tag(i, s.cfg, s.name))
         self.arena.verify_layout()
+        # EXPERIMENT ONLY (MM-SOL P1-IS push probe; never for merge): built in every arm, launched with
+        # K31_MMSOL_PROBE=1 after every launch (mmsol_probe.py).
+        from .mmsol_probe import MmsolPushProbe
+
+        self.mmsol_probe = MmsolPushProbe(self.arena, self.rank, self.world)
         device = torch.device("cuda", torch.cuda.current_device())
         # Sticky route-id error flag [flag, offending id] + its async host mirror.
         self.route_error = torch.zeros(2, dtype=torch.int64, device=device)
@@ -436,6 +441,7 @@ class RubinMegaMoE:
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
             session.launch(weights, session.empty_output, ep_tokens, rmsnorm, shared)
+            self.mmsol_probe(session, 0)
             result = hidden.new_empty((0, self.problem.hidden))
         else:
             if out is None:
@@ -448,6 +454,7 @@ class RubinMegaMoE:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
             session.launch(weights, result, ep_tokens, rmsnorm, shared)
+            self.mmsol_probe(session, n)
             if unfused_norm is not None:
                 from vllm import _custom_ops as ops
 
