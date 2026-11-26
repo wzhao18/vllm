@@ -86,6 +86,8 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
     """``RubinGroupedExpertsKernel`` at ``capacity`` (a multiple of 64, at most
     ``WIDE_MAX``) token rows; ``publish`` False or "local" (module docstring)."""
 
+    LATE_FC2 = False  # its own heads match all four lists
+
     def __init__(
         self, experts, grid, slots, capacity, publish=False, stages=7, trace=0,
         pool=(12, 6), dies=(), static_groups=False, tables=True,
