@@ -382,14 +382,14 @@ class RouteSitu:
         for w in c.range_constexpr(1, 8):
             group = max(group, km[w, lane])
         part = lane % 8
-        mine = Uint32(cute.arch.shuffle_sync(group, warp * 4 + lane // 8))
-        rank = Int32(0)
+        gkey = Uint32(cute.arch.shuffle_sync(group, warp * 4 + lane // 8))
+        above = Int32(0)
         for k in c.range_constexpr(4):  # unsigned keys: compare as Uint32
             other = Uint32(cute.arch.shuffle_sync(group, part + 8 * k))
-            rank += Int32(other > mine)
+            above += Int32(other > gkey)
         for shift in c.range_constexpr(3):
-            rank += cute.arch.shuffle_sync_bfly(rank, 1 << shift)
-        low = redux(mine if rank < 16 else Uint32(0xFFFFFFFF))
+            above += cute.arch.shuffle_sync_bfly(above, 1 << shift)
+        low = redux(gkey if above < 16 else Uint32(0xFFFFFFFF))
         if lane == 0:
             shared_min(cutoff.iterator, low)
         cute.arch.sync_threads()
