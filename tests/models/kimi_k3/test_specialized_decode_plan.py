@@ -808,6 +808,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyLoopDefer: "loopstock",  # (its record form)
+        prepared.KdaVerifyLoopDefer4: "loopstock",  # (its record form, 4 rows/thread)
         prepared.KdaVerifyFeed: "feed",
         prepared.KdaVerifyHalfStock: "halfstock",
         prepared.KdaVerifyHalfDefer: "halfstock",
@@ -942,7 +943,7 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             if prepared.record_protocol(q, False, KDA_HEADS, RUBIN):
                 # their deferred-verify record forms (TP16 q8)
                 stock = (
-                    prepared.KdaVerifyLoopDefer, prepared.KdaSplitDefer,
+                    prepared.KdaVerifyLoopDefer4, prepared.KdaSplitDefer,
                     prepared.KdaVerifyHalfDefer,
                 )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
