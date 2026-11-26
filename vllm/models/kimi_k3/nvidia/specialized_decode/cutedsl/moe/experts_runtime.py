@@ -6,6 +6,7 @@ predecessor (incl. workspace rearm/counters) before shared state is read; output
 keep the caller's top16 order."""
 
 import functools
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -472,9 +473,11 @@ def compile_rubin64(
     dies when the weights were ``place``d; ``static``: constant epilogue-group
     barrier ids (``ExpertsKernel.static_groups``); ``zone``: the FC2 tail pool's
     (``POOL_ZONE``)."""
+    # DIAG (MOEU1, not for merge): ring depth of the grouped engine.
+    stages = int(os.environ.get("MOEU1_STAGES", "7"))
     moe = RubinGroupedExpertsKernel(
         experts, grid, slots, publish=publish, pool=(zone, 6), dies=dies,
-        static_groups=static,
+        static_groups=static, stages=stages,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
