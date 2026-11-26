@@ -219,6 +219,14 @@ def _warm_gluon_chunk_kda(layer, input_dtype: torch.dtype) -> None:
         )
 
 
+def _conv_state_dim_view(conv_state: torch.Tensor) -> torch.Tensor:
+    """The conv cache as the conv kernels read it, (lines, dim, width - 1),
+    whatever VLLM_SSM_CONV_STATE_LAYOUT stores (KDA forward does the same)."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    return conv_state if is_conv_state_dim_first() else conv_state.transpose(-1, -2)
+
+
 def _warm_prefill_glue(worker: Worker, layer: KimiK3DeltaAttention) -> None:
     """Prefill-only kernels that dummy runs never reach (KDA's _forward returns
     without attention metadata), once each at the serving strides, so no
@@ -249,6 +257,9 @@ def _warm_prefill_glue(worker: Worker, layer: KimiK3DeltaAttention) -> None:
     conv_state, rec_state = kv_cache[0], kv_cache[1]
     if not isinstance(conv_state, torch.Tensor) or not conv_state.numel():
         return
+    # The conv kernels consume (lines, dim, width - 1), as in KDA forward: the
+    # default SD cache layout stores (lines, width - 1, dim).
+    conv_state = _conv_state_dim_view(conv_state)
     device = conv_state.device
     dtype = worker.model_config.dtype
     P = int(layer.local_projection_size)
@@ -294,11 +305,8 @@ def _warm_prefill_glue(worker: Worker, layer: KimiK3DeltaAttention) -> None:
             kda_conv.kda_prefill_conv(xt, wp, st, qsl, null, no_init, md)
     # The fused Q|K|V conv (CUDA): builds / loads the extension here, not in
     # the first prefill.
-    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-
-    cs = conv_state if is_conv_state_dim_first() else conv_state.transpose(-1, -2)
-    if kda_conv.qkv_conv_supported(proj[:, : 3 * P], w, cs, P):
-        kda_conv.qkv_conv(proj[:, : 3 * P], w, cs, qsl, null, no_init, P)
+    if kda_conv.qkv_conv_supported(proj[:, : 3 * P], w, conv_state, P):
+        kda_conv.qkv_conv(proj[:, : 3 * P], w, conv_state, qsl, null, no_init, P)
 
     # Output gate norm: the gate is a view of the prefill projection (row
     # stride width) or of the decode projection-overlap output (4 P).
