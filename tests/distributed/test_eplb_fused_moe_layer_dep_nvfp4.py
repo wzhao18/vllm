@@ -11,7 +11,6 @@ import torch
 from tests.kernels.moe.utils import make_test_quant_config
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
-from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.distributed.eplb.rebalance_execute import rearrange_expert_weights_inplace
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
@@ -25,6 +24,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4FusedMoE,
 )
 from vllm.platforms import current_platform
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from .eplb_utils import distributed_run, set_env_vars_and_device
 
@@ -65,20 +65,18 @@ def make_fused_moe_layer(
         activation="silu",
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
+        # Served models pass parallel_config.enable_eplb; the factory then gives
+        # the router the EplbLayerState that set_eplb_state() registers into.
+        enable_eplb=True,
     )
 
-    nvfp4_fused_moe = ModelOptNvFp4FusedMoE(quant_config, fml)
-    nvfp4_fused_moe.create_weights(
-        fml,
-        test_config.num_local_experts,
-        test_config.hidden_size,
-        test_config.intermediate_size,
-        params_dtype=torch.uint8,
-        global_num_experts=test_config.num_experts,
-    )
-
+    # The factory builds the RoutedExperts with its own ModelOptNvFp4FusedMoE
+    # (constructed from re.moe_config) and creates the NVFP4 weights on it, as
+    # in a served model. Use that method: the forward runs it.
     fml = fml.to(device)
     re = fml.routed_experts
+    nvfp4_fused_moe = re.quant_method
+    assert isinstance(nvfp4_fused_moe, ModelOptNvFp4FusedMoE)
     w1_q, w2_q, quant_config = make_test_quant_config(
         test_config.num_local_experts,
         test_config.intermediate_size,
@@ -103,11 +101,34 @@ def make_fused_moe_layer(
         torch.randn(re.w13_weight_scale.data.shape, device=device) / 5
     ).to(re.w13_weight_scale.data.dtype)
 
+    # Builds the modular kernel too (MoERunner.maybe_init_modular_kernel is gone).
     nvfp4_fused_moe.process_weights_after_loading(re)
 
-    fml.maybe_init_modular_kernel()
-
     return fml
+
+
+def register_eplb_state(
+    fml_layers: list[MoERunner], logical_to_physical_map: torch.Tensor
+) -> None:
+    """Register EPLB maps in every layer, as EplbState.add_model does when
+    serving (before the first forward) and after each rearrangement."""
+    num_layers, num_experts = logical_to_physical_map.shape[:2]
+    device = logical_to_physical_map.device
+    for lidx, fml in enumerate(fml_layers):
+        # enable_eplb: the factory gave the router an EplbLayerState.
+        assert fml.eplb_state is not None
+        fml.set_eplb_state(
+            lidx,
+            torch.zeros((num_layers, num_experts), dtype=torch.int32, device=device),
+            logical_to_physical_map,
+            torch.ones((num_layers, num_experts), dtype=torch.int32, device=device),
+        )
+        fml.router.eplb_state.should_record_tensor = torch.ones(
+            (), dtype=torch.bool, device=device
+        )
+        fml.router.eplb_state.num_unpadded_tokens_tensors = [
+            torch.tensor(0, dtype=torch.int32, device=device)
+        ]
 
 
 def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
@@ -116,6 +137,8 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
     vllm_config = VllmConfig()
     vllm_config.parallel_config.data_parallel_size = world_size
     vllm_config.parallel_config.enable_expert_parallel = True
+    # get_eplb_group() (the EPLB communicator below) exists only with EPLB on.
+    vllm_config.parallel_config.enable_eplb = True
     vllm_config.kernel_config.moe_backend = test_config.moe_backend
 
     with set_current_vllm_config(vllm_config):
@@ -127,6 +150,9 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
         ep_rank = torch.distributed.get_rank()
 
         device = torch.device(f"cuda:{ep_rank}")
+        # The modular kernel takes its scratch from the v1 WorkspaceManager,
+        # which the model runner initializes in a served model.
+        init_workspace_manager(device)
 
         fml_layers = [
             make_fused_moe_layer(ep_rank, layer_idx, test_config).to(device)
@@ -151,6 +177,14 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
                     device=device,
                 )
             )
+
+        # Identity placement before the rearrangement.
+        register_eplb_state(
+            fml_layers,
+            torch.arange(test_config.num_experts, dtype=torch.int32, device=device)
+            .reshape(1, test_config.num_experts, 1)
+            .repeat(test_config.num_layers, 1, 1),
+        )
 
         out_before_shuffle = []
         with set_forward_context(
@@ -209,29 +243,7 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
 
         logical_to_physical_map = torch.stack(logical_to_physical_map_list)
 
-        for lidx, fml in enumerate(fml_layers):
-            logical_replica_count = torch.ones(
-                (test_config.num_layers, num_global_experts),
-                dtype=torch.int32,
-                device=device,
-            )
-            fml.eplb_state = EplbLayerState()
-            fml.set_eplb_state(
-                lidx,
-                torch.zeros(
-                    (test_config.num_layers, num_global_experts),
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                logical_to_physical_map,
-                logical_replica_count,
-            )
-            fml.router.eplb_state.should_record_tensor = torch.ones(
-                (), dtype=torch.bool, device=device
-            )
-            fml.router.eplb_state.num_unpadded_tokens_tensors = [
-                torch.tensor(0, dtype=torch.int32, device=device)
-            ]
+        register_eplb_state(fml_layers, logical_to_physical_map)
 
         out_after_shuffle = []
         with set_forward_context(
