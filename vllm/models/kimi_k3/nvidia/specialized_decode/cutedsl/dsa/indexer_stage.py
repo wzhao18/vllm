@@ -18,6 +18,7 @@ With Wei's DcpExchange on (dsa_kernels.dcp_exchange: built by policy on decode),
 DeepGEMM logits, its KV slots and counts in place of the merge's (no DeepSelect,
 pack or all-gather). The merge stays built for the steps it declines."""
 
+from dataclasses import dataclass
 from functools import cache
 
 import torch
@@ -25,6 +26,25 @@ import torch
 from vllm.utils.torch_utils import _encode_layer_name
 
 from .index import DIM, fp4_query_views, is_fp4_cache
+
+
+@dataclass(frozen=True)
+class MicInputs:
+    """The #63 merge's state for DsaCore.run_mic: its rescue workspace (``ws``,
+    round-1 mailbox included), the step's logits / row ends (the saturated rank's
+    second round), the MLA rows mapping, and this rank's rows / counts outputs."""
+
+    ws: object
+    logits: torch.Tensor
+    row_ends: torch.Tensor
+    req_id: torch.Tensor
+    block_table: torch.Tensor
+    block_size: int
+    stride_rows: int
+    rows: torch.Tensor
+    valid: torch.Tensor
+    topk: int
+    local_topk: int
 
 
 class IndexerStage:
@@ -263,6 +283,57 @@ class IndexerStage:
             slots[rows:].fill_(-1)
             valid[rows:].zero_()
         return slots, valid
+
+    def merge_in_core(
+        self, q_fp8, head_w, metadata, stride_rows, batch, q=1, after_logits=None
+    ):
+        """The #63 merge inside the DSA sparse core (DsaCore.run_mic) on a step whose
+        rows the fused DCP indexer publishes into the merge's round-1 mailbox itself
+        (the "merge" source, every row a decode row, ``packs`` and the mailbox; the same
+        on every rank): runs that indexer (scorer + local top-N + publish) and returns
+        the core's merge inputs (``MicInputs``) instead of selecting; None on any other
+        step (the caller then runs ``merge_rows``). ``after_logits``: as merge_rows'."""
+        from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+            get_dcp_topk_rescue_workspace,
+        )
+
+        if self.dcp_ids is not None:  # (tests: the global ids need the select)
+            return None
+        source, rows = self.merge_source(batch)
+        fused = self.fused
+        if source != "merge" or rows != batch or fused is None:
+            return None
+        indexer = self.indexer
+        decode = get_forward_context().attn_metadata[indexer.k_cache.prefix].decode
+        if (
+            decode.seq_lens.numel() != rows
+            or (batch, q) not in fused.kernels
+            or not fused.publishes(rows)
+        ):
+            return None
+        ws = get_dcp_topk_rescue_workspace(self.topk, self.local_topk)
+        if ws is None or ws.mailbox is None:
+            return None
+        # The logits stay valid until the core returns (stream order): a saturated
+        # rank re-reads its row in the merge's second round.
+        packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
+        assert packed is not None
+        if after_logits is not None:
+            after_logits()
+        return MicInputs(
+            ws=ws,
+            logits=logits[:rows],
+            row_ends=ends[:rows],
+            req_id=metadata.req_id_per_token,
+            block_table=metadata.block_table,
+            block_size=metadata.block_size,
+            stride_rows=stride_rows,
+            rows=self.dcp_rows[:batch],
+            valid=self.dcp_valid[:batch],
+            topk=self.topk,
+            local_topk=self.local_topk,
+        )
 
     def decode_logits(self, q_fp8, head_w, decode, rows, batch):
         """The bf16 paged MQA logits of the first ``rows`` rows of a ``batch``-row

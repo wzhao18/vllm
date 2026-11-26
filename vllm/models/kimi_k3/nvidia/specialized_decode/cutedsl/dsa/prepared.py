@@ -669,12 +669,20 @@ class PreparedDsa:
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
         late, self.late_query = self.late_query, None
-        sel, counts = self.dsac_rows.rows(*args, q=q, after_logits=late)
+        # The fused indexer publishes the merge's round 1 itself: the core merges
+        # (no select kernel between them); else the merge's rows and counts.
+        mic = self.indexer_stage.merge_in_core(*args, q=q, after_logits=late)
+        if mic is None:
+            sel, counts = self.dsac_rows.rows(*args, q=q, after_logits=late)
         if join is not None:
             join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
         impl._prepare_mqa_kernel(self.layer, self.device)
         scales = impl.bmm1_scale, impl.bmm2_scale
+        if mic is not None:
+            args = box.q[p], kv, mic, scales, box, self.heads, p, batch
+            self.dsac.run_mic(variant, *args, lse_wide=spread)
+            return
         args = box.q[p], sel, counts, kv, scales, box, self.heads, p, batch
         self.dsac.run(variant, *args, lse_wide=spread)
 

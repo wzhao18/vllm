@@ -113,6 +113,29 @@ struct Params {
   long long spin_ns;
   long long* dbg;         // optional [T * G * S, 16] timestamps (ns): start, q polled,
                           // slots, loop done, pushed, after the PDL wait
+  // ---- the #63 merge in the core (``mic``; see "merge in core" below). 0: the
+  // slots / counts come from ``sel`` / ``cnt`` (the merge's outputs).
+  int mic;
+  const uint32_t* box;    // this rank's round-1 mailbox [2, max_rows, W, box_words] (u32)
+  int* ordinals;          // [max_rows] merges per row so far (the mailbox's)
+  int* readers;           // [2, rcap] zeroed: CTAs of a row done with round 1 / 2
+  int rcap, max_rows, nloc, topk, box_words, gid_bits;
+  const int* req_id;      // [T] request of a row
+  const int* block_table; // [reqs, bt_width] MLA cache blocks
+  int64_t bt_stride;
+  int bt_width, block_size, stride_rows;
+  // exact merge's second round (DCPTopkRescueWorkspace + the indexer's logits)
+  const uint16_t* logits;  // [T, logits_stride] BF16 bits
+  int64_t logits_stride;
+  int logits_width;
+  const int* row_ends;     // [T]
+  const uint64_t* peer_recv;   // [W] recv bases [max_rows, slots, K + K / 32]
+  const uint64_t* peer_flags;  // [W] flag bases [W, max_rows]
+  int* seq2;               // [max_rows]
+  int num_slots;
+  int* rows_out;           // optional [T, rows_stride]: this rank's rows (CTA (0, 0) of a row)
+  int64_t rows_stride;
+  int* valid_out;          // optional [T]
 };
 
 // ------------------------------------------------------------------ primitives
@@ -250,6 +273,414 @@ __device__ __forceinline__ uint32_t no_neg_zero(uint32_t w) {
   return w;
 }
 
+// ------------------------------------------------------------------ merge in core
+// ``mic``: the #63 exact merge (DCPTopkSelectKernel, mailbox + fold) runs inside the
+// core, so the step's chain is pack (publishes) -> core instead of pack -> select ->
+// core. Every CTA of a row polls the row's W round-1 mailbox slots (before its PDL
+// wait, as the select), and the last of the row's CTAs to stage them re-arms the slots
+// and bumps the row's ordinal (the select's re-arm / bump, once per row). Every CTA
+// then finds the cut of the global top-K under the select's total order (bf16 score
+// desc, global id asc; keys (ord16 << gid_bits) | ~gid, the same radix passes) and
+// takes this rank's selected keys in the select's order (slot order j of its own
+// round-1 row) as its slots: the same slots and count as the select's rows_out /
+// valid_out, so the core's arithmetic is unchanged (bitwise the select + core).
+// Saturated rows (the select's sat mask: a rank whose N words are all above tau16) run
+// the exact merge's second round here as the folded select does: each CTA of a
+// saturated rank pushes its local top-K of the logits to every rank's rescue slot
+// (identical bytes from every CTA of the row; the flag value is the row's seq2 + 1),
+// every CTA waits for the mask's flags, re-selects over the other ranks' round-1 words
+// at or above tau16 plus the pushed lists, and the row's last CTA bumps seq2.
+// Every CTA pushes before it waits, and a row's CTAs are launched in the same order on
+// every rank (as the folded select's "every CTA resident" argument).
+
+__device__ __forceinline__ uint32_t ld_cg_u32(const void* p) {
+  uint32_t v;
+  asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ uint16_t ld_cg_u16(const void* p) {
+  uint16_t v;
+  asm volatile("ld.global.cg.u16 %0, [%1];" : "=h"(v) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ int ld_acquire_sys(const int* p) {
+  int v;
+  asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void st_release_sys(int* p, int v) {
+  asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t ord16(uint32_t b) {
+  return (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
+}
+// inclusive block scan of 512 threads; ``total``: the block's sum
+__device__ __forceinline__ int block_scan(int x, int* wt, int lane, int warp, int* total) {
+  int v = x;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(~0u, v, o);
+    if (lane >= o) v += y;
+  }
+  if (lane == 31) wt[warp] = v;
+  __syncthreads();
+  if (warp == 0) {
+    int w = lane < kThreads / 32 ? wt[lane] : 0;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int y = __shfl_up_sync(~0u, w, o);
+      if (lane >= o) w += y;
+    }
+    if (lane < kThreads / 32) wt[lane] = w;
+  }
+  __syncthreads();
+  const int r = v + (warp > 0 ? wt[warp - 1] : 0);
+  if (total) *total = wt[kThreads / 32 - 1];
+  __syncthreads();
+  return r;
+}
+// The cut of the top-``K`` of ``n`` keys (``key(i)``; 0 = empty; keys unique) under the
+// select's radix schedule (9 + 7 score bits, then the gid bits 9 at a time while the
+// K-th key's score is tied): key i is selected iff key(i) != 0 && key(i) >= the result.
+// ``*full``: K keys selected (else every key: fewer than K).
+template <class F>
+__device__ uint64_t radix_cut(F key, int n, int K, int gb, int* hist, int* wt, int* sc, int tid,
+                              int lane, int warp, bool* full) {
+  uint64_t prefix = 0;
+  int need = K, shift = gb + 7, bits = 9;
+  for (int pass = 0;; ++pass) {
+    hist[tid] = 0;  // (512 bins = 512 threads)
+    __syncthreads();
+    const int top = shift + bits;
+    for (int i = tid; i < n; i += kThreads) {
+      const uint64_t k = key(i);
+      if (k != 0 && (k >> top) == prefix)
+        atomicAdd(&hist[(int)((k >> shift) & ((1ull << bits) - 1))], 1);
+    }
+    __syncthreads();
+    const int count = hist[kThreads - 1 - tid];
+    const int incl = block_scan(count, wt, lane, warp, nullptr);
+    if (count > 0 && incl >= need && incl - count < need) {
+      sc[0] = kThreads - 1 - tid;
+      sc[1] = incl - count;
+      sc[2] = incl == need;
+      sc[3] = 1;
+    }
+    if (tid == kThreads - 1 && incl < need) {  // fewer keys than K (pass 0): all of them
+      sc[0] = 0;
+      sc[1] = 0;
+      sc[2] = 1;
+      sc[3] = 0;
+    }
+    __syncthreads();
+    const int thr = sc[0], above = sc[1], done = sc[2], kfull = sc[3];
+    __syncthreads();  // (sc, hist reused)
+    const uint64_t np = (prefix << bits) | (uint64_t)thr;
+    if (done || shift == 0) {
+      *full = kfull != 0;
+      return np << shift;
+    }
+    need -= above;
+    prefix = np;
+    if (pass == 0) {
+      shift = gb;
+      bits = 7;
+    } else {
+      bits = min(9, shift);
+      shift -= bits;
+    }
+  }
+}
+
+constexpr int kTab = 1024;  // block-table entries of a row kept in shared memory (as the select)
+
+// The saturated rank's push (DCPTopkSelectKernel.push_local_topk): its local top-min(K,
+// valid) of ``logits[t]`` in the B' layout (keys above the cut v in ascending local
+// index, then keys equal to v in ascending local index up to K) -> every rank's
+// recv[t, slot]; then flag (rank, t) = ``expected`` on every rank.
+__device__ void mic_push(const Params& p, int t, int slot, int expected, uint32_t* buf, int* hist,
+                         int* wt, int* sc, int tid, int lane, int warp) {
+  const int K = p.topk, RW = K + K / 32;
+  int end = min(p.logits_width, 1 << 17);
+  end = min(end, ld_cg(p.row_ends + t));
+  const uint16_t* lrow = p.logits + (int64_t)t * p.logits_stride;
+  auto lo = [&](int l) -> uint32_t {
+    const uint32_t b = ld_cg_u16(lrow + l);
+    return (b & 0x7FFFu) <= 0x7F80u ? ord16(b) : 0u;  // NaN: not a candidate
+  };
+  hist[tid] = 0;
+  if (tid == 0) {
+    sc[4] = -1;
+    sc[5] = 0;
+  }
+  __syncthreads();
+  for (int l = tid; l < end; l += kThreads) {
+    const uint32_t o = lo(l);
+    if (o) atomicAdd(&hist[o >> 7], 1);
+  }
+  __syncthreads();
+  {
+    const int count = hist[kThreads - 1 - tid];
+    const int incl = block_scan(count, wt, lane, warp, nullptr);
+    if (count > 0 && incl >= K && incl - count < K) {
+      sc[4] = kThreads - 1 - tid;
+      sc[5] = incl - count;
+    }
+  }
+  __syncthreads();
+  const int b1 = sc[4], above = sc[5];
+  uint32_t v = 0;
+  int cgt = 0;
+  if (b1 >= 0) {
+    hist[tid] = 0;
+    __syncthreads();
+    for (int l = tid; l < end; l += kThreads) {
+      const uint32_t o = lo(l);
+      if (o && (int)(o >> 7) == b1) atomicAdd(&hist[o & 127], 1);
+    }
+    __syncthreads();
+    const int c2 = hist[kThreads - 1 - tid];
+    const int i2 = block_scan(c2, wt, lane, warp, nullptr);
+    const int need2 = K - above;
+    if (c2 > 0 && i2 >= need2 && i2 - c2 < need2) {
+      sc[6] = kThreads - 1 - tid;
+      sc[7] = above + i2 - c2;
+    }
+    __syncthreads();
+    v = ((uint32_t)b1 << 7) | (uint32_t)sc[6];
+    cgt = sc[7];
+  }
+  for (int i = tid; i < RW; i += kThreads) buf[i] = 0;
+  __syncthreads();
+  int eq_run = 0, gt_run = 0;
+  for (int base = 0; base < end; base += kThreads) {
+    const int l = base + tid;
+    const uint32_t o = l < end ? lo(l) : 0u;
+    const bool is_eq = o == v && o != 0;
+    int flag = is_eq ? 1 : 0;
+    if (o > v) flag = 1 << 16;
+    int tot;
+    const int incl = block_scan(flag, wt, lane, warp, &tot);
+    int pos = -1;
+    if (o > v) pos = gt_run + (incl >> 16) - 1;
+    if (is_eq) {
+      const int idx = eq_run + (incl & 0xFFFF) - 1;
+      if (idx < K - cgt) pos = cgt + idx;
+    }
+    if (pos >= 0) {
+      buf[pos] = (o << 16) | (0xFFFFu - ((uint32_t)l & 0xFFFFu));
+      if ((uint32_t)l >> 16) atomicOr(&buf[K + (pos >> 5)], 1u << (pos & 31));
+    }
+    eq_run += tot & 0xFFFF;
+    gt_run += tot >> 16;
+  }
+  __syncthreads();
+  const int64_t off = ((int64_t)t * p.num_slots + slot) * RW;
+  for (int pr = 0; pr < p.W; ++pr) {
+    uint32_t* dst = reinterpret_cast<uint32_t*>(p.peer_recv[pr]) + off;
+    for (int i = tid; i < RW / 4; i += kThreads)
+      st_v4(dst + 4 * i, reinterpret_cast<const uint4*>(buf)[i]);
+  }
+  __syncthreads();
+  if (tid < p.W) {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    int* f = reinterpret_cast<int*>(p.peer_flags[tid]) + ((int64_t)p.rank * p.max_rows + t);
+    st_release_sys(f, expected);
+  }
+}
+
+// The merge in the core (see above): this rank's selected slots of row t -> sIdx [0, n)
+// (-1 after), returns n. Waits on the PDL predecessor (and triggers the dependents) itself.
+__device__ int mic_front(const Params& p, int t, int tid, int lane, int warp, uint8_t* kvbuf,
+                         uint8_t* scratch, int* sIdx, long long* dbg) {
+  __shared__ int wt[kThreads / 32];
+  __shared__ int sc[8];
+  __shared__ int notsat[16], owner[16];
+  __shared__ int s_last, s_tau;
+  const int W = p.W, N = p.nloc, K = p.topk, BW = p.box_words, gb = p.gid_bits;
+  const uint64_t gmask = (1ull << gb) - 1;
+  uint32_t* stage = reinterpret_cast<uint32_t*>(kvbuf);
+  uint32_t* pbuf = stage + W * BW;  // the push's B' row (W * BW: a multiple of 4)
+  int* hist = reinterpret_cast<int*>(scratch);  // [512]
+  int* tab = hist + kThreads;                   // [kTab]
+  const int nreaders = gridDim.x * gridDim.y;
+  const int ordinal = ld_cg(p.ordinals + t);
+  const int seq = ld_cg(p.seq2 + t);
+  const int req = ld_cg(p.req_id + t);
+  const int* trow = p.block_table + (int64_t)req * p.bt_stride;
+  const int twidth = min(p.bt_width, kTab);
+  for (int i = tid; i < twidth; i += kThreads) tab[i] = ld_cg(trow + i);
+  // ---- round 1: the row's W slots (Lamport: no word is the armed 0xFFFFFFFF)
+  const uint32_t* base = p.box + ((int64_t)(ordinal & 1) * p.max_rows + t) * (int64_t)W * BW;
+  const int chunks = W * BW / 4;
+  for (int c = tid; c < chunks; c += kThreads) {
+    uint4 v = ld_sys_v4(base + 4 * c);
+    if (armed(v)) {
+      const long long ts = now_ns();
+      do {
+        __nanosleep(32);
+        if (now_ns() - ts > p.spin_ns) fail(p.err, 3);
+        v = ld_sys_v4(base + 4 * c);
+      } while (armed(v));
+    }
+    reinterpret_cast<uint4*>(stage)[c] = v;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    s_last = atomicAdd(p.readers + t, 1) == nreaders - 1;
+  }
+  __syncthreads();
+  const bool last = s_last;
+  if (last) {  // every CTA of the row has staged it: re-arm (the select's per-chunk re-arm)
+    uint32_t* wb = const_cast<uint32_t*>(base);
+    for (int c = tid; c < chunks; c += kThreads) st_v4(wb + 4 * c, make_uint4(kSent, kSent, kSent, kSent));
+    if (tid == 0) p.readers[t] = 0;
+  }
+  if (dbg && tid == 0) dbg[19] = now_ns();
+  pdl_wait();
+  // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
+  pdl_launch();
+  if (dbg && tid == 0) dbg[5] = now_ns();
+  if (last && tid == 0) p.ordinals[t] = ordinal + 1;
+  // ---- round-1 keys (ord16 << gid_bits) | ~gid of slot j of rank r; 0: empty
+  auto r1 = [&](int i) -> uint64_t {
+    const int r = i / N, j = i - r * N;
+    const uint32_t* s = stage + r * BW;
+    const uint32_t w = s[j];
+    if (w == 0) return 0;
+    const uint32_t* pl = s + N + 2 * (j >> 5);
+    const uint32_t hi = (pl[0] & 0xFFFFu) | (pl[1] << 16);
+    const uint32_t local = (0xFFFFu - (w & 0xFFFFu)) | (((hi >> (j & 31)) & 1u) << 16);
+    const uint64_t gid = (uint64_t)local * W + r;
+    return ((uint64_t)(w >> 16) << gb) | (gmask - gid);
+  };
+  const int n1 = W * N;
+  bool full;
+  const uint64_t cut = radix_cut(r1, n1, K, gb, hist, wt, sc, tid, lane, warp, &full);
+  // tau16: the smallest selected score (0 when fewer than K were selected)
+  {
+    int mn = 0x10000;
+    if (full) {
+      for (int i = tid; i < n1; i += kThreads) {
+        const uint64_t k = r1(i);
+        if (k != 0 && k >= cut) mn = min(mn, (int)(k >> gb));
+      }
+    }
+    mn = __reduce_min_sync(~0u, mn);
+    if (lane == 0) wt[warp] = mn;
+    if (tid < 16) notsat[tid] = 0;
+    __syncthreads();
+    if (tid == 0) {
+      int m = 0x10000;
+      for (int w = 0; w < kThreads / 32; ++w) m = min(m, wt[w]);
+      s_tau = full ? m : 0;
+    }
+    __syncthreads();
+  }
+  const int tau = s_tau;
+  // rank r is saturated iff all its N slots hold a key with ord16 > tau16
+  for (int i = tid; i < n1; i += kThreads) {
+    const uint64_t k = r1(i);
+    if (k == 0 || (int)(k >> gb) <= tau) notsat[i / N] = 1;
+  }
+  __syncthreads();
+  int mask = 0;
+  for (int r = 0; r < W; ++r)
+    if (!notsat[r]) mask |= 1 << r;
+  // distinct keys bound the saturated ranks by the slots; else round 1 stands (select)
+  if (__popc(mask) > p.num_slots) mask = 0;
+  if (dbg && tid == 0) dbg[20] = now_ns();
+  const int RW = K + K / 32;
+  const uint32_t* recv_row = nullptr;
+  const int expected = seq + 1;
+  const bool me_sat = (mask >> p.rank) & 1;
+  int sme = 0;
+  // ---- the second round of a saturated row (DCPTopkRescueKernel / the folded select)
+  auto r2 = [&](int i) -> uint64_t {
+    if (i < n1) {
+      if ((mask >> (i / N)) & 1) return 0;
+      const uint64_t k = r1(i);
+      return (k != 0 && (int)(k >> gb) < tau) ? 0 : k;
+    }
+    const int s = (i - n1) / K, j = i - n1 - s * K;
+    const uint32_t* b = recv_row + (int64_t)s * RW;
+    const uint32_t w = ld_cg_u32(b + j);
+    if (w == 0) return 0;
+    const uint32_t hi = ld_cg_u32(b + K + (j >> 5));
+    const uint32_t local = (0xFFFFu - (w & 0xFFFFu)) | (((hi >> (j & 31)) & 1u) << 16);
+    const uint64_t gid = (uint64_t)local * W + owner[s];
+    return ((uint64_t)(w >> 16) << gb) | (gmask - gid);
+  };
+  uint64_t cut2 = cut;
+  if (mask) {
+    recv_row = reinterpret_cast<const uint32_t*>(p.peer_recv[p.rank]) + (int64_t)t * p.num_slots * RW;
+    if (me_sat) {
+      sme = __popc(mask & ((1 << p.rank) - 1));
+      mic_push(p, t, sme, expected, pbuf, hist, wt, sc, tid, lane, warp);
+    }
+    if (tid == 0) {
+      int k = 0;
+      for (int r = 0; r < W; ++r)
+        if ((mask >> r) & 1) owner[k++] = r;
+    }
+    if (warp == 0 && lane < W && ((mask >> lane) & 1)) {
+      const int* f = reinterpret_cast<const int*>(p.peer_flags[p.rank]) + ((int64_t)lane * p.max_rows + t);
+      const long long ts = now_ns();
+      while (ld_acquire_sys(f) != expected) {
+        __nanosleep(64);
+        if (now_ns() - ts > p.spin_ns) fail(p.err, 4);
+      }
+    }
+    __syncthreads();
+    bool full2;
+    cut2 = radix_cut(r2, n1 + __popc(mask) * K, K, gb, hist, wt, sc, tid, lane, warp, &full2);
+  }
+  if (dbg && tid == 0) dbg[21] = now_ns();
+  // ---- this rank's selected keys in the select's order -> flat KV rows
+  const int obase = me_sat ? n1 + sme * K : p.rank * N;
+  const int ocount = me_sat ? K : N;
+  const uint64_t c = mask ? cut2 : cut;
+  int total = 0;
+  for (int b0 = 0; b0 < ocount; b0 += kThreads) {
+    const int j = b0 + tid;
+    int row = -1, f = 0;
+    if (j < ocount) {
+      const uint64_t k = mask ? r2(obase + j) : r1(obase + j);
+      if (k != 0 && k >= c) {
+        const uint32_t gid = (uint32_t)(gmask - (k & gmask));
+        const int local = (int)(gid / (uint32_t)W);
+        const int blk = local / p.block_size;
+        if (blk < p.bt_width) {
+          const int e = blk < kTab ? tab[blk] : ld_cg(trow + blk);
+          row = e * p.stride_rows + (local - blk * p.block_size);
+          f = 1;
+        }
+      }
+    }
+    int tot;
+    const int incl = block_scan(f, wt, lane, warp, &tot);
+    if (f && total + incl - 1 < kMaxK) sIdx[total + incl - 1] = row;
+    total += tot;
+  }
+  const int n = min(total, kMaxK);
+  for (int k = n + tid; k < kMaxK; k += kThreads) sIdx[k] = -1;
+  __syncthreads();
+  if (mask && tid == 0) {  // the row's second round is over on this CTA
+    __threadfence();
+    if (atomicAdd(p.readers + p.rcap + t, 1) == nreaders - 1) {
+      p.seq2[t] = expected;
+      p.readers[p.rcap + t] = 0;
+    }
+  }
+  if (p.rows_out && blockIdx.x == 0 && blockIdx.y == 0) {
+    for (int k = tid; k < n; k += kThreads) p.rows_out[(int64_t)t * p.rows_stride + k] = sIdx[k];
+    if (tid == 0) p.valid_out[t] = n;
+  }
+  if (dbg && tid == 0) dbg[22] = now_ns();
+  return n;
+}
+
 // ------------------------------------------------------------------ kernel
 // HG = 32: warp (m-tile hg, n-tile wl) of QK, 2 heads of softmax, latent dims
 // [32 w, +32) of both m-tiles in PV. HG = 16: warp (n-tile w & 7, k-half w >> 3) of
@@ -314,22 +745,33 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     sL[tid] = 0.f;
   }
   if (dbg && tid == 0) dbg[1] = now_ns();
-  // ---- the top-k slots / counts and the KV insert of this step are ours from here
-  pdl_wait();
-  // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
-  pdl_launch();
-  if (dbg && tid == 0) dbg[5] = now_ns();
-  // the count and the row's whole slot list in one round trip (past the count: -1)
-  const int* selrow = p.sel + (int64_t)t * p.sel_stride;
-  int v[kMaxK / kThreads];
+  int n;
+  if (p.mic) {
+    // the merge in the core: round 1 polled before the PDL wait, this rank's slots
+    n = mic_front(p, t, tid, lane, warp, sKV, reinterpret_cast<uint8_t*>(sVh), sIdx, dbg);
+  } else {
+    // ---- the top-k slots / counts and the KV insert of this step are ours from here
+    pdl_wait();
+    // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
+    pdl_launch();
+    if (dbg && tid == 0) dbg[5] = now_ns();
+    // the count and the row's whole slot list in one round trip (past the count: -1)
+    const int* selrow = p.sel + (int64_t)t * p.sel_stride;
+    int v[kMaxK / kThreads];
 #pragma unroll
-  for (int b = 0; b < kMaxK / kThreads; ++b) {
-    const int k = b * kThreads + tid;
-    v[b] = k < p.width ? ld_cg(selrow + k) : -1;
+    for (int b = 0; b < kMaxK / kThreads; ++b) {
+      const int k = b * kThreads + tid;
+      v[b] = k < p.width ? ld_cg(selrow + k) : -1;
+    }
+    if (tid == 0) s_n = ld_cg(p.cnt + t);
+    __syncthreads();
+    n = min(s_n, p.width);
+#pragma unroll
+    for (int b = 0; b < kMaxK / kThreads; ++b) {
+      const int k = b * kThreads + tid;
+      sIdx[k] = k < n ? v[b] : -1;
+    }
   }
-  if (tid == 0) s_n = ld_cg(p.cnt + t);
-  __syncthreads();
-  const int n = min(s_n, p.width);
   const int nall = (n + kChunk - 1) / kChunk;
   // rows of at most split_min chunks run on split 0 alone (no merge across the cluster;
   // the other splits leave), longer ones on every split: chunks sp, sp + S, ..
@@ -370,11 +812,6 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   int nchunks = 2 * mytiles;
   // (the row's last tile may hold one chunk: only a split's last local one)
   if (nchunks > 0 && 2 * last + 1 >= nall) --nchunks;
-#pragma unroll
-  for (int b = 0; b < kMaxK / kThreads; ++b) {
-    const int k = b * kThreads + tid;
-    sIdx[k] = k < n ? v[b] : -1;
-  }
   __syncthreads();
   if (dbg && tid == 0) {
     dbg[2] = now_ns();
@@ -1008,6 +1445,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
 
 // ------------------------------------------------------------------ host
 
+void launch(const Params& p, int heads, int64_t heads_per_cta, int64_t pdl);
+
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv,
          double s2scale, double vscale, torch::Tensor part_peers, torch::Tensor lse_peers,
          int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide,
@@ -1053,6 +1492,113 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.err = err.data_ptr<int>();
   p.spin_ns = spin_ns;
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  launch(p, heads, heads_per_cta, pdl);
+}
+
+// The core with the #63 merge in it (``mic``): ``sel`` / ``cnt`` are optional outputs
+// (this rank's slots and count, as the select's rows_out / valid_out; ``sel`` also sets
+// the slot width trtllm_kv_ctas saw); the rest are the merge's mailbox and rescue state.
+void run_mic(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv,
+             double s2scale, double vscale, torch::Tensor part_peers, torch::Tensor lse_peers,
+             int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T,
+             int64_t lse_wide, int64_t splits, int64_t split_min, int64_t kv_ctas,
+             int64_t heads_per_cta, torch::Tensor err, int64_t spin_ns, int64_t pdl,
+             c10::optional<torch::Tensor> dbg, torch::Tensor box, torch::Tensor ordinals,
+             torch::Tensor readers, int64_t topk, int64_t nloc, torch::Tensor req_id,
+             torch::Tensor block_table, int64_t block_size, int64_t stride_rows,
+             torch::Tensor logits, torch::Tensor row_ends, torch::Tensor peer_recv,
+             torch::Tensor peer_flags, torch::Tensor seq2, int64_t write_rows) {
+  if (T == 0) return;
+  const int W = (int)part_peers.numel();
+  const int heads = (int)(W * hpr);
+  TORCH_CHECK(heads_per_cta == 16 || heads_per_cta == 32, "dsa_core: 16 or 32 heads per CTA");
+  TORCH_CHECK(heads % heads_per_cta == 0, "dsa_core: gathered heads not a multiple of the CTA's");
+  TORCH_CHECK(q.dim() == 3 && q.size(-1) == kRowB && q.element_size() == 1 && q.size(1) >= heads,
+              "dsa_core: q mailbox [rows, q_heads >= W * hpr, 576] bytes");
+  TORCH_CHECK(T <= q.size(0) && T <= box_cap);
+  TORCH_CHECK(kv.element_size() == 1 && kv.size(-1) == kRowB);
+  TORCH_CHECK(W <= 16 && nloc % 32 == 0 && nloc > 0 && topk % 32 == 0 && topk <= kMaxK,
+              "dsa_core mic: W <= 16, N and K multiples of 32, K <= 2048");
+  const int box_words = (int)(((nloc + 2 * (nloc / 32)) + 3) / 4 * 4);
+  const int max_rows = (int)ordinals.numel();
+  TORCH_CHECK(box.dtype() == torch::kInt32 && box.numel() == 2LL * max_rows * W * box_words,
+              "dsa_core mic: mailbox [2, max_rows, W, box_words] int32");
+  TORCH_CHECK(T <= max_rows && 2 * T <= readers.numel() && seq2.numel() >= max_rows);
+  // stage (W x box_words) + the push's B' row in the KV buffers, the block-table cache
+  // and the radix bins in the FP16 V buffer
+  TORCH_CHECK((int64_t)W * box_words + topk + topk / 32 <= 2 * kChunk * kRowS / 4,
+              "dsa_core mic: round-1 rows do not fit the KV buffers");
+  TORCH_CHECK(block_table.dtype() == torch::kInt32 && block_table.stride(1) == 1);
+  TORCH_CHECK(req_id.dtype() == torch::kInt32 && req_id.numel() >= T);
+  TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1 && logits.size(0) >= T);
+  TORCH_CHECK(row_ends.dtype() == torch::kInt32 && row_ends.numel() >= T);
+  TORCH_CHECK(peer_recv.numel() == W && peer_flags.numel() == W);
+  const int num_slots = (int)((topk - 1) / nloc);
+  const c10::cuda::CUDAGuard guard(q.device());
+  Params p{};
+  p.q = reinterpret_cast<const uint8_t*>(q.data_ptr());
+  p.q_row_stride = q.stride(0);
+  p.sel = nullptr;
+  p.width = kMaxK;
+  p.cnt = nullptr;
+  p.kv = reinterpret_cast<const uint8_t*>(kv.data_ptr());
+  p.s2scale = (float)s2scale;
+  p.vscale = (float)vscale;
+  p.part_peers = reinterpret_cast<const uint64_t*>(part_peers.data_ptr<int64_t>());
+  p.lse_peers = reinterpret_cast<const uint64_t*>(lse_peers.data_ptr<int64_t>());
+  p.box_cap = (int)box_cap;
+  p.lse_wide = (int)lse_wide;
+  p.split_min = (int)split_min;
+  TORCH_CHECK(kv_ctas >= 1 && kv_ctas <= kMaxK / kTile, "dsa_core: kv_ctas in [1, 16]");
+  p.kv_ctas = (int)kv_ctas;
+  p.hpr = (int)hpr;
+  p.parity = (int)parity;
+  p.rank = (int)rank;
+  p.W = W;
+  p.T = (int)T;
+  p.splits = (int)splits;
+  TORCH_CHECK(splits == 1 || splits == 2 || splits == 4 || splits == 8,
+              "dsa_core: splits 1, 2, 4 or 8 (one cluster per (row, group))");
+  p.err = err.data_ptr<int>();
+  p.spin_ns = spin_ns;
+  p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  p.mic = 1;
+  p.box = reinterpret_cast<const uint32_t*>(box.data_ptr<int>());
+  p.ordinals = ordinals.data_ptr<int>();
+  p.readers = readers.data_ptr<int>();
+  p.rcap = (int)(readers.numel() / 2);
+  p.max_rows = max_rows;
+  p.nloc = (int)nloc;
+  p.topk = (int)topk;
+  p.box_words = box_words;
+  int gb = 0;
+  while ((1LL << gb) <= (int64_t)W * (1LL << 17) - 1) ++gb;  // _gid_bits
+  p.gid_bits = gb;
+  p.req_id = req_id.data_ptr<int>();
+  p.block_table = block_table.data_ptr<int>();
+  p.bt_stride = block_table.stride(0);
+  p.bt_width = (int)block_table.size(1);
+  p.block_size = (int)block_size;
+  p.stride_rows = (int)stride_rows;
+  p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  p.logits_stride = logits.stride(0);
+  p.logits_width = (int)logits.size(1);
+  p.row_ends = row_ends.data_ptr<int>();
+  p.peer_recv = reinterpret_cast<const uint64_t*>(peer_recv.data_ptr<int64_t>());
+  p.peer_flags = reinterpret_cast<const uint64_t*>(peer_flags.data_ptr<int64_t>());
+  p.seq2 = seq2.data_ptr<int>();
+  p.num_slots = num_slots;
+  if (write_rows) {
+    TORCH_CHECK(sel.dtype() == torch::kInt32 && sel.stride(1) == 1 && cnt.dtype() == torch::kInt32);
+    p.rows_out = sel.data_ptr<int>();
+    p.rows_stride = sel.stride(0);
+    p.valid_out = cnt.data_ptr<int>();
+  }
+  launch(p, heads, heads_per_cta, pdl);
+}
+
+void launch(const Params& p, int heads, int64_t heads_per_cta, int64_t pdl) {
+  const int64_t splits = p.splits;
   const int HG = (int)heads_per_cta;
   auto kernel = HG == 16 ? dsac_kernel<16> : dsac_kernel<32>;
   const int smem_bytes = HG == 16 ? Plan<16>::kSmem : Plan<32>::kSmem;
@@ -1064,7 +1610,7 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
     attr = true;
   }
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3((unsigned)splits, (unsigned)(heads / HG), (unsigned)T);
+  cfg.gridDim = dim3((unsigned)splits, (unsigned)(heads / HG), (unsigned)p.T);
   cfg.blockDim = dim3(kThreads, 1, 1);
   cfg.dynamicSmemBytes = smem_bytes;
   cfg.stream = c10::cuda::getCurrentCUDAStream();
@@ -1096,6 +1642,7 @@ int64_t smem_bytes(int64_t heads_per_cta) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &k31dsac::run);
+  m.def("run_mic", &k31dsac::run_mic);
   m.def("smem_bytes", &k31dsac::smem_bytes);
   m.def("prepare", [] { k31dsac::prepare(); });
 }

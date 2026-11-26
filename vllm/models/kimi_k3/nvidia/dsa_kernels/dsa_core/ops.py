@@ -28,7 +28,11 @@ from vllm.models.kimi_k3.nvidia.dsa_kernels import stable_sources
 
 _EXT = None
 LOG2E = math.log2(math.e)
-_ERR = {1: "q mailbox poll timeout"}
+_ERR = {
+    1: "q mailbox poll timeout",
+    3: "merge round-1 mailbox poll timeout",
+    4: "merge second-round flag timeout",
+}
 GROUP_HEADS = 32
 
 
@@ -110,6 +114,8 @@ class DsaCore:
         self.err = torch.zeros(1, dtype=torch.int32, device=device)
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.spin_ns = int(spin_s * 1e9)
+        # run_mic: per row, the CTAs done with the merge's round 1 / round 2 ([2, cap])
+        self.readers = torch.zeros(2 * cap, dtype=torch.int32, device=device)
 
     def run(
         self,
@@ -176,6 +182,83 @@ class DsaCore:
             self.spin_ns,
             1 if pdl else 0,
             dbg,
+        )
+
+    def run_mic(
+        self,
+        q_box: torch.Tensor,
+        kv: torch.Tensor,
+        mic,
+        *,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        part_peers: torch.Tensor,
+        lse_peers: torch.Tensor,
+        box_cap: int,
+        hpr: int,
+        parity: int,
+        rank: int,
+        rows: int,
+        splits: int = 1,
+        split_min: int = 4,
+        kv_ctas: int | None = None,
+        heads_per_cta: int = 32,
+        lse_wide: bool = False,
+        pdl: bool = True,
+        dbg: torch.Tensor | None = None,
+        write_rows: bool = True,
+    ) -> None:
+        """``run`` with the #63 exact merge inside the core (csrc "merge in core"):
+        ``mic`` (IndexerStage.MicInputs) instead of the merge's rows and counts; the
+        core polls the round-1 mailbox the fused indexer published into, selects this
+        rank's keys (and runs the second round of a saturated row) itself.
+        ``write_rows``: also write this rank's slots / counts into ``mic.rows`` /
+        ``mic.valid`` (the select's outputs)."""
+        if rows > self.cap:
+            raise ValueError(f"DsaCore: {rows} rows > cap {self.cap}")
+        if splits not in (1, 2, 4, 8) or splits > self.max_splits:
+            raise ValueError(f"DsaCore: splits {splits} not 1, 2, 4 or 8 (<= max)")
+        ws, box = mic.ws, mic.ws.mailbox
+        if kv_ctas is None:
+            kv_ctas = trtllm_kv_ctas(rows, q_box.shape[1], mic.rows.shape[1], self.sms)
+        self.ext.run_mic(
+            q_box,
+            mic.rows,
+            mic.valid,
+            kv,
+            bmm1_scale * LOG2E,
+            bmm2_scale,
+            part_peers,
+            lse_peers,
+            box_cap,
+            hpr,
+            parity,
+            rank,
+            rows,
+            int(lse_wide),
+            splits,
+            split_min,
+            kv_ctas,
+            heads_per_cta,
+            self.err,
+            self.spin_ns,
+            1 if pdl else 0,
+            dbg,
+            box.box,
+            box.ordinals,
+            self.readers,
+            mic.topk,
+            mic.local_topk,
+            mic.req_id,
+            mic.block_table,
+            mic.block_size,
+            mic.stride_rows,
+            mic.logits,
+            mic.row_ends,
+            ws.peer_recv,
+            ws.peer_flags,
+            ws.seq2,
+            int(write_rows),
         )
 
     def check(self) -> None:

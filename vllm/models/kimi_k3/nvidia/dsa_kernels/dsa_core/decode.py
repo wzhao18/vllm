@@ -240,6 +240,33 @@ class DsacDecode:
         )
 
 
+    def run_mic(
+        self, variant, q_box, kv, mic, scales, box, hpr, parity, batch, lse_wide=False
+    ):
+        """``run`` with the #63 merge inside the core (``mic``: IndexerStage's
+        MicInputs, from ``merge_in_core``) in place of ``sel`` / ``counts``."""
+        bmm1, bmm2 = scales
+        splits, heads, split_min = variant
+        self.core.run_mic(
+            q_box,
+            kv,
+            mic,
+            bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
+            part_peers=box.peers,
+            lse_peers=box.lse_peers,
+            box_cap=box.cap,
+            hpr=hpr,
+            parity=parity,
+            rank=box.rank,
+            rows=batch,
+            splits=splits,
+            split_min=split_min,
+            heads_per_cta=heads,
+            lse_wide=lse_wide,
+        )
+
+
 def unsupported(model, config=None) -> str | None:
     """Why the deployment of ``model`` (``config``: its specialized DecodeConfig) runs
     FlashInfer's chain instead of the core, or None (the core runs)."""
