@@ -813,6 +813,14 @@ class WideDsa:
             wait()
         if self.fp8:
             self.impl.record_logical_topk_ready()
+            # The "proj" DcpValue (dsa.dcp_value, per_row) reads the per-row valid
+            # counts: a row without local entries sends EMPTY_LSE and no value row,
+            # whatever its latent and LSE hold (its MMA row is independent of the
+            # others), so trtllm-gen's empty-row fill (_finish_dcp_partials, 1.4-1.5
+            # us on the critical path between the decode and DcpValue at 64-512 rows,
+            # VR200 16 ranks) is not launched. The BF16 DcpValue reads request
+            # lengths: it keeps the fill.
+            per_row = self.dsa_box.mailbox(batch).format == PROJECTED
             rows, lse = self.impl._forward_mqa_kernel(
                 box.q[self.parity, :batch].view(torch.float8_e4m3fn),
                 cache,
@@ -821,13 +829,14 @@ class WideDsa:
                 layer=self.layer,
                 block_size=md.block_size,
                 is_decode=True,
+                empty_rows=not per_row,
             )
             assert lse is not None
-            # A row without local entries must reach DcpValue with LSE -inf. On
-            # trtllm-gen the stock decode's _finish_dcp_partials already wrote it (and
-            # a zero latent), so the out-of-place masked_fill would only add two
-            # kernels per DSA layer (CompareEq + masked_fill, 3.8 us per layer at q4
-            # M512 on VR200, nsys); prims_ts keeps it.
+            # A row without local entries must reach the BF16 DcpValue with LSE -inf.
+            # On trtllm-gen _finish_dcp_partials wrote it (and a zero latent), so the
+            # out-of-place masked_fill would only add two kernels per DSA layer
+            # (CompareEq + masked_fill, 3.8 us per layer at q4 M512 on VR200, nsys);
+            # prims_ts keeps it.
             if self.impl.use_prims_ts:
                 lse = lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
             return rows, lse, valid
