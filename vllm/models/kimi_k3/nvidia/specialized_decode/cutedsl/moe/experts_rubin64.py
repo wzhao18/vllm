@@ -233,6 +233,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         self.diag_ring = 0  # DIAG (GRPSTAMP): ring base or 0
         # DIAG (GRPFC2): FC1(A) / FC2(A) share of the units in % (dev 50).
         self.split = int(_os.environ.get("GRPFC2_SPLIT", "50"))
+        # DIAG (GRPFC2 f2): claim the next pool grain before the producer took the
+        # previous one (1) / dev order (0); first claim's lead in static jobs (dev 3).
+        self.ahead = int(_os.environ.get("GRPFC2_AHEAD", "0"))
+        self.lead = int(_os.environ.get("GRPFC2_LEAD", str(POOL_LEAD)))
         # RubinExpertsKernel.encode_maps' packed maps.
         self.packed, self.parts, self.grid_maps = True, 1, True
         self.stages = stages
@@ -557,7 +561,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             state = self.fc2_job(ring, state, maps, experts, ranges, j, False)
         # The first claim goes out ``POOL_LEAD`` static jobs before the end, so its
         # grain is there when the static jobs are issued.
-        kick = hi - POOL_LEAD
+        kick = hi - self.lead
         if kick < lo:
             kick = lo
         for j in cutlass.range(lo, hi, unroll=1):
@@ -571,10 +575,15 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             t0 = self.dnow()
             self.sync(bars.iterator, taken & 1)
             self.dwait(768, t0)  # DIAG (GRPFC2): producer waits for a pool grain
+            if taken == 0:
+                self.dwait(848, t0)  # DIAG (GRPFC2 f2): first grain's wait
+                self.dstamp(40)
             first = base[0]
             cute.arch.mbarrier_arrive(bars.iterator + 1)
             taken += 1
             if first < 0:
+                self.dwait(864, t0)  # DIAG (GRPFC2 f2): end marker's wait
+                self.dstamp(41)
                 ended = True
             else:
                 for j in cutlass.range(first, first + self.pool_grain, unroll=1):
@@ -612,13 +621,20 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             size = zone * ranks
             active = size > 0
             while active:
-                if posted > 0:
-                    self.sync(bars.iterator + 1, posted - 1 & 1)
+                if cutlass.const_expr(self.ahead == 0):
+                    if posted > 0:
+                        self.sync(bars.iterator + 1, posted - 1 & 1)
                 position = Int32(claim(counters + 4 * (own ^ p), g)) + 1
+                if posted == 0:
+                    self.dstamp(42)  # DIAG (GRPFC2 f2): first claim returned
                 active = position < size
                 if active:
                     rank = self.pool_rank(homed, position // zone)
                     end = self.fc2b_end(sm, (start, units), rank)
+                    if cutlass.const_expr(self.ahead != 0):
+                        # claimed ahead: hand it over once the producer took the last
+                        if posted > 0:
+                            self.sync(bars.iterator + 1, posted - 1 & 1)
                     base[0] = end - zone + position % zone
                     cute.arch.mbarrier_arrive(bars.iterator)
                     posted += 1
@@ -628,6 +644,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.sync(bars.iterator + 1, posted - 1 & 1)
         base[0] = Int32(-1)
         cute.arch.mbarrier_arrive(bars.iterator)
+        self.dstamp(43)  # DIAG (GRPFC2 f2): end marker posted
 
     @cute.jit
     def stream(self, sm, maps, w13_scales, w2_scales, ranges, experts, steal=None):
@@ -759,6 +776,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 self.dwait(496, t0)  # DIAG (GRPSTAMP g2): MMA FC2 full wait (pool)
             kind, a, b = (meta[4 * state[0] + i] for i in range(3))
             if kind != 1:  # the end marker
+                if lane == 0:
+                    self.dwait(880, t0)  # DIAG (GRPFC2 f2): MMA end-marker wait
+                    self.dstamp(44)
                 ended = True
             else:
                 state = self.fc2_mma(state, mma, a, (accmeta, pmeta, b))
