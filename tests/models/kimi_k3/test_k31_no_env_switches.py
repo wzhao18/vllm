@@ -24,6 +24,10 @@ ALLOWED = {
     "K31_DCPX_BUILD_DIR",
     "K31_DSAC_BUILD_DIR",
     "CUDA_HOME",
+    # the CuTe DSL's own target-architecture variable (the DSL reads it at start):
+    # cute_cache reads it only so the compile-cache key names the arch the DSL
+    # compiles for; it selects no K3 path
+    "CUTE_DSL_ARCH",
     # stock vLLM settings, honoured with their stock meaning (not K3 feature switches)
     "VLLM_CACHE_ROOT",
     "VLLM_BATCH_INVARIANT",
@@ -40,10 +44,28 @@ ALLOWED = {
     # set by no serving recipe
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
+    # Mi Sun Park 1408a90317: K31_SPIN_GUARD=0 traces the DSL poll loops without
+    # the bounded-spin hang detector (same polls, order and values; part of the
+    # cute_cache key). Adopted by the user on 2026-11-24 for every K3.1 decode
+    # measurement and checkpoint. It selects no compute path, only whether a hang
+    # traps. Open: replace it with a code policy (e.g. by role) and drop this entry.
+    "K31_SPIN_GUARD",
+    # Mi Sun Park, 214b7620ce; owner decides code policy; prefill does not use it.
+    # K31CH_FRONT_TMEM appends row ranges to the TP16 MoeFrontTmem64 decode front
+    # table (specialized_decode/cutedsl/moe/front.py); unset keeps the stock table.
+    "K31CH_FRONT_TMEM",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31EX_W2_DENSE=1 gives the TP16 routed experts kernels dense w2 rows
+    # (specialized_decode/cutedsl/moe/experts_runtime.py, dense_w2); unset keeps
+    # the padded parameter and the stock path.
+    "K31EX_W2_DENSE",
 }
-# Byte-identical vendored kernel sources (megamoe_rubin/VENDOR.md); their diagnostic
-# variables (MEGA_USE_NCU, MEGA_F4CVT_USE_MANUAL) are never set by vLLM.
-VENDORED = ROOT / "megamoe_rubin" / "src"
+# Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
+# (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
+# upstream's, byte for byte (diagnostics MEGA_USE_NCU, MEGA_F4CVT_USE_MANUAL,
+# MEGA_DIAG_SKIP_TOKEN_BACK, MEGA_DEDUP_WAIT_SLEEP[_MAX]_NS and the DSL's
+# CUTE_DSL_ARCH) and are never set by vLLM.
+VENDORED = (ROOT / "megamoe_rubin" / "src", ROOT / "megamoe_rubin" / "src_gp")
 
 
 def test_no_env_switches():
@@ -52,7 +74,7 @@ def test_no_env_switches():
     for path in sorted(ROOT.rglob("*")):
         if path.suffix not in (".py", ".cu", ".cuh", ".h", ".cpp"):
             continue
-        if path.is_relative_to(VENDORED):
+        if any(path.is_relative_to(v) for v in VENDORED):
             continue
         # macOS AppleDouble metadata ("._x.py" next to x.py on copied trees) is not
         # source; any other file is scanned even when not valid UTF-8 (the patterns

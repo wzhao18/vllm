@@ -211,20 +211,19 @@ class RubinMegaMoE:
         w13_global: torch.Tensor,
         w2_global: torch.Tensor,
         *,
+        fc1_norm_const: torch.Tensor | None = None,
         num_experts: int | None = None,
     ) -> RubinMoeWeights:
         """Native NVFP4 local-expert weights (E4M3 block-16 scales + per-expert
-        ``weight_scale_2``) -> kernel layout, as stored (no conversion).
+        ``weight_scale_2``) -> kernel layout, as stored (no conversion). The FC1
+        input uses the problem's ``input_norm_const``; the FC1->FC2 wire the
+        per-expert ``fc1_norm_const`` (default: the problem's, for every expert).
         ``num_experts``: a subset of the local experts (expert DWDP's home half);
         default all of them."""
         p = self.problem
         if p.quant_kind != "nvfp4":
             raise ValueError(
                 f"NVFP4 checkpoint weights need the nvfp4 kernel, not {p.quant_kind!r}."
-            )
-        if p.input_norm_const != 1.0 or p.fc1_norm_const != 1.0:
-            raise ValueError(
-                "NVFP4 checkpoint alphas assume unit activation norm constants."
             )
         expected = self.experts_per_rank if num_experts is None else num_experts
         if w13.shape[0] != expected:
@@ -241,6 +240,10 @@ class RubinMegaMoE:
             w2_global,
             hidden=p.hidden,
             intermediate=p.intermediate,
+            input_norm_const=p.input_norm_const,
+            fc1_norm_const=(
+                p.fc1_norm_const if fc1_norm_const is None else fc1_norm_const
+            ),
         )
 
     # -- route-id errors ------------------------------------------------------------
