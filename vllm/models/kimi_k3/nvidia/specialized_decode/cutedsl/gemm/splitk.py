@@ -61,6 +61,14 @@ def _tma_load_evict_first(smem, mbar, tensor_map, k0, row0, *, loc=None, ip=None
 
 
 @dsl_user_op
+def _tma_prefetch_l2(tensor_map, k0, row0, *, loc=None, ip=None):
+    """L2 prefetch of the {64, rows} box of A at (k0, row0) (no shared memory)."""
+    code = "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [$0, {$1, $2}];"
+    operands = [tensor_map.ir_value(), k0.ir_value(), row0.ir_value()]
+    _asm(code, "l,r,r", operands, loc, ip)
+
+
+@dsl_user_op
 def _wait_cluster(mbar, phase, *, loc=None, ip=None):
     """``cute.arch.mbarrier_wait`` at ``.acquire.cluster`` (remote ``st.async``)."""
     code = "{ .reg .pred P1; LAB_WAIT: "

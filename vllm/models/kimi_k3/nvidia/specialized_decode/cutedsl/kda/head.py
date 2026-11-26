@@ -75,6 +75,7 @@ from ..gemm.splitk import (
     _smem,
     _store_shared_remote_v4,
     _tma_load_evict_first,
+    _tma_prefetch_l2,
     _wait_cluster,
 )
 from .kernel import KdaSplit, load_activation_bf16x4, load_bf16x4
@@ -1001,6 +1002,9 @@ class KdaHeadWide(KdaHead):
     path); a counter pair must then not be reused before a graph boundary (the model
     has one pair per layer)."""
 
+    # weight tiles past the ring's first round prefetched into L2 at CTA entry
+    weight_prefetch = True
+
     def __init__(
         self, heads, *, stages=12, cta_k=64, tmem_tiles=0, early_loads=None,
         bf16_state=True, has_bias=False, hidden=7168,
@@ -1037,6 +1041,16 @@ class KdaHeadWide(KdaHead):
         )
         early = self.k_tiles if self.early_loads is None else self.early_loads
         _acquire_tensor_map(a_map)
+        if cutlass.const_expr(self.weight_prefetch):
+            # every tile past the ring's first round into L2 at once: the ring keeps
+            # only ``stages`` 16 KiB loads in flight, so from HBM it streams at
+            # ~stages x 16 KiB per load latency (KDA2ISS stamps: ~0.22 us per tile);
+            # from L2 its loads return in a fraction of that
+            with cute.arch.elect_one():
+                for k_tile in cutlass.range(stages, k_tile_count, unroll=1):
+                    k0 = (k_tile_start + k_tile) * self.cta_k
+                    for atom in cutlass.range_constexpr(self.cta_k // ATOM_K):
+                        _tma_prefetch_l2(a_map, k0 + atom * ATOM_K, row0)
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % stages
