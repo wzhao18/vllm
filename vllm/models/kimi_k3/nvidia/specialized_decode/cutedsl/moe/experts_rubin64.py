@@ -184,6 +184,12 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
     and FP32 accumulators, a different grouping inside the MMA).
     ``static_groups``: ``ExpertsKernel.group_sync``'s constant barrier ids."""
 
+    # ``dies``: the FC2(A) / FC2(B) lists' home bits and matched ranks come from the
+    # hidden loader warp during FC1 (``match_fc2``), not the head (``group``); the
+    # FC2 work waits for them (``fc2_ranges``). Subclasses with their own heads keep
+    # all four lists in the head.
+    LATE_FC2 = True
+
     def __init__(
         self, experts, grid, slots, publish=False, stages=7, trace=0, pool=(12, 6),
         dies=(), static_groups=False,
@@ -218,6 +224,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.ws_census = (self.workspace_bytes + 15) // 16 * 16
             self.workspace_bytes = self.ws_census + CENSUS_BYTES
             assert grid <= 256
+        self.late_fc2 = bool(dies) and self.LATE_FC2
+        # ``match_fc2``'s one-shot barrier (misc 2920, past the matched ranks).
+        self.bar_fc2 = 2920
         # trace (benchmarks only): a global address; (%globaltimer, %smid) stamps in
         # 16 slots of 16 B per CTA at trace + 512 cta.
         self.trace = trace
@@ -328,6 +337,9 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 cute.arch.mbarrier_init(pmeta.iterator + i, 1)
             for i in cutlass.range_constexpr(3):
                 cute.arch.mbarrier_init(claims.iterator + i, 1)
+            if cutlass.const_expr(self.late_fc2):
+                fc2 = view(sm.iterator, self.off_misc + self.bar_fc2, Uint64, 1)
+                cute.arch.mbarrier_init(fc2.iterator, 1)
             cute.arch.mbarrier_init_fence()
             for descriptor in maps:
                 prefetch_map(descriptor)  # parameter space: no proxy fence
@@ -495,6 +507,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         the producer took the previous one (a late CTA holds at most one grain it has
         not started); its first job is handed over, -1 ends. A pool the last grain
         emptied is not claimed again (the end costs one claim, not two)."""
+        self.fc2_ranges(sm, ranges)  # pool_homed reads FC2(B)'s home bits
         g = self.pool_grain
         zone = self.zone_jobs(ranges)
         units, start = (ranges[1, 1] // (self.tiles * 14), ranges[1, 0])
@@ -560,6 +573,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         r, index = (Int32(0), index + 1)
                         expert = experts[index]
         self.stamp(4)
+        self.fc2_ranges(sm, ranges)
         state = (slot, phase, issued, Int32(0), Int32(-1))
         work = (ring, state, maps, experts, ranges, *steal)
         slot, phase, issued = self.fc2_pool(*work)
@@ -638,6 +652,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         mma = (tmem, a0, asf0, h0, hsf0, bars)
         slot, phase = (count % stages, count // stages & 1)
         state = (slot, phase, uses, acc, current, ordinal, hbuffer, Int32(0))
+        self.fc2_ranges(sm, ranges)
         zone = self.zone_jobs(ranges)
         for g in cutlass.range_constexpr(2):
             end = ranges[g, 5] - (zone if g == 1 else 0)
@@ -747,6 +762,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if lo < hi:
                     count = (hi - 1) // 14 - lo // 14 + 1
             else:  # static FC2 jobs
+                if cutlass.const_expr(k == 2):
+                    self.fc2_ranges(sm, ranges)
                 start = ranges[g, 4]
                 count = ranges[g, 5] - start - (zone if g == 1 else 0)
             for i in cutlass.range((eg ^ offset) & 1, count, 2, unroll=1):
@@ -904,10 +921,11 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             self.arrive(sm, workspace, arrival)
         cute.arch.sync_threads()
         if cutlass.const_expr(len(self.dies) > 0):  # before warp 0 starts streaming
-            self.home_bits(sm, experts, scalars[0])
+            kinds: cutlass.Constexpr = 1 if self.late_fc2 else 2
+            self.home_bits(sm, experts, scalars[0], kinds)
             cute.arch.sync_threads()
             if warp == 0:
-                self.matched(sm)
+                self.matched(sm, 0, 2 * kinds)
             cute.arch.sync_threads()
         if warp > 0:
             for pair in cutlass.range(tid - 32, batch * 16, threads - 32, unroll=1):
@@ -1014,7 +1032,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             info[0], info[1], info[3] = (die, Int32(arrivals), k)
 
     @cute.jit
-    def home_bits(self, sm, experts, units):
+    def home_bits(self, sm, experts, units, kinds: cutlass.Constexpr = 2):
         """Threads 0 .. grid - 1 (rank = thread): the die of the middle w13 stage of
         rank's FC1(A) / FC1(B) range and of the middle w2 tile of its FC2(A) / FC2(B)
         range; one ballot word per warp and list (misc 2704 + list x 48 B). The four
@@ -1024,7 +1042,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if warp < (self.grid + 31) // 32:
             ranges = self.rank_ranges(sm, units, tid)
             dies = []
-            for kind in cutlass.range_constexpr(2):
+            for kind in cutlass.range_constexpr(kinds):
                 for group in cutlass.range_constexpr(2):
                     lo, hi = (ranges[group, 2 + 2 * kind], ranges[group, 3 + 2 * kind])
                     mid = (lo + hi) // 2
@@ -1037,13 +1055,15 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         address = Int64(row) * W2_PITCH
                     live = (tid < self.grid) & (lo < hi)
                     dies.append(live & ((address >> HOME_SHIFT & 1) != 0))
-            for p in cutlass.range_constexpr(4):
+            for p in cutlass.range_constexpr(2 * kinds):
                 ballot = cute.arch.vote_ballot_sync(dies[p])
                 if lane == 0:
                     bits[p * 12 + warp] = Uint32(ballot)
 
     @cute.jit
-    def matched(self, sm):
+    def matched(
+        self, sm, first: cutlass.Constexpr = 0, end: cutlass.Constexpr = 4
+    ):  # fmt: skip
         """Warp 0: ``match_arrival`` of the four lists (FC1(A), FC1(B), FC2(A),
         FC2(B); ``home_bits`` and the arrival rank) into misc 2904 + 4 p, lanes 8 p of
         list p, each alone: the list's words (independent loads), the die-1 total, the
@@ -1089,7 +1109,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     hit = hit >> Uint32(half)
             rank = base - base % 32 + position
         ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
-        if (lane & 7 == 0) & (p < 4):
+        if (lane & 7 == 0) & (p >= first) & (p < end):  # lists first .. end - 1
             ranks[p] = rank
 
     @cute.jit
@@ -1101,12 +1121,59 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         ranges = cute.make_rmem_tensor((2, 7), Int32)
         for g in cutlass.range_constexpr(2):
             fc1 = self.partition(units, ranks[g])
-            fc2 = self.rank_ranges(sm, units, ranks[2 + g])
             for i in cutlass.range_constexpr(4):
                 ranges[g, i] = fc1[g, i]
-            ranges[g, 4], ranges[g, 5] = (fc2[g, 4], fc2[g, 5])
+            ranges[g, 4], ranges[g, 5] = (Int32(0), Int32(0))
+            if cutlass.const_expr(not self.late_fc2):
+                fc2 = self.rank_ranges(sm, units, ranks[2 + g])
+                ranges[g, 4], ranges[g, 5] = (fc2[g, 4], fc2[g, 5])
             ranges[g, 6] = ranks[g]
         return ranges
+
+    @cute.jit
+    def match_fc2(self, sm, experts, units):
+        """The hidden loader warp during FC1 (``late_fc2``): ``home_bits`` of the FC2(A)
+        / FC2(B) lists, 32 ranks a round (the same dies, ballots and words), then
+        ``matched`` of those two lists into misc 2904 + 8 / + 12, and the one-shot
+        barrier that ``fc2_ranges`` waits on. The FC2 work starts after FC1, so the
+        ~1 us here runs under the FC1 stream instead of before the first stage."""
+        lane = thread()[2]
+        words: cutlass.Constexpr = (self.grid + 31) // 32
+        bits = view(sm.iterator, self.off_misc + 2704, Uint32, 48)
+        for w in cutlass.range_constexpr(words):
+            rank = lane + 32 * w
+            ranges = self.rank_ranges(sm, units, rank)
+            dies = []
+            for group in cutlass.range_constexpr(2):
+                lo, hi = (ranges[group, 4], ranges[group, 5])
+                mid = (lo + hi) // 2
+                row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
+                address = Int64(row) * W2_PITCH
+                live = (rank < self.grid) & (lo < hi)
+                dies.append(live & ((address >> HOME_SHIFT & 1) != 0))
+            for group in cutlass.range_constexpr(2):
+                ballot = cute.arch.vote_ballot_sync(dies[group])
+                if lane == 0:
+                    bits[(2 + group) * 12 + w] = Uint32(ballot)
+        cute.arch.sync_warp()
+        self.matched(sm, 2, 4)
+        cute.arch.sync_warp()
+        if lane == 0:
+            ready = view(sm.iterator, self.off_misc + self.bar_fc2, Uint64, 1)
+            cute.arch.mbarrier_arrive(ready.iterator)
+
+    @cute.jit
+    def fc2_ranges(self, sm, ranges):
+        """``late_fc2``: once ``match_fc2`` is done, this thread's FC2 ranges (columns
+        4 / 5) from the matched FC2 ranks; else nothing (``matched_ranges`` has them)."""
+        if cutlass.const_expr(self.late_fc2):
+            ready = view(sm.iterator, self.off_misc + self.bar_fc2, Uint64, 1)
+            self.sync(ready.iterator, 0)
+            ranks = view(sm.iterator, self.off_misc + 2904, Int32, 4)
+            units = view(sm.iterator, self.off_misc + 1140, Int32, 3)[0]
+            for g in cutlass.range_constexpr(2):
+                fc2 = self.rank_ranges(sm, units, ranks[2 + g])
+                ranges[g, 4], ranges[g, 5] = (fc2[g, 4], fc2[g, 5])
 
     @cute.jit
     def partials(self, workspace, values, tile, ranges, batch):
@@ -1304,6 +1371,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 if lane == 0:
                     self.stamp(9)
             elif warp == 2:
+                if cutlass.const_expr(self.late_fc2):
+                    self.match_fc2(sm, experts, distinct)
                 self.load_hidden(sm, workspace, ranges, generation & 1)
                 if lane == 0:
                     self.stamp(12)
