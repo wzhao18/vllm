@@ -3,8 +3,10 @@
 """FlashInfer sparse MLA attention backend."""
 
 import bisect
+import dataclasses
 import math
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -20,6 +22,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadata,
     SparseMLACommonMetadataBuilder,
 )
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
@@ -878,6 +881,131 @@ def _kv_counters(
     return {"multi_ctas_kv_counter_buffer": counters}
 
 
+class TrtllmGenDcpPathCubins(VllmJitKernel["TrtllmGenDcpPathCubins.CompileKey"]):
+    """The trtllm-gen sparse MLA decode cubins of the DCP path's launches
+    under DCP ShardQ.
+
+    FlashInfer picks each ``trtllm_batch_decode_with_kv_cache_mla`` launch's
+    kernel on the host from the launch shape: with the heads, the top-k
+    capacity, the SM count and the workspace fixed, from its row count (a
+    multi-CTA KV split while rows x CTAs leave SMs idle, its reduction, the
+    Q tile and swap-AB form, 2-CTA MMA). It loads that kernel's cubin on first
+    use. A DCP ShardQ instance keeps the DCP path for a step's leading decode
+    rows (``MLAAttention._dcp_decode_rows``) and for the steps the planner
+    leaves on it, in launches of any row count up to ``dcp_path_max_rows``
+    (dense-MHA steps in balanced chunks of at most that many), while its
+    dummy runs launch a few row counts only. Every such row count is warmed
+    here: one launch each, through the shared workspace and KV counters, on
+    dummy inputs with one valid KV row per query row (the choice depends on
+    the launch shape, not on the values). A row count past the workspace's
+    softmax-stats slab never launches (``_forward_mqa_kernel`` launches in
+    balanced chunks that fit it), so the warmup stops there."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        num_rows: int
+        # Query heads the kernel runs (trtllm_gen_query_heads of the gathered
+        # heads).
+        num_heads: int
+        dtype: torch.dtype
+        kv_lora_rank: int
+        qk_nope_head_dim: int
+        qk_rope_head_dim: int
+        # Width of the physical top-k rows (the kernel's max_seq_len and
+        # sparse_mla_top_k).
+        topk_capacity: int
+        # Native no-rope MLA passes per-row top-k lengths.
+        topk_lens: bool
+
+    def get_warmup_keys(  # type: ignore[override]
+        self, *, max_rows: int, **fields
+    ) -> list[CompileKey]:
+        return [
+            self.CompileKey(num_rows=rows, **fields) for rows in range(1, max_rows + 1)
+        ]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        self.compile_many([compile_key])
+
+    def compile_many(self, compile_keys: Iterable[CompileKey]) -> None:
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+
+        device = torch.device(
+            current_platform.device_type, torch.accelerator.current_device_index()
+        )
+        workspace = _get_workspace_buffer(device)
+        by_shape: dict[TrtllmGenDcpPathCubins.CompileKey, list[int]] = {}
+        for key in dict.fromkeys(compile_keys):
+            if key in self._compiled_cache:
+                continue
+            shape = dataclasses.replace(key, num_rows=0)
+            by_shape.setdefault(shape, []).append(key.num_rows)
+        for shape, rows in by_shape.items():
+            capacity = min(
+                _TRTLLM_GEN_MAX_REQUESTS,
+                trtllm_gen_lse_rows_capacity(workspace.numel(), shape.num_heads),
+            )
+            for num_rows in rows:
+                if num_rows > capacity:
+                    never = dataclasses.replace(shape, num_rows=num_rows)
+                    self._compiled_cache[never] = None
+            rows = [r for r in rows if r <= capacity]
+            if not rows:
+                continue
+            max_rows = max(rows)
+            head_dim = shape.kv_lora_rank + shape.qk_rope_head_dim
+            # One 64-row KV page; every query row attends its first row.
+            kv_cache = torch.zeros(
+                (1, 1, 64, head_dim), dtype=shape.dtype, device=device
+            )
+            query = torch.zeros(
+                (max_rows, 1, shape.num_heads, head_dim),
+                dtype=shape.dtype,
+                device=device,
+            )
+            block_tables = torch.zeros(
+                (max_rows, 1, shape.topk_capacity), dtype=torch.int32, device=device
+            )
+            seq_lens = torch.ones(max_rows, dtype=torch.int32, device=device)
+            out = torch.empty(
+                (max_rows, 1, shape.num_heads, shape.kv_lora_rank),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            lse = torch.empty(
+                (max_rows, shape.num_heads), dtype=torch.float32, device=device
+            )
+            for num_rows in rows:
+                extra_kwargs = _kv_counters(num_rows, shape.num_heads, device)
+                if shape.topk_lens:
+                    extra_kwargs["sparse_mla_top_k_lens"] = seq_lens[:num_rows]
+                trtllm_batch_decode_with_kv_cache_mla(
+                    query=query[:num_rows],
+                    kv_cache=kv_cache,
+                    workspace_buffer=workspace,
+                    qk_nope_head_dim=shape.qk_nope_head_dim,
+                    kv_lora_rank=shape.kv_lora_rank,
+                    qk_rope_head_dim=shape.qk_rope_head_dim,
+                    block_tables=block_tables[:num_rows],
+                    seq_lens=seq_lens[:num_rows],
+                    max_seq_len=shape.topk_capacity,
+                    out=out[:num_rows],
+                    bmm1_scale=1.0,
+                    bmm2_scale=1.0,
+                    sparse_mla_top_k=shape.topk_capacity,
+                    return_lse=True,
+                    lse=lse[:num_rows],
+                    **extra_kwargs,
+                )
+                done = dataclasses.replace(shape, num_rows=num_rows)
+                self._compiled_cache[done] = None
+            torch.accelerator.synchronize()
+            del query, block_tables, seq_lens, out, lse, kv_cache
+
+
+TRTLLM_GEN_DCP_PATH_CUBINS = TrtllmGenDcpPathCubins()
+
+
 @triton.jit
 def _pad_query_heads_kernel(
     src_ptr,
@@ -1236,6 +1364,26 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             self.lse_slab_rows = trtllm_gen_lse_slab_rows(
                 vllm_config, self.use_shardq
             )
+            topk_indices_buffer = self.topk_indices_buffer
+            if self.use_shardq and topk_indices_buffer is not None:
+                # The DCP path's launches of every row count a DCP ShardQ step
+                # can leave on it (TrtllmGenDcpPathCubins).
+                TRTLLM_GEN_DCP_PATH_CUBINS.register_warmup(
+                    max_rows=self.dcp_path_max_rows,
+                    num_heads=trtllm_gen_query_heads(
+                        self.num_heads * self.dcp_world_size
+                    ),
+                    dtype=(
+                        current_platform.fp8_dtype()
+                        if is_quantized_kv_cache(kv_cache_dtype)
+                        else vllm_config.model_config.dtype
+                    ),
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    topk_capacity=topk_indices_buffer.shape[1],
+                    topk_lens=self.is_nope_mla,
+                )
 
     def do_kv_cache_update(
         self,
@@ -1699,7 +1847,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         block_size: int,
         is_decode: bool,
         return_lse: bool | None = None,
+        empty_rows: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``empty_rows`` False (trtllm-gen with LSE): rows without top-k entries
+        keep whatever the decode left in their output and LSE; the caller's DCP
+        combine drops them by their per-row counts itself (``_finish_dcp_partials``
+        is not launched)."""
         if return_lse is None:
             return_lse = self.need_to_return_lse_for_decode
         q = _joined_query(q)
@@ -1841,6 +1994,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 lse.masked_fill_(empty_queries[:, None], float("-inf"))
             else:
                 out.masked_fill_(empty_queries[:, None, None], 0.0)
-        elif lse is not None:
+        elif lse is not None and empty_rows:
             _finish_dcp_partials(out, lse, seq_lens)
         return out, lse

@@ -30,6 +30,8 @@ from .experts_rubin import (
     HOME_RUN,
     ROUTE_IDS,
     ROUTE_WORDS,
+    W2_DENSE,
+    W2_PITCH,
     ImagePlanKernel,
     RubinExpertsKernel,
     generation_bytes,
@@ -384,6 +386,83 @@ def place(routed):
     return table
 
 
+# K31EX_W2_DENSE: the padded w2 the stock paths read, one per device and shape, shared
+# by the MoE layers (``dense_w2``).
+_STOCK_W2: dict = {}
+
+
+def dense_w2(routed, table=()):
+    """K31EX_W2_DENSE (``W2_DENSE``): one MoE layer's routed w2 (uint8 rows: the E2M1
+    data bytes, then padding) as dense rows of the data bytes for the experts kernels
+    (row pitch ``W2_PITCH``), placed like ``place``'s w2 when ``table`` (its die map)
+    is given. The same bytes reach the MMAs. The parameter then views one padded copy
+    per device shared by the layers (zero padding, as the checkpoint loader leaves
+    it); the stock paths (``forward_modular`` / ``forward_monolithic``,
+    ``StockExperts``) copy this layer's rows into it first
+    (``routed._dense_w2_refresh``)."""
+    from ..common import dies
+
+    weight = routed.w2_weight
+    e, rows, width = weight.shape
+    shape = (tuple(weight.shape), weight.dtype)
+    assert W2_DENSE and width == 128 and weight.element_size() == 1, shape
+    device = weight.device
+    free0 = torch.cuda.mem_get_info(device)[0]
+    nbytes = e * rows * W2_PITCH
+    if table:
+        run = 1 << HOME_RUN
+        raw = dies.localized_empty(nbytes, [0] * run + [1] * run, device)
+        chunks = -(-nbytes // dies.CHUNK)
+        picks = {chunks * i // PLACE_SAMPLES for i in range(PLACE_SAMPLES)}
+        sample = tuple(sorted(picks))
+        wrong, sms = sample, 4
+        for attempt in range(PLACE_PASSES):
+            homes = dies.chunk_homes(raw, wrong, sms)
+            wrong = tuple(c for c, home in zip(wrong, homes) if home != c // run % 2)
+            if not wrong:
+                break
+            sms = 8 if attempt < 2 else 16
+        if len(wrong) > PLACE_UNCLEAR:  # still correct; only the FC2 die match is off
+            logger.warning(
+                "K31EX_W2_DENSE: dense w2 chunks %s of %s not homed as requested",
+                wrong, sample,
+            )  # fmt: skip
+    else:
+        raw = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    dense = raw[:nbytes].view(e, rows, W2_PITCH)
+    flat = dense.view(e * rows, W2_PITCH)
+    flat.copy_(weight.data.view(torch.uint8).view(e * rows, width)[:, :W2_PITCH])
+    key = (device, tuple(weight.shape), weight.dtype)
+    if key not in _STOCK_W2:
+        _STOCK_W2[key] = torch.zeros_like(weight.data)
+    stock = _STOCK_W2[key]
+    data = stock.view(torch.uint8).view(e * rows, width)[:, :W2_PITCH]
+
+    def refresh():
+        data.copy_(flat)
+
+    weight.data = stock  # the padded original goes (``place``'s copy or the loader's)
+    routed._dense_w2_refresh = refresh
+    for name in ("forward_modular", "forward_monolithic"):
+        original = getattr(routed, name, None)
+        if original is None:
+            continue
+
+        def call(*args, _original=original, **kwargs):
+            refresh()
+            return _original(*args, **kwargs)
+
+        setattr(routed, name, call)
+    torch.cuda.synchronize(device)
+    logger.info_once(
+        "K31EX_W2_DENSE: routed w2 as dense rows (%.0f MB a layer, placed %s); "
+        "free memory %.2f -> %.2f GiB over the first layer",
+        nbytes / 1e6, bool(table), free0 / 2**30,
+        torch.cuda.mem_get_info(device)[0] / 2**30, scope="process",
+    )  # fmt: skip
+    return dense
+
+
 @functools.cache
 def compile_rubin64(
     experts, batch, grid, device, publish, slots, dies=(), static=False, zone=12
@@ -548,7 +627,7 @@ class PersistentExperts:
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster
         # experts use maps 2-4 (w13, w2 two-chunk and one-chunk boxes, promoted); TP8
         # FC2 pairs (B4-64) use map 5 (w2 chunk 2 of 256 rows).
-        w2_tile = (192, 3, 64) if self.tp == 8 else (128, 2, 32)
+        w2_tile = (192, 3, 64) if self.tp == 8 else (W2_PITCH, 2, 32)
         specs = [(w13, rows, 1792, 28, 64, 2, True), (w2, 3584, *w2_tile, 2, False)]
         if self.tp == 8:
             specs += [specs[0]] + [(w2, 3584, 192, 3, 64, box, True) for box in (2, 1)]

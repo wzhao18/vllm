@@ -17,6 +17,8 @@ weights land packed (plain bytes) and feed Rubin's K64 block-scaled MMAs, which 
 packed E2M1 from shared memory: half the slot bytes and half the MMAs of the K32
 ``mxf8f6f4`` steps on unpacked (16U4) weights."""
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -166,6 +168,11 @@ DESCRIPTOR_LIMIT = 262144 - 1024
 # die at 16-64 rows).
 HOME_RUN = 4
 HOME_SHIFT = 21 + HOME_RUN
+# K31EX_W2_DENSE=1: the experts kernels read the routed w2 as dense rows of its data
+# bytes, without the row padding of the parameter (``experts_runtime.dense_w2``). The
+# w2 descriptors and the FC2 home dies use this row pitch.
+W2_DENSE = os.environ.get("K31EX_W2_DENSE", "0") == "1"
+W2_PITCH = 96 if W2_DENSE else 128
 
 
 @asm(Uint32)
@@ -1189,7 +1196,7 @@ class RubinExpertsKernel(ExpertsKernel):
                 if (rank < self.grid) & (lo < hi):
                     mid = (lo + hi) // 2
                     row = experts[mid // 28] * 3584 + mid % 28 * 128 + 64
-                    home = Int32(Int64(row) * 128 >> HOME_SHIFT & 1)
+                    home = Int32(Int64(row) * W2_PITCH >> HOME_SHIFT & 1)
                 ballot = cute.arch.vote_ballot_sync(home != 0)
                 if lane == 0:
                     bits[g * words + i] = Uint32(ballot)
@@ -1362,6 +1369,7 @@ class RubinExpertsKernel(ExpertsKernel):
 
     def encode_maps(self, w13, w2):
         """``PersistentExperts``' TP16 w13 / w2 descriptors (same bytes)."""
+        assert self.packed or not W2_DENSE, "K31EX_W2_DENSE: packed maps only"
         types, swizzles = (cuda.CUtensorMapDataType, cuda.CUtensorMapSwizzle)
         promotion = cuda.CUtensorMapL2promotion
         fp4 = types.CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
@@ -1376,8 +1384,8 @@ class RubinExpertsKernel(ExpertsKernel):
                     promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                 ),
                 encode_map(
-                    w2, u8, (128, rows[1], 1), (128, 128 * rows[1]), (96, 128, 1),
-                    swizzle, promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                    w2, u8, (W2_PITCH, rows[1], 1), (W2_PITCH, W2_PITCH * rows[1]),
+                    (96, 128, 1), swizzle, promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
                 ),
             )  # fmt: skip
         return (
