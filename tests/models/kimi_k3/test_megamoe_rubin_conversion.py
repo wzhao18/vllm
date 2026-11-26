@@ -961,6 +961,54 @@ def test_nvfp4_norm_const_from_amax():
     C.RubinMoeProblem(input_norm_const=f(4.0), fc1_norm_const=f(0.02))
 
 
+def test_nvfp4_fc1_norm_const():
+    """The served FC1->FC2 wire scale: stock's a2_gscale at the mean routing weight,
+    capped where no block scale can saturate (|SiTU| < beta * beta_lin, w <= rsf)."""
+    C = _load("config")
+    f = C.nvfp4_fc1_norm_const
+    situ = dict(situ_beta=4.0, situ_linear_beta=25.0)
+    # Kimi K3.1: top-16, rsf 1, unit / absent input scales -> 16 (stock's scale).
+    assert f(top_k=16, **situ) == 16.0
+    assert f(top_k=16, **situ, fc2_input_gscale=1.0, routed_scaling_factor=1.0) == 16.0
+    assert f(top_k=8, **situ) == 8.0
+    assert f(top_k=2, **situ) == 2.0
+    # The saturation cap: 6 * 448 / (4 * 25) = 26.88 -> 16 even at top-64.
+    assert f(top_k=64, **situ) == 16.0
+    # rsf 2.5: mean weight 2.5 / 16 -> 6.4 -> 4; cap 10.75 -> 8 not reached.
+    assert f(top_k=16, **situ, routed_scaling_factor=2.5) == 4.0
+    # A calibrated g (stock's own non-saturating scale for u) is never lowered.
+    assert f(top_k=16, **situ, fc2_input_gscale=2.0**10) == 2.0**10
+    assert f(top_k=16, **situ, fc2_input_gscale=0.5) == 8.0
+    for top_k in (1, 3, 16, 100):
+        for g in (2.0**-3, 1.0, 3.0, 300.0):
+            n = f(top_k=top_k, **situ, fc2_input_gscale=g)
+            assert W.is_power_of_two(n)
+            # never below stock's global scale, never saturating unless g allows it
+            assert n >= g / 2 and (n * 100.0 <= 6.0 * 448.0 or n <= g)
+    for bad in (dict(top_k=0), dict(top_k=16.0), dict(top_k=16, situ_beta=0.0),
+                dict(top_k=16, fc2_input_gscale=float("inf")),
+                dict(top_k=16, routed_scaling_factor=-1.0)):  # fmt: skip
+        with pytest.raises(ValueError):
+            f(**{**situ, **bad})
+    C.RubinMoeProblem(fc1_norm_const=f(top_k=16, **situ))
+
+
+def test_nvfp4_checkpoint_alphas_fold_norms_exactly():
+    E = 6
+    g13 = torch.tensor([2.0**-13, 2.0**-12, 3e-4, 1.0, 2.0**-126, 0.7])
+    g2 = torch.tensor([2.0**-12, 2.0**-13, 5e-4, 2.0, 1e-5, 0.3])
+    a1, a2, n1 = W.nvfp4_checkpoint_alphas(g13, g2, 1.0, 16.0)
+    assert torch.equal(a1, g13) and torch.equal(n1, torch.full((E,), 16.0))
+    assert torch.equal(a2, g2 / 16.0) and torch.equal(a2 * 16.0, g2)  # exact
+    per = torch.tensor([16.0, 4.0, 16.0, 16.0, 2.0, 16.0])
+    a1, a2, n1 = W.nvfp4_checkpoint_alphas(g13, g2, 2.0, per)
+    assert torch.equal(a1 * 2.0, g13) and torch.equal(a2 * per, g2)
+    assert torch.equal(n1, per)
+    for bad in ((3.0, 16.0), (1.0, 12.0), (1.0, torch.full((E,), -16.0))):
+        with pytest.raises(ValueError):
+            W.nvfp4_checkpoint_alphas(g13, g2, *bad)
+
+
 def test_vendored_sources_match_manifest():
     text = (PKG_DIR / "VENDOR.md").read_text()
     manifest = dict(

@@ -68,10 +68,16 @@ from .config import (
     RubinMoeProblem,
     Variant,
     make_buckets,
+    nvfp4_fc1_norm_const,
 )
 from .session import ep_mean_tokens
 from .staging import EplbStage
-from .weights import MX_BLOCK, NV_BLOCK, RubinMoeWeights
+from .weights import (
+    MX_BLOCK,
+    NV_BLOCK,
+    RubinMoeWeights,
+    nvfp4_checkpoint_alphas,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -494,6 +500,13 @@ class KimiK3MegaMoEExperts(nn.Module):
             if isinstance(additional_config, dict)
             else "auto",
         )
+        self.situ_betas = (float(activation.alpha), float(activation.beta))
+        model_config = getattr(vllm_config, "model_config", None)
+        text_config = getattr(model_config, "hf_text_config", None)
+        # topk_weights reach the kernel scaled by routed_scaling_factor (<= rsf each).
+        self.routed_scaling_factor = float(
+            getattr(text_config, "routed_scaling_factor", None) or 1.0
+        )
         self.problem = RubinMoeProblem(
             num_experts=num_experts,
             top_k=top_k,
@@ -502,6 +515,14 @@ class KimiK3MegaMoEExperts(nn.Module):
             situ_beta=float(activation.alpha),
             situ_linear_beta=float(activation.beta),
             quant_kind=self.quant_kind,
+            # FC1 input: stock's a1_gscale = 1 / w13_input_scale = 1 (the K3.1 NVFP4
+            # export stores 1.0; the MXFP4 checkpoint has no activation scale).
+            # FC1->FC2 wire: stock's scale for the routing-weighted wire (never
+            # FlashInfer's 1.0, which flushes it); NVFP4 checkpoints are checked
+            # against their stored input scales in _nvfp4_scales.
+            fc1_norm_const=(
+                self.wire_norm_const(1.0) if self.quant_kind == "nvfp4" else 1.0
+            ),
         )
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
@@ -511,8 +532,6 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.compact_scales = scale_staging.wanted(vllm_config, self.prefill_worker)
         self.scale_staging: scale_staging.ScaleStaging | None = None
         self.moe_ordinal = -1
-        model_config = getattr(vllm_config, "model_config", None)
-        text_config = getattr(model_config, "hf_text_config", None)
         # MoE layers of the model: an upper bound for the die-local budget check
         # (1 without a model config, e.g. a standalone experts module).
         self.num_moe_layers = getattr(text_config, "num_hidden_layers", 1)
@@ -742,13 +761,35 @@ class KimiK3MegaMoEExperts(nn.Module):
             self.w2_weight_scale.data.view(torch.uint8),
         )
 
-    def _nvfp4_alphas(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-expert FC1 / FC2 global weight scales of the loaded NVFP4 experts.
+    def wire_norm_const(self, fc2_input_gscale: float) -> float:
+        """NVFP4 ``fc1_norm_const`` for a stock FC2-input global scale
+        (:func:`~.config.nvfp4_fc1_norm_const`)."""
+        return nvfp4_fc1_norm_const(
+            top_k=self.top_k,
+            situ_beta=self.situ_betas[0],
+            situ_linear_beta=self.situ_betas[1],
+            fc2_input_gscale=fc2_input_gscale,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
-        The kernel takes one FC1 scale per expert and quantizes activations with
-        unit global scales, so every ``w1`` / ``w3`` ``weight_scale_2`` pair must be
-        equal and every ``input_scale`` 1.0 (the Kimi K3.1 ModelOpt export stores
-        exactly that); anything else raises instead of changing the math.
+    def _nvfp4_scales(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-expert ``(w13 weight_scale_2, w2 weight_scale_2, fc1_norm_const)`` of
+        the loaded NVFP4 experts (``fc1_alpha = w13 weight_scale_2 /
+        input_norm_const``, ``fc2_alpha = w2 weight_scale_2 / fc1_norm_const``), from the checkpoint's own scales as stock NVFP4 MoE reads them
+        (``a1_gscale = 1 / w13_input_scale``, ``a2_gscale = 1 / w2_input_scale``,
+        alphas ``input_scale * weight_scale_2``; ``fused_moe/oracle/nvfp4.py:601-602``,
+        ``experts/trtllm_nvfp4_moe.py:153-155``).
+
+        The kernel takes one FC1 scale per expert, so every ``w1`` / ``w3``
+        ``weight_scale_2`` pair must be equal. The FC1 input is staged once per token
+        before dispatch with the layer's ``input_norm_const``, so ``1 /
+        w13_input_scale`` must equal it for every expert. The FC1->FC2 wire takes
+        ``fc1_norm_const = wire_norm_const(1 / w2_input_scale)`` per expert (the
+        routing weight is applied before that requantization here, after FC2 in
+        stock). The Kimi K3.1
+        ModelOpt export stores ``input_scale`` 1.0 everywhere (no activation
+        calibration): ``input_norm_const`` 1, ``fc1_norm_const`` 16. Anything not
+        representable exactly raises instead of changing the math.
         """
         ws13 = self.w13_weight_scale_2.data
         if not torch.equal(ws13[:, 0], ws13[:, 1]):
@@ -757,36 +798,53 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{self.prefix}: w1 and w3 weight_scale_2 differ for local experts "
                 f"{bad}; the Rubin NVFP4 kernel takes one FC1 scale per expert."
             )
-        for name in ("w13_input_scale", "w2_input_scale"):
-            scales = getattr(self, name).data
-            if not bool((scales == 1.0).all()):
-                raise NotImplementedError(
-                    f"{self.prefix}: {name} values {scales.unique()[:8].tolist()}; the "
-                    "Rubin NVFP4 path takes unit activation scales only."
-                )
-        return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone()
+        a13 = self.w13_input_scale.data.to(torch.float64)
+        a2 = self.w2_input_scale.data.to(torch.float64)
+        for name, scales in (("w13_input_scale", a13), ("w2_input_scale", a2)):
+            if not bool(torch.isfinite(scales).all()) or not bool((scales > 0).all()):
+                raise ValueError(f"{self.prefix}: {name} must be finite and positive.")
+        input_norm = float(self.problem.input_norm_const)
+        if not bool((1.0 / a13 == input_norm).all()):
+            raise NotImplementedError(
+                f"{self.prefix}: w13_input_scale values {a13.unique()[:8].tolist()}; "
+                f"the Rubin NVFP4 path stages the FC1 input with one global scale "
+                f"(1 / input_scale = {input_norm})."
+            )
+        norms = {
+            float(v): self.wire_norm_const(1.0 / float(v)) for v in a2.unique().tolist()
+        }
+        fc1_norm = torch.tensor(
+            [norms[float(v)] for v in a2.tolist()],
+            dtype=torch.float32,
+            device=ws13.device,
+        )
+        return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone(), fc1_norm
 
     def _prepare_resident_nvfp4(self, runtime: RubinMegaMoE) -> RubinMoeWeights:
         """Expert DWDP, NVFP4: the kernel layout of the resident half (the layout is
         per expert, so the half converts to the same bytes as the same experts of a
         whole conversion), with every local expert's alphas."""
         lo, hi = self.resident_experts
-        fc1_alpha, fc2_alpha = self._nvfp4_alphas()
-        for name, g in (("w13", fc1_alpha), ("w2", fc2_alpha)):
+        ws13, ws2, fc1_norm = self._nvfp4_scales()
+        for name, g in (("w13", ws13), ("w2", ws2)):
             if not bool(torch.isfinite(g).all()) or not bool((g > 0).all()):
                 raise ValueError(
                     f"{self.prefix}: {name} weight_scale_2 must be finite and positive."
                 )
         weights = runtime.prepare_nvfp4_checkpoint_weights(
             *self.canonical_weights(),
-            fc1_alpha[lo:hi].contiguous(),
-            fc2_alpha[lo:hi].contiguous(),
+            ws13[lo:hi].contiguous(),
+            ws2[lo:hi].contiguous(),
+            fc1_norm_const=fc1_norm[lo:hi].contiguous(),
             num_experts=hi - lo,
+        )
+        fc1_alpha, fc2_alpha, fc1_norm = nvfp4_checkpoint_alphas(
+            ws13, ws2, self.problem.input_norm_const, fc1_norm
         )
         return weights._replace(
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
-            fc1_norm_const=torch.ones_like(fc1_alpha),
+            fc1_norm_const=fc1_norm,
         )
 
     def reserve_sms_for_shared_expert(
@@ -993,9 +1051,9 @@ class KimiK3MegaMoEExperts(nn.Module):
             if self.weight_format is MEGA_MOE_NVFP4 and self.sharded_experts:
                 weights = self._prepare_resident_nvfp4(runtime)
             elif self.weight_format is MEGA_MOE_NVFP4:
-                alphas = self._nvfp4_alphas()
+                ws13, ws2, fc1_norm = self._nvfp4_scales()
                 weights = runtime.prepare_nvfp4_checkpoint_weights(
-                    *self.canonical_weights(), *alphas
+                    *self.canonical_weights(), ws13, ws2, fc1_norm_const=fc1_norm
                 )
             else:
                 weights = runtime.prepare_weights(
