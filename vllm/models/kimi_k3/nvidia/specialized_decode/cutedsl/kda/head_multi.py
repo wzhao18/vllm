@@ -39,6 +39,7 @@ from cutlass.cute.arch import store_async_dsmem
 from cutlass.cute.nvgpu import tcgen05
 
 from ..attn_res.kernel import BESIDE_SMEM
+from ..common import diagstamp as ds
 from ..common.primitives import (
     asm,
     at,
@@ -369,6 +370,11 @@ class KdaHeadMulti(KdaHeadVerify):
         a_step = cute.size_in_bytes(sA.element_type, a_layout) // 16
         b_step = cute.size_in_bytes(sB.element_type, b_layout) // 16
         columns = self.cta_k // 2  # tensor-memory columns of one A tile
+        # DIAG (KDA2ISS): MMA-warp stamps, CTA key head * CLUSTER + rank (thread 64)
+        d_rank, d_head, _ = cute.arch.block_idx()
+        d_tid, _, _ = cute.arch.thread_idx()
+        mbase, mctr = ds.buffer("kdamma", 0)
+        maddr = ds.begin(mbase, mctr, d_head * 16 + d_rank, d_tid == 64)
         cute.arch.alloc_tmem(512, tmem_base_ptr, is_two_cta=False)
         _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -386,18 +392,28 @@ class KdaHeadMulti(KdaHeadVerify):
                     source = a_desc + stage * a_step + 2 * kb
                     _copy_to_tmem(base + N + columns * k + 8 * kb, source)
                 tcgen05.commit(bar_empty + stage, None, self.cta_group)
+        ds.stamp(maddr, 1)  # weight tiles 0 .. staged - 1 landed (copies issued)
         for k in cutlass.range_constexpr(staged):  # A from tensor memory
             cute.arch.mbarrier_wait(b_full + k, 0)
+            if cutlass.const_expr(k == 0):
+                ds.stamp(maddr, 2)  # x tile 0 landed
             _fence_tcgen05()
             with cute.arch.elect_one():
                 for kb in cutlass.range_constexpr(k_blocks):
                     b = b_desc + k * b_step + 2 * kb
                     accumulate = Int32(0 if k == 0 and kb == 0 else 1)
                     mma_tmem(base, base + N + columns * k + 8 * kb, b, accumulate)
+        ds.stamp(maddr, 3)  # TMEM-staged tiles' MMAs issued
         for k in cutlass.range(staged, self.k_tiles, unroll=1):  # A from the ring
             ring_stage, ring_phase = k % stages, (k // stages) % 2
             cute.arch.mbarrier_wait(bar_full + ring_stage, ring_phase)
+            if k == self.early_loads:
+                ds.stamp(maddr, 4)  # first post-wait weight tile landed
+            if k == self.k_tiles - 1:
+                ds.stamp(maddr, 5)  # last weight tile landed
             cute.arch.mbarrier_wait(b_full + k, 0)
+            if k == self.k_tiles - 1:
+                ds.stamp(maddr, 6)  # last x tile landed
             _fence_tcgen05()
             with cute.arch.elect_one():
                 for kb in cutlass.range_constexpr(k_blocks):
@@ -406,6 +422,7 @@ class KdaHeadMulti(KdaHeadVerify):
                 tcgen05.commit(bar_empty + ring_stage, None, self.cta_group)
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        ds.stamp(maddr, 7)  # last MMAs committed
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)  # the release lands in phase 1
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
