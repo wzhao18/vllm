@@ -2006,7 +2006,7 @@ def _quad_code(ties: bool, write: bool) -> str:
     write: the key index of each take is stored at shared $12 and $12 advances one
     word ($0 returns it), each tie likewise at $13 ($1); pb = $14. No branches."""
     cmp = "gt" if ties else "ge"
-    code = "{ .reg .pred v, g, e; .reg .b32 x, q; "
+    code = "{ .reg .pred v, g, e; .reg .b32 x, q, tq, rq; "
     if write:
         code += "mov.b32 $0, $13; mov.b32 $1, $14; "
     else:
@@ -2017,8 +2017,13 @@ def _quad_code(ties: bool, write: bool) -> str:
         if ties:
             code += "setp.eq.and.u32 e, x, $10X, v; "
         if write:
-            code += (f"shr.u32 q, ${6 + k}X, 9; and.b32 q, q, 0xFFFFFF80; "
-                     f"add.u32 q, q, $14X; add.u32 q, q, {4 * k}; "
+            # key = tile * 128 + 4 * ((column % 32 - tile) mod 32) + column // 32
+            # (rotated columns, IndexerScore.publish_rot); pb = (4 lane) % 32 |
+            # (lane >> 3) << 8, column = 4 lane + k
+            code += (f"shr.u32 tq, ${6 + k}X, 16; shl.b32 q, tq, 7; "
+                     f"and.b32 rq, $14X, 0xFF; add.u32 rq, rq, {k}; sub.u32 rq, rq, tq; "
+                     "and.b32 rq, rq, 31; shl.b32 rq, rq, 2; add.u32 q, q, rq; "
+                     "shr.u32 rq, $14X, 8; add.u32 q, q, rq; "
                      "@g st.shared.b32 [$0], q; @g add.u32 $0, $0, 4; ")
             if ties:
                 code += "@e st.shared.b32 [$1], q; @e add.u32 $1, $1, 4; "
@@ -2302,7 +2307,8 @@ class CandSelect2:
             n_nx = row_len[bid]
             thr_nx = Uint32(row_bin[3 * bid])
         lt_mask = lanemask_lt()
-        pb0 = Uint32(16 * (lane % 8) + lane // 8)
+        # this lane quad's key-lane base (rotated columns: _quad_code)
+        pb0 = Uint32((4 * lane) % 32) | (Uint32(lane // 8) << Uint32(8))
         out_base = Int64(out.iterator.toint())
         n_it = (n_rows - bid + G - 1) // G
         for it in cutlass.range(n_it, unroll=1):
