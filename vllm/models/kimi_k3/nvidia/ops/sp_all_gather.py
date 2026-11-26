@@ -845,9 +845,27 @@ def enable_overlap(idle_sms: int, cl_rows: int) -> None:
     gather = _sp_all_gather
     if gather is None or gather.dtype != torch.bfloat16:
         return
+    if (gather.idle_sms, gather.cl_rows) == (idle_sms, cl_rows):
+        return  # every KDA layer reports the same GEMM
     if gather.gidx:
         raise RuntimeError("SP all-gather: overlap enabled after the first gather")
     gather.idle_sms, gather.cl_rows = idle_sms, cl_rows
+    # Load the pusher / wait / arrival kernels now. CUDA lazy loading loads a
+    # module at its first launch and that load waits for the running kernels:
+    # a first pusher launch behind a GEMM that waits for it deadlocks (seen in
+    # the engine profile run: every GEMM CTA past its PDL trigger, no pusher
+    # CTA started, also from a side stream). Every rank runs the same warm-up
+    # (one arrival each), so the arrival counts stay equal.
+    ext = _ag_module()
+    dev_flags = gather.flags.data_ptr()
+    ext.sp_ag_push(
+        gather.storage.data_ptr(), gather.peer_ptrs[0], gather.peer_flags, gather.rank,
+        gather.world, 0, gather.hidden_size, 0, cl_rows, _AG_CHUNK, 1, False, _AG_SPIN_NS,
+    )  # fmt: skip
+    ext.sp_ag_wait(dev_flags, 0, 0, 0, 0, _AG_SPIN_NS)
+    ext.sp_ag_arrive(dev_flags, 0)
+    ext.sp_ag_arrivals(gather.peer_flags, gather.rank, gather.world, _AG_SPIN_NS)
+    torch.accelerator.synchronize()
     logger.info_once(
         "Kimi K3 SP all-gather: KDA in_proj gathers overlap the Q|K|V GEMM "
         "(pushers on %d idle SMs, %d-row tiles)", idle_sms, cl_rows,
