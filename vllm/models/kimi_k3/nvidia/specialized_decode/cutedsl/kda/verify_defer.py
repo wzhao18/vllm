@@ -363,7 +363,6 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
         thread, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         lane, warp = thread % 32, thread // 32
-        group, j = lane // 8, lane % 8
         first = Int32(self.items * cta // self.ctas)
         count = Int32(self.items * (cta + 1) // self.ctas) - first
 
@@ -413,7 +412,7 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
             self.stage(state, page, state_full, meta, live_items, first, 0)
         cute.arch.sync_threads()
         nw = [norm_weight[thread % 64 + 64 * h] for h in range(2)]
-        row0 = 8 * warp + group
+        group, j, row0 = self.thread_rows(lane, warp)
 
         for item_index in cutlass.range(count, unroll=1):
             item = first + item_index
@@ -429,13 +428,7 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                         output[token + t, head * 128 + thread] = BFloat16(0)
             else:
                 wait(state_full, phase, scope="cta")
-                history = zeros((2, CHUNKS, 4), Float32)
-                for r in cutlass.range_constexpr(2):
-                    for c in cutlass.range_constexpr(CHUNKS):
-                        pointer = page.iterator + (row0 + 4 * r) * K + 4 * (j + 8 * c)
-                        values = load_f32x4(pointer, shared=True)
-                        for e in cutlass.range_constexpr(4):
-                            history[r, c, e] = values[e]
+                history = self.load_history(page, row0, j)
                 records = meta[item_index, 5]
                 self.fold(history, self.rec, row0, j, offset * Int32(records > 0))
                 cute.arch.sync_threads()  # every thread holds the page and its records
@@ -489,18 +482,7 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                     self.loop_token(history, t, group, j, row0, shared_q, shared_k,
                                     shared_decay, shared_v, shared_beta, shared_o,
                                     state, meta, item_index, head)  # fmt: skip
-                q_last = self.column_chunks(shared_q, T - 1, j)
-                sums = self.row_dots(history, q_last)
-                upper = (j & 4) != 0
-                send = sums[0] if upper else sums[1]
-                keep = sums[1] if upper else sums[0]
-                owned = keep + cute.arch.shuffle_sync_bfly(send, 4)
-                owned += cute.arch.shuffle_sync_bfly(owned, 2)
-                owned += cute.arch.shuffle_sync_bfly(owned, 1)
-                if (j & 3) == 0:
-                    row = row0 + 4 * (j // 4)
-                    position = (T - 1) * 128 + self.output_position(row)
-                    shared_o[position] = self.round_out(owned)
+                self.last_outputs(history, j, row0, shared_q, shared_o)
                 if (thread < 128) & (meta[item_index, 5] > 0):  # k / decay records
                     record_page = state[Int64(meta[item_index, 5]), None, None, None]
                     for tt in cutlass.range_constexpr(1, T):
@@ -518,6 +500,41 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                 # the item's shared operands and outputs are free for the next one
                 cute.arch.sync_threads()
         cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def thread_rows(self, lane, warp):
+        """(group, j, row0): lane 8 group + j of warp w holds rows row0 = 8 w + group
+        and row0 + 4 (``KdaVerifyPacked``'s layout)."""
+        return lane // 8, lane % 8, 8 * warp + lane // 8
+
+    @cute.jit
+    def load_history(self, page, row0, j):
+        """The thread's rows of the staged FP32 page (shared memory) in registers."""
+        history = zeros((2, CHUNKS, 4), Float32)
+        for r in cutlass.range_constexpr(2):
+            for c in cutlass.range_constexpr(CHUNKS):
+                pointer = page.iterator + (row0 + 4 * r) * K + 4 * (j + 8 * c)
+                values = load_f32x4(pointer, shared=True)
+                for e in cutlass.range_constexpr(4):
+                    history[r, c, e] = values[e]
+        return history
+
+    @cute.jit
+    def last_outputs(self, history, j, row0, shared_q, shared_o):
+        """The last token's query dots (the state after the loop) into ``shared_o``."""
+        T: cutlass.Constexpr = self.tokens
+        q_last = self.column_chunks(shared_q, T - 1, j)
+        sums = self.row_dots(history, q_last)
+        upper = (j & 4) != 0
+        send = sums[0] if upper else sums[1]
+        keep = sums[1] if upper else sums[0]
+        owned = keep + cute.arch.shuffle_sync_bfly(send, 4)
+        owned += cute.arch.shuffle_sync_bfly(owned, 2)
+        owned += cute.arch.shuffle_sync_bfly(owned, 1)
+        if (j & 3) == 0:
+            row = row0 + 4 * (j // 4)
+            position = (T - 1) * 128 + self.output_position(row)
+            shared_o[position] = self.round_out(owned)
 
     @cute.jit
     def stage(self, state, page, state_full, meta, live_items, first, n):
@@ -543,3 +560,178 @@ class KdaVerifyLoopDefer(DeferTokens, KdaVerifyLoopStock):
                     COPY_BYTES,
                     state_full,
                 )
+
+
+SPAN = 2  # column chunks per row per thread in KdaVerifyLoopDefer4 (h and h + 2)
+
+
+class KdaVerifyLoopDefer4(KdaVerifyLoopDefer):
+    """``KdaVerifyLoopDefer`` with 4 state rows per thread and half the columns.
+
+    Why: at B32 / B64 (one or two items per CTA) LoopDefer's token loop is bound by
+    shared-memory operand delivery, not by its FP32 chain (lanes/KDA round 11: 4.67 /
+    8.30 us of the 13.2 / 22.7 us core at 16 warps; halving the operand loads cut
+    the loop 37%). LoopDefer's lane holds 2 rows x 16 columns and loads 48 operand
+    floats (k, decay, q) per token for its 32 state values; here lane 16 g + 8 h + j
+    of warp w holds rows 8 w + 4 g .. + 3 and, of each, the column chunks h and
+    h + 2 of LoopDefer's lane j (columns 4 (j + 8 (h + 2 c)) .. + 3, c = 0, 1): the
+    same 32 state values per thread (same registers), 24 operand floats per token.
+
+    Math (bit for bit LoopDefer's): each row's dot keeps LoopDefer's tree. Its
+    in-thread level (c0 + c2) + (c1 + c3) becomes lane h = 0's c0 + c2 and lane
+    h = 1's c1 + c3 summed over the lane xor 8 pair, then xor 4, 2, 1 as today
+    (fp32 adds commute bit for bit, so which lane adds whose partner is free). Per
+    token the 8 values (4 query, 4 key dots) are reduce-scattered over lanes xor 8,
+    4, 2 and all-reduced over xor 1 (8 shuffles + 4 key-dot broadcasts vs 4 + 2).
+    The decay, update and fold are the same per-element instructions; the state
+    store, records, outputs and conv window are LoopDefer's values."""
+
+    @cute.jit
+    def thread_rows(self, lane, warp):
+        return lane // 16, lane % 16, 8 * warp + 4 * (lane // 16)
+
+    @cute.jit
+    def column(self, j, c):
+        """Column of chunk c (0, 1) of lane j (= 8 h + LoopDefer's lane)."""
+        return 4 * (j % 8 + 8 * (j // 8 + 2 * c))
+
+    @cute.jit
+    def load_history(self, page, row0, j):
+        history = zeros((4, SPAN, 4), Float32)
+        for r in cutlass.range_constexpr(4):
+            for c in cutlass.range_constexpr(SPAN):
+                pointer = page.iterator + (row0 + r) * K + self.column(j, c)
+                values = load_f32x4(pointer, shared=True)
+                for e in cutlass.range_constexpr(4):
+                    history[r, c, e] = values[e]
+        return history
+
+    @cute.jit
+    def column_chunks(self, source, t, j):
+        """Token t's [128] shared operand at the lane's 2 chunks: [c][e]."""
+        result = cute.make_rmem_tensor((SPAN, 4), Float32)
+        for c in cutlass.range_constexpr(SPAN):
+            v4 = load_f32x4(source.iterator + 128 * t + self.column(j, c), shared=True)
+            for e in cutlass.range_constexpr(4):
+                result[c, e] = v4[e]
+        return result
+
+    @cute.jit
+    def row_dots(self, history, operand):
+        """The 4 rows' partial dots: per chunk LoopDefer's chain (h0 q0, then
+        fma(h e, q e, acc), rows paired in packed instructions), then the lane's
+        level c_h + c_(h + 2) of LoopDefer's in-thread (c0 + c2) + (c1 + c3)."""
+        chains = []
+        for c in cutlass.range_constexpr(SPAN):
+            for p in cutlass.range_constexpr(2):  # row pairs (0, 1), (2, 3)
+                x = operand[c, 0]
+                acc = mul2((history[2 * p, c, 0], history[2 * p + 1, c, 0]), (x, x))
+                for e in cutlass.range_constexpr(1, 4):
+                    x = operand[c, e]
+                    pair = (history[2 * p, c, e], history[2 * p + 1, c, e])
+                    acc = fma2(pair, (x, x), acc)
+                chains.append(acc)
+        # chains[2 c + p][i] = chunk c, row 2 p + i
+        return [chains[r // 2][r % 2] + chains[2 + r // 2][r % 2] for r in range(4)]
+
+    @cute.jit
+    def decay_rows(self, history, decay):
+        for c in cutlass.range_constexpr(SPAN):
+            for e in cutlass.range_constexpr(4):
+                x = decay[c, e]
+                for p in cutlass.range_constexpr(2):
+                    pair = mul2((history[2 * p, c, e], history[2 * p + 1, c, e]), (x, x))
+                    history[2 * p, c, e], history[2 * p + 1, c, e] = pair
+
+    @cute.jit
+    def update_rows(self, history, k, v_new):
+        for c in cutlass.range_constexpr(SPAN):
+            for e in cutlass.range_constexpr(4):
+                x = k[c, e]
+                for p in cutlass.range_constexpr(2):
+                    pair = (history[2 * p, c, e], history[2 * p + 1, c, e])
+                    pair = fma2((x, x), (v_new[2 * p], v_new[2 * p + 1]), pair)
+                    history[2 * p, c, e], history[2 * p + 1, c, e] = pair
+
+    @cute.jit
+    def fold(self, history, rec, row0, j, pending):
+        for i in cutlass.range(pending, unroll=1):
+            k = self.column_chunks(rec, i, j)
+            decay = self.column_chunks(rec, DECAY_ROW + i, j)
+            v_new = [rec[(V_ROW + i) * K + row0 + r] for r in range(4)]
+            self.decay_rows(history, decay)
+            self.update_rows(history, k, v_new)
+
+    @cute.jit
+    def loop_token(self, history, t, group, j, row0, shared_q, shared_k,
+                   shared_decay, shared_v, shared_beta, shared_o, state, meta,
+                   item_index, head):  # fmt: skip
+        k = self.column_chunks(shared_k, t, j)
+        decay = self.column_chunks(shared_decay, t, j)
+        values = [Float32(0), Float32(0), Float32(0), Float32(0)]
+        if cutlass.const_expr(t > 0):
+            values = self.row_dots(history, self.column_chunks(shared_q, t - 1, j))
+        self.decay_rows(history, decay)
+        values += self.row_dots(history, k)  # [q rows 0..3, k rows 0..3]
+        # reduce-scatter over xor 8, 4, 2: lane 16 g + 8 h + j' ends with value
+        # 4 h + 2 (j' >> 2 & 1) + (j' >> 1 & 1) (h = 0: query, h = 1: key dots)
+        upper = (j & 8) != 0
+        for i in cutlass.range_constexpr(4):
+            send = values[i] if upper else values[i + 4]
+            keep = values[i + 4] if upper else values[i]
+            values[i] = keep + cute.arch.shuffle_sync_bfly(send, 8)
+        upper = (j & 4) != 0
+        for i in cutlass.range_constexpr(2):
+            send = values[i] if upper else values[i + 2]
+            keep = values[i + 2] if upper else values[i]
+            values[i] = keep + cute.arch.shuffle_sync_bfly(send, 4)
+        upper = (j & 2) != 0
+        send = values[0] if upper else values[1]
+        keep = values[1] if upper else values[0]
+        owned = keep + cute.arch.shuffle_sync_bfly(send, 2)
+        owned += cute.arch.shuffle_sync_bfly(owned, 1)
+        base = 16 * group + 8
+        dot_k = [cute.arch.shuffle_sync(owned, base + 2 * r) for r in range(4)]
+        beta = shared_beta[t]
+        v_new = [(shared_v[128 * t + row0 + r] - dot_k[r]) * beta for r in range(4)]
+        self.update_rows(history, k, v_new)
+        if cutlass.const_expr(t > 0):  # noqa: SIM102
+            if (j & 9) == 0:  # j = 0, 2, 4, 6: query rows 0 .. 3
+                row = row0 + j // 2
+                shared_o[(t - 1) * 128 + self.output_position(row)] = self.round_out(
+                    owned
+                )
+        if cutlass.const_expr(t == 0):  # the one state store: slot 0, after token 0
+            slot = meta[item_index, 4]
+            page = state[Int64(slot), None, None, None]
+            for r in cutlass.range_constexpr(4):
+                for c in cutlass.range_constexpr(SPAN):
+                    values4 = [history[r, c, e] for e in range(4)]
+                    pointer = at(page, head, row0 + r, self.column(j, c))
+                    self.store_state(pointer, values4, slot > 0)
+        else:  # token t's record: the rows' corrections
+            records = meta[item_index, 5]
+            if (j == 0) & (records > 0):
+                record_page = state[Int64(records), None, None, None]
+                for r in cutlass.range_constexpr(4):
+                    record_page[head, V_ROW + t - 1, row0 + r] = v_new[r]
+
+    @cute.jit
+    def last_outputs(self, history, j, row0, shared_q, shared_o):
+        T: cutlass.Constexpr = self.tokens
+        sums = self.row_dots(history, self.column_chunks(shared_q, T - 1, j))
+        upper = (j & 8) != 0
+        for i in cutlass.range_constexpr(2):
+            send = sums[i] if upper else sums[i + 2]
+            keep = sums[i + 2] if upper else sums[i]
+            sums[i] = keep + cute.arch.shuffle_sync_bfly(send, 8)
+        upper = (j & 4) != 0
+        send = sums[0] if upper else sums[1]
+        keep = sums[1] if upper else sums[0]
+        owned = keep + cute.arch.shuffle_sync_bfly(send, 4)
+        owned += cute.arch.shuffle_sync_bfly(owned, 2)
+        owned += cute.arch.shuffle_sync_bfly(owned, 1)
+        if (j & 3) == 0:  # j = 0, 4, 8, 12: rows 0 .. 3 (2 h + (j >> 2 & 1))
+            row = row0 + j // 4
+            position = (T - 1) * 128 + self.output_position(row)
+            shared_o[position] = self.round_out(owned)

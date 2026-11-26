@@ -30,7 +30,7 @@ from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
 from .cols_defer import KdaVerifyColsDefer
 from .split_defer import KdaSplitDefer
-from .verify_defer import KdaVerifyHalfDefer, KdaVerifyLoopDefer
+from .verify_defer import KdaVerifyHalfDefer, KdaVerifyLoopDefer, KdaVerifyLoopDefer4
 from .window import check_conv_cache
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
@@ -234,8 +234,10 @@ WIDE_KINDS = (
 # stock-math kinds run their record forms (``verify_defer``); KdaVerifyFeed has none,
 # so its rows run LoopDefer.
 RECORD_FORMS = {
-    KdaVerifyLoopStock: KdaVerifyLoopDefer,
-    KdaVerifyFeed: KdaVerifyLoopDefer,
+    # LoopDefer4: LoopDefer's math with 4 state rows per thread (half the operand
+    # loads; lanes/KDA round 12: -1.50 / -2.92 us per layer at q8 B32 / B64, bitwise)
+    KdaVerifyLoopStock: KdaVerifyLoopDefer4,
+    KdaVerifyFeed: KdaVerifyLoopDefer4,
     KdaVerifyHalfStock: KdaVerifyHalfDefer,
     # HalfPair (the halves' DSMEM output exchange) has none: its rows (q8 B11-17) run
     # HalfStock's record form (two CTAs per item, scratch + counter exchange)
