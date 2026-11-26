@@ -80,13 +80,29 @@ def test_ep32_wide_ep_unchanged():
 
 
 def test_inference_decode_bucket_server_unchanged():
-    """C512-style decode (inference 256 decode bucket): no GenPhase bucket added
-    (GenPhase without the fused shared was slower than the 256 inference bucket
-    at the EP16 decode shape)."""
+    """C512-style decode (inference 256 decode bucket) on the stock path: no
+    GenPhase bucket in its buckets (GenPhase without the fused shared was slower
+    than the 256 inference bucket at the EP16 decode shape)."""
     layer = _layer(2048, 16)
+    assert [(b.variant, b.max_tokens) for b in layer.buckets] == [
+        ("inference", 256), ("inference", 2048)]
+
+
+def test_ep16_inference_server_fuses_shared_bucket():
+    """The same server on the specialized decode (enable_fused_shared) adds the
+    EP32 128-token GenPhase bucket with the shared expert fused in (measured
+    faster: RUBIN_FUSED_DECODE_EP_SIZES); larger steps keep their buckets."""
+    layer = _layer(2048, 16)
+    layer.fused_decode_eligible = X.RUBIN_FUSED_DECODE_NOTE in _notes(2048, 16)
     before = layer.buckets
-    assert not _enable(layer)
-    assert layer.buckets == before
+    assert _enable(layer)
+    small, *rest = layer.buckets
+    assert (small.variant, small.max_tokens) == ("genphase", X.RUBIN_WIDE_EP_DECODE_TOKENS)
+    assert small.knobs == X.RUBIN_GENPHASE_FUSED_SHARED_KNOBS
+    assert small.shared == (HIDDEN, INTER) and small.max_sm_count is None
+    assert tuple(rest) == before
+    assert _enable(layer)  # idempotent
+    assert [b.max_tokens for b in layer.buckets] == [128, 256, 2048]
 
 
 @pytest.mark.parametrize("prefill,kind", [(True, "nvfp4"), (False, "mxfp4_mxfp8")])
@@ -107,30 +123,27 @@ def test_inserted_bucket_keeps_placement():
     assert layer.buckets[0].die_sm_mask32 == placed.die_sm_mask32
 
 
-@pytest.mark.parametrize("world", [16])
-@pytest.mark.parametrize("tokens", [2048, 4096])
-def test_ep16_inference_server_gets_gp_decode_bucket(world, tokens):
-    """EP16 NVFP4 decode servers above the GenPhase limit (inference kernel)
-    add the EP32 128-token GenPhase decode bucket in select_rubin_buckets; with the
-    fused shared expert enabled it becomes the fused-shared bucket (as on EP32)."""
-    layer = _layer(tokens, world)
-    small, *rest = layer.buckets
-    assert (small.variant, small.max_tokens) == ("genphase", X.RUBIN_WIDE_EP_DECODE_TOKENS)
-    assert small.knobs == X.RUBIN_GENPHASE_DECODE_KNOBS
-    assert all(b.variant != "genphase" for b in rest)
-    assert _enable(layer)
-    small, *rest2 = layer.buckets
-    assert small.shared == (HIDDEN, INTER) and rest2 == rest
+@pytest.mark.parametrize("world,tokens,eligible", [
+    (16, 2048, True), (16, 4096, True), (16, 192, False), (32, 2048, False),
+    (64, 2048, False), (8, 2048, False)])
+def test_fused_decode_eligibility(world, tokens, eligible):
+    assert (X.RUBIN_FUSED_DECODE_NOTE in _notes(tokens, world)) == eligible
 
 
-def test_ep16_gp_decode_bucket_opt_out(monkeypatch):
+def test_ep16_fused_decode_opt_out(monkeypatch):
     monkeypatch.setenv("VLLM_K31_EP_FUSED_DECODE", "0")
-    layer = _layer(2048, 16)
-    assert [b.max_tokens for b in layer.buckets] == [256, 2048]
-    assert not _enable(layer)
+    assert X.RUBIN_FUSED_DECODE_NOTE not in _notes(2048, 16)
 
 
-def test_ep64_keeps_its_buckets():
-    """EP64 is out of scope: its decode buckets are unchanged."""
+def test_ineligible_inference_server_unchanged():
     layer = _layer(2048, 64)
-    assert [b.max_tokens for b in layer.buckets] == [256, 2048]
+    layer.fused_decode_eligible = False
+    before = layer.buckets
+    assert not _enable(layer)
+    assert layer.buckets == before
+
+
+def _notes(tokens, world):
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    return X.select_rubin_buckets(problem, world, tokens, prefill_worker=False)[1]

@@ -150,6 +150,9 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 RUBIN_FUSED_DECODE_EP_SIZES = (16,)
 
 
+RUBIN_FUSED_DECODE_NOTE = "fused-shared decode bucket eligible (EP16)"
+
+
 def _fused_decode_enabled() -> bool:
     return os.environ.get("VLLM_K31_EP_FUSED_DECODE", "1") != "0"
 
@@ -329,30 +332,23 @@ def select_rubin_buckets(
     if problem.quant_kind == "nvfp4":
         buckets = [_prefill_dedup(b) for b in buckets]
         main = _prefill_dedup(main)
+    extra_notes: tuple[str, ...] = ()
     if (
         problem.quant_kind == "nvfp4"
         and not prefill_worker
         and world_size in RUBIN_FUSED_DECODE_EP_SIZES
         and (buckets[0] if buckets else main).max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS
-        and (buckets[0] if buckets else main).variant != "genphase"
+        and (buckets[0] if buckets else main).variant == "inference"
         and _fused_decode_enabled()
     ):
-        # EP16 inference-kernel decode (a GenPhase server gets the bucket from
-        # enable_fused_shared instead): the EP32 wide-EP decode bucket (GenPhase, decode
-        # scheduler, RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank) below the existing
-        # ones, so SP decode shards of at most that many tokens run the src_gp kernel
-        # (ll-encoded combine + fused RMSNorm reduce, and the MXFP8 shared expert fused
-        # in by enable_fused_shared) as EP32 does. Larger steps keep their buckets.
-        buckets = [
-            RubinBucket(
-                "genphase", RUBIN_WIDE_EP_DECODE_TOKENS, RUBIN_GENPHASE_DECODE_KNOBS
-            ),
-            *buckets,
-        ]
+        # EP16 inference-kernel decode: eligible for the EP32 wide-EP decode bucket
+        # with the shared expert fused in (enable_fused_shared adds it; the stock
+        # path, which would run GenPhase without the fused shared, keeps these).
+        extra_notes = (RUBIN_FUSED_DECODE_NOTE,)
     for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
-    return (*buckets, main), notes + extra
+    return (*buckets, main), notes + extra + extra_notes
 
 
 def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
@@ -578,6 +574,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             prefill_worker=self.prefill_worker,
         )
         self.bucket = self.buckets[-1]
+        self.fused_decode_eligible = RUBIN_FUSED_DECODE_NOTE in notes
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         # Whether forward gets a 1/TP sequence-parallel shard (see ep_tokens).
         self.sequence_parallel = False
@@ -972,10 +969,17 @@ class KimiK3MegaMoEExperts(nn.Module):
             return False
         first = self.buckets[0]
         if (
-            first.variant == "genphase"
+            (
+                first.variant == "genphase"
+                or getattr(self, "fused_decode_eligible", False)
+            )
             and first.max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS
             and self.problem.quant_kind == "nvfp4"
         ):
+            # (EP16 inference-kernel decode, RUBIN_FUSED_DECODE_EP_SIZES: the same
+            # bucket on the GenPhase kernel; the loop below sets its variant, knobs
+            # and fused shared expert. Measured in the specialized decode: see
+            # RUBIN_FUSED_DECODE_EP_SIZES.)
             # A GenPhase server sized above the fused bucket (EP16 SP decode: shards
             # of 192 / 242 tokens per rank) adds it: steps of at most
             # RUBIN_WIDE_EP_DECODE_TOKENS tokens per rank run the fused shared
@@ -987,9 +991,10 @@ class KimiK3MegaMoEExperts(nn.Module):
                 *self.buckets,
             )
             logger.info_once(
-                "Rubin MegaMoE: EP%d GenPhase decode adds the %d-token fused-shared "
+                "Rubin MegaMoE: EP%d %s decode adds the %d-token fused-shared "
                 "bucket below its %d bucket.",
                 self.ep_size,
+                first.variant,
                 RUBIN_WIDE_EP_DECODE_TOKENS,
                 first.max_tokens,
             )
