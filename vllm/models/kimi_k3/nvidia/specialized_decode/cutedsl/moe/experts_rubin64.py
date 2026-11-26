@@ -87,7 +87,7 @@ def diag_ring(device):
     if device not in DIAG_RINGS:
         with _torch.accelerator.device_index(device):
             DIAG_RINGS[device] = _torch.zeros(
-                DIAG_RING * 256 * 64, dtype=_torch.int64, device=f"cuda:{device}"
+                DIAG_RING * 256 * 128, dtype=_torch.int64, device=f"cuda:{device}"
             )
     return DIAG_RINGS[device].data_ptr()
 
@@ -95,6 +95,19 @@ def diag_ring(device):
 @asm(Uint64)
 def _gridid():
     return "mov.u64 $0, %gridid;", "=l", ()
+
+
+@asm()
+def _cstamp_at(pointer):
+    """DIAG (MOEFS): {%globaltimer, %clock64} into a 16 B slot."""
+    code = "{ .reg .u64 t,c; mov.u64 t, %globaltimer; mov.u64 c, %clock64; "
+    code += "st.global.v2.u64 [$0], {t, c}; }"
+    return code, "l,~{memory}", (pointer,)
+
+
+@asm()
+def _wait_cp_async_all():
+    return "cp.async.wait_all;", "~{memory}", ()
 
 
 @asm()
@@ -279,7 +292,13 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         """DIAG (GRPSTAMP): this CTA's 512 B row of the gridid-keyed ring."""
         gid = Int64(_gridid())
         row = (gid & (DIAG_RING - 1)) * 256 + Int64(thread()[3])
-        return Int64(self.diag_ring) + row * 512
+        return Int64(self.diag_ring) + row * 1024
+
+    @cute.jit
+    def cstamp(self, slot: cutlass.Constexpr[int]):
+        """DIAG (MOEFS): a {globaltimer, clock64} stamp in ring slot 32-63."""
+        if cutlass.const_expr(self.diag_ring != 0):
+            _cstamp_at(self.diag_row() + 16 * slot)
 
     @cute.jit
     def dstamp(self, slot):
@@ -553,6 +572,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 )
                 if issued == 1:
                     self.stamp(3)
+                    self.cstamp(44)  # DIAG (MOEFS): first weight stage issued
                 ks += 1
                 if ks == 14:
                     ks, tile, r = (Int32(0), tile + 1, r + 1)
@@ -600,6 +620,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             for s in cutlass.range(lo, hi, unroll=1):
                 slot = count % stages
                 self.sync(full.iterator + slot, count // stages & 1, True)
+                if (lane == 0) & (count == 0):
+                    self.cstamp(48)  # DIAG (MOEFS): first FC1 stage full
                 weights = (tmem + 128 + slot * 8, asf0 + slot * 64)
                 released = shared_address(empty.iterator + slot)
                 first, last = ((s == lo) | (ks == 0), (s == hi - 1) | (ks == 13))
@@ -623,6 +645,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                 cute.arch.sync_warp()
                 if (lane == 0) & (count == 0):
                     self.stamp(6)
+                    self.cstamp(49)  # DIAG (MOEFS): first FC1 MMA issued
                 if last:  # the commit signals the epilogue
                     uses += 1
                     acc = uses % 16
@@ -937,6 +960,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         scale = self.off_xsf + lane // 8 * 128 + (lane & 7) * 16
         sources = cute.make_rmem_tensor(5, Int32)
         slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        if lane == 0:
+            self.cstamp(45)  # DIAG (MOEFS): gather warp entry
         for group in cutlass.range_constexpr(2):
             lo, hi = (ranges[group, 2], ranges[group, 3])
             ks, r = (lo % 14, lo // 14 % 3)
@@ -953,6 +978,10 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                     src = PLAN_XSF + sources[4] + (2 * ks + lane // 8) * 16
                     copy_g2s(sm.iterator + scale + slot * 256, ws + src)
                 cute.arch.cp_async_mbarrier_arrive_noinc(full.iterator + slot)
+                if (lane == 0) & (issued == 0):
+                    self.cstamp(46)  # DIAG (MOEFS): first x slice issued
+                    _wait_cp_async_all()
+                    self.cstamp(47)  # DIAG (MOEFS): lane 0's first x slice landed
                 slot, issued = (slot + 1, issued + 1)
                 if slot == stages:
                     slot, phase = (Int32(0), phase ^ 1)
@@ -1275,12 +1304,16 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         cute.arch.griddepcontrol_wait()
         if tid == 0:
             self.stamp(1)
+            self.cstamp(40)  # DIAG (MOEFS): wait return
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
         # Images and rearm alternate over grouped calls; ``x`` is the plan.
         routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
         self.group(sm, ids, workspace, batch, arrival=arrival)
         if tid == 0:
             self.stamp(2)
+            self.cstamp(42)  # DIAG (MOEFS): warp 0 grouped
+        if tid == 96:
+            self.cstamp(50)  # DIAG (MOEFS): warp 3 past the pair ranking
         distinct, call_count, generation = (routed[0], routed[1], routed[2])
         if tid == 0:
             self.diag_meta(distinct, call_count)
@@ -1294,6 +1327,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
             ranges = self.partition(distinct, cta)
         if tid == 0:
             self.stamp(11)
+            self.cstamp(43)  # DIAG (MOEFS): ranges
         if warp == 0:
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
@@ -1336,6 +1370,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         release_tmem(tmem, 512, warp, 3)
         if tid == 0:
             self.stamp(13)
+            self.cstamp(41)  # DIAG (MOEFS): exit
             counters[cta] = call_count + 1
             if cta < self.slots - self.grid:
                 counters[self.grid + cta] = call_count + 1
