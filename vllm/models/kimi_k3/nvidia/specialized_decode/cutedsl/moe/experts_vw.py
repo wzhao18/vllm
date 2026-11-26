@@ -109,6 +109,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
     def __init__(
         self, experts, grid, slots, capacity, width=32, publish=False, stages=None,
         trace=0, pool=(12, 6), dies=(), static_groups=False, fc2_base=1,
+        epi_groups=2,
     ):  # fmt: skip
         assert width in (8, 16, 32)  # 8: the V2 machinery on 8-token units (a control)
         if stages is None:  # a 7th stage fits shared memory up to width 16
@@ -122,6 +123,14 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             static_groups, tables=False,
         )  # fmt: skip
         self.wide, self.subs = (width, width // 8)
+        # Epilogue groups of four warps (2: warps 4-11). More groups take the big
+        # slots in turn (use u: group u % epi_groups) so the FC2 epilogue, which the
+        # MMA warp waits on at 256+ rows, drains more slots at once; the finalize
+        # spreads over 2 + 4 epi_groups warps. Same work per slot, same order per row.
+        # (three: 16 warps, 512 threads; the grouping's warp totals hold 16)
+        assert epi_groups in (2, 3) and not (static_groups and epi_groups != 2)
+        self.epi_groups = epi_groups
+        self.threads = 128 * (1 + epi_groups)
         # Accumulator big slots of ``width`` columns (one barrier pair each), then the
         # weight scales (8 columns a slot), the hidden scales (8 a buffer) and the
         # activation scales (8 a slot) from column 384.
@@ -155,7 +164,8 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         end = self.off_rows + 16 * units
         # without the spill: bases, sbases, totals, bounds, then the transpose buffers
         whole = end + 8 * experts + 64 + 8 * (grid + 1)
-        whole = (whole + 127) // 128 * 128 + 8 * 512
+        whole = (whole + 127) // 128 * 128 + 4 * epi_groups * 512
+        whole += 0 if epi_groups == 2 else 640 * epi_groups
         if self.grouping_spill(stages, whole):  # grouping-only arrays below off_misc
             low = (2 * self.owners, 4 * experts, 4 * experts, 64)
             self.off_owner, self.off_bases, self.off_sbases, self.off_totals = (
@@ -172,7 +182,10 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         self.off_bounds = end
         end = self.off_bounds + 8 * (grid + 1)
         self.off_fc2s = (end + 127) // 128 * 128  # ``fc2``'s transpose buffers
-        end = self.off_fc2s + 8 * 512
+        end = self.off_fc2s + 4 * epi_groups * 512
+        if epi_groups != 2:  # ``epi_smem``: the store_hidden maxima and staging rows
+            self.off_emax, self.off_estage = (end, end + 128 * epi_groups)
+            end = self.off_estage + 512 * epi_groups
         # The token masks, then their running counts, in the weight ring while grouping
         # (below off_misc past the ring: ``grouping_spill``).
         self.off_masks = 0
@@ -545,7 +558,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             else:
                 state = self.fc2_mma(state, mma, bars, a, b, (accmeta, pmeta))
         slot, phase, uses, current, ordinal, hbuffer, _, _ = state
-        for _ in cutlass.range(2, unroll=1):
+        for _ in cutlass.range(self.epi_groups, unroll=1):  # one per epilogue group
             b = uses % self.big
             self.acquire_big(accempty, b, uses)
             self.signal(accmeta, pmeta, b, (Int32(2), Int32(0), Int32(0), Int32(0)))
@@ -618,8 +631,9 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         marker per group) come in ``consume``'s order, a big slot each, and the two
         epilogue groups take every other one. The owner reads the item's k sub-units
         in order (``take``: the slot released after the last read) and handles each
-        as the 64-row kernel handles a unit."""
-        eg = (thread()[1] - 4) // 4
+        as the 64-row kernel handles a unit. ``epi_groups`` groups: use u's slot goes to
+        group u % epi_groups (two: every other one)."""
+        eg, groups = ((thread()[1] - 4) // 4, self.epi_groups)
         full = view(sm.iterator, self.off_misc + self.bar_accfull, Uint64, 16)
         empty = view(sm.iterator, self.off_misc + self.bar_accempty, Uint64, 16)
         sub0 = self.sub_starts(sm)
@@ -635,7 +649,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
             else:
                 start = ranges[g, 4]
                 count = ranges[g, 5] - start - (zone if g == 1 else 0)
-            for i in cutlass.range((eg ^ offset) & 1, count, 2, unroll=1):
+            for i in cutlass.range(self.turn(eg, offset), count, groups, unroll=1):
                 item, use = (start + i, offset + i)
                 stream = item // (self.tiles if kk < 2 else self.jobs)
                 first = sub0[stream]
@@ -657,7 +671,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         # counts the earlier pool uses of the slot (m // big).
         accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
         pmeta = view(sm.iterator, self.off_misc + self.bar_pmeta, Uint64, 16)
-        m, ended = ((eg ^ offset) & 1, False)
+        m, ended = (self.turn(eg, offset), False)
         while not ended:
             pool_use = offset + m
             slot = pool_use % self.big
@@ -672,9 +686,18 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
                 for s in cutlass.range(k, unroll=1):
                     values = self.take(tmem, empty, slot, s, s == k - 1)
                     self.fc2(sm, workspace, output, values, first + s, tile0, ranges)
-                m += 2
+                m += groups
         if cutlass.const_expr(self.publish):
             self.finalize(workspace, output, batch, scalars[3:], sm=sm)
+
+    @cute.jit
+    def turn(self, eg, offset):
+        """Group ``eg``'s first use past ``offset`` uses: u - offset with u % groups ==
+        eg (two groups: (eg ^ offset) & 1)."""
+        if cutlass.const_expr(self.epi_groups == 2):
+            return (eg ^ offset) & 1
+        groups: cutlass.Constexpr = self.epi_groups
+        return (eg + groups - offset % groups) % groups
 
     @cute.jit
     def take(self, tmem, empty, b, s, last):

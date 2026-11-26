@@ -426,9 +426,9 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
     @cute.jit
     def finalize(self, workspace, weights, batch, box, sm=None):
         """The staged rows' units (``unit``) into this rank's partial latent rows at
-        ``box[0]`` (``"local"``), over ten warps a CTA (the hidden loader, the gather
-        warp and the eight epilogue warps). Die oblivious: unit 10 cta + warp - 2,
-        stride 10 grid. ``dies``: pages 2i and 2i + 1 sit on opposite dies (the home of
+        ``box[0]`` (``"local"``), over F warps a CTA (the hidden loader, the gather warp
+        and the epilogue warps: F = 2 + 4 epi_groups, ten by default; the 10s below are
+        F). Die oblivious: unit 10 cta + warp - 2, stride 10 grid. ``dies``: pages 2i and 2i + 1 sit on opposite dies (the home of
         a default allocation's 4 KiB page k of a 2 MiB chunk is parity(k & 0x1DB) ^ c,
         c per chunk in ``ws_homes``, ``common.dies``), so pair i gives each die one
         unit. Die d's job j holds its units of pairs j, j + 5 grid, ...; warp rank
@@ -438,12 +438,13 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         the locality (die-local reads and re-arms: ~1 us at 96-128 rows)."""
         _, warp, lane, cta = thread()
         stage = workspace.iterator + self.ws_stage
+        f: cutlass.Constexpr = self.threads // 32 - 2  # finalizing warps a CTA
         if cutlass.const_expr(len(self.dies) > 0):
             info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
             die, k = (info[0], info[3])
             homes = view(workspace.iterator, self.ws_homes, Uint32, 2)
-            half: cutlass.Constexpr = self.grid * 5
-            rank = k * 10 + warp - 2
+            half: cutlass.Constexpr = self.grid * f // 2
+            rank = k * f + warp - 2
             target, job = (die, rank)
             if rank >= half:
                 target, job = (1 - die, 2 * half - 1 - rank)
@@ -459,7 +460,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 h = (Int32(cute.arch.popc(bits)) ^ Int32(word)) & 1
                 self.unit(stage, weights, box, 2 * i + Int32(h != target), lane)
         else:
-            for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):
+            for unit in range(cta * f + warp - 2, batch * 28, self.grid * f):
                 self.unit(stage, weights, box, unit, lane)
 
     @cute.jit

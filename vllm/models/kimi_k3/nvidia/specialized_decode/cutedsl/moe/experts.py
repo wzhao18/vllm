@@ -1286,7 +1286,8 @@ class ExpertsKernel(ExpertsGeometry):
         expert, chunk = (tile // self.tiles, tile % self.tiles)
         up = lane & 8 == 0
         h, maxima = (cute.make_rmem_tensor(self.width, Float32) for _ in range(2))
-        shared_max = view(sm.iterator, self.off_misc + 884, Float32, 64)
+        emax, estage = self.epi_smem()
+        shared_max = view(sm.iterator, emax, Float32, 32 * self.epi_groups)
         for t in cutlass.range_constexpr(self.width):
             gate = cute.arch.shuffle_sync_bfly(values[t], 8)
             h[t] = situ(gate, values[t], *scalars) if up else Float32(0)
@@ -1298,7 +1299,7 @@ class ExpertsKernel(ExpertsGeometry):
             if lane == 0:
                 shared_max[(eg * 4 + ew) * 8 + t] = maxima[t]
         self.group_sync(eg)
-        stage_base, scale_token = (self.off_misc + 3200 + (eg * 4 + ew) * 128, Int32(0))
+        stage_base, scale_token = (estage + (eg * 4 + ew) * 128, Int32(0))
         for t in cutlass.range_constexpr(self.width):
             peer = shared_max[(eg * 4 + (ew ^ 1)) * 8 + t]
             scale = mx_exponent(cute.arch.fmax(maxima[t], peer), floor=self.tp == 8)
@@ -1319,6 +1320,17 @@ class ExpertsKernel(ExpertsGeometry):
                 value = Uint8(scale_token)
                 byte[self.h_image_bytes + lane * 16 + 2 * chunk + ew // 2] = value
         self.group_sync(eg)
+
+    # Epilogue groups of four warps (warps 4 ..): 2 everywhere but the wide VW engine
+    # (``RubinVWExpertsKernel`` epi_groups), whose per-warp shared areas then move past
+    # its tables (``off_emax`` / ``off_estage``).
+    epi_groups = 2
+
+    def epi_smem(self):
+        """(maxima [warps, 8] FP32, staging rows [warps, 128 B]) of the epilogue warps."""
+        if self.epi_groups == 2:
+            return (self.off_misc + 884, self.off_misc + 3200)
+        return (self.off_emax, self.off_estage)
 
     @cute.jit
     def group_sync(self, eg):

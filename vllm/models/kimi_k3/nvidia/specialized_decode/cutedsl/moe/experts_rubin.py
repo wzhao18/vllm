@@ -1113,7 +1113,8 @@ class RubinExpertsKernel(ExpertsKernel):
         up = Uint32(lane & 8 == 0)
         h = cute.make_rmem_tensor(self.width, Float32)
         maxima = cute.make_rmem_tensor(self.width, Float32)
-        shared_max = view(sm.iterator, self.off_misc + 884, Float32, 64)
+        emax, estage = self.epi_smem()
+        shared_max = view(sm.iterator, emax, Float32, 32 * self.epi_groups)
         for t in cutlass.range_constexpr(self.width):
             gate = cute.arch.shuffle_sync_bfly(values[t], 8)
             g = float_bits(situ(gate, values[t], *scalars))
@@ -1125,10 +1126,10 @@ class RubinExpertsKernel(ExpertsKernel):
             bits = select_u32(Uint32(bits > Uint32(2139095040)), 0, bits)
             maxima[t] = bits_float(redux(bits, "max"))
         for t in cutlass.range_constexpr(self.width):
-            own = sm.iterator + self.off_misc + 884 + 4 * ((eg * 4 + ew) * 8 + t)
+            own = sm.iterator + emax + 4 * ((eg * 4 + ew) * 8 + t)
             store_shared_if(own, float_bits(maxima[t]), Uint32(lane == 0), "b32")
         self.group_sync(eg)
-        stage_base = self.off_misc + 3200 + (eg * 4 + ew) * 128
+        stage_base = estage + (eg * 4 + ew) * 128
         scale_token = Int32(0)
         # The peer maxima first, then the scales and FP8 values, then the stores: the
         # same arithmetic per token, no store between a load and its use.

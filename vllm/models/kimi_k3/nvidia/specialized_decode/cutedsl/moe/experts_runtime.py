@@ -234,6 +234,10 @@ WIDE = {16: "65-80:8,81-:16"}
 # +0.8 at 768; M128: -0.1).
 WIDE_POOL = {16: "257-:48"}
 
+# Wide rows' epilogue groups (``RubinVWExpertsKernel`` epi_groups: four warps each), by
+# rows; other wide rows keep 2. Same work per accumulator slot and per row: bitwise.
+WIDE_EPI = {16: ""}
+
 
 def wide_capacity(rows):
     return (rows + 63) // 64 * 64
@@ -283,7 +287,7 @@ def compile_wide_plan(batch, device):
 @functools.cache
 def compile_wide(
     experts, batch, grid, device, slots, dies=(), static=False, width=8,
-    publish="local", cap=0, pool=(12, 6),
+    publish="local", cap=0, pool=(12, 6), epi=2,
 ):  # fmt: skip
     """The wide engine (``wide_kernel``) at ``batch`` rows: the plan (64-row blocks),
     ids, the maps, scales, workspace, the routing weights, the SiTU scalars, the
@@ -292,7 +296,7 @@ def compile_wide(
     w13 / w2 addresses."""
     moe = wide_kernel(
         experts, grid, slots, batch, width, publish=publish, dies=dies,
-        static_groups=static, pool=pool,
+        static_groups=static, pool=pool, **({} if epi == 2 else {"epi_groups": epi}),
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
@@ -541,6 +545,7 @@ class PersistentExperts:
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
         self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
+        self.wide_epi = batch_table(WIDE_EPI.get(self.tp, "") if q > 1 else "")
         self.slots = workspace_slots(self.device)
         self.weights = (w13, s13, w2, s2)
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
@@ -722,12 +727,13 @@ class PersistentExperts:
         grid = self.grid_for(batch)
         static = bool(self.static.get(batch))
         mode, cap = ("twoshot", publish[1].shape[1]) if twoshot else ("local", 0)
-        pool = (self.wide_pool.get(batch, 12), 6)
+        pool, epi = ((self.wide_pool.get(batch, 12), 6), self.wide_epi.get(batch, 2))
         code = compile_wide(
             self.experts, batch, grid, self.device.index, self.slots, self.dies, static,
-            self.wide[batch], mode, cap, pool,
+            self.wide[batch], mode, cap, pool, epi,
         )  # fmt: skip
-        check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
+        threads = 128 * (1 + epi)
+        check_residency(code, self.device.index, grid, threads, "Kimi K3 MoE experts")
         width, slots = (self.wide[batch], self.slots)
         kernel = wide_kernel(self.experts, slots, slots, batch, width)
         assert buffers["workspace"].numel() >= kernel.workspace_bytes, (

@@ -239,7 +239,8 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
 
     @cute.jit
     def __call__(self, *args):
-        options = dict(grid=(self.grid, 1, 1), block=(384, 1, 1), cluster=(1, 1, 1))
+        block = (self.threads, 1, 1)  # 384 but for the VW engine's epi_groups
+        options = dict(grid=(self.grid, 1, 1), block=block, cluster=(1, 1, 1))
         maps = self.encode_maps(args[-3], args[-2])
         kernel = self.kernel_maps(args[:-3], *maps)
         kernel.launch(stream=args[-1], use_pdl=True, **options)
