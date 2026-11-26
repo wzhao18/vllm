@@ -574,6 +574,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
                         expert = experts[index]
         self.stamp(4)
         self.fc2_ranges(sm, ranges)
+        self.dstamp(30)  # DIAG (U3): producer past the FC2 ranks
         state = (slot, phase, issued, Int32(0), Int32(-1))
         work = (ring, state, maps, experts, ranges, *steal)
         slot, phase, issued = self.fc2_pool(*work)
@@ -1161,6 +1162,7 @@ class RubinGroupedExpertsKernel(ExpertsKernel):
         if lane == 0:
             ready = view(sm.iterator, self.off_misc + self.bar_fc2, Uint64, 1)
             cute.arch.mbarrier_arrive(ready.iterator)
+            self.dstamp(27)  # DIAG (U3): FC2 ranks matched
 
     @cute.jit
     def fc2_ranges(self, sm, ranges):
