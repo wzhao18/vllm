@@ -798,7 +798,7 @@ def compile_head_multi(
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))
     stages, tmem_tiles, early = MULTI_TILE[requests, tokens]
-    kind = HEAD_MULTI_KIND
+    kind = multi_kind(requests, tokens)
     if kind is None:  # the record form under the record protocol (head_defer)
         from .head_defer import KdaHeadMultiDefer
         from .prepared import record_protocol
@@ -820,7 +820,18 @@ def compile_head_multi(
 # an AttnRes CTA once x is resident for every token (2 x 8: 7 stages; the 21 early
 # tiles still fit: 15 to tensor memory, 6 in the ring). 2 x 4 has the M8 head's x and
 # keeps its tile (VERIFY_STAGES 10).
-MULTI_TILE = {(2, 8): (7, 15, 21), (2, 4): (10, 15, 21)}
+MULTI_TILE = {(2, 8): (7, 15, 21), (2, 4): (10, 15, 21), (4, 8): (5, 15, 19)}
 # The class ``compile_head_multi`` builds (``head_defer.set_head_protocol``); None:
 # the deferred-verify record form under ``prepared.record_protocol``, else KdaHeadMulti.
 HEAD_MULTI_KIND = None
+
+
+def multi_kind(requests, tokens):
+    """The multi-request head class of ``requests`` x ``tokens``: ``KdaHeadR24``
+    (24-CTA clusters, deferred-verify records) past one 16-CTA cluster's eight KDA
+    roles per request pair (4 x q8), else ``HEAD_MULTI_KIND``."""
+    if requests * KDA_CTAS > CLUSTER:
+        from .head_r24 import KdaHeadR24
+
+        return KdaHeadR24
+    return HEAD_MULTI_KIND

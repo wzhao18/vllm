@@ -45,6 +45,9 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.head import (  # 
     PreparedKdaHead,
     head_supported,
 )
+from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (  # noqa: E402
+    WIDE_B64,
+)
 
 DEVICE = torch.device("cuda", 0)
 RUBIN = (10, 7)
@@ -123,7 +126,10 @@ def reference_projection(weight, x):
     rows = x.shape[0]
     projected = torch.zeros(rows, PITCH, dtype=torch.bfloat16, device=DEVICE)
     # (ring stages do not change the sums)
-    main = PreparedProjection(weight[: 4 * DIM], {rows: (128, rows, 4, 4)}).prepare()
+    main_tactic = (128, rows, 4, 4)
+    if rows > 16:  # KdaHeadR24 (4 x q8): SplitKTmemGemm64's split-6 slices and sums
+        main_tactic = WIDE_B64[PITCH]
+    main = PreparedProjection(weight[: 4 * DIM], {rows: main_tactic}).prepare()
     fa_tactic = FA_TACTIC_ROWS.get(rows, FA_TACTIC)
     fa = PreparedProjection(weight[4 * DIM :], {rows: fa_tactic}).prepare()
     main.run(x, projected[:, : 4 * DIM])
@@ -137,6 +143,7 @@ HEAD_SHAPES = [
     pytest.param(8, 8, False, id="q8-M8-verify"),
     pytest.param(8, 8, True, id="q8-M8-verify-polled"),
     pytest.param(16, 8, False, id="q8-M16-multi"),
+    pytest.param(32, 8, False, id="q8-M32-r24"),
     pytest.param(8, 4, False, id="q4-M8-multi"),
     pytest.param(8, 4, True, id="q4-M8-multi-polled"),
 ]
@@ -148,6 +155,8 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
     """KdaHead (plain or polled output) vs in-projection -> PreparedKda, bitwise on
     the output, the recurrent state / checkpoints and the conv state; the head is
     admitted for this shape and dtype (its compile probe passes)."""
+    if rows == 32 and state_dtype == torch.bfloat16:
+        pytest.skip("KdaHeadR24 serves the FP32 state (deferred-verify records)")
     attention = kda_attention()
     g = torch.Generator(device=DEVICE).manual_seed(3)
     weight = torch.randn(PITCH, HIDDEN, generator=g, device=DEVICE) * HIDDEN**-0.5

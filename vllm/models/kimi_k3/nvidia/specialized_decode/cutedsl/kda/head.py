@@ -1539,12 +1539,12 @@ def head_constructs(heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_
                 hidden=hidden, **options,
             )  # fmt: skip
         else:
-            from .head_multi import MULTI_TILE, KdaHeadMulti
+            from .head_multi import MULTI_TILE, KdaHeadMulti, multi_kind
 
             if batch % q or (batch // q, q) not in MULTI_TILE:
                 return False
             stages, tmem_tiles, early = MULTI_TILE[batch // q, q]
-            KdaHeadMulti(
+            (multi_kind(batch // q, q) or KdaHeadMulti)(
                 heads, requests=batch // q, tokens=q, stages=stages,
                 tmem_tiles=tmem_tiles, early_loads=early, hidden=hidden, **options,
             )  # fmt: skip
