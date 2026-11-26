@@ -333,6 +333,24 @@ def _install_save_hidden() -> None:
             torch.save(t.detach().cpu(), os.path.join(out_dir, f"{key}.rank{rank}.pt"))
 
         layers[i].register_forward_hook(hook)
+        if i == 0 and os.environ.get("VLLM_BENCH_PERTURB_MOE0"):
+            # Control: +-1 bf16 ulp on a fixed 8.7% of MoE layer 0's output elements
+            # (the measured EPLB-vs-no-EPLB layer-0 rounding difference), to measure
+            # how far rounding-level noise is amplified downstream.
+            frac = float(os.environ["VLLM_BENCH_PERTURB_MOE0"])
+
+            def perturb(mod, args, out):
+                t = out[0] if isinstance(out, tuple) else out
+                if t.dtype != torch.bfloat16 or t.numel() == 0:
+                    return None
+                g = torch.Generator(device=t.device).manual_seed(1234)
+                u = torch.rand(t.shape, generator=g, device=t.device)
+                step = torch.where(u < frac / 2, 1, torch.where(u < frac, -1, 0)).to(torch.int16)
+                bits = t.view(torch.int16)
+                bits.add_(step * (t != 0).to(torch.int16))  # one ulp up/down, zeros kept
+                return None
+
+            layers[i].register_forward_hook(perturb)
 
         def pre_hook(mod, args, kwargs, i=i):
             # Inputs of the same first sub-call: hidden, topk weights, topk ids.
