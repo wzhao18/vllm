@@ -218,6 +218,12 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         runner, args.routing, args.load_format == "dummy", batch.num_tokens, args.seed
     )
     try:
+        # DIAG (DSTAMP, never merge): clock sync before the case (interpolated offsets)
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            dsadiag as _dsadiag,
+        )
+
+        _dsadiag.presync()
         result = bench.run()
         # DIAG (ROUTE, never merge): this case's last replays' MoE front-chain rings
         # (nq_step leaves with os._exit, so an atexit dump never runs).

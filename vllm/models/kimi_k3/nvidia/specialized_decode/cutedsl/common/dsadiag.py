@@ -303,6 +303,17 @@ def clocksync():
     return out.cpu()
 
 
+def presync():
+    """Clock sync BEFORE a bench case (forward bench, all ranks): with the dump's passes
+    the stamps lie between two syncs, so the per-rank offset is interpolated, never
+    extrapolated (a drift estimate from passes 0.5 s apart is too noisy to extrapolate)."""
+    try:
+        _CLK["pre"] = clocksync()
+    except Exception as e:  # (diagnostic: never fail the bench)
+        _CLK.pop("pre", None)
+        print(f"dsadiag presync failed: {e!r}", flush=True)
+
+
 # ------------------------------------------------------------------ dump
 def _run_dir():
     out = os.environ.get(
@@ -325,6 +336,8 @@ def dump(case):
         time.sleep(0.5)
         c1 = clocksync()
         data["clk:0"], data["clk:1"] = c0, c1
+        if "pre" in _CLK:
+            data["clk:pre"] = _CLK.pop("pre")
         data["clk:rank"] = torch.tensor([_CLK["rank"], _CLK["W"], _CLK["global_rank"]], dtype=torch.int64)
     except Exception as e:  # (diagnostic: never fail the bench)
         print(f"dsadiag clocksync failed: {e!r}", flush=True)
