@@ -81,6 +81,10 @@ class RubinMoeProblem:
     quant_kind: QuantKind = "nvfp4"
     # NVFP4 activation staging scale and FC1->FC2 requantization scale; powers of two
     # so the per-expert alphas stay exact. Rank-uniform by construction (one value).
+    # The defaults are FlashInfer's contract (unit global scales). A served model must
+    # not keep fc1_norm_const at 1.0: the kernel requantizes the FC1 output AFTER the
+    # routing weight, so the E4M3 block scales of real wires flush to zero; the model
+    # passes :func:`nvfp4_fc1_norm_const` (KimiK3MegaMoEExperts).
     input_norm_const: float = 1.0
     fc1_norm_const: float = 1.0
 
@@ -874,7 +878,8 @@ def nvfp4_norm_const_from_amax(amax: float, *, headroom: float = 1.0) -> float:
     ``fc1_norm_const`` that of the FC1 output after SiTU and the routing weight (the
     FC1->FC2 wire). ``headroom >= 1`` leaves room for unseen larger activations (2.0
     halves ``n``). The runtime never derives constants itself: ``RubinMoeProblem``
-    takes explicit values and defaults to FlashInfer's 1.0.
+    takes explicit values and defaults to FlashInfer's 1.0. Served layers use
+    :func:`nvfp4_fc1_norm_const` (no calibration data needed).
     """
     amax = float(amax)
     headroom = float(headroom)
@@ -889,6 +894,69 @@ def nvfp4_norm_const_from_amax(amax: float, *, headroom: float = 1.0) -> float:
     while amax * headroom * 2.0 ** (exponent + 1) <= NVFP4_RANGE:
         exponent += 1
     return 2.0**exponent
+
+
+def _pow2_floor(x: float) -> float:
+    exponent = math.floor(math.log2(x))
+    while 2.0**exponent > x:
+        exponent -= 1
+    while 2.0 ** (exponent + 1) <= x:
+        exponent += 1
+    return 2.0**exponent
+
+
+def nvfp4_fc1_norm_const(
+    *,
+    top_k: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+    fc2_input_gscale: float = 1.0,
+    routed_scaling_factor: float = 1.0,
+) -> float:
+    """``fc1_norm_const`` of an NVFP4 MegaMoE layer: the FC1->FC2 wire global scale.
+
+    Stock NVFP4 MoE (vLLM ModelOpt -> FlashInfer TRT-LLM-Gen,
+    ``fused_moe/oracle/nvfp4.py:602`` ``a2_gscale = 1 / w2_input_scale``,
+    ``experts/trtllm_nvfp4_moe.py:144-145`` SiTU ``output1_scale_scalar =
+    a2_gscale``) requantizes the activation output ``u = SiTU(fc1)`` with the global
+    scale ``g = fc2_input_gscale`` and applies the routing weight ``w`` after FC2, in
+    finalize (``trtllm_nvfp4_moe.py:541-546``). This kernel requantizes ``w * u``
+    instead, so its E4M3 block scales ``amax(w * u) * n / 6`` equal stock's
+    ``amax(u) * g / 6`` iff ``n = g / w``. With ``n = g`` (FlashInfer's 1.0) the
+    wire sits ``1 / w`` (16x on average at top-16) below stock and its block scales
+    flush to zero (measured on K3.1 real-text prefill: 94-99.7 % of the 16-blocks).
+
+    Returned: the largest power of two (exact alpha folding) not above
+    ``max(g / max(rsf, 1), min(g * top_k / rsf, 6 * 448 / (beta * beta_lin * rsf)))``:
+
+    - ``g * top_k / rsf``: stock's block scales at the mean routing weight
+      ``rsf / top_k`` (renormalized top-k); heavier routes get larger scales than stock.
+    - ``6 * 448 / (beta * beta_lin * rsf)``: no block scale can saturate.
+      ``|SiTU(gate, up)| < beta * beta_lin`` (``beta tanh(gate / beta) sigmoid(gate)
+      < beta``, ``beta_lin tanh(up / beta_lin) < beta_lin``) and ``w <= rsf``, so
+      ``amax_block(w * u) * n / 6 <= 448``.
+    - ``g / max(rsf, 1)``: a calibrated ``g`` (stock's own non-saturating scale for
+      ``u``) is never lowered further, since ``w * u <= rsf * u``.
+
+    Kimi K3.1 (top-16, beta 4, beta_lin 25, rsf 1.0, checkpoint ``w2_input_scale``
+    1.0 or no activation scale at all): ``min(16, 26.88) = 16``, i.e. stock's scale.
+    """
+    values = (
+        ("situ_beta", situ_beta),
+        ("situ_linear_beta", situ_linear_beta),
+        ("fc2_input_gscale", fc2_input_gscale),
+        ("routed_scaling_factor", routed_scaling_factor),
+    )
+    for name, value in values:
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be positive and finite, got {value!r}.")
+    if type(top_k) is not int or top_k <= 0:
+        raise ValueError(f"top_k must be a positive int, got {top_k!r}.")
+    g = float(fc2_input_gscale)
+    rsf = float(routed_scaling_factor)
+    unsaturated = NVFP4_RANGE / (float(situ_beta) * float(situ_linear_beta) * rsf)
+    return _pow2_floor(max(g / max(rsf, 1.0), min(g * top_k / rsf, unsaturated)))
 
 
 # ---------------------------------------------------------------------------------

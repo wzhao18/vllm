@@ -377,7 +377,10 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         block_size: int,
         is_decode: bool,
         return_lse: bool | None = None,
+        empty_rows: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # (``empty_rows``: FlashInferMLASparseImpl's; FA4's decode below keeps its
+        # own empty-row output either way)
         if not is_decode:
             out, lse = super()._forward_mqa_kernel(
                 q,
@@ -388,6 +391,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                 block_size=block_size,
                 is_decode=is_decode,
                 return_lse=return_lse,
+                empty_rows=empty_rows,
             )
             return out, None if lse is None else lse * math.log(2.0)
         if isinstance(q, tuple):

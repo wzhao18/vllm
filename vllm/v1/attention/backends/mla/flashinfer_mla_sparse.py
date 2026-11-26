@@ -1849,7 +1849,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         block_size: int,
         is_decode: bool,
         return_lse: bool | None = None,
+        empty_rows: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``empty_rows`` False (trtllm-gen with LSE): rows without top-k entries
+        keep whatever the decode left in their output and LSE; the caller's DCP
+        combine drops them by their per-row counts itself (``_finish_dcp_partials``
+        is not launched)."""
         if return_lse is None:
             return_lse = self.need_to_return_lse_for_decode
         q = _joined_query(q)
@@ -1991,6 +1996,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 lse.masked_fill_(empty_queries[:, None], float("-inf"))
             else:
                 out.masked_fill_(empty_queries[:, None, None], 0.0)
-        elif lse is not None:
+        elif lse is not None and empty_rows:
             _finish_dcp_partials(out, lse, seq_lens)
         return out, lse

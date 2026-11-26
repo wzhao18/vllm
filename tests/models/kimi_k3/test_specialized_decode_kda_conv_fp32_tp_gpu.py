@@ -75,8 +75,20 @@ KIND_CASES = [
 ]  # fmt: skip
 
 
+def has_record_form(kind):
+    """Whether plain verify kind ``kind`` runs a record form under the deferred-verify
+    record protocol (KdaSplit -> KdaSplitDefer; the wide kinds in RECORD_FORMS)."""
+    index = prepared.WIDE_NAMES.index(kind)
+    return index == 0 or prepared.WIDE_KINDS[index - 1] in prepared.RECORD_FORMS
+
+
 def run_kind(monkeypatch, kind, q, requests, state_dtype, pad, dtype):
-    with conv_dtype(monkeypatch, dtype):
+    with conv_dtype(monkeypatch, dtype), monkeypatch.context() as patch:
+        if not has_record_form(kind):
+            # a record deployment (record_protocol: q8, 6 heads, FP32 state) never
+            # runs this kind and make_kernel refuses it; its conv twin is checked
+            # under the stock protocol (its own state format)
+            patch.setattr(prepared, "RECORDS", False)
         attention = tp_loop.kda_attention()
         slots = requests * q + 1
         conv, state = tp_loop.caches(slots, q)
