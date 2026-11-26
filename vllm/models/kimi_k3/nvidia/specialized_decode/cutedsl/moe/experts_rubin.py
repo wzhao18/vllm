@@ -63,6 +63,7 @@ from ..common.primitives import (
     view,
 )
 from ..common.tensormap import GridMap, encode_map, map_address, prefetch_map
+from ..common import routediag as rd  # DIAG (never merge)
 from .experts import ExpertsKernel, claim, mx_block, swizzled
 
 shuffle = cute.arch.shuffle_sync
@@ -1411,6 +1412,8 @@ class RubinExpertsKernel(ExpertsKernel):
         """The kernel; ``maps``: the (w13, w2) descriptor addresses."""
         x, ids, _, w13_scales, w2_scales, workspace, output, batch, *scalars = args
         tid, warp, lane, cta = thread()
+        dbase, dctr = rd.buffer("m8", self.grid)
+        daddr = rd.begin(dbase, dctr, cta, tid == 0)  # DIAG slot 0 entry, 6 smid
         sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem_bytes, 1024)
         tmem_base = self.initialize(sm, maps, batch)
         counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
@@ -1426,6 +1429,7 @@ class RubinExpertsKernel(ExpertsKernel):
         else:
             cute.arch.griddepcontrol_wait()
         trace = workspace.iterator + self.stamp + cta * 128
+        rd.stamp(daddr, 1)  # DIAG: initialized
         if cutlass.const_expr(self.stamp > 0):
             if tid == 0:
                 stamp_at(trace, 4)
@@ -1465,6 +1469,7 @@ class RubinExpertsKernel(ExpertsKernel):
         own = call_count
         if cutlass.const_expr(self.fast_exchange):
             own = view(sm.iterator, self.off_misc + 4880, Int32, 1)[0]
+        rd.stamp(daddr, 2)  # DIAG: routed (route warp parsed the ids)
         if cutlass.const_expr(self.stamp > 0):
             if tid == 0:
                 stamp_at(trace, 0)
@@ -1488,6 +1493,7 @@ class RubinExpertsKernel(ExpertsKernel):
             if lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
                 self.produce16(*weights, workspace)
+                rd.stamp(daddr, 4)  # DIAG: producer issued its last weight stage
                 counters[cta] = call_count + 1
                 if cta < self.slots - self.grid:
                     counters[self.grid + cta] = call_count + 1
@@ -1506,6 +1512,8 @@ class RubinExpertsKernel(ExpertsKernel):
                             stamp_at(trace, 6)
             if warp == 1:
                 self.consume(sm, tmem, trace, ranges)
+                m0, m1 = rd.buffer("m8m", self.grid)
+                rd.begin(m0, m1, cta, tid == 32)  # DIAG RT2: MMA warp done
                 fence_tmem(before=True)
                 named_barrier(TMEM_DONE, 320, arrive=True)
             elif warp == 2:
@@ -1518,6 +1526,8 @@ class RubinExpertsKernel(ExpertsKernel):
                     self.rearm_peers(workspace, own & 1 ^ 1, cta)
                 if cutlass.const_expr(self.polled):
                     cute.arch.griddepcontrol_wait()  # the shared rows
+                w0, w1 = rd.buffer("m8w", self.grid)
+                rd.begin(w0, w1, cta, tid == 96)  # DIAG: warp 3 past the PDL wait
                 if cutlass.const_expr(self.publish == "push" and self.late_push):
                     # After the CTA's first latent stage landed (a one-shot barrier):
                     # the stores stay out of the first weight loads' way.
@@ -1541,6 +1551,8 @@ class RubinExpertsKernel(ExpertsKernel):
                 self.epilogue(
                     sm, workspace, output, tmem, ranges, batch, own & 1, scalars
                 )
+                q0, q1 = rd.buffer("m8e", self.grid)
+                rd.begin(q0, q1, cta, tid == 128)  # DIAG RT2: epilogue warp 4 done
         if cutlass.const_expr(self.stamp > 0):
             if (lane == 0) & ((warp < 2) | (warp == 4)):
                 stamp_at(trace, 1 + warp - 2 * Int32(warp == 4))
