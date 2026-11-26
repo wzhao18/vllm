@@ -2092,11 +2092,13 @@ class KimiDecoderLayer(nn.Module):
             else:
                 hidden_states = self._run_dsa_dp(positions, hidden_states)
         else:
+            px_x = hidden_states  # PX probe only (arm D inputs)
             hidden_states = self._run_self_attn(
                 positions,
                 hidden_states,
                 (prefix_sum, not self.is_block_write_layer) if resid_attn else None,
             )
+            sp_ag.px_after_attn(self.self_attn, "kda" if self._layer_kind == "kda" else "dsa", px_x)  # PX probe only
         dsa_dp.rec(evs)
 
         # GEMM-RS returns the local sequence shard; standard O-proj preserves M.

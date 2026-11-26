@@ -182,7 +182,10 @@ _TMA_CUDA = r"""
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <stdint.h>
+#include <map>
+#include <utility>
 
 __device__ __forceinline__ uint64_t tp_now() { uint64_t t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
 __device__ __forceinline__ uint32_t tp_sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -369,6 +372,154 @@ void px_tma_push(std::vector<int64_t> srcs, std::vector<int64_t> nbs, std::vecto
 }
 
 
+// PX arm C (TLX, never merged): head->token all-to-all of the KDA o_proj input. Source (this rank, head group g) =
+// [W * R, 1536] E4M3 rows + F8_128x4 scales ([W * R / 128 row tiles] x 12 blocks x 512 B). Owner d gets rows
+// [d R, (d + 1) R) at column g * 1536 of its [R, 12288] buffer: a strided 2D destination, written with
+// cp.async.bulk.tensor 2D stores through one tensor map per destination (box 192 x u64 by BR rows); the scale slice of a
+// row tile is 12 whole 512 B blocks, contiguous at block g * 12 of the owner's 96 (one 1D bulk store per row tile).
+// Unit u = (j = u / W, destination (rank + 1 + u % W) % W): j < R / BR a data chunk, else scale tile j - R / BR.
+// Completion as sp_ag_tma_push_kernel (counted, on the slot's arrival counters).
+struct __align__(64) PxA2a { CUtensorMap m[8]; int64_t sf[8]; };
+template <int NS>
+__global__ void __launch_bounds__(32, 1) px_a2a_kernel(
+    const __grid_constant__ PxA2a a, const uint8_t* __restrict__ src, const uint8_t* __restrict__ src_sf, int R, int gh,
+    const int64_t* __restrict__ ctr, uint64_t done, int rank, int W, int br, int chunk, uint64_t limit) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ __align__(8) uint64_t bar[NS];
+  if (threadIdx.x != 0 || R == 0) return;
+  for (int i = 0; i < NS; ++i) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(tp_sa(&bar[i])));
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  const int G = gridDim.x, g = blockIdx.x;
+  const int nd = R / br, ns = R / 128;
+  const int64_t total = (int64_t)(nd + ns) * W;
+  const int64_t n = g < total ? (total - g + G - 1) / G : 0;
+  int kind[NS], dd[NS], jj[NS];
+  uint32_t nbs[NS];
+  uint32_t ph = 0;
+  auto issue = [&](int64_t k) {
+    const int64_t u = g + k * (int64_t)G;
+    const int j = (int)(u / W), d = (rank + 1 + (int)(u % W)) % W, s = (int)(k % NS);
+    const uint8_t* p;
+    uint32_t nb;
+    if (j < nd) { p = src + ((int64_t)d * R + (int64_t)j * br) * 1536; nb = (uint32_t)br * 1536u; kind[s] = 0; jj[s] = j; }
+    else { p = src_sf + ((int64_t)d * ns + (j - nd)) * 6144; nb = 6144u; kind[s] = 1; jj[s] = j - nd; }
+    dd[s] = d; nbs[s] = nb;
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1;\n}"
+                 :: "r"(tp_sa(&bar[s])), "r"(nb) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(tp_sa(smem + (size_t)s * chunk)), "l"(p), "r"(nb), "r"(tp_sa(&bar[s])) : "memory");
+  };
+  for (int64_t k = 0; k < NS - 1 && k < n; ++k) issue(k);
+  for (int64_t k = 0; k < n; ++k) {
+    const int s = (int)(k % NS);
+    const uint32_t ab = tp_sa(&bar[s]), p = (ph >> s) & 1u;
+    asm volatile("{\n.reg .pred q;\nW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 q, [%0], %1;\n@!q bra W_%=;\n}"
+                 :: "r"(ab), "r"(p) : "memory");
+    ph ^= 1u << s;
+    if (kind[s] == 0) {
+      asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
+                   :: "l"(reinterpret_cast<uint64_t>(&a.m[dd[s]])), "r"(gh * 192), "r"(jj[s] * br),
+                      "r"(tp_sa(smem + (size_t)s * chunk)) : "memory");
+    } else {
+      asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                   :: "l"((uint64_t)a.sf[dd[s]] + (uint64_t)jj[s] * 49152u + (uint64_t)gh * 6144u),
+                      "r"(tp_sa(smem + (size_t)s * chunk)), "r"(nbs[s]) : "memory");
+    }
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
+    if (k + NS - 1 < n) issue(k + NS - 1);
+  }
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+  __threadfence_system();
+  uint32_t prev;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(done) : "memory");
+  if (prev != (uint32_t)(G - 1)) return;
+  *(volatile uint32_t*)done = 0u;
+  __threadfence_system();
+  for (int i = 0; i < W; ++i) {
+    const uint64_t c = (uint64_t)ctr[(rank + 1 + i) % W];
+    asm volatile("red.release.sys.global.add.u32 [%0], 1;" :: "l"(c) : "memory");
+  }
+  const uint64_t own = (uint64_t)ctr[rank];
+  const uint32_t target = (uint32_t)W;
+  const uint64_t t0 = tp_now();
+  uint32_t v;
+  while ((int32_t)((v = tp_ld_acq(own)) - target) < 0) {
+    __nanosleep(32);
+    if (tp_now() - t0 > limit) {
+      printf("K31_SPIN_TIMEOUT kernel=px_a2a rank=%d target=%u seen=%u\n", rank, target, v);
+      __trap();
+    }
+  }
+  asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" :: "l"(own), "r"(0u - target) : "memory");
+}
+
+// PX arm D marker: an empty kernel that tags the stand-in GEMMs after it in the trace (px_an.py).
+__global__ void px_mark_kernel(int id) {}
+
+typedef CUresult (*PxEncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                               const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
+                               CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static PxEncodeFn px_encode_fn() {
+  static PxEncodeFn fn = nullptr;
+  if (fn == nullptr) {
+    void* p = nullptr;
+    cudaDriverEntryPointQueryResult q;
+#if CUDART_VERSION >= 12050
+    C10_CUDA_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &p, 12000, cudaEnableDefault, &q));
+#else
+    C10_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &p, cudaEnableDefault, &q));
+#endif
+    TORCH_CHECK(q == cudaDriverEntryPointSuccess && p != nullptr, "px: cuTensorMapEncodeTiled not found");
+    fn = (PxEncodeFn)p;
+  }
+  return fn;
+}
+
+void px_a2a(int64_t src, int64_t src_sf, int64_t R, int64_t gh, std::vector<int64_t> dst, std::vector<int64_t> dst_sf,
+            torch::Tensor ctr, int64_t done, int64_t rank, int64_t W, int64_t br, int64_t grid, int64_t limit) {
+  TORCH_CHECK((int64_t)dst.size() == W && (int64_t)dst_sf.size() == W && W <= 8 && ctr.numel() == W, "px_a2a: W");
+  TORCH_CHECK(R % 128 == 0 && R % br == 0 && br <= 256 && src % 16 == 0 && src_sf % 16 == 0, "px_a2a: shape");
+  static std::map<std::pair<int64_t, int64_t>, PxA2a> cache;
+  const auto key = std::make_pair(R * 64 + br, dst[0]);
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    PxA2a a;
+    memset(&a, 0, sizeof(a));
+    for (int d = 0; d < W; ++d) {
+      TORCH_CHECK(dst[d] % 16 == 0 && dst_sf[d] % 16 == 0, "px_a2a: 16-byte aligned destinations");
+      const cuuint64_t dims[2] = {(cuuint64_t)(12288 / 8), (cuuint64_t)R};
+      const cuuint64_t strides[1] = {(cuuint64_t)12288};
+      const cuuint32_t box[2] = {192u, (cuuint32_t)br};
+      const cuuint32_t es[2] = {1u, 1u};
+      CUresult r = px_encode_fn()(&a.m[d], CU_TENSOR_MAP_DATA_TYPE_UINT64, 2, (void*)dst[d], dims, strides, box, es,
+                                  CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                  CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      TORCH_CHECK(r == CUDA_SUCCESS, "px_a2a: cuTensorMapEncodeTiled failed ", (int)r);
+      a.sf[d] = dst_sf[d];
+    }
+    it = cache.emplace(key, a).first;
+  }
+  const int chunk = (int)std::max<int64_t>(br * 1536, 6144);
+  auto k = px_a2a_kernel<2>;
+  const int smem = 2 * chunk;
+  static int smem_set = 0;
+  if (smem_set < smem) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    smem_set = smem;
+  }
+  k<<<(unsigned)grid, 32, smem, tp_cur()>>>(it->second, (const uint8_t*)src, (const uint8_t*)src_sf, (int)R, (int)gh,
+                                            ctr.data_ptr<int64_t>(), (uint64_t)done, (int)rank, (int)W, (int)br, chunk,
+                                            (uint64_t)limit);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void px_mark(int64_t id) {
+  px_mark_kernel<<<1, 32, 0, tp_cur()>>>((int)id);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void sp_ag_tma_push(torch::Tensor src, torch::Tensor dst_slot, int64_t dst_off, torch::Tensor ctr, int64_t done, int64_t rank,
                     int64_t W, int64_t chunk, int64_t grid, int64_t limit) {
   TORCH_CHECK(src.is_cuda() && src.is_contiguous(), "sp_ag_tma_push: contiguous CUDA source");
@@ -397,6 +548,9 @@ void sp_ag_tma_push(torch::Tensor, torch::Tensor, int64_t, torch::Tensor, int64_
                     int64_t);
 void px_tma_push(std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, torch::Tensor, torch::Tensor, int64_t,
                  int64_t, int64_t, int64_t, int64_t, int64_t);
+void px_a2a(int64_t, int64_t, int64_t, int64_t, std::vector<int64_t>, std::vector<int64_t>, torch::Tensor, int64_t, int64_t,
+            int64_t, int64_t, int64_t, int64_t);
+void px_mark(int64_t);
 """
 
 _tma_lock = threading.Lock()
@@ -423,7 +577,7 @@ def _tma_module():
                 name=f"k3_sp_ag_tma_{tag}",
                 cpp_sources=_TMA_CPP,
                 cuda_sources=_TMA_CUDA,
-                functions=["sp_ag_tma_push", "px_tma_push"],
+                functions=["sp_ag_tma_push", "px_tma_push", "px_a2a", "px_mark"],
                 extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
                 build_directory=build,
                 verbose=False,
@@ -508,6 +662,36 @@ def _px_take() -> list[tuple[int, int]]:
     return s
 
 
+# PX arms C / D (rev 5 follow-up, 2026-11-26). Regions of a slot's dead tail (bytes from px_tail; PX shadow bytes of
+# arms A / B occupy [0, 409 MB) in DSA layers and [0, 91 MB) in KDA layers):
+#   a2a  : the head->token all-to-all destination [R, 12288] E4M3 + [R / 128, 96 x 512 B] scales (C, KDA layers);
+#   src  : the o_norm output quantized to MXFP8, [W R, 1536] E4M3 + scales (C's source; the GemmRsAr still runs on BF16);
+#   wsf  : constant UE8M0 weight scales of D's [7168, 12288] KDA o_proj stand-in (last 3 MiB of the tail);
+#   D outputs (discarded) go to the OTHER slot's tail from byte 0.
+#   a2a  : flag "a2a"  -> arm C, every KDA layer;   dgemm : flag "dgemm" -> arm D on 8 KDA + 4 DSA layers per forward.
+_PX_A2A_OFF = 96 << 20
+_PX_SRC_OFF = 152 << 20
+_PX_WSF_OFF_FROM_END = 3 << 20
+_PX_WSF_BYTES = 7168 * 12288 // 32
+_PX_BR = 16  # rows per 2D box (192 x u64 = 1536 B wide): 24 KiB per unit
+_PX_KDA_D_EVERY, _PX_KDA_D_AT = 9, 4  # KDA layers 4, 13, ..., 67 of 69
+_PX_DSA_D_EVERY, _PX_DSA_D_AT = 6, 2  # DSA layers 2, 8, 14, 20 of 24
+
+
+def px_kda_out(core_attn_out: torch.Tensor) -> None:
+    """Arm C: the KDA o_norm output ([W R, 1536] BF16) as TLX's head->token all-to-all, into the slot tail."""
+    g = _sp_all_gather
+    if g is not None and "a2a" in _PX:
+        g.px_kda_a2a(core_attn_out)
+
+
+def px_after_attn(module: torch.nn.Module, kind: str, x: Any) -> None:
+    """Arm D: token-local stand-in GEMMs on R rows after the attention output (GemmRsAr) of sampled layers."""
+    g = _sp_all_gather
+    if g is not None and "dgemm" in _PX:
+        g.px_dgemm(module, kind, x)
+
+
 class SymmSpAllGather:
     """Two-slot symmetric output buffer of the TP group, sized for
     ``max_rows`` rows per rank (the token shard of the largest step)."""
@@ -534,6 +718,12 @@ class SymmSpAllGather:
             for peer in range(self.world)
         ]
         esize = torch.empty((), dtype=dtype).element_size()
+        self.px_bases = bases  # PX probe: host copies of the peers' buffer addresses
+        self.px_slot_bytes = self.slot_numel * esize
+        self.px_slot = 0
+        self.px_R = None
+        self.px_n = {"kda": 0, "dsa": 0}
+        self.px_rg: dict = {}
         # [slot, peer] absolute address of the slot in the peer's buffer.
         self.peer_ptrs = torch.tensor(
             [
@@ -575,6 +765,7 @@ class SymmSpAllGather:
                     [], [], [], self.peer_ptrs[0], self.ctr_ptrs[0], self.done_ptrs[0],
                     self.rank, self.world, _TMA_CHUNK, 1, _TMA_SPIN_NS,
                 )  # fmt: skip
+                _tma_module().px_mark(0)  # loads the module (px_a2a lives in it too)
         # PX: dead tail of each slot (bytes), after the MXFP8 scale region; shadow bytes land at tail + rank * B.
         esz = torch.empty((), dtype=dtype).element_size()
         self.px_tail = self.world * max_rows * hidden_size * (1 + 1 / MXFP8_BLOCK)
@@ -592,6 +783,8 @@ class SymmSpAllGather:
     def begin_forward(self, num_gathers: int) -> None:
         self.num_gathers = num_gathers
         self.count = 0
+        self.px_n = {"kda": 0, "dsa": 0}
+        self.px_R = None
 
     def _check_shard(self, rows: int, hidden: int, dtype: torch.dtype) -> int:
         """Validate a gather of ``rows`` x ``hidden`` ``dtype`` rows per rank
@@ -619,6 +812,7 @@ class SymmSpAllGather:
             # The previous forward's last push used slot 0 as well.
             self.handle.barrier()
         self.count += 1
+        self.px_slot = slot
         return slot
 
     def _px_push(self, slot: int, segs: list[tuple[int, int, int]]) -> None:
@@ -633,6 +827,100 @@ class SymmSpAllGather:
             self.peer_ptrs[slot], self.ctr_ptrs[slot], self.done_ptrs[slot], self.rank, self.world,
             _TMA_CHUNK, min(self.num_sms, units), _TMA_SPIN_NS,
         )  # fmt: skip
+
+    def _px_raw(self, slot: int, off: int, nbytes: int) -> torch.Tensor:
+        """uint8 view of this rank's slot tail bytes [off, off + nbytes) (asserted inside the tail)."""
+        assert 0 <= off and off + nbytes <= self.px_tail_bytes, f"PX region {off}+{nbytes} > tail {self.px_tail_bytes}"
+        o = slot * self.px_slot_bytes + self.px_tail + off
+        return self.storage.view(torch.uint8)[o : o + nbytes]
+
+    def px_kda_a2a(self, x: torch.Tensor) -> None:
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+        M, W = x.shape[0], self.world
+        self.px_R = None
+        if x.dim() != 2 or x.shape[1] != 1536 or M % (W * 128) or 2 * (M // W) > self.max_rows or not x.is_contiguous():
+            return  # init profile run (gathers reach the tail) or an unsupported shape: no a2a
+        R, slot = M // W, self.px_slot
+        sf_src = M * 1536
+        src = self._px_raw(slot, _PX_SRC_OFF, sf_src + M * 48)
+        buf = object.__new__(mxfp8_act.Mxfp8Buffer)
+        buf.rows, buf.k, buf.padded_cols, buf.orig_dtype = M, 1536, 1536 // MXFP8_BLOCK, x.dtype
+        buf.data = src[:sf_src].view(torch.float8_e4m3fn).view(M, 1536)
+        buf.scale = src[sf_src:]
+        mxfp8_act.quantize(x, out=buf)
+        self._px_raw(slot, _PX_A2A_OFF, R * 12288 + R * 384)  # bounds check of the destination
+        dst = [b + slot * self.px_slot_bytes + self.px_tail + _PX_A2A_OFF for b in self.px_bases]
+        units = (R // _PX_BR + R // 128) * W
+        _tma_module().px_a2a(
+            src.data_ptr(), src.data_ptr() + sf_src, R, self.rank, dst, [d + R * 12288 for d in dst],
+            self.ctr_ptrs[slot], self.done_ptrs[slot], self.rank, W, _PX_BR, min(self.num_sms, units), _TMA_SPIN_NS,
+        )  # fmt: skip
+        self.px_R, self.px_a2a_slot = R, slot
+
+    def px_dgemm(self, module: torch.nn.Module, kind: str, x: Any) -> None:
+        from types import SimpleNamespace
+
+        n = self.px_n[kind]
+        self.px_n[kind] = n + 1
+        bf = torch.bfloat16
+        mark = _tma_module().px_mark
+        if kind == "kda":
+            if n % _PX_KDA_D_EVERY != _PX_KDA_D_AT or self.px_R is None:
+                return
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_resid
+
+            R, slot = self.px_R, self.px_a2a_slot
+            a = self._px_raw(slot, _PX_A2A_OFF, R * 12288 + R * 384)
+            qa = SimpleNamespace(data=a[: R * 12288].view(torch.float8_e4m3fn).view(R, 12288), scale=a[R * 12288 :])
+            wsf = self._px_raw(slot, self.px_tail_bytes - _PX_WSF_OFF_FROM_END, _PX_WSF_BYTES)
+            wsf.fill_(119)  # 2^-8: real o_proj weight scales sit near it; profile-run gathers overwrite the tail
+            rg = self.px_rg.get(slot)
+            if rg is None:
+                w = self._px_raw(slot, 0, 7168 * 12288).view(torch.float8_e4m3fn).view(7168, 12288)
+                rg = self.px_rg[slot] = attn_res_resid.ResidGemm.from_rows(w, wsf)
+            out = self._px_raw(slot ^ 1, 0, R * 7168 * 2).view(bf).view(R, 7168)
+            mark(1)
+            rg.store_into(qa, out)
+            mark(0)
+            return
+        if n % _PX_DSA_D_EVERY != _PX_DSA_D_AT or not isinstance(x, torch.Tensor) or x.dtype != bf:
+            return
+        M, W = x.shape[0], self.world
+        if M % W or 2 * (M // W) > self.max_rows or x.shape[1] != 7168 or not x.is_contiguous():
+            return
+        R, slot = M // W, self.px_slot
+        o = 0
+        ws = []
+        for nn_, k_ in ((18432, 1536), (12288, 7168), (7168, 12288)):
+            ws.append(self._px_raw(slot, o, nn_ * k_ * 2).view(bf).view(nn_, k_))
+            o += nn_ * k_ * 2
+        outb = self._px_raw(slot ^ 1, 0, R * 18432 * 2)
+
+        def out(cols: int) -> torch.Tensor:
+            return outb[: R * cols * 2].view(bf).view(R, cols)
+
+        lins = [getattr(module, "fused_qkv_a_proj", None), getattr(getattr(module, "dsa_indexer", None), "wkv_index", None)]
+        lins = [m for m in lins if m is not None]
+        if "dsa_d" not in _px_logged:
+            _px_logged.add("dsa_d")
+            logger.warning("K31_PX D: DSA R-row input linears %s; q_b|g|o stand-ins BF16 %s on R=%d",
+                           [(type(m.quant_method).__name__, tuple(m.weight.shape), str(m.weight.dtype)) for m in lins],
+                           [tuple(w.shape) for w in ws], R)
+        xr = x[:R]
+        mark(2)
+        for m in lins:
+            if m.weight.dtype == bf and m.weight.dim() == 2 and m.weight.shape[1] == 7168:
+                torch.mm(xr, m.weight.t(), out=out(m.weight.shape[0]))
+            else:
+                m(xr)
+        mark(3)
+        torch.mm(x[:R, :1536], ws[0].t(), out=out(18432))
+        mark(4)
+        torch.mm(xr, ws[1].t(), out=out(12288))
+        mark(5)
+        torch.mm(x.view(-1)[: R * 12288].view(R, 12288), ws[2].t(), out=out(7168))
+        mark(0)
 
     def gather_mxfp8(
         self, data: torch.Tensor, scale: torch.Tensor

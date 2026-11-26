@@ -1163,6 +1163,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             # Hand back the workspace view (bitwise; no copy): the decoder layer
             # consumes it before the next GEMM-AR, and copies it only where it
             # keeps it (AttnRes block-write layers).
+            from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as _px_spag  # PX probe only
+
+            _px_spag.px_kda_out(core_attn_out)  # PX probe only (arm C)
             return self.gemm_rs_ar.apply(core_attn_out, self.o_proj, copy_out=False)
         return self.o_proj(core_attn_out)[0]
 
