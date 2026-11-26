@@ -75,6 +75,7 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     tmem_alloc_exclusive,
     tmem_free_exclusive,
     tmem_ld,
+    tmem_st,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
     bulk_g2s,
@@ -99,10 +100,15 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
 )
 
 # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 445 < 448 (E4M3 max), m the lazy max (raised
-# only when a subtile's max exceeds it by more than THR). P_PRE 6 keeps the E4M3 P of the
-# far tail out of subnormals (4: L0 error vs FP32 up to 1.7x trtllm-gen's on real text even
-# with l from the quantized P); THR 2.8 is the headroom left (more rescales than 4.5)
-P_PRE, THR = 6, 2.8
+# only when a subtile's max exceeds it by more than THR). P_PRE sets how far the E4M3 P of
+# the tail stays out of subnormals: on one-key-dominated (sink) rows the ~1-10% tail mass
+# is spread over ~2K keys, and its rounding is the error. Per-row gate (24 real-text dumps,
+# rel error / trtllm-gen's): L0 sink rows 2.96x at P_PRE 6, 1.75x at 7 (exact max), 1.20x
+# at 8 (exact max or THR 0.8 alike); THR 0.8 is the headroom left
+P_PRE, THR = 8, 0.8
+# lazy-max rescale: above this many grown heads in a subtile, rescale whole O^T blocks in
+# 16-column TMEM loads instead of one 4-column load/store pair per grown head
+WIDE_RESCALE = 24
 NS = 6  # 64-key KV stages
 # cpa 2: a gather warp signals stage g full once its stage g - CPA_LAG + 1 copies are done
 # (one arrive per warp; per-thread cp.async.mbarrier arrives serialize at ~0.9 us per stage)
@@ -312,6 +318,11 @@ def commit_e(bar):
 def ballot(pred):
     code = "{ .reg .pred p; setp.ne.u32 p, $1, 0; vote.sync.ballot.b32 $0, p, 0xffffffff; }"
     return code, "=r,r", (Uint32(pred),)
+
+
+@asm(Uint32)
+def popc(v):
+    return "popc.b32 $0, $1;", "=r,r", (Uint32(v),)
 
 
 @asm(Uint32)
@@ -1799,7 +1810,7 @@ class SparseMlaPrefillH8:
         gw = ballot(Uint32(grow))
         if lane == 0 and sp < 3:
             st_shared_u32(gm + Uint32(4 * sp), gw)
-        if grow != 0:
+        if real_m:  # every head's alpha (1 if it did not grow): the wide rescale reads all
             st_shared_f32(alb + Uint32(h * 4), alpha)
         anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
         self.ss(base, cta, lane, u, 8 * wg + 3, 1)
@@ -1846,8 +1857,27 @@ class SparseMlaPrefillH8:
         if anyg != Uint32(0):
             mbar_wait(_bar(base, B_PEMPTY + (u - 1) % NP), Uint32(((u - 1) // NP) & 1))
             tc_fence_after()
+            g0 = ld_shared_u32(gm)
+            g1 = ld_shared_u32(gm + Uint32(4))
+            g2 = ld_shared_u32(gm + Uint32(8))
+            if popc(g0) + popc(g1) + popc(g2) > Uint32(WIDE_RESCALE):
+                # many heads grew (early subtiles): all 96 columns of each O^T block in
+                # 16-column loads, x alpha (1 for heads that did not grow)
+                for c in cutlass.range_constexpr(H // 16):
+                    al = [ld_shared_f32(alb + Uint32((16 * c + j) * 4)) for j in range(16)]
+                    for b in cutlass.range_constexpr(4):
+                        col = lane_addr + Uint32(C_O + 96 * b + 16 * c)
+                        v = tmem_ld(col, 16)
+                        tmem_st(col, [v[j] * al[j] for j in range(16)])
+                g0 = Uint32(0)
+                g1 = Uint32(0)
+                g2 = Uint32(0)
             for w in cutlass.range_constexpr(3):
-                m = ld_shared_u32(gm + Uint32(4 * w))
+                m = g0
+                if cutlass.const_expr(w == 1):
+                    m = g1
+                if cutlass.const_expr(w == 2):
+                    m = g2
                 while m != Uint32(0):
                     j = bfind(m)
                     m = m ^ (Uint32(1) << j)
