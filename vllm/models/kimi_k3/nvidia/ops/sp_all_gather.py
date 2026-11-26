@@ -523,6 +523,7 @@ void px_mark(int64_t id) {
     case 3: px_mark_kernel<3><<<1, 32, 0, tp_cur()>>>(); break;
     case 4: px_mark_kernel<4><<<1, 32, 0, tp_cur()>>>(); break;
     case 5: px_mark_kernel<5><<<1, 32, 0, tp_cur()>>>(); break;
+    case 6: px_mark_kernel<6><<<1, 32, 0, tp_cur()>>>(); break;
     default: px_mark_kernel<0><<<1, 32, 0, tp_cur()>>>(); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -906,6 +907,14 @@ class SymmSpAllGather:
             out = self._px_raw(slot ^ 1, 0, R * 7168 * 2).view(bf).view(R, 7168)
             mark(1)
             rg.store_into(qa, out)
+            mark(2)  # cuBLASLt MXFP8 (FP32 accumulate; bitwise the PlainGemm on a 1-GPU check)
+            w = rg.weight
+            try:
+                torch._scaled_mm(qa.data, w.t(), qa.scale.view(torch.float8_e8m0fnu), wsf.view(torch.float8_e8m0fnu),
+                                 out_dtype=bf, out=out)
+            except TypeError:
+                torch._scaled_mm(qa.data, w.t(), qa.scale.view(torch.float8_e8m0fnu), wsf.view(torch.float8_e8m0fnu),
+                                 out_dtype=bf)
             mark(0)
             return
         if n % _PX_DSA_D_EVERY != _PX_DSA_D_AT or not isinstance(x, torch.Tensor) or x.dtype != bf:
@@ -932,17 +941,17 @@ class SymmSpAllGather:
                            [(type(m.quant_method).__name__, tuple(m.weight.shape), str(m.weight.dtype)) for m in lins],
                            [tuple(w.shape) for w in ws], R)
         xr = x[:R]
-        mark(2)
+        mark(3)
         for m in lins:
             if m.weight.dtype == bf and m.weight.dim() == 2 and m.weight.shape[1] == 7168:
                 torch.mm(xr, m.weight.t(), out=out(m.weight.shape[0]))
             else:
                 m(xr)
-        mark(3)
-        torch.mm(x[:R, :1536], ws[0].t(), out=out(18432))
         mark(4)
-        torch.mm(xr, ws[1].t(), out=out(12288))
+        torch.mm(x[:R, :1536], ws[0].t(), out=out(18432))
         mark(5)
+        torch.mm(xr, ws[1].t(), out=out(12288))
+        mark(6)
         torch.mm(x.view(-1)[: R * 12288].view(R, 12288), ws[2].t(), out=out(7168))
         mark(0)
 
