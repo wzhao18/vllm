@@ -167,7 +167,7 @@ HOME_RUN = 4
 HOME_SHIFT = 21 + HOME_RUN
 # The TP16 routed w2 row: the parameter's row (``W2_ROW`` bytes: the E2M1 data bytes,
 # then the stock kernel's padding) and its data bytes (``W2_DATA``). Where every
-# experts kernel of the deployment reads them (``experts_runtime.dense_w2_layout``),
+# experts kernel of the deployment reads them (``experts_runtime.dense_w2_rows``),
 # the experts read dense rows of the data bytes (``experts_runtime.dense_w2``): the
 # kernels take the row pitch (``w2_pitch``) for the w2 descriptors and the FC2 home
 # dies; the padded pitch otherwise.
