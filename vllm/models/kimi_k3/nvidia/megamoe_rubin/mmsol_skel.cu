@@ -21,7 +21,7 @@ using namespace mm;
 
 namespace sk {
 constexpr int NT = 512;                       // 16 warps
-constexpr int AS = 8, BS = 5;                 // ring slots
+constexpr int AS = MMSOL_ABL == 11 ? 4 : 8, BS = MMSOL_ABL == 10 ? 3 : 5;  // ring slots (ABL 10/11: depth law)
 constexpr int A_DATA = 16384, A_SF = 2048, A_SLOT = A_DATA + A_SF;          // 18 KiB
 constexpr int B_DATA = 152 * 128, B_SF = 12 * 512, B_SLOT = B_DATA + B_SF;  // 25 KiB
 constexpr int STG = 16384;                    // epilogue staging buffer (x2)
