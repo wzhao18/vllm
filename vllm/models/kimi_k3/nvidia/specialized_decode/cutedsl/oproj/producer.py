@@ -442,7 +442,7 @@ class OprojUmma(OprojProducer):
         budget = 12 * (8192 + 64 * 128) if resident else budget
         super().__init__(k, staged_blocks=0, twoshot=twoshot)
         self.blocks, self.budget = k // 64, budget
-        # reduce (two-shot): after its pushes each CTA also owns-reduces 32 chunks of
+        # reduce (two-shot): each CTA's MMA warp also owns-reduces 32 chunks of
         # this rank's columns (``common.twoshot.reduce``: the TP slots in rank order,
         # multicast to the gather, slots re-armed), args (gather, gather multicast)
         # after the push tail. Its CTAs are resident from the start, so the reduction
@@ -595,10 +595,14 @@ class OprojUmma(OprojProducer):
             # The MMAs (async proxy) read the ring the epilogue now overwrites.
             cute.arch.fence_proxy("async.shared", space="cta")
             self.epilogue(args, ring, tmem, cta, n)
-            if cutlass.const_expr(self.reduce):
-                self.reduce_owned(args, cta, tid)
         else:
             self.multiply(ring, bars, tmem, n, stage)
+            if cutlass.const_expr(self.reduce):
+                # The MMA warp owner-reduces once its last MMA is issued: the poll runs
+                # in a warp that pushed nothing this round. In a pushing warp the round
+                # landed 0.13-0.21 us later (TPC S8MB-2: writer-also-polls cost of a
+                # 16-way Lamport round, any completion form). Same reduction, bitwise.
+                self.reduce_owned(args, cta, tid - 128)
         release_tmem(tmem, columns, warp, 4)
         if cutlass.const_expr(self.xmc > 1):  # no CTA leaves while peers' tiles land
             cute.arch.cluster_arrive()
@@ -618,7 +622,8 @@ class OprojUmma(OprojProducer):
 
     @cute.jit
     def reduce_owned(self, args, cta, tid):
-        """Warp 0: chunk 32 cta + lane of this rank's owned [tokens, W] columns."""
+        """``tid`` 0-31 (the caller's warp; OprojUmma: the MMA warp): chunk 32 cta + lane
+        of this rank's owned [tokens, W] columns."""
         x, _, recv, _, rank, gather, gather_mc = args[:7]
         per: Constexpr = recv.shape[2] // 8  # 8-column chunks per token
         # above 64 tokens the 112 x 32 lanes take more than one item each
