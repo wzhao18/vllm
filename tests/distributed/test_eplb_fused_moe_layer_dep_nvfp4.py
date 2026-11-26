@@ -67,18 +67,13 @@ def make_fused_moe_layer(
         quant_config=quant_config,
     )
 
-    nvfp4_fused_moe = ModelOptNvFp4FusedMoE(quant_config, fml)
-    nvfp4_fused_moe.create_weights(
-        fml,
-        test_config.num_local_experts,
-        test_config.hidden_size,
-        test_config.intermediate_size,
-        params_dtype=torch.uint8,
-        global_num_experts=test_config.num_experts,
-    )
-
+    # The factory builds the RoutedExperts with its own ModelOptNvFp4FusedMoE
+    # (constructed from re.moe_config) and creates the NVFP4 weights on it, as
+    # in a served model. Use that method: the forward runs it.
     fml = fml.to(device)
     re = fml.routed_experts
+    nvfp4_fused_moe = re.quant_method
+    assert isinstance(nvfp4_fused_moe, ModelOptNvFp4FusedMoE)
     w1_q, w2_q, quant_config = make_test_quant_config(
         test_config.num_local_experts,
         test_config.intermediate_size,
