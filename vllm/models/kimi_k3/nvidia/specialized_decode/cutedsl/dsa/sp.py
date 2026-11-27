@@ -89,11 +89,14 @@ SP_PARTIALS = PROJECTED
 #   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
-SP_LOCAL_QUERY = "65-:local"
-# DSA campaign knob (default unchanged): K31_SP_LOCAL_QUERY replaces the table, e.g.
-# "17-:local". In-step D3-32 slice (EP32 k3 B16 = 64 rows, fork): MlaQuery (24 us) ran
-# serialized after the top-k on the main stream instead of beside the index chain,
-# then QueryWait (DSA layer span 136 us vs 102 us at 128 local rows).
+# In-step D3-32 slice (EP32 k3 B16 = 64 rows, fork): MlaQuery (24 us) ran serialized
+# after the top-k on the main stream instead of beside the index chain, then QueryWait
+# (DSA layer span 136 us vs 102 us at 128 local rows); local from 17 rows: k3 B8 / B12
+# / B16 (32 / 48 / 64 rows) -2.7 / -3.5 / -3.8 % per 24L step. Numerics: the stock q_b /
+# W_UK / FP8 quantization in another K order (real weights: 1.2-2.1e-4 of FP8 bytes one
+# ulp off, same max error vs FP32). K31_SP_LOCAL_QUERY replaces the table for A/B (the
+# previous default was "65-:local").
+SP_LOCAL_QUERY = "17-:local"
 if os.environ.get("K31_SP_LOCAL_QUERY"):
     SP_LOCAL_QUERY = os.environ["K31_SP_LOCAL_QUERY"]
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
