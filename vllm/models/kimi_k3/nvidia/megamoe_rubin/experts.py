@@ -181,6 +181,14 @@ RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     token_in_flag_batch=1,
     token_back_mode="epi_warps",
     reduce_topk_in_kernel=False,
+    # Bitwise claim-policy options (config.DECODE_IMPL_KEYS): claim_exhausted_skip = one
+    # cluster-uniform exhausted-mask probe ends the claim stream instead of a contended past-the-end claim per
+    # remaining source; shared_fc2_no_park = early shared FC2 only once shared FC1 is done, routed work otherwise
+    # (no cluster parks on the shared fc1_done spin past the routing gate). EP4 bench (896 experts / 28 active,
+    # die-local, fused real MXFP8 shared, graph p50, ABAB x2, outputs bitwise): off 55.89 / 56.09 / 56.80 / 57.13 us
+    # at B8 / 16 / 32 / 48; exs -0.35 / -0.17 / -0.04 / -0.08; no-park -0.06 / -0.25 / -0.32 / -0.09; both
+    # -0.74 / -0.67 / -0.52 / -0.29. decode_impl=() restores the previous claim order.
+    decode_impl=(("claim_exhausted_skip", True), ("shared_fc2_no_park", True)),
 )
 
 # The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): the decode

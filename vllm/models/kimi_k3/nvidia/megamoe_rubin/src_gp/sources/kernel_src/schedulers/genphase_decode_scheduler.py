@@ -153,6 +153,13 @@ from .fc12_scheduler import (
     shared_expert_problem_requirements,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
+from ....common.spin_guard import red_or_relaxed_sys_b32
+
+# vLLM-local ``claim_exhausted_skip``: one tail-reset word whose bit c is set (red.or) by any cluster that
+# drew a past-the-end id from routed counter c. A cluster that ends a source probes the word once (one leader load,
+# cluster broadcast) and returns Done at once when every remaining source's counter is already exhausted, instead of
+# one contended past-the-end claim per remaining source (the serial end-of-work claims of the tail).
+_EXHAUSTED_REGION = "rubin.genphase_decode.routed_exhausted_mask"
 
 # The policy: (side, phase) per source; side 0 = this CTA's die (die-blind: the one stream), 1 = the other die;
 # phase 0 = FC1, 1 = FC2. Safety-critical: n_split never claims the other die's FC1 (K6 and the argument above).
@@ -287,6 +294,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
             "die_aware": OptionalRequirement(str),
             "decode_lead": OptionalRequirement(Optional[int]),
+            "claim_exhausted_skip": OptionalRequirement(bool),
             **shared_expert_impl_requirements(),
         }
 
@@ -300,6 +308,10 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             setattr(self, name, impl_desc[name])
         self.die_aware = impl_desc.get("die_aware") or "off"
         self.decode_lead = impl_desc.get("decode_lead")
+        # Lead builds share one counter across phases (an FC1 past-the-end id is not the counter's end): off there.
+        self.exhausted_skip = bool(impl_desc.get("claim_exhausted_skip", False)) and self.decode_lead is None
+        self._exhausted_pointer = None
+        self._own_die = None
         self._validate(impl_desc.get("fallback_cluster_shape_mn"))
 
         self.n_split = self.die_aware == "on"
@@ -401,6 +413,10 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     def register_device_workspace(self, device_workspace: DeviceWorkspace) -> None:
         """Register the 2 * die_count claim counters (tail_reset)."""
         self._work_id_worker.register_device_workspace(device_workspace)
+        if self.exhausted_skip:
+            device_workspace.register(
+                _EXHAUSTED_REGION, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
+            )
 
     def get_grid_shape(self, *, max_active_clusters: Optional[int] = None, problem_desc=None) -> Tuple[int, int, int]:
         """The persistent grid: launch_cluster_count clusters (the kernel's tail counts promised_launchable_sm_count
@@ -465,6 +481,9 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             sizes_load_sorted=True,  # the GenPhase communication grid ranks slots by descending load
         )
         self._source = Int32(0)
+        if cutlass.const_expr(self.exhausted_skip):
+            self._exhausted_pointer = device_workspace.ptr(_EXHAUSTED_REGION)
+            self._own_die = Int32(owner_index)
         self._assign_shared_expert_stream(block_idx, device_workspace)
         if cutlass.const_expr(self.decode_lead is not None):
             # placeholder: K per owner comes from the scheduler warp's compute_stream_token_blocks (mandatory)
@@ -571,6 +590,28 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
                 if has_work:
                     resolved = Boolean(True)
                 elif ends_source:
+                    if cutlass.const_expr(self.exhausted_skip):
+                        # This counter is drawn past its end: publish it, then skip every remaining source whose
+                        # counter another cluster has already exhausted (one cluster-uniform probe).
+                        counter = Int32(mapping.owner_index) * Int32(2) + is_fc2
+                        if cute.arch.lane_idx() == Int32(0):
+                            red_or_relaxed_sys_b32(self._exhausted_pointer.toint(), Int32(1) << counter)
+                        remaining = Int32(0)
+                        for index in cutlass.range_constexpr(len(self.sources)):
+                            side, phase = self.sources[index]
+                            die = self._own_die
+                            if cutlass.const_expr(side == 1):
+                                die = Int32(1) - self._own_die
+                            bit = Int32(1) << (die * Int32(2) + Int32(phase))
+                            if source >= Int32(index):
+                                bit = Int32(0)
+                            remaining = remaining | bit
+                        if remaining != Int32(0):
+                            all_exhausted = worker.cluster_uniform_counter_ready(
+                                self._exhausted_pointer, remaining, ready_is_mask=True
+                            )
+                            if all_exhausted:
+                                source = Int32(len(self.sources)) - Int32(1)
                     source = source + Int32(1)
                     if cutlass.const_expr(self._first_other_side_source is not None):
                         if source == Int32(self._first_other_side_source):

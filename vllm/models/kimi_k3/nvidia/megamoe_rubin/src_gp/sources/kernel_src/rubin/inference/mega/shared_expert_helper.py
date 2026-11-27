@@ -42,6 +42,8 @@ def shared_kernel_impl_requirements() -> dict:
         # Shared FC1 L2 swizzle: walk the tiles G feature blocks at a time so fewer weight bytes are live (0: off,
         # unset: the kernel's default).
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        # vLLM-local: early shared FC2 only once shared FC1 is done, routed work otherwise (bitwise).
+        "shared_fc2_no_park": OptionalRequirement(bool),
     }
 
 
@@ -281,6 +283,7 @@ class SharedExpertKernelMixin:
             + f"_l2{self.shared_l2_position}"
             + (f"_fc1sw{self.scheduler._shared_fc1_swizzle}" if self.scheduler._shared_fc1_swizzle else "")
             + ("_reduced" if self.reduce_shared_output else "")
+            + ("_fc2nopark" if getattr(self.scheduler, "shared_fc2_no_park", False) else "")
         )
 
     def _shared_fake_arguments(self, fake_tensor, tokens: int) -> dict:

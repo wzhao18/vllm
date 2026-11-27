@@ -378,6 +378,17 @@ p50 (682 vs 731 us).
   shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
   expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
   wait is skipped when the shared stream owns the gate.
+- **S-CL** (vLLM-local): two bitwise decode claim-policy impl fields, set by the knob record's
+  ``RubinKnobs.decode_impl`` (``config.DECODE_IMPL_KEYS``; both on in ``RUBIN_GENPHASE_DECODE_KNOBS``).
+  ``claim_exhausted_skip`` (``genphase_decode_scheduler.py``, off with a lead): a cluster that draws a
+  routed counter past its end sets that counter's bit in a tail-reset mask word (``red.or``) and, with one
+  cluster-uniform probe, skips every remaining source already exhausted instead of one contended
+  past-the-end claim per source. ``shared_fc2_no_park`` (``fc12_scheduler.SharedExpertStreamMixin``,
+  early shared FC2, atomic shared ids, one shared token block; the kernel forwards
+  ``shared_fc1_done_region``): a cluster past the shared FC1 stream probes the shared fc1_done counter
+  before each claim and takes FC2 only when it is complete, routed work otherwise, remaining FC2 after
+  the routed sources as in "tail". Claim order only; the FC2 TMA-B spin stays the synchronisation (same
+  tiles, same math). Kernel name tags ``_exs`` / ``_fc2nopark``.
 - **E2a** (vLLM-local, as for ``src``): ``TopkReduce._reduce_bf16_ll_rmsnorm``: the polled BF16 reduce
   of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
   ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
