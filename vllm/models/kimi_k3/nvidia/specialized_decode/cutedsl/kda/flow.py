@@ -147,6 +147,15 @@ PACKED = True
 # Tuning: a warp sync after every FOLD_FENCE scan chunks (bounds how far ptxas
 # hoists the independent chunks' loads into spills).
 FOLD_FENCE = 1
+# Code size (G1-F1): in step KdaFlow runs after foreign code (in-proj GEMM, MegaMoE), and
+# its hot loop is refetched each item pass (instruction-supply bound: 2 warps/scheduler,
+# no_instruction ~48 % of stalls), so its bytes cost time per pass. ROLL bits: 1 the
+# scan's 4 key chunks as a runtime loop, 2 scan_halves' two row halves as a runtime loop
+# (smaller, but slower warm: off), 4 prep's coupling-norm select chain decoded per
+# thread. Same operations in the same order: outputs, records and state bit-identical
+# (q4, q8). Default 5: q8 hot loop 71.3 -> 47.1 KB; DB32 24L slice k7 B25 -3.3 %, k3 B59
+# -2.1 % (G1F1, Hecate 2026-11-27).
+ROLL = 5
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms, q previous
 # output squares (q^2 + 4q: 12, 21, 32 at q2..q4; one 32-value reduction). Above q4
 # (45 / 60 / 77 / 96 at q5..q8) ``block_sums_rounds`` reduces them 32 at a time.
@@ -386,6 +395,8 @@ class KdaFlow(KdaWS):
         self.mx = mx
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
+        self.roll = ROLL
+        assert not self.roll & 1 or self.fold_fence == 1, "ROLL syncs after every chunk"
         self.skip = tuple(SKIP)
 
     @cute.jit
@@ -1047,49 +1058,65 @@ class KdaFlow(KdaWS):
         for rr in cutlass.range_constexpr(ROWS):
             for m in cutlass.range_constexpr(NV):
                 acc[rr, m] = Float32(0)
-        for ch in cutlass.range_constexpr(CHUNKS):
-            key = 4 * (lane_in + LANES * ch)
-            d4 = load_shared_f32x4(at(fd_s, b, key))
-            w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
-            xs = cute.make_rmem_tensor((4, NVP), Float32)
-            for e in cutlass.range_constexpr(4):
-                for h in cutlass.range_constexpr(NVP // 4):
-                    # swizzled: [chunk][e][h][lane][4] (lanes read 128 B in a row)
-                    pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
-                    x4 = load_shared_f32x4(at(xv, b, pos))
-                    for i in cutlass.range_constexpr(4):
-                        xs[e, 4 * h + i] = x4[i]
-            if cutlass.const_expr("scan" in self.skip):
-                for e in cutlass.range_constexpr(4):
-                    for m in cutlass.range_constexpr(NV):
-                        acc[0, m] = acc[0, m] + xs[e, m] + w4[0][e] + d4[e]
-            for rr in cutlass.range_constexpr(ROWS):
-                address = at(pages, s, (base + rr) * K + key)
-                sv = load_shared_f32x4(address)
-                new = [Float32(0) for _ in range(4)]
-                if cutlass.const_expr("scan" in self.skip):
-                    new = [sv[e] for e in range(4)]
-                else:
-                    for p in cutlass.range_constexpr(2):
-                        fc = (start, start)
-                        for i in cutlass.range_constexpr(T):
-                            t = T - 1 - i
-                            fc = self.pfma((us[rr, t], us[rr, t]),
-                                           (w4[t][2 * p], w4[t][2 * p + 1]), fc)  # fmt: skip
-                        pair = self.pfma((sv[2 * p], sv[2 * p + 1]),
-                                         (d4[2 * p], d4[2 * p + 1]), fc)  # fmt: skip
-                        new[2 * p], new[2 * p + 1] = pair
-                    for e in cutlass.range_constexpr(4):
-                        for p in cutlass.range_constexpr(NV // 2):
-                            pair = (acc[rr, 2 * p], acc[rr, 2 * p + 1])
-                            pair = self.pfma((new[e], new[e]),
-                                             (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
-                            acc[rr, 2 * p], acc[rr, 2 * p + 1] = pair
-                if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
-                    if stored:
-                        store_global_f32x4(at(destination, base + rr, key), new)
-            if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
+        if cutlass.const_expr(self.roll & 1):
+            for ch in cutlass.range(CHUNKS, unroll=1):
+                self.scan_chunk(acc, ch, b, s, pages, start, us, lane_in, base, xv,
+                                fw_s, fd_s, destination, stored)  # fmt: skip
                 cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+        else:
+            for ch in cutlass.range_constexpr(CHUNKS):
+                self.scan_chunk(acc, ch, b, s, pages, start, us, lane_in, base, xv,
+                                fw_s, fd_s, destination, stored)  # fmt: skip
+                if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
+                    cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+
+    @cute.jit
+    def scan_chunk(self, acc, ch, b, s, pages, start, us, lane_in, base, xv, fw_s, fd_s,
+                   destination, stored):
+        """``scan``'s key chunk ch (keys 4 (lane_in + 8 ch) + [0, 4)) over the 8 rows."""
+        T: cutlass.Constexpr = self.tokens
+        NV: cutlass.Constexpr = 2 * T
+        NVP: cutlass.Constexpr = vectors(T)
+        key = 4 * (lane_in + LANES * ch)
+        d4 = load_shared_f32x4(at(fd_s, b, key))
+        w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
+        xs = cute.make_rmem_tensor((4, NVP), Float32)
+        for e in cutlass.range_constexpr(4):
+            for h in cutlass.range_constexpr(NVP // 4):
+                # swizzled: [chunk][e][h][lane][4] (lanes read 128 B in a row)
+                pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
+                x4 = load_shared_f32x4(at(xv, b, pos))
+                for i in cutlass.range_constexpr(4):
+                    xs[e, 4 * h + i] = x4[i]
+        if cutlass.const_expr("scan" in self.skip):
+            for e in cutlass.range_constexpr(4):
+                for m in cutlass.range_constexpr(NV):
+                    acc[0, m] = acc[0, m] + xs[e, m] + w4[0][e] + d4[e]
+        for rr in cutlass.range_constexpr(ROWS):
+            address = at(pages, s, (base + rr) * K + key)
+            sv = load_shared_f32x4(address)
+            new = [Float32(0) for _ in range(4)]
+            if cutlass.const_expr("scan" in self.skip):
+                new = [sv[e] for e in range(4)]
+            else:
+                for p in cutlass.range_constexpr(2):
+                    fc = (start, start)
+                    for i in cutlass.range_constexpr(T):
+                        t = T - 1 - i
+                        fc = self.pfma((us[rr, t], us[rr, t]),
+                                       (w4[t][2 * p], w4[t][2 * p + 1]), fc)  # fmt: skip
+                    pair = self.pfma((sv[2 * p], sv[2 * p + 1]),
+                                     (d4[2 * p], d4[2 * p + 1]), fc)  # fmt: skip
+                    new[2 * p], new[2 * p + 1] = pair
+                for e in cutlass.range_constexpr(4):
+                    for p in cutlass.range_constexpr(NV // 2):
+                        pair = (acc[rr, 2 * p], acc[rr, 2 * p + 1])
+                        pair = self.pfma((new[e], new[e]),
+                                         (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
+                        acc[rr, 2 * p], acc[rr, 2 * p + 1] = pair
+            if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
+                if stored:
+                    store_global_f32x4(at(destination, base + rr, key), new)
 
     @cute.jit
     def scan_halves(self, b, s, pages, pending, lane_in, base, xv, fw_s, fu_s, fd_s,
@@ -1111,68 +1138,16 @@ class KdaFlow(KdaWS):
         start = Float32(0)
         if pending == 0:
             start = Float32(-0.0)  # S + (-0) == S for every S, -0 included
-        reduced = []
-        for hf in cutlass.range_constexpr(2):
-            us = cute.make_rmem_tensor((HALF, T), Float32)
-            for t in cutlass.range_constexpr(T):
-                u4 = load_shared_f32x4(at(fu_s, b, t, base + HALF * hf))
-                for e in cutlass.range_constexpr(4):
-                    us[e, t] = u4[e]
-            acc = cute.make_rmem_tensor((HALF, NV), Float32)
-            for rr in cutlass.range_constexpr(HALF):
-                for m in cutlass.range_constexpr(NV):
-                    acc[rr, m] = Float32(0)
-            for ch in cutlass.range_constexpr(CHUNKS):
-                key = 4 * (lane_in + LANES * ch)
-                d4 = load_shared_f32x4(at(fd_s, b, key))
-                w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
-                xs = cute.make_rmem_tensor((4, NVP), Float32)
-                for e in cutlass.range_constexpr(4):
-                    for h in cutlass.range_constexpr(NVP // 4):
-                        pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
-                        x4 = load_shared_f32x4(at(xv, b, pos))
-                        for i in cutlass.range_constexpr(4):
-                            xs[e, 4 * h + i] = x4[i]
-                for r4 in cutlass.range_constexpr(HALF):
-                    row = base + HALF * hf + r4
-                    sv = load_shared_f32x4(at(pages, s, row * K + key))
-                    new = [Float32(0) for _ in range(4)]
-                    for p in cutlass.range_constexpr(2):
-                        fc = (start, start)
-                        for i in cutlass.range_constexpr(T):
-                            t = T - 1 - i
-                            fc = self.pfma((us[r4, t], us[r4, t]),
-                                           (w4[t][2 * p], w4[t][2 * p + 1]), fc)  # fmt: skip
-                        pair = self.pfma((sv[2 * p], sv[2 * p + 1]),
-                                         (d4[2 * p], d4[2 * p + 1]), fc)  # fmt: skip
-                        new[2 * p], new[2 * p + 1] = pair
-                    for e in cutlass.range_constexpr(4):
-                        for p in cutlass.range_constexpr(NV // 2):
-                            pair = (acc[r4, 2 * p], acc[r4, 2 * p + 1])
-                            pair = self.pfma((new[e], new[e]),
-                                             (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
-                            acc[r4, 2 * p], acc[r4, 2 * p + 1] = pair
-                    if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
-                        if stored:
-                            store_global_f32x4(at(destination, row, key), new)
-                if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
-                    cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
-            # This half's 4 rows over the 8 lanes: transposed ^4, ^2.
-            rows = [[acc[rr, m] for m in range(NV)] for rr in range(HALF)]
-            for stage in cutlass.range_constexpr(2):
-                offset: cutlass.Constexpr = 4 >> stage
-                half: cutlass.Constexpr = len(rows) // 2
-                upper = (lane_in & offset) != 0
-                merged = []
-                for i in cutlass.range_constexpr(half):
-                    row_v = []
-                    for m in cutlass.range_constexpr(NV):
-                        send = rows[i][m] if upper else rows[i + half][m]
-                        keep = rows[i + half][m] if upper else rows[i][m]
-                        row_v.append(keep + cute.arch.shuffle_sync_bfly(send, offset))
-                    merged.append(row_v)
-                rows = merged
-            reduced.append(rows[0])
+        red = cute.make_rmem_tensor((2, NV), Float32)
+        if cutlass.const_expr(self.roll & 2):  # the halves as a runtime loop
+            for hf in cutlass.range(2, unroll=1):
+                self.scan_half(red, hf, b, s, pages, start, lane_in, base, xv, fw_s, fu_s,
+                               fd_s, destination, stored)  # fmt: skip
+        else:
+            for hf in cutlass.range_constexpr(2):
+                self.scan_half(red, hf, b, s, pages, start, lane_in, base, xv, fw_s, fu_s,
+                               fd_s, destination, stored)  # fmt: skip
+        reduced = [[red[h, m] for m in range(NV)] for h in range(2)]
         # Across the halves: transposed ^1 (lane bit 0 keeps the second half's row).
         upper = (lane_in & 1) != 0
         values = []
@@ -1181,6 +1156,101 @@ class KdaFlow(KdaWS):
             keep = reduced[1][m] if upper else reduced[0][m]
             values.append(keep + cute.arch.shuffle_sync_bfly(send, 1))
         return values
+
+    @cute.jit
+    def scan_half(self, red, hf, b, s, pages, start, lane_in, base, xv, fw_s, fu_s, fd_s,
+                  destination, stored):
+        """``scan_halves``' half hf (rows base + 4 hf + [0, 4)): every key chunk, then the
+        ^4, ^2 transposed butterfly; this lane's partial row sums into red[hf]."""
+        T: cutlass.Constexpr = self.tokens
+        NV: cutlass.Constexpr = 2 * T
+        HALF: cutlass.Constexpr = ROWS // 2
+        us = cute.make_rmem_tensor((HALF, T), Float32)
+        for t in cutlass.range_constexpr(T):
+            u4 = load_shared_f32x4(at(fu_s, b, t, base + HALF * hf))
+            for e in cutlass.range_constexpr(4):
+                us[e, t] = u4[e]
+        acc = cute.make_rmem_tensor((HALF, NV), Float32)
+        for rr in cutlass.range_constexpr(HALF):
+            for m in cutlass.range_constexpr(NV):
+                acc[rr, m] = Float32(0)
+        if cutlass.const_expr(self.roll & 1):
+            for ch in cutlass.range(CHUNKS, unroll=1):
+                self.halves_chunk(acc, ch, b, s, pages, start, us, hf, lane_in, base, xv,
+                                  fw_s, fd_s, destination, stored)  # fmt: skip
+                cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+        else:
+            for ch in cutlass.range_constexpr(CHUNKS):
+                self.halves_chunk(acc, ch, b, s, pages, start, us, hf, lane_in, base, xv,
+                                  fw_s, fd_s, destination, stored)  # fmt: skip
+                if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
+                    cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+        # This half's 4 rows over the 8 lanes: transposed ^4, ^2.
+        rows = [[acc[rr, m] for m in range(NV)] for rr in range(HALF)]
+        for stage in cutlass.range_constexpr(2):
+            offset: cutlass.Constexpr = 4 >> stage
+            half: cutlass.Constexpr = len(rows) // 2
+            upper = (lane_in & offset) != 0
+            merged = []
+            for i in cutlass.range_constexpr(half):
+                row_v = []
+                for m in cutlass.range_constexpr(NV):
+                    send = rows[i][m] if upper else rows[i + half][m]
+                    keep = rows[i + half][m] if upper else rows[i][m]
+                    row_v.append(keep + cute.arch.shuffle_sync_bfly(send, offset))
+                merged.append(row_v)
+            rows = merged
+        if cutlass.const_expr(isinstance(hf, int)):
+            for m in cutlass.range_constexpr(NV):
+                red[hf, m] = rows[0][m]
+        else:
+            if hf == 0:
+                for m in cutlass.range_constexpr(NV):
+                    red[0, m] = rows[0][m]
+            else:
+                for m in cutlass.range_constexpr(NV):
+                    red[1, m] = rows[0][m]
+
+    @cute.jit
+    def halves_chunk(self, acc, ch, b, s, pages, start, us, hf, lane_in, base, xv, fw_s,
+                     fd_s, destination, stored):
+        """``scan_halves``' key chunk ch of half hf (rows base + 4 hf + [0, 4))."""
+        T: cutlass.Constexpr = self.tokens
+        NV: cutlass.Constexpr = 2 * T
+        NVP: cutlass.Constexpr = vectors(T)
+        HALF: cutlass.Constexpr = ROWS // 2
+        key = 4 * (lane_in + LANES * ch)
+        d4 = load_shared_f32x4(at(fd_s, b, key))
+        w4 = [load_shared_f32x4(at(fw_s, b, t, key)) for t in range(T)]
+        xs = cute.make_rmem_tensor((4, NVP), Float32)
+        for e in cutlass.range_constexpr(4):
+            for h in cutlass.range_constexpr(NVP // 4):
+                pos = (((ch * 4 + e) * (NVP // 4) + h) * LANES + lane_in) * 4
+                x4 = load_shared_f32x4(at(xv, b, pos))
+                for i in cutlass.range_constexpr(4):
+                    xs[e, 4 * h + i] = x4[i]
+        for r4 in cutlass.range_constexpr(HALF):
+            row = base + HALF * hf + r4
+            sv = load_shared_f32x4(at(pages, s, row * K + key))
+            new = [Float32(0) for _ in range(4)]
+            for p in cutlass.range_constexpr(2):
+                fc = (start, start)
+                for i in cutlass.range_constexpr(T):
+                    t = T - 1 - i
+                    fc = self.pfma((us[r4, t], us[r4, t]),
+                                   (w4[t][2 * p], w4[t][2 * p + 1]), fc)  # fmt: skip
+                pair = self.pfma((sv[2 * p], sv[2 * p + 1]),
+                                 (d4[2 * p], d4[2 * p + 1]), fc)  # fmt: skip
+                new[2 * p], new[2 * p + 1] = pair
+            for e in cutlass.range_constexpr(4):
+                for p in cutlass.range_constexpr(NV // 2):
+                    pair = (acc[r4, 2 * p], acc[r4, 2 * p + 1])
+                    pair = self.pfma((new[e], new[e]),
+                                     (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
+                    acc[r4, 2 * p], acc[r4, 2 * p + 1] = pair
+            if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
+                if stored:
+                    store_global_f32x4(at(destination, row, key), new)
 
     @cute.jit
     def rows_reduce(self, acc, lane_in):
@@ -1438,13 +1508,33 @@ class KdaFlow(KdaWS):
             # The couplings, normalized (thread i: coupling i; one select chain, no
             # per-lane branches).
             norm = Float32(0)
-            for i in cutlass.range_constexpr(len(index)):
-                key = list(index)[i]
-                kind, t, s = key
-                norm_i = mul_rn(fk[s], fk[t])
-                if cutlass.const_expr(kind == "e"):
-                    norm_i = mul_rn(fk[s], mul_rn(fq[t], scale))
-                norm = Float32(cutlass.select_(c == i, norm_i, norm))
+            if cutlass.const_expr(self.roll & 4):
+                # Coupling c's (kind, t, s) decoded (token t's block starts at t^2: its
+                # t key-key then t + 1 key-query couplings), its operands selected by
+                # token: the same products as below, ~4x fewer instructions.
+                tc = Int32(0)
+                for u in cutlass.range_constexpr(1, T):
+                    tc = tc + Int32(cutlass.select_(c >= u * u, Int32(1), Int32(0)))
+                rc = c - tc * tc
+                sc = rc
+                if rc >= tc:  # a key-query coupling
+                    sc = rc - tc
+                fk_s, fk_t, fq_t = Float32(0), Float32(0), Float32(0)
+                for t in cutlass.range_constexpr(T):
+                    fk_s = Float32(cutlass.select_(sc == t, fk[t], fk_s))
+                    fk_t = Float32(cutlass.select_(tc == t, fk[t], fk_t))
+                    fq_t = Float32(cutlass.select_(tc == t, fq[t], fq_t))
+                norm = mul_rn(fk_s, fk_t)
+                if rc >= tc:
+                    norm = mul_rn(fk_s, mul_rn(fq_t, scale))
+            else:
+                for i in cutlass.range_constexpr(len(index)):
+                    key = list(index)[i]
+                    kind, t, s = key
+                    norm_i = mul_rn(fk[s], fk[t])
+                    if cutlass.const_expr(kind == "e"):
+                        norm_i = mul_rn(fk[s], mul_rn(fq[t], scale))
+                    norm = Float32(cutlass.select_(c == i, norm_i, norm))
             if c < len(index):
                 ce_s[blk, c] = mul_rn(self.quad_sum(sums[NV + c, None]), norm)
             # The commit's reverse token loop over this key: w_t = kn_t P_t (P_t:
