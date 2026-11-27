@@ -1297,6 +1297,10 @@ class GenphaseTokenComm(KernelComponent):
             block=[self.threads_per_cta, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            # G2-F3: a programmatic dependent of the route producer (route_stage triggers right after its own
+            # griddepcontrol.wait), so launch + the epoch prologue below overlap the producer's tail; the kernel
+            # waits for the producer (griddepcontrol.wait) before releasing its own dependent or reading routes.
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -1378,6 +1382,11 @@ class GenphaseTokenComm(KernelComponent):
                 self._reset_sparse_ll_history(
                     device_workspace, peer_rank_ptr_mapper, linear_cta_idx, thread_idx
                 )
+        # PDL launch (G2-F3): the route producer (topk_indices / topk_scores / activation planes) and everything
+        # before it are complete past this wait. Waiting before the release keeps the main kernel ordered after
+        # the producer exactly as with the old plain launch (its pre-wait shared-expert work reads no route plane
+        # only by contract, so it is not relied on). The prologue above touches only this kernel's workspace.
+        cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
 
         if linear_cta_idx < Int32(self.world_size):

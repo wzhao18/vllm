@@ -21,7 +21,15 @@ One block per row:
 
 Trailing blocks write ``topk_idx = -1`` for the dead rows ``[n, capacity)``.
 The launch is programmatic-dependent (PDL) on the GEMM before it and waits for
-it in-kernel (``griddepcontrol.wait``); it never triggers its dependents early.
+it in-kernel (``griddepcontrol.wait``); right after that wait it triggers its
+dependent (token_comm, itself a PDL launch that waits for this grid before
+reading any route), so the dependent's launch and prologue overlap this kernel.
+
+Top-k (G2-F3): an exact bound + compact + rank selection (``fast_keys``) picks
+the same (score, id) per rank as the two-pass warp selection (``route_block``,
+kept for rows with more than 256 candidates, i.e. heavy score ties) without the
+16 serial warp-max rounds, and its tail runs on the last warp under the
+quantization. Outputs are bitwise those of ``route_block``.
 
 This replaces router split-K reduce -> top-k -> (latent down join) -> stager:
 four kernels and two streams on the path to MegaMoE become GEMM -> this kernel.
@@ -168,43 +176,14 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
   return mine;
 }
 
-// Block-parallel top-k of one row (the stock selection order: largest
-// (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
-// write_outputs (verbatim) and the stager's route rules on warp 0.
-// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
-// warp 0 selects the top-k of the 8 sorted warp lists (exact:
-// the global top-k is inside the union of the per-warp top-k).
-__device__ __forceinline__ void route_block(const Args& a, int32_t row,
-                                            const float (&lg)[kPer],
-                                            const float* s_bias, float* s_unb,
-                                            uint64_t* s_cand) {
+// write_outputs (verbatim) and the stager's route rules: rank r's packed key on
+// lane r of the calling warp (0 on lanes >= topk).
+__device__ __forceinline__ void route_write(const Args& a, int32_t row,
+                                            uint64_t lane_packed,
+                                            const float* s_unb) {
   int32_t const lane = threadIdx.x & 31;
-  int32_t const wid = threadIdx.x >> 5;
   int32_t const num_experts = a.num_logits;
   int32_t const topk = a.topk;
-  uint64_t k1[kPer];
-#pragma unroll
-  for (int j = 0; j < kPer; ++j) {
-    int32_t const e = j * (kWarps * 32) + threadIdx.x;
-    k1[j] = 0;
-    if (e < num_experts) {
-      float unb, s;
-      preprocess_score(lg[j], s_bias[e], unb, s);
-      s_unb[e] = unb;
-      k1[j] = make_key(s, e);
-    }
-  }
-  sort_desc<kPer>(k1);
-  uint64_t const w = warp_select<kPer>(k1, lane, topk);
-  s_cand[wid * 32 + lane] = w;
-  __syncthreads();
-  if (wid != 0) return;
-  // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
-  uint64_t k2[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
-  uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
-
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
   float lane_score = -INFINITY;
   int32_t lane_expert = -1;
@@ -264,6 +243,114 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   int32_t const vec = a.scale_mult > 0.0F ? 16 : 32;
   for (int32_t c = a.hidden / vec + lane; c < a.sf_cols; c += 32) {
     a.sf[int64_t{row} * a.sf_stride + c] = 0;
+  }
+}
+
+// Block-parallel top-k of one row (the stock selection order: largest
+// (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
+// write_outputs (verbatim) and the stager's route rules on warp 0.
+// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
+// warp 0 selects the top-k of the 8 sorted warp lists (exact:
+// the global top-k is inside the union of the per-warp top-k).
+__device__ __forceinline__ void route_block(const Args& a, int32_t row,
+                                            const float (&lg)[kPer],
+                                            const float* s_bias, float* s_unb,
+                                            uint64_t* s_cand) {
+  int32_t const lane = threadIdx.x & 31;
+  int32_t const wid = threadIdx.x >> 5;
+  int32_t const num_experts = a.num_logits;
+  int32_t const topk = a.topk;
+  uint64_t k1[kPer];
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    int32_t const e = j * (kWarps * 32) + threadIdx.x;
+    k1[j] = 0;
+    if (e < num_experts) {
+      float unb, s;
+      preprocess_score(lg[j], s_bias[e], unb, s);
+      s_unb[e] = unb;
+      k1[j] = make_key(s, e);
+    }
+  }
+  sort_desc<kPer>(k1);
+  uint64_t const w = warp_select<kPer>(k1, lane, topk);
+  s_cand[wid * 32 + lane] = w;
+  __syncthreads();
+  if (wid != 0) return;
+  // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
+  uint64_t k2[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
+  uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
+
+  route_write(a, row, lane_packed, s_unb);
+}
+
+// Fast exact top-k (G2-F3; same keys, same selected (score, id) per rank as
+// route_block, so bitwise-identical outputs). Bound: L = min over the 8 warps of
+// the warp's largest key hi word. The 8 warp-max keys are distinct with hi >= L,
+// so for topk <= kWarps every top-k key has hi >= L. Candidates (hi >= L, real
+// experts) are compacted into s_cand and each ranks itself by counting the larger
+// candidates (keys are unique); rank r < topk lands in s_sel[r]. Typical rows
+// keep ~10-40 candidates (no serial selection rounds); more than kWarps * 32
+// candidates (heavy ties, e.g. all logits equal or non-finite) take route_block.
+// Step 1 (all threads, before a barrier): scores, keys, warp max of the hi words.
+__device__ __forceinline__ void fast_keys(const Args& a, const float (&lg)[kPer],
+                                          const float* s_bias, float* s_unb,
+                                          uint64_t (&k)[kPer], uint32_t* s_wmax,
+                                          int* s_cnt, uint64_t* s_sel) {
+  int32_t const lane = threadIdx.x & 31;
+  int32_t const wid = threadIdx.x >> 5;
+  uint32_t hmax = 0;
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    int32_t const e = j * (kWarps * 32) + threadIdx.x;
+    k[j] = 0;
+    if (e < a.num_logits) {
+      float unb, sc;
+      preprocess_score(lg[j], s_bias[e], unb, sc);
+      s_unb[e] = unb;
+      k[j] = make_key(sc, e);
+      hmax = max(hmax, uint32_t(k[j] >> 32));
+    }
+  }
+  uint32_t const wm = __reduce_max_sync(kFull, hmax);
+  if (lane == 0) s_wmax[wid] = wm;
+  if (threadIdx.x == 0) *s_cnt = 0;
+  if (threadIdx.x < 32) s_sel[threadIdx.x] = 0;
+}
+
+// Step 2 (after the barrier): compact the candidates.
+__device__ __forceinline__ void fast_compact(const uint64_t (&k)[kPer],
+                                             const uint32_t* s_wmax, int* s_cnt,
+                                             uint64_t* s_cand) {
+  uint32_t lo = s_wmax[0];
+#pragma unroll
+  for (int w = 1; w < kWarps; ++w) lo = min(lo, s_wmax[w]);
+  int c = 0;
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) c += (k[j] != 0 && uint32_t(k[j] >> 32) >= lo) ? 1 : 0;
+  if (c) {
+    int base = atomicAdd(s_cnt, c);
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      if (k[j] != 0 && uint32_t(k[j] >> 32) >= lo) {
+        if (base < kWarps * 32) s_cand[base] = k[j];
+        ++base;
+      }
+    }
+  }
+}
+
+// Step 3 (after the barrier): candidate t ranks itself.
+__device__ __forceinline__ void fast_rank(int t, int cnt, int topk,
+                                          const uint64_t* s_cand, uint64_t* s_sel) {
+  if (t < cnt) {
+    uint64_t const m = s_cand[t];
+    int r = 0;
+#pragma unroll 4
+    for (int i = 0; i < cnt; ++i) r += s_cand[i] > m ? 1 : 0;
+    if (r < topk) s_sel[r] = m;
   }
 }
 
@@ -372,6 +459,9 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
   __shared__ float s_bias[kWarps * 32 * kPer];
   __shared__ float s_unb[kWarps * 32 * kPer];
   __shared__ uint64_t s_cand[kWarps * 32];
+  __shared__ uint32_t s_wmax[kWarps];
+  __shared__ int s_cnt;
+  __shared__ uint64_t s_sel[32];
   int32_t const row = blockIdx.x;
   if (row < a.n) {
     for (int e = threadIdx.x; e < a.num_logits; e += blockDim.x) {
@@ -381,6 +471,12 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
   // The GEMM that wrote y (PDL predecessor) and every kernel before it are
   // complete past this point.
   asm volatile("griddepcontrol.wait;" ::: "memory");
+  // Release the dependent (token_comm, a PDL launch that griddepcontrol.waits
+  // for this grid before it reads any route) now, so its launch and prologue
+  // overlap this kernel. Only after the wait: every kernel before this one is
+  // complete by then, so nothing the dependent's own dependents may read early
+  // is still being written upstream (G2-F3).
+  asm volatile("griddepcontrol.launch_dependents;");
   if (row >= a.n) {  // dead rows [n, capacity): routes -1 only
     int64_t const base = a.n + int64_t{row - a.n} * kDeadRows;
     int64_t const end = min(base + kDeadRows, int64_t{a.capacity});
@@ -410,6 +506,38 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
 #pragma unroll
     for (int q = 0; q < vec / 4; ++q) in[q] = src[q];
   }
+  if (a.splits == 2) {
+    // Both partials' loads in flight together (the general loop below issues
+    // split 1's loads behind split 0's); the same (p0 + p1) sums.
+    const float* ys = yrow + a.split_stride;
+    float l1[kPer];
+    float4 p1[8];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      int32_t const e = j * (kWarps * 32) + threadIdx.x;
+      l1[j] = e < a.num_logits ? ys[e] : 0.0F;
+    }
+    if (quant) {
+      const float4* src = reinterpret_cast<const float4*>(
+          ys + a.num_logits + int64_t{threadIdx.x} * vec);
+#pragma unroll
+      for (int q = 0; q < vec / 4; ++q) p1[q] = src[q];
+    }
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      int32_t const e = j * (kWarps * 32) + threadIdx.x;
+      if (e < a.num_logits) lg[j] += l1[j];
+    }
+    if (quant) {
+#pragma unroll
+      for (int q = 0; q < vec / 4; ++q) {
+        in[q].x += p1[q].x;
+        in[q].y += p1[q].y;
+        in[q].z += p1[q].z;
+        in[q].w += p1[q].w;
+      }
+    }
+  } else
   for (int s = 1; s < a.splits; ++s) {
     const float* ys = yrow + int64_t{s} * a.split_stride;
 #pragma unroll
@@ -431,6 +559,35 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
     }
   }
   __syncthreads();  // s_bias
+  if (a.topk <= kWarps) {
+    // Fast exact top-k (fast_keys): keys first, then the quantization on the
+    // quant blocks' threads while the last warp (no quant block when
+    // hidden / vec <= (kWarps - 1) * 32) ranks the candidates and writes the
+    // routes, so the selection tail hides under the quantization.
+    uint64_t k[kPer];
+    fast_keys(a, lg, s_bias, s_unb, k, s_wmax, &s_cnt, s_sel);
+    __syncthreads();
+    fast_compact(k, s_wmax, &s_cnt, s_cand);
+    __syncthreads();
+    int const cnt = s_cnt;
+    if (cnt <= kWarps * 32) {
+      if (quant) {
+        if (NVFP4) {
+          quant_nvfp4(a, row, threadIdx.x, in);
+        } else {
+          quant_mxfp8(a, row, threadIdx.x, in);
+        }
+      }
+      fast_rank(kWarps * 32 - 1 - threadIdx.x, cnt, a.topk, s_cand, s_sel);
+      if (cnt > 32) __syncthreads();  // rankers beyond the last warp
+      if ((threadIdx.x >> 5) == kWarps - 1) {
+        __syncwarp();
+        int32_t const lane = threadIdx.x & 31;
+        route_write(a, row, lane < a.topk ? s_sel[lane] : 0, s_unb);
+      }
+      return;
+    }
+  }
   if (quant) {
     if (NVFP4) {
       quant_nvfp4(a, row, threadIdx.x, in);
