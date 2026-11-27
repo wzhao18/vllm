@@ -30,6 +30,7 @@ every kernel in one stream, MlaQuery first.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
+import os
 from functools import cache, partial
 
 import cutlass
@@ -413,6 +414,14 @@ WIDE_MERGE = "65-256:1"
 # the scorer / on DeepGEMM) 128 rows 53.40 / 52.85, 256 76.24 / 74.75, 512 117.12 /
 # 115.65 (L1 round 6, Rhea 136406).
 WIDE_SCORER = ""
+# K31DSC_WIDE_SCORER: wide rows whose merge reads IndexerScoreFp4's logits (rows table,
+# appended; unset keeps the table). In the 16-rank TP16 = DCP16 step the forked
+# MlaQuery ends before the logits start, so the scorer runs alone there, unlike the
+# one-node chain above.
+if os.environ.get("K31DSC_WIDE_SCORER"):
+    WIDE_SCORER = ",".join(
+        x for x in (WIDE_SCORER, os.environ["K31DSC_WIDE_SCORER"]) if x
+    )
 # The scorer's own local top-N select (IndexerLocalTopk, publishing the merge's B'
 # rows) at the wide rows it packs (rows <= SMs) instead of DeepSelect + #63's pack.
 WIDE_LOCAL_TOPK = False

@@ -104,6 +104,12 @@ ALLOWED = {
     # (specialized_decode/cutedsl/dsa/prepared.py): those DSA sparse core rows push
     # into the spread DcpValue merge (LSE box [CAP, H, DCP]); unset keeps the table.
     "K31DSC_CORE_SPREAD",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31DSC_WIDE_SCORER appends rows to WIDE_SCORER
+    # (specialized_decode/cutedsl/dsa/wide.py): those wide DSA rows score the #63
+    # merge's logits with IndexerScoreFp4 (bit for bit DeepGEMM's); unset keeps the
+    # table.
+    "K31DSC_WIDE_SCORER",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
