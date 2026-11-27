@@ -101,7 +101,13 @@ logger = init_logger(__name__)
 # spread): see the L1 DCPV row in DECISIONS.md. Rows 32 (B4 x q8, the core's 1x16
 # variant: 12 per-head merge CTAs -> 192 one-row CTAs): 9.59 -> 5.06 us per call,
 # bitwise (DCPV4 row).
-CORE_SPREAD = batch_table("8:1,16:1,32:1")
+CORE_SPREAD_ROWS = "8:1,16:1,32:1"
+# K31DSC_CORE_SPREAD: further rows of the core's table (rows table, appended; unset
+# keeps the stock rows). The core's widened rows past the stock ones otherwise run the
+# per-head merge.
+if os.environ.get("K31DSC_CORE_SPREAD"):
+    CORE_SPREAD_ROWS += "," + os.environ["K31DSC_CORE_SPREAD"]
+CORE_SPREAD = batch_table(CORE_SPREAD_ROWS)
 # DSA campaign knob K31_DSA_EARLY_FORK=1: no late query fork (overlap.QUERY_FORK_AT) on
 # layers without the #63 merge, whose after_logits hook never fires there (the fork
 # then waited for the join: D3-32 slice k3 M64, MlaQuery 24 us after the top-k).

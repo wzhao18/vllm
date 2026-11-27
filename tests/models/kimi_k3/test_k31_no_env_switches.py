@@ -97,6 +97,11 @@ ALLOWED = {
     # (specialized_decode/cutedsl/moe/front_rows.py): e.g. "97-128:3" pushes those
     # rows' shared RS right behind the early down rows; unset keeps the table.
     "K31PL_SHARED_EARLY",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31DSC_CORE_SPREAD appends rows to CORE_SPREAD
+    # (specialized_decode/cutedsl/dsa/prepared.py): those DSA sparse core rows push
+    # into the spread DcpValue merge (LSE box [CAP, H, DCP]); unset keeps the table.
+    "K31DSC_CORE_SPREAD",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
