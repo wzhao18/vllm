@@ -21,6 +21,7 @@ to BF16 before SiTU, BF16 h and partial); the GEMMs sum K in their own orders (F
 accumulation reorders of the stock layer's GEMMs)."""
 
 import functools
+import os
 
 import cutlass as c
 import cutlass.cute as cute
@@ -99,6 +100,15 @@ MERGED_ROWS = {"*": "65-256:1"}
 # 64): 97-128 rows value 1 and 129-256 rows value 3 (the shared RS push right behind the
 # early down rows): -175 / -88 / -87 / -183; graph output sha equal.
 SHARED_EARLY_ROWS = {"*": "97-128:1,129-256:3"}
+# K31PL_SHARED_EARLY: a batch table appended to SHARED_EARLY_ROWS (later entries
+# override), e.g. "97-128:3": those rows' shared RS push follows the early down rows
+# beside the routed experts (``run_shared_push_early``) instead of the experts. Same
+# kernels and words: bitwise. Measured faster in the 16-rank decode step A/B at 104,
+# 112 and 128 rows. Unset keeps the table.
+if os.environ.get("K31PL_SHARED_EARLY"):
+    SHARED_EARLY_ROWS = {
+        "*": f"{SHARED_EARLY_ROWS['*']},{os.environ['K31PL_SHARED_EARLY']}"
+    }
 # Unmerged rows (not MERGED_ROWS) whose whole shared expert forks to the side stream at
 # a later point than before the front kernel (``PreparedMoE.run_front_rows``): 1 once
 # the front kernel has completed (beside routing), 2 once routing has completed (beside

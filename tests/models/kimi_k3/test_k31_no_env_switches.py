@@ -92,6 +92,11 @@ ALLOWED = {
     # (specialized_decode/cutedsl/kda/prepared.py): those requests run FP32_WIDE
     # (the record protocol's LoopDefer4); unset keeps the table's rows.
     "K31PL_LOOP4",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31PL_SHARED_EARLY appends rows to SHARED_EARLY_ROWS
+    # (specialized_decode/cutedsl/moe/front_rows.py): e.g. "97-128:3" pushes those
+    # rows' shared RS right behind the early down rows; unset keeps the table.
+    "K31PL_SHARED_EARLY",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
