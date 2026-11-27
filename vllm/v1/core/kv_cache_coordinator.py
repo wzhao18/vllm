@@ -189,6 +189,16 @@ class KVCacheCoordinator(ABC):
                 self.single_type_managers[i].block_pool, SlotBlockPool
             ),
         )
+        self._slot_group_ids = frozenset(
+            i
+            for i, manager in enumerate(self.single_type_managers)
+            if isinstance(manager.block_pool, SlotBlockPool)
+        )
+        # Request -> external-hit arguments of its slot groups, taken in the
+        # allocate_new_blocks that follows allocate_new_computed_blocks.
+        self._deferred_slot_externals: dict[
+            str, tuple[int, int, tuple[int, ...]]
+        ] = {}
         # A window group packed into slots beside Mamba groups caches only the
         # window tails a hit can resume at: where the Mamba states are kept.
         self._state_boundary_managers: list[MambaManager] = [
@@ -389,6 +399,18 @@ class KVCacheCoordinator(ABC):
             )
         if num_external_computed_tokens > 0:
             for i in self._allocation_order:
+                if i in self._slot_group_ids:
+                    # A slot pool may take more pool blocks than admission
+                    # counted (a new row when its free slots are recent or
+                    # cached). Its external slots are taken in
+                    # allocate_new_blocks, after the other groups' new blocks,
+                    # like its new slots (same-step loads compute in this call).
+                    self._deferred_slot_externals[request_id] = (
+                        num_local_computed_tokens,
+                        num_external_computed_tokens,
+                        skip_zeroing_group_ids,
+                    )
+                    continue
                 self.single_type_managers[i].allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
@@ -422,8 +444,17 @@ class KVCacheCoordinator(ABC):
         """
         self._dsa_bind(request_id)
         new_blocks: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
+        deferred = self._deferred_slot_externals.pop(request_id, None)
         for i in self._allocation_order:
             manager = self.single_type_managers[i]
+            if deferred is not None and i in self._slot_group_ids:
+                num_local, num_external, skip_zeroing = deferred
+                manager.allocate_external_computed_blocks(
+                    request_id,
+                    num_local,
+                    num_external,
+                    record_for_zeroing=i not in skip_zeroing,
+                )
             new_blocks[i] = manager.allocate_new_blocks(
                 request_id,
                 num_encoder_tokens
