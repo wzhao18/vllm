@@ -121,6 +121,9 @@ FOLDS = ("fused", "fused_ws", "wide", "flow")
 MODES = ("deferred", "triton", "none")
 
 
+_SPLIT_SCRATCH: dict = {}
+
+
 def record_kind(heads, requests, q):
     """The record core at ``requests`` of q tokens (RECORD_KINDS), or None."""
     entry = RECORD_KINDS.get(heads, "")
@@ -237,7 +240,7 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
         bufs = flow.conv_buffers(tokens, streamed[1], conv_size, budget, items=build)
         return flow.KdaFlow(
             heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx, items=build,
-            conv_bufs=bufs,
+            conv_bufs=bufs, split=flow.split_for(tokens, items, sms),
         )
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
@@ -384,7 +387,7 @@ class SpKdaCore:
         norm.copy_(self.layer.o_norm.weight)
 
     def _operands(self, caches, projected, slots, out, accepted, deferred=(),
-                  mx=()):  # fmt: skip
+                  mx=(), scratch=()):  # fmt: skip
         """Kernel tensors in launch order (upstream ``PreparedKda._operands``): 13
         before the scalars, then F_B, the accepted counts, the records, (deferred)
         the record rows and pending counts and (``mx``) the MXFP8 output's bytes
@@ -396,8 +399,22 @@ class SpKdaCore:
         p = lambda start, width: projected[:, start : start + width]
         ops = (p(0, 3 * d), w, bias, conv, p(4 * d, K), p(4 * d + K, h), a_log, dt)
         tail = (fb, accepted, *self.records, *deferred)
-        tail += tuple(mx)
+        tail += tuple(mx) + tuple(scratch)
         return ops + (slots, state, out, p(3 * d, d), norm) + tail
+
+    def _scratch(self, rows, kind, device):
+        """The phase-split KdaFlow's operand scratch (``flow.split_for``), one per
+        device and q: layers run one after another, so they share it."""
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        if kind != "flow" or not flow.split_for(self.q, self.heads * (rows // self.q), sms):
+            return ()
+        shape = (flow.PREP_CTAS_PER_SM * sms, flow.split_words(self.q))  # split_for's bound
+        if str(device) == "meta":
+            return (torch.empty(shape, dtype=torch.float32, device="meta"),)
+        key = (str(device), self.q)
+        if key not in _SPLIT_SCRATCH:
+            _SPLIT_SCRATCH[key] = torch.empty(shape, dtype=torch.float32, device=device)
+        return (_SPLIT_SCRATCH[key],)
 
     def prepare_caches(self, caches):
         """Compile every R's core for the bound KV cache (before graph capture)."""
@@ -435,7 +452,8 @@ class SpKdaCore:
                 pending = torch.empty(count, dtype=torch.int32, **meta)
                 deferred = (torch.empty(n, dtype=torch.int32, **meta), pending)
             operands = self._operands(
-                caches, projected, slots, out, accepted, deferred, mx
+                caches, projected, slots, out, accepted, deferred, mx,
+                self._scratch(r, kind, "meta"),
             )
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
@@ -485,7 +503,8 @@ class SpKdaCore:
                 raise Unsupported("kda", Shape(rows, self.q), cause)
             target, mx = self.staged[:rows], (out.data.view(torch.uint8), out.scale)
         tensors = self._operands(
-            caches, projected, slots, target, accepted[:n], extra, mx
+            caches, projected, slots, target, accepted[:n], extra, mx,
+            self._scratch(rows, self.kinds[rows], projected.device),
         )
         specs = tuple(map(layout, tensors))
         if specs != self.specs[rows]:  # CuTe takes a mismatched layout silently

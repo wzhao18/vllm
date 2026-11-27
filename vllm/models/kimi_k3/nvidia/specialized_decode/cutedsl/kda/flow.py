@@ -156,6 +156,37 @@ FOLD_FENCE = 1
 # (q4, q8). Default 5: q8 hot loop 71.3 -> 47.1 KB; DB32 24L slice k7 B25 -3.3 %, k3 B59
 # -2.1 % (G1F1, Hecate 2026-11-27).
 ROLL = 5
+# Phase split (KDAFLOW2): at these verify lengths (even q) the prep runs in its own
+# kernel ahead of the scan (``prep_kernel``: one 128-thread CTA per (request, head) item,
+# PREP_CTAS_PER_SM resident per SM), which leaves each item's scan operands in a global
+# scratch (the last operand, ``split_words`` FP32 words per item); the persistent kernel
+# then streams them in (two blocks per group) and runs only the scan, the solve and the
+# gated norm (``finish_alone``: the same reduction trees). Same operations, same order:
+# bit-identical. In step the prep is latency-bound on one warp per scheduler and group,
+# serial over the group's items, and at q8 its 28.8 KB push the item loop past the
+# instruction cache (KDAFLOW2, Hecate 2026-11-27). On at q8 (``split_for`` limits it
+# to one prep wave: B <= 26 at 24 heads / 212 SMs); q4 / q6 stay fused (a second-wave
+# prep CTA faults there, cause open).
+SPLIT_TOKENS = (8,)
+PREP_CTAS_PER_SM = 3  # prep CTAs resident per SM (smem ~70 KB, <= 168 registers)
+# Diagnostics (benchmarks only): which split kernels launch ("prep", "scan" or both).
+SPLIT_LAUNCH = ("prep", "scan")
+
+def split_for(tokens, items, sms):
+    """Whether the phase split serves ``items`` (heads x requests) at verify length
+    ``tokens``: q8 in SPLIT_TOKENS, and every item's prep in the first wave of prep
+    CTAs (a second wave runs its preps after the first: q8 n28 / n32 +5..+8 us warm,
+    -1..-2.6 us at gap3: not worth it)."""
+    return tokens == 8 and tokens in SPLIT_TOKENS and items <= PREP_CTAS_PER_SM * sms
+
+
+def split_words(tokens):
+    """FP32 words of one item's scan operands in the split scratch: x / v / w blocks
+    (4 q K), the old corrections (q K), D_n (K), the couplings (q^2), then the output
+    gates (q K BF16)."""
+    return 5 * tokens * K + K + tokens * tokens + tokens * K // 2
+
+
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms, q previous
 # output squares (q^2 + 4q: 12, 21, 32 at q2..q4; one 32-value reduction). Above q4
 # (45 / 60 / 77 / 96 at q5..q8) ``block_sums_rounds`` reduces them 32 at a time.
@@ -378,6 +409,7 @@ class KdaFlow(KdaWS):
         mx=False,
         items=MAX_ITEMS,
         conv_bufs=2,
+        split=None,
     ):
         assert tokens in FLOW_TOKENS and stages == 1 and conv_dim_first
         assert conv_bufs in (1, 2), conv_bufs
@@ -398,14 +430,32 @@ class KdaFlow(KdaWS):
         self.roll = ROLL
         assert not self.roll & 1 or self.fold_fence == 1, "ROLL syncs after every chunk"
         self.skip = tuple(SKIP)
+        self.split = tokens in SPLIT_TOKENS if split is None else bool(split)
+        self.prep_ctas, self.split_launch = PREP_CTAS_PER_SM, tuple(SPLIT_LAUNCH)
+        # Validated at q8 only (bitwise q8 n18-48, any number of prep waves); at q4 / q6
+        # a prep CTA of a second wave faults (unspecified launch failure; open, KDAFLOW2).
+        assert not self.split or tokens == 8, "the phase split runs q8 only"
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+        if cutlass.const_expr(self.split and "prep" in self.split_launch):
+            items: cutlass.Constexpr = self.heads * (args[10].shape[0] // self.tokens)
+            launch(self.prep_kernel, args, self.prep_grid(items), GROUP_THREADS,
+                   min_blocks_per_mp=self.prep_ctas)  # fmt: skip
+        if cutlass.const_expr(not self.split or "scan" in self.split_launch):
+            launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+
+    def prep_grid(self, items):
+        """Split mode: the prep kernel's grid (one CTA per item)."""
+        return items
+
+    def extra_args(self):
+        """Operands after the deferred ones: MXFP8 output (2), split scratch (1)."""
+        return (2 if self.mx else 0) + (1 if self.split else 0)
 
     def folds(self, args):
         """Whether the deferred operands (record rows, pending counts) follow."""
-        return len(args) - (2 if self.mx else 0) > 20
+        return len(args) - self.extra_args() > 20
 
     @cute.jit
     def quantize_outputs(self, args, tid, count, table):
@@ -414,7 +464,8 @@ class KdaFlow(KdaWS):
         into the MXFP8 o_proj input, ``ops.mxfp8_act.quantize`` bit for bit (4
         lanes per 32-wide block, 8 columns each: its quant8_store). Off the item
         chains: the scan loop is unchanged."""
-        output, data, scale = args[10], args[len(args) - 2], args[len(args) - 1]
+        last: cutlass.Constexpr = len(args) - 1 - (1 if self.split else 0)
+        output, data, scale = args[10], args[last - 1], args[last]
         T: cutlass.Constexpr = self.tokens
         width: cutlass.Constexpr = self.heads * K
         units: cutlass.Constexpr = T * (K // 8)  # 8-column lane units per item
@@ -592,7 +643,367 @@ class KdaFlow(KdaWS):
     @cute.kernel
     def kernel(self, args):
         if cutlass.const_expr("noop" not in self.skip):
-            self.body(args)
+            if cutlass.const_expr(self.split):
+                self.split_body(args)
+            else:
+                self.body(args)
+
+    # ------------------------------------------------------------ phase split
+    @cute.kernel
+    def prep_kernel(self, args):
+        if cutlass.const_expr("noop" not in self.skip):
+            self.prep_body(args)
+
+    @cute.jit
+    def prep_body(self, args):
+        """Split mode, one item per CTA (128 threads = one group): the persistent
+        kernel's prologue pieces for this item (table row, head constants, F_B rows,
+        F_A rows, inputs), its gate projection and ``prep_item``; the new records and
+        window leave as in ``group_items``, the scan operands into the scratch row.
+        No mbarriers (``prep_stage``): any number of CTA waves."""
+        f_a = args[4]
+        T: cutlass.Constexpr = self.tokens
+        H: cutlass.Constexpr = self.heads
+        dim: cutlass.Constexpr = H * K
+        tid, _, _ = cute.arch.thread_idx()
+        item, _, _ = cute.arch.block_idx()
+        conv_state = args[3]
+        conv_type: cutlass.Constexpr = conv_state.element_type
+        scratch = args[len(args) - 1]
+        smem = cutlass.utils.SmemAllocator()
+        # F_B rows, read by the gate projection only; the operand block overlays them.
+        fbs = alloc(smem, BFloat16, (1, K, K), align=1024)
+        hcs = alloc(smem, Float32, (1, CONSTS, K))
+        raw = alloc(smem, BFloat16, (1, T, K), align=16)
+        table = alloc(smem, Int32, (1, META))
+        fas = alloc(smem, BFloat16, (1, T, K), align=16)
+        convs = alloc(smem, conv_type, (1, 3, K * self.window), align=128)
+        xs = alloc(smem, BFloat16, (1, T, 3, K), align=128)
+        gs = alloc(smem, BFloat16, (1, T, K), align=128)
+        kgs = alloc(smem, BFloat16, (1, T, 2 * K), align=128)
+        uss = alloc(smem, Float32, (1, T, K), align=128)
+        # Over F_B (read by the gate projection only): the operand block, then the
+        # block sums and the new key / gate records (all written by prep_item).
+        base = cute.recast_ptr(at(fbs, 0, 0, 0), dtype=Float32)
+        WORDS: cutlass.Constexpr = split_words(T)
+        NS: cutlass.Constexpr = sums_count(T)
+        sums = cute.make_tensor(base + WORDS, cute.make_layout((1, NS, 4), stride=(NS * 4, 4, 1)))
+        kgo = cute.make_tensor(
+            cute.recast_ptr(base + WORDS + NS * 4, dtype=BFloat16),
+            cute.make_layout((1, T, 2 * K), stride=(T * 2 * K, 2 * K, 1)),
+        )
+        qkvd = cute.make_tensor(base, cute.make_layout((1, 4, T, K),
+                                                       stride=(4 * T * K, T * K, K, 1)))
+        xv = cute.make_tensor(base, cute.make_layout((1, 2 * T * K), stride=(4 * T * K, 1)))
+        v_s, fw_s = qkvd[None, 2, None, None], qkvd[None, 3, None, None]
+        fu_s = cute.make_tensor(base + 4 * T * K,
+                                cute.make_layout((1, T, K), stride=(T * K, K, 1)))
+        fd_s = cute.make_tensor(base + 5 * T * K, cute.make_layout((1, K), stride=(K, 1)))
+        ce_s = cute.make_tensor(base + 5 * T * K + K,
+                                cute.make_layout((1, T * T), stride=(T * T, 1)))
+        g_s = cute.make_tensor(
+            cute.recast_ptr(base + 5 * T * K + K + T * T, dtype=BFloat16),
+            cute.make_layout((1, T, K), stride=(T * K, K, 1)),
+        )
+        if tid == 0:
+            head, request, slot, conv_slot, conv_offset, pending, rec = self.item_info(
+                args, item
+            )
+            table[0, SLOT] = slot
+            table[0, HEAD] = head
+            table[0, REQUEST] = request
+            table[0, CONV_SLOT] = conv_slot
+            table[0, CONV_OFFSET] = conv_offset
+            table[0, PENDING] = pending
+            table[0, RECORD] = rec
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        head = table[0, HEAD]
+        # Before the PDL wait: the head constants (synchronous loads: the stock
+        # head_constants path, the same values as the bulk rows) and the F_B rows.
+        self.prep_stage_fb(args, table, fbs, tid)
+        self.head_constants(hcs[0, None, None], args, head, tid)
+        buffers = (convs[0, None, None], xs[0, None, None, None], gs[0, None, None],
+                   kgs[0, None, None], uss[0, None, None])  # fmt: skip
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        self.prep_stage(args, table, fbs, buffers, tid)
+        FA_CHUNKS: cutlass.Constexpr = K * 2 // 16
+        if tid < T * FA_CHUNKS:
+            t, part = tid // FA_CHUNKS, tid % FA_CHUNKS
+            row = table[0, REQUEST] * T + t
+            v = load_global_u32x4(at(f_a, row, part * 8))
+            store_shared_u32x4(at(fas, 0, t, part * 8), [v[e] for e in range(4)])
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_warp()
+        cute.arch.barrier()  # F_B, F_A, inputs
+        self.gate_projection(tid, 1, head, table, fbs, fas, raw)
+        cute.arch.sync_warp()
+        cute.arch.barrier()  # raw gates; F_B is free for the operand block
+        slot, pending = table[0, SLOT], table[0, PENDING]
+        po = cute.make_rmem_tensor(T, Float32)
+        for t in cutlass.range_constexpr(T):
+            po[t] = Float32(0)
+        pt = zeros(6, Int64)
+        ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
+        if slot > 0:
+            self.prep_item(args, 0, tid, 0, slot, pending, table[0, CONV_OFFSET], raw,
+                           hcs[0, None, None], buffers, ops, (sums[0, None, None],),
+                           kgo[0, None, None], pt, po)  # fmt: skip
+        fence_async_shared()
+        self.group_sync(0)
+        if tid == 0:
+            if slot > 0:
+                rec = table[0, RECORD]
+                part_bytes: cutlass.Constexpr = K * self.window * conv_type.width // 8
+                store_bulk(at(args[19], rec, head, 0, 0), at(kgo, 0, 0, 0), T * 2 * K * 2)
+                page = conv_state[Int64(table[0, CONV_SLOT]), None, None]
+                for part in cutlass.range_constexpr(3):
+                    store_bulk(at(page, part * dim + head * K, 0),
+                               at(convs, 0, part, 0), part_bytes)  # fmt: skip
+                store_bulk(at(scratch, item, 0), base, WORDS * 4)
+                bulk_commit()
+                wait_bulk_reads()
+
+    @cute.jit
+    def prep_stage_fb(self, args, table, fbs, tid):
+        """Split mode: the F_B rows of the item's head by 16-byte cp.async (weights:
+        issued before the PDL wait, their own commit group)."""
+        f_b = args[16]
+        head = table[0, HEAD]
+        FB: cutlass.Constexpr = K * K * 2 // 16
+        for r in cutlass.range_constexpr(FB // GROUP_THREADS):
+            i = tid + r * GROUP_THREADS
+            copy_g2s(at(fbs, 0, i // 16, (i % 16) * 8), at(f_b, head * K + i // 16, (i % 16) * 8))
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def prep_stage(self, args, table, fbs, buffers, tid):
+        """Split mode's prep inputs by 16-byte cp.async (no mbarrier: with mbarriers, a
+        prep CTA that started after another of the same grid had left its SM faulted
+        at mbarrier.init, KDAFLOW2 dbg11/12): q / k / v and output gate rows, the
+        convolution window and, with a pending commit, its records; the bytes
+        ``stage_item`` moves. The caller waits (cp.async.wait_group 0) and syncs."""
+        x, conv_state, gate = args[0], args[3], args[11]
+        convs, xs, gs, kgs, uss = buffers
+        T: cutlass.Constexpr = self.tokens
+        H: cutlass.Constexpr = self.heads
+        dim: cutlass.Constexpr = H * K
+        csize: cutlass.Constexpr = conv_state.element_type.width // 8
+        head, slot, pending = table[0, HEAD], table[0, SLOT], table[0, PENDING]
+        token = table[0, REQUEST] * T
+        if slot > 0:
+            ROWS: cutlass.Constexpr = 4 * T * 16  # gates, then x parts: T rows of 16 chunks
+            for r in cutlass.range_constexpr(-(-ROWS // GROUP_THREADS)):
+                i = tid + r * GROUP_THREADS
+                if i < ROWS:
+                    part, t, ch = i // (T * 16), (i // 16) % T, i % 16
+                    if part == 0:
+                        copy_g2s(at(gs, t, ch * 8), at(gate, token + t, head * K + ch * 8))
+                    else:
+                        copy_g2s(at(xs, t, part - 1, ch * 8),
+                                 at(x, token + t, (part - 1) * dim + head * K + ch * 8))  # fmt: skip
+            PER: cutlass.Constexpr = 16 // csize  # window elements per chunk
+            WCH: cutlass.Constexpr = K * self.window // PER
+            page = conv_state[Int64(table[0, CONV_SLOT]), None, None]
+            for r in cutlass.range_constexpr(-(-3 * WCH // GROUP_THREADS)):
+                i = tid + r * GROUP_THREADS
+                if i < 3 * WCH:
+                    part, e = i // WCH, (i % WCH) * PER
+                    copy_g2s(at(convs, part, e),
+                             at(page, part * dim + head * K + e // self.window,
+                                e % self.window))  # fmt: skip
+            if pending > 0:
+                rec = table[0, RECORD]
+                KCH: cutlass.Constexpr = T * 2 * K * 2 // 16
+                UCH: cutlass.Constexpr = T * K * 4 // 16
+                for r in cutlass.range_constexpr(-(-(KCH + UCH) // GROUP_THREADS)):
+                    i = tid + r * GROUP_THREADS
+                    if i < KCH:
+                        copy_g2s(at(kgs, i // 32, (i % 32) * 8),
+                                 at(args[19], rec, head, i // 32, (i % 32) * 8))  # fmt: skip
+                    elif i < KCH + UCH:
+                        u = i - KCH
+                        copy_g2s(at(uss, u // 32, (u % 32) * 4),
+                                 at(args[18], rec, head, u // 32, (u % 32) * 4))  # fmt: skip
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def stage_ops(self, args, table, j, first, blk, ops, barrier, c):
+        """Split mode: bulk-copy table item j's scan operands (scratch row first + j)
+        into operand block ``blk`` (group thread 0)."""
+        xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
+        scratch = args[len(args) - 1]
+        T: cutlass.Constexpr = self.tokens
+        if c == 0:
+            if table[j, SLOT] > 0:
+                row = first + j
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, split_words(T) * 4)
+                copy_g2s(at(xv, blk, 0), at(scratch, row, 0), 4 * T * K * 4, barrier)
+                copy_g2s(at(fu_s, blk, 0, 0), at(scratch, row, 4 * T * K), T * K * 4,
+                         barrier)  # fmt: skip
+                copy_g2s(at(fd_s, blk, 0), at(scratch, row, 5 * T * K), K * 4, barrier)
+                copy_g2s(at(ce_s, blk, 0), at(scratch, row, 5 * T * K + K), T * T * 4,
+                         barrier)  # fmt: skip
+                copy_g2s(at(g_s, blk, 0, 0), at(scratch, row, 5 * T * K + K + T * T),
+                         T * K * 2, barrier)  # fmt: skip
+            else:
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
+
+    @cute.jit
+    def split_body(self, args):
+        """Split mode's persistent kernel: ``body`` without the gate projection and the
+        prep inputs; the state stream starts before the PDL wait (the prep kernel
+        does not write the state); two operand blocks per group."""
+        output = args[10]
+        beta = args[5]
+        T: cutlass.Constexpr = self.tokens
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        requests: cutlass.Constexpr = output.shape[0] // T
+        total_items: cutlass.Constexpr = self.heads * requests
+        first = Int32(total_items * cta // self.ctas)
+        count = Int32(total_items * (cta + 1) // self.ctas) - first
+        NB: cutlass.Constexpr = 2 * GROUPS
+        smem = cutlass.utils.SmemAllocator()
+        pages = alloc(smem, Float32, (self.slots, K * K), align=1024)
+        table = alloc(smem, Int32, (self.items, META))
+        betas = alloc(smem, Float32, (self.items, 8))
+        qkvd = alloc(smem, Float32, (NB, 4, T, K), align=128)
+        xv = cute.make_tensor(
+            at(qkvd, 0, 0, 0, 0),
+            cute.make_layout((NB, 2 * T * K), stride=(4 * T * K, 1)),
+        )
+        v_s, fw_s = qkvd[None, 2, None, None], qkvd[None, 3, None, None]
+        fu_s = alloc(smem, Float32, (NB, T, K), align=128)
+        fd_s = alloc(smem, Float32, (NB, K), align=128)
+        ce_s = alloc(smem, Float32, (NB, T * T), align=128)
+        g_s = alloc(smem, BFloat16, (NB, T, K), align=128)
+        sums = alloc(smem, Float32, (GROUPS, sums_count(T), 4))
+        # One operand barrier per block (g + GROUPS b): a block's barrier is re-armed
+        # only after the whole group finished the item that used it last.
+        bars = cute.recast_ptr(smem.allocate(8 * (2 * self.slots + NB), 8),
+                               dtype=cutlass.Uint64)
+        state_full, stage_full = bars, bars + 2 * self.slots
+        if tid == 0:
+            for s in cutlass.range_constexpr(2 * self.slots):
+                cute.arch.mbarrier_init(state_full + s, PAGE_BYTES // COPY_BYTES)
+            for b in cutlass.range_constexpr(NB):
+                cute.arch.mbarrier_init(stage_full + b, 1)
+            cute.arch.mbarrier_init_fence()
+        if tid < count:
+            head, request, slot, conv_slot, conv_offset, pending, rec = self.item_info(
+                args, first + tid
+            )
+            table[tid, SLOT] = slot
+            table[tid, HEAD] = head
+            table[tid, REQUEST] = request
+            table[tid, CONV_SLOT] = conv_slot
+            table[tid, CONV_OFFSET] = conv_offset
+            table[tid, PENDING] = pending
+            table[tid, RECORD] = rec
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        h0 = first // requests
+        # The state stream before the PDL wait: the prep kernel does not touch it.
+        if tid == 0:
+            for s in cutlass.range_constexpr(self.slots):
+                if s < count:
+                    self.load_page(args, pages, s, table, s, state_full)
+        if tid < count * T:
+            item, t = tid // T, tid % T
+            row = table[item, REQUEST] * T + t
+            betas[item, t] = triton_sigmoid(Float32(beta[row, table[item, HEAD]]))
+        cute.arch.sync_warp()
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        g = tid // GROUP_THREADS
+        c = tid % GROUP_THREADS
+        ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
+        if g < count:
+            self.stage_ops(args, table, g, first, g, ops, stage_full + g, c)
+        cute.arch.sync_warp()
+        cute.arch.barrier()  # betas
+        if cutlass.const_expr("loop" not in self.skip):
+            self.split_items(args, g, c, count, first, pages, table, betas, ops,
+                             (sums[g, None, None],), state_full, stage_full)  # fmt: skip
+        if cutlass.const_expr(self.mx):
+            cute.arch.barrier()  # both groups' outputs stored
+            self.quantize_outputs(args, tid, count, table)
+
+    @cute.jit
+    def split_items(self, args, g, c, count, first, pages, table, betas, ops, sums_g,
+                    state_full, stage_full):  # fmt: skip
+        """``group_items`` in split mode: operands streamed in one item ahead (block
+        g + GROUPS (jj % 2)), then scan, solve and the gated norm."""
+        xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
+        state, output = args[9], args[10]
+        T: cutlass.Constexpr = self.tokens
+        lane, warp = c % 32, c // 32
+        lane_in, base = c % LANES, (c // LANES) * ROWS
+        own = base + lane_in
+        if cutlass.const_expr(T > 4):
+            own = base + 4 * (lane_in & 1) + 2 * ((lane_in >> 2) & 1) + ((lane_in >> 1) & 1)
+        col = c
+        if cutlass.const_expr(T > 4):
+            col = own
+        nw = args[12][col]
+        mine = (count - g + 1) // 2
+        po = cute.make_rmem_tensor(T, Float32)
+        pg = cute.make_rmem_tensor(T, Float32)
+        pm = cute.make_rmem_tensor(3, Int32)
+        for t in cutlass.range_constexpr(T):
+            po[t] = Float32(0)
+        pm[0] = Int32(0)
+        for jj in cutlass.range(mine, unroll=1):
+            j = g + GROUPS * jj
+            blk = g + GROUPS * (jj % 2)
+            slot, head = table[j, SLOT], table[j, HEAD]
+            pending, rec = table[j, PENDING], table[j, RECORD]
+            token = table[j, REQUEST] * T
+            self.bwait(stage_full + blk, (jj // 2) % 2, "split stage_full")
+            for t in cutlass.range_constexpr(T):
+                pg[t] = Float32(g_s[blk, t, col])
+            if jj + 1 < mine:  # the next item's operands into the other block
+                nb = g + GROUPS * ((jj + 1) % 2)
+                self.stage_ops(args, table, j + GROUPS, first, nb, ops, stage_full + nb, c)
+            cute.arch.sync_warp()
+            s = j % self.slots
+            self.bwait(page_barrier(state_full, j, self.slots),
+                       page_parity(j, self.slots), "state_full")  # fmt: skip
+            if slot > 0:
+                stored = pending > 0
+                destination = state[Int64(slot), head, None, None]
+                if cutlass.const_expr(T <= 4):
+                    acc = cute.make_rmem_tensor((ROWS, 2 * T), Float32)
+                    self.scan(acc, blk, s, pages, pending, lane_in, base, xv, fw_s, fu_s,
+                              fd_s, destination, stored)  # fmt: skip
+                else:
+                    values = self.scan_halves(blk, s, pages, pending, lane_in, base, xv,
+                                              fw_s, fu_s, fd_s, destination, stored)  # fmt: skip
+                fence_async_shared()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    if j + self.slots < count:
+                        self.load_quarter(args, pages, s, table, j + self.slots,
+                                          state_full, warp)  # fmt: skip
+                cute.arch.sync_warp()
+                if cutlass.const_expr(T <= 4):
+                    values = self.rows_reduce(acc, lane_in)
+                self.solve(values, blk, betas, j, own, v_s, ce_s,
+                           args[18][rec, head, None, None], po)  # fmt: skip
+                pm[0], pm[1], pm[2] = Int32(1), token, head
+                self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw, col)
+                pm[0] = Int32(0)
+            else:
+                self.release_slot(args, c, j, count, pages, table, state_full, False)
+                for t in cutlass.range_constexpr(T):
+                    output[token + t, head * K + c] = BFloat16(0)
+                # One group sync per item, as finish_alone's on a real item: every warp
+                # has waited on and read this item's block before the next iteration
+                # re-arms and refills it (else a lagging warp after padded items could
+                # see the stage barrier's parity flip twice, or read refilled gates).
+                self.group_sync(g)
 
     @cute.jit
     def body(self, args):
@@ -647,7 +1058,9 @@ class KdaFlow(KdaWS):
         sums = alloc(smem, Float32, (GROUPS, sums_count(T), 4))
         # Two page barriers per ring slot, alternating by the slot's generation
         # (item j // self.slots): see page_barrier.
-        bars = smem.allocate(cutlass.Uint64, 2 * self.slots + GROUPS + 2)
+        # (SmemAllocator.allocate(type, n) is ONE element aligned to n: allocate bytes.)
+        NBARS: cutlass.Constexpr = 2 * self.slots + GROUPS + 2
+        bars = cute.recast_ptr(smem.allocate(8 * NBARS, 8), dtype=cutlass.Uint64)
         state_full, stage_full = bars, bars + 2 * self.slots
         fb_full = bars + 2 * self.slots + GROUPS
         fa_full = bars + 2 * self.slots + GROUPS + 1
