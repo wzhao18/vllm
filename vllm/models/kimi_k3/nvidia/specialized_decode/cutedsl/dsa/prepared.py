@@ -106,6 +106,11 @@ CORE_SPREAD = batch_table("8:1,16:1,32:1")
 # layers without the #63 merge, whose after_logits hook never fires there (the fork
 # then waited for the join: D3-32 slice k3 M64, MlaQuery 24 us after the top-k).
 EARLY_FORK_WITHOUT_MERGE = os.environ.get("K31_DSA_EARLY_FORK", "0") == "1"
+# DSA campaign knob K31_DSA_LOCAL_LATE=1: local-query rows launch the all-head query
+# (q_b GEMM, QueryUK, KV insert) on the side stream only after wq_b + DsaIndex are
+# enqueued, so the index chain's small kernels are not queued behind the q_b GEMM's
+# CTAs (D3-32 slice: DsaIndex 2.9 / 5.9 / 13.7 us at 128 / 256 / 384 rows beside it).
+LOCAL_LATE = os.environ.get("K31_DSA_LOCAL_LATE", "0") == "1"
 
 __all__ = [
     "QUERY_HEADS",
@@ -782,12 +787,25 @@ class PreparedDsa:
         and this rank's KV insert. Returns what makes the sparse core wait for it."""
         stage, batch = self.query_stage, projected.shape[0]
         stage.run_norm(self.overlap_kernels[batch, q][2], projected)
-        main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
-            self.local.run(stage.qc[:batch], projected, cache, slots)
+
+        def launch():
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                self.local.run(stage.qc[:batch], projected, cache, slots)
+
+        if LOCAL_LATE:
+            # launched by run_dcp right after run_index (on the index chain's stream)
+            self.local_launch = launch
+        else:
+            launch()
         return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
+
+    def launch_local(self):
+        """K31_DSA_LOCAL_LATE: the deferred local query launch (run_local), once."""
+        launch, self.local_launch = getattr(self, "local_launch", None), None
+        if launch is not None:
+            launch()
 
     def run_query(self, projected, cache, slots, q, publish=(), poll=True):
         """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
@@ -959,6 +977,7 @@ class PreparedDsa:
             return run_core_value(*args, projected, out)
         if (batch, q) not in self.prioritized:
             self.run_index(index, projected, index_slots, q)
+            self.launch_local()
             args = cache, None, metadata, batch, projected, join, q
             core = self.dcp_core(*args, query=query)
         else:
@@ -968,6 +987,7 @@ class PreparedDsa:
             hi.wait_stream(main)
             with torch.cuda.stream(hi):
                 self.run_index(index, projected, index_slots, q)
+                self.launch_local()
                 args = cache, None, metadata, batch, projected, join, q
                 core = self.dcp_core(*args, query=query)
             main.wait_stream(hi)
