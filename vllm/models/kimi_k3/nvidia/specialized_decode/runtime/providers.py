@@ -4,6 +4,7 @@
 the helpers ``SpecializedDecode.build_providers`` uses."""
 
 import contextlib
+import os
 from typing import Any
 
 import torch
@@ -152,6 +153,15 @@ KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
 # q4 M32 -1.8), so q4 keeps the plain KdaSplitStock.
 # q6 B8 (48 rows, TP16NV LHF): the same stock-math fold (rows 40 / 48 bitwise).
 KDA_FOLD64_FP32: dict[int, str] = {16: "48:1,64:1"}
+# Per TP, verify rows of fewer than 8 requests that run the 8 x q fold above with
+# padding requests appended (slot 0, accepted 1; ``Attention.fold_pad``): x keeps its
+# rows (the fold's x tiles load zeros past them; token columns are independent) and
+# the fold computes the in-projection -> KdaSplitStock pair's math, so every real row
+# is bitwise the pair's. Empty: those rows run the pair.
+KDA_FOLD_PAD: dict[int, str] = {16: ""}
+# K31PL_FOLD_ROWS: a batch table of further padded-fold rows (appended to TP16's).
+if os.environ.get("K31PL_FOLD_ROWS"):
+    KDA_FOLD_PAD = {16: f"{KDA_FOLD_PAD[16]},{os.environ['K31PL_FOLD_ROWS']}"}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 bins 16-64, by rows:
 # SplitKTmemGemm64 (128, 64, split, x's slots, 14): the weights of each 128-row tile's K
 # slice staged in tensor memory (and shared memory) before the PDL wait, clusters of
@@ -621,6 +631,10 @@ class Attention:
             # SplitKTmemGemm64's CTAs are resident beside the preceding AttnRes
             self.before_carveout = MLA_BEFORE_CARVEOUT
         self.fold64: Any = None  # PreparedKdaInProj64 (KDA_FOLD64 verify rows)
+        # KDA_FOLD_PAD rows, and this step's padded (slots, accepted) for them
+        # (``SpecializedDecode.fill_fold_pad``)
+        self.fold_pad: frozenset[int] = frozenset()
+        self.fold_pad_operands: Any = None
         # Wide batches whose MLA runs PreparedMla (``mla.prepared.choose``); the
         # others run the stock MLA attention (seam S2, ``run_wide``).
         self.mla_wide: frozenset[int] = frozenset()
@@ -717,6 +731,20 @@ class Attention:
                     rows = scratch(runtime, name, (64, pitch))
                     rows[:, fa : fa + 128].view(torch.int16).fill_(-1)  # FA_SENT
                 self.fold_projected = runtime.buffers[name]
+                pad = batch_table(KDA_FOLD_PAD.get(tp, ""))
+                self.fold_pad = frozenset(
+                    b
+                    for b in runtime.batches
+                    if pad.get(b) and b % q == 0 and b < 8 * q
+                )
+                # per row count: [KDA cache group, 8 requests, q] slots, [group, 8]
+                # accepted; the rows past a step's requests stay padding
+                for b in self.fold_pad:
+                    if f"kda.fold_pad.slots.{b}" not in runtime.buffers:
+                        name = f"kda.fold_pad.slots.{b}"
+                        scratch(runtime, name, (8, 8, q), torch.int32).fill_(0)
+                        name = f"kda.fold_pad.accepted.{b}"
+                        scratch(runtime, name, (8, 8), torch.int32).fill_(1)
             # KdaHead batches (Rubin TP16 KDA rows): the shapes whose kernel takes this
             # state dtype, fits its shared-memory budget and (a state other than the
             # measured BF16) compiles here (``head_supported``); the others keep the
@@ -991,6 +1019,22 @@ class Attention:
             self.output.run(
                 local, prefix, blocks, out, after_head=True, polled=polled is not None
             )
+            self.prefetch.fork("oproj_down", self.layer.layer_idx, b)
+            return out
+        if q > 1 and b in self.fold_pad and self.fold_pad_operands is not None:
+            # KDA_FOLD_PAD: the 8 x q fold with padding requests; the verify writes
+            # all 8 q local rows, whose first b are ``local``
+            slots, accepted = self.fold_pad_operands
+            projected, prepared = self.fold_projected, self.prepared[: 8 * q]
+            self.fold64.run(
+                x, projected, prepared, caches=caches, slots=slots, accepted=accepted
+            )  # fmt: skip
+            self.prefetch.fork("attention_moe", self.layer.layer_idx, b)
+            self.core.run(
+                projected, self.storage[8 * q][1], caches=caches, slots=slots,
+                accepted=accepted, prepared=prepared,
+            )  # fmt: skip
+            self.output.run(local, prefix, blocks, out)
             self.prefetch.fork("oproj_down", self.layer.layer_idx, b)
             return out
         fold = self.fold64 is not None and q > 1 and b == 8 * q

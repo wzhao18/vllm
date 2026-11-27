@@ -1059,6 +1059,7 @@ class SpecializedDecode:
             aux_out = [torch.empty_like(x) for _ in self.aux_layers]
         aux = dict(zip(self.aux_layers, aux_out))
         b, q, slots = x.shape[0], step.q, step.slot_mapping
+        self.fill_fold_pad(step, b, q)
         prefix, blocks = self.prefix[:b], self.blocks[:b]
         first, second = self.hidden[0][:b], self.hidden[1][:b]
         hidden, pre_ready = x, False
@@ -1108,6 +1109,32 @@ class SpecializedDecode:
         self.prefetch.join()
         self.kda_side.join()
         return (out, aux_out) if aux_out else out
+
+    def fill_fold_pad(self, step, b, q):
+        """KDA_FOLD_PAD rows: copy the step's spec slots / accepted counts into the
+        padded 8-request operands, once per KDA cache group's metadata, and point each
+        KDA layer of the rows at its group's (``Attention.fold_pad_operands``)."""
+        groups: dict = {}
+        for layer, md in zip(self.layers, step.metadata):
+            attention = self.attention.get(layer.layer_idx)
+            if attention is None or b not in attention.fold_pad:
+                continue
+            attention.fold_pad_operands = None
+            slots, accepted = md.spec_state_indices_tensor, md.num_accepted_tokens
+            if slots is None or accepted is None or q < 2:
+                continue
+            requests = b // q
+            padded_slots = self.buffers[f"kda.fold_pad.slots.{b}"]
+            padded_accepted = self.buffers[f"kda.fold_pad.accepted.{b}"]
+            key = (slots.data_ptr(), accepted.data_ptr())
+            if key not in groups:
+                group = groups[key] = len(groups)
+                assert group < padded_slots.shape[0], "KDA_FOLD_PAD: over 8 KDA groups"
+                assert slots.shape[0] == requests and slots.shape[1] >= q
+                padded_slots[group, :requests].copy_(slots[:requests, :q])
+                padded_accepted[group, :requests].copy_(accepted[:requests])
+            group = groups[key]
+            attention.fold_pad_operands = (padded_slots[group], padded_accepted[group])
 
     def bind_model_state(self, state):
         """The runner-state side of the SP step's deferred RecoverSSM (its KDA

@@ -59,6 +59,12 @@ ALLOWED = {
     # (specialized_decode/cutedsl/moe/experts_runtime.py, dense_w2); unset keeps
     # the padded parameter and the stock path.
     "K31EX_W2_DENSE",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31PL_FOLD_ROWS appends row ranges to the TP16 KDA_FOLD_PAD decode table
+    # (specialized_decode/runtime/providers.py): fewer than 8 requests run the
+    # 8-request KDA fold with padding requests; unset keeps the in-projection ->
+    # KdaSplit pair.
+    "K31PL_FOLD_ROWS",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
