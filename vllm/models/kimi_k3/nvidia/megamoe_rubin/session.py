@@ -243,6 +243,13 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         if tuple(cfg.schedule_policy)[0] != "phase_interleave":
             raise ValueError("die-local streams need the phase-interleaved schedule.")
         impl_fields["die_split"] = True
+    if cfg.kernel_variant == "genphase" and tuple(cfg.schedule_policy)[0] == "decode":
+        # vLLM-local: the knob record's bitwise decode-scheduler options (config.DECODE_IMPL_KEYS).
+        # shared_fc2_no_park needs the fused shared expert, so it is dropped without one.
+        decode_impl = dict(cfg.decode_impl)
+        if cfg.shared is None:
+            decode_impl.pop("shared_fc2_no_park", None)
+        impl_fields.update({k: v for k, v in decode_impl.items() if v})
     if cfg.fallback_cluster_shape_mn is not None:
         impl_fields["fallback_cluster_shape_mn"] = tuple(cfg.fallback_cluster_shape_mn)
         impl_fields["preferred_cluster_count"] = preferred_count

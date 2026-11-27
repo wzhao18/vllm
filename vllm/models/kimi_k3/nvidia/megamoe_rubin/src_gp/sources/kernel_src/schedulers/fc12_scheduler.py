@@ -90,6 +90,10 @@ def shared_expert_impl_requirements() -> dict:
         "shared_l2_position": OptionalRequirement(Optional[str]),
         "shared_work_id_mode": OptionalRequirement(Optional[str]),
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        # vLLM-local: early shared FC2 claimed only once the shared FC1 tiles are done (cluster-uniform probe of the
+        # shared fc1_done counter, ``shared_fc1_done_region``), routed work otherwise; never parks.
+        "shared_fc2_no_park": OptionalRequirement(bool),
+        "shared_fc1_done_region": OptionalRequirement(str),
         "expert_sizes_ready_region": OptionalRequirement(str),
         "expert_sizes_ready_target": OptionalRequirement(int),
         "expert_sizes_ready_scope": OptionalRequirement(str),
@@ -127,7 +131,13 @@ class SharedExpertStreamMixin:
         self._routed_done = None
         self.shared_fc2_position = None
         self._shared_fc1_swizzle = 0
+        self.shared_fc2_no_park = False
+        self._shared_fc1_done_region = None
+        self._shared_fc1_done_pointer = None
+        self._shared_fc1_done_target = 0
         if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
+            if impl_desc.get("shared_fc2_no_park", False):
+                raise ValueError("shared_fc2_no_park needs the fused shared expert stream.")
             return
         if not self.is_swap_ab:
             raise ValueError("shared_expert tiles need the swap-AB work tile layout.")
@@ -172,6 +182,27 @@ class SharedExpertStreamMixin:
         if mixed_atomic and not self.shared_ids_atomic:
             # Fallback CTAs take their M slot from the registered group, which a block_idx-strided shared id ignores.
             raise ValueError("shared_work_id_mode='grid_stride' is unsupported on a mixed-cluster atomic launch.")
+        # vLLM-local no-park early shared FC2: an early FC2 claim waits on all shared FC1 tiles (the fc1_done spin,
+        # K3); parked there past the routing gate, a cluster idles ~4 us while routed tiles queue. With the flag a
+        # cluster that has drawn FC1 past its end probes (leader load + cluster broadcast, uniform) the shared
+        # fc1_done counter before each claim: done -> FC2 (no wait), else routed work; once the routed sources are
+        # exhausted it claims the remaining FC2 tiles as "tail" does. Liveness: FC2 tiles depend only on FC1 tiles,
+        # which wait for nothing (K2), and every cluster claims FC2 before Done. The probe only steers which counter
+        # is drawn; the FC2 TMA-B spin stays the synchronisation (same tiles, same math: bitwise).
+        if impl_desc.get("shared_fc2_no_park", False):
+            if position != "early":
+                raise ValueError("shared_fc2_no_park applies to shared_l2_position='early' only.")
+            if not self.shared_ids_atomic or self.non_clc_mixed_cga_config.is_mixed:
+                raise ValueError("shared_fc2_no_park needs atomic shared ids on a single-shape cluster launch.")
+            if self.shared_token_blocks != 1:
+                raise ValueError("shared_fc2_no_park probes one fc1_done slot: one shared token block.")
+            region = impl_desc.get("shared_fc1_done_region")
+            if not region:
+                raise ValueError("shared_fc2_no_park needs shared_fc1_done_region (the kernel forwards it).")
+            self.shared_fc2_no_park = True
+            self._shared_fc1_done_region = region
+            # The FC2 TMA-B spin target (shared_expert_helper.shared_fc2_spin_threshold): one count per CTA tile.
+            self._shared_fc1_done_target = ceil_div(gateup, cta_tile_m)
 
     @property
     def shared_stream_count(self) -> int:
@@ -183,6 +214,8 @@ class SharedExpertStreamMixin:
         if cutlass.const_expr(self._expert_sizes_ready_region is not None):
             self._expert_sizes_ready_pointer = device_workspace.ptr(self._expert_sizes_ready_region)
             self._expert_sizes_ready = Boolean(False)
+        if cutlass.const_expr(self.shared_fc2_no_park):
+            self._shared_fc1_done_pointer = device_workspace.ptr(self._shared_fc1_done_region)
         if cutlass.const_expr(self.shared_fc2_position is not None):
             self._shared_stage = Int32(_SHARED_FC1)
             # Grid-stride only: this cluster's next shared id in the current stage.
@@ -268,9 +301,22 @@ class SharedExpertStreamMixin:
         work_tile = make_fc12_done_tile(True)
         if stage == Int32(_SHARED_FC1):
             work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 0)
-        if cutlass.const_expr(self.shared_fc2_position == "early"):
+        if cutlass.const_expr(self.shared_fc2_position == "early" and not self.shared_fc2_no_park):
             if stage == Int32(_SHARED_FC2):
                 work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        if cutlass.const_expr(self.shared_fc2_no_park):
+            # stage FC2 here means FC1 was drawn past its end (this call or earlier): work_tile is Done. stage and
+            # routed_done come from cluster broadcasts, so every CTA of the cluster takes the same probe sequence.
+            if stage == Int32(_SHARED_FC2):
+                if not routed_done:
+                    fc1_ready = work_id_worker.cluster_uniform_counter_ready(
+                        self._shared_fc1_done_pointer, Int32(self._shared_fc1_done_target)
+                    )
+                    work_id_worker = work_id_worker  # the probe advanced the broadcast channel state: carry it out
+                    if fc1_ready:
+                        work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                            work_id_worker, stage, next_id, 1
+                        )
         if not work_tile.is_valid_tile:
             if not routed_done:
                 # Stores on ``self`` make the DSL carry the state touched by the routed call out of this branch.
@@ -281,7 +327,7 @@ class SharedExpertStreamMixin:
                 work_id_worker = self._work_id_worker
                 if not work_tile.is_valid_tile:
                     routed_done = Boolean(True)
-            if cutlass.const_expr(self.shared_fc2_position == "tail"):
+            if cutlass.const_expr(self.shared_fc2_position == "tail" or self.shared_fc2_no_park):
                 if routed_done & (stage == Int32(_SHARED_FC2)):
                     work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
                         work_id_worker, stage, next_id, 1

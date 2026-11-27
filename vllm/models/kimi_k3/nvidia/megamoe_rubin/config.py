@@ -55,6 +55,14 @@ KNOB_KEYS = (
     "reduce_topk_in_kernel",
 )
 
+# vLLM-local GenPhase decode-scheduler impl keys a RubinKnobs may set (all bitwise: they change only
+# which tile a cluster claims next or how the end of the claim stream is found, never a tile's math).
+#   claim_exhausted_skip: one cluster-uniform probe of a routed-exhausted mask replaces the serial past-the-end claims
+#     (EP4 bench -0.04..-0.35 us/call alone).
+#   shared_fc2_no_park: early shared FC2 only once shared FC1 is done, routed work otherwise (-0.06..-0.32 alone;
+#     both -0.29..-0.74 us/call at B8-B48).
+DECODE_IMPL_KEYS = ("claim_exhausted_skip", "shared_fc2_no_park")
+
 # FlashInfer shim/knob_cache.py BACKEND_REVISION / core/tuning.py KNOB_CACHE_VERSION of
 # the vendored drop; a record from another revision describes another kernel.
 BACKEND_REVISION = "sm107-block-scaled-1667b47a-runtime-options-v1"
@@ -132,8 +140,16 @@ class RubinKnobs:
     token_in_flag_batch: int
     token_back_mode: str
     reduce_topk_in_kernel: bool
+    # vLLM-local: bitwise GenPhase decode-scheduler impl options, ((key, value), ...) with keys from
+    # DECODE_IMPL_KEYS. Not a FlashInfer knob: outside KNOB_KEYS, so knob records (JSON) never carry it.
+    decode_impl: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
+        for item in self.decode_impl:
+            if len(item) != 2 or item[0] not in DECODE_IMPL_KEYS or type(item[1]) is not bool:
+                raise ValueError(f"decode_impl items must be (key in {DECODE_IMPL_KEYS}, bool), got {item!r}.")
+        if self.decode_impl and tuple(self.schedule_policy)[0] != "decode":
+            raise ValueError("decode_impl applies to the decode schedule only.")
         if self.reduce_topk_in_kernel:
             raise ValueError(
                 "reduce_topk_in_kernel=True is nondeterministic and not supported by "
@@ -230,6 +246,7 @@ class RubinMoeConfig:
     max_sm_count: int | None = None
     die_sm_mask32: tuple[int, ...] | None = None
     shared: tuple[int, int] | None = None
+    decode_impl: tuple[tuple[str, Any], ...] = ()
 
     @classmethod
     def make(
@@ -271,6 +288,7 @@ class RubinMoeConfig:
             max_sm_count=bucket.max_sm_count,
             die_sm_mask32=bucket.die_sm_mask32,
             shared=bucket.shared,
+            decode_impl=tuple(k.decode_impl),
         )
 
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list

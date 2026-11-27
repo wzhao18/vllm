@@ -393,6 +393,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 **({"die_aware": self.die_aware} if self.die_aware != "off" else {}),
                 # The scheduler owns the shared tile stream and the wait for the published expert sizes.
                 **self._shared_scheduler_impl_fields(),
+                # vLLM-local: the no-park shared FC2 policy probes the shared fc1_done counter.
+                **(
+                    {"shared_fc1_done_region": self.shared_fc1_done_counter_region}
+                    if impl_desc.get("shared_fc2_no_park", False)
+                    else {}
+                ),
                 "expert_sizes_ready_region": self.token_comm.sizes_ready_region,
                 "expert_sizes_ready_target": self.token_comm.sizes_ready_target,
             }
@@ -799,6 +805,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 else ""
             )
             + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
+            + ("_exs" if getattr(self.scheduler, "exhausted_skip", False) else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
