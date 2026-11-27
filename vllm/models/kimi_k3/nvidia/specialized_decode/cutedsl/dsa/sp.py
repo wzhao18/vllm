@@ -38,6 +38,7 @@ merge is linear: sum_s w_s (O_s W) = (sum_s w_s O_s) W).
 Every captured row count either compiles here or raises ``Unsupported`` at build,
 naming the cause: there is no stock DSA fallback under SP."""
 
+import os
 from functools import cache
 from typing import NamedTuple
 
@@ -89,6 +90,12 @@ SP_PARTIALS = PROJECTED
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
 SP_LOCAL_QUERY = "65-:local"
+# DSA campaign knob (default unchanged): K31_SP_LOCAL_QUERY replaces the table, e.g.
+# "17-:local". In-step D3-32 slice (EP32 k3 B16 = 64 rows, fork): MlaQuery (24 us) ran
+# serialized after the top-k on the main stream instead of beside the index chain,
+# then QueryWait (DSA layer span 136 us vs 102 us at 128 local rows).
+if os.environ.get("K31_SP_LOCAL_QUERY"):
+    SP_LOCAL_QUERY = os.environ["K31_SP_LOCAL_QUERY"]
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
 # Rubin keys-on-M kernel ("km", dsa.sparse_mla_km: softmax groups correct O^T and
 # write the latent, QK and PV from separate warps, all-TMA gathers; one row per
