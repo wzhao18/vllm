@@ -536,3 +536,49 @@ def test_fused_in_proj_drops_tp_padding_rows(monkeypatch):
     assert beta.shape == (rows, heads)
     # the kept columns are the GEMM's first columns (padding dropped at the end)
     assert torch.equal(rest[1], torch.arange(rest_rows, 2 * rest_rows)[: rest.shape[1]].float())
+
+
+def test_fused_in_proj_defers_to_eager_break(monkeypatch):
+    """PF-P3: under a breakable (piecewise) capture of a MIN_ROWS batch the
+    q|k|v rows go to the eager KDA break (defer_to_break); a plain capture,
+    a FULL-mode breakable capture, smaller batches and eager steps do not
+    defer (eager steps take fused() directly)."""
+    from types import SimpleNamespace
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.config import CUDAGraphMode
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+
+    mode = {"m": CUDAGraphMode.PIECEWISE}
+    monkeypatch.setattr(
+        kda_conv_in_proj,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=mode["m"]),
+    )
+    monkeypatch.setattr(
+        "vllm.forward_context.is_forward_context_available", lambda: True
+    )
+    fused = kda_conv_in_proj.PrefillKdaConvInProj.__new__(
+        kda_conv_in_proj.PrefillKdaConvInProj
+    )
+    dev = "cuda"
+    rows = kda_conv_in_proj.MIN_ROWS
+    qa = SimpleNamespace(data=torch.zeros(rows, 128, device=dev))
+    small = SimpleNamespace(data=torch.zeros(rows - 1, 128, device=dev))
+    assert not fused.defer_to_break(qa)  # eager
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert not fused.defer_to_break(qa)  # plain (one-shot) capture
+    seen = []
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side), BreakableCUDAGraphCapture():
+        seen.append(fused.defer_to_break(qa))
+        seen.append(fused.defer_to_break(small))
+        mode["m"] = CUDAGraphMode.FULL
+        seen.append(fused.defer_to_break(qa))
+    assert seen == [True, False, False]
+    monkeypatch.setattr(kda_conv_in_proj, "DEFER_TO_BREAK", False)
+    mode["m"] = CUDAGraphMode.PIECEWISE
+    with torch.cuda.stream(side), BreakableCUDAGraphCapture():
+        seen.append(fused.defer_to_break(qa))
+    assert seen[-1] is False

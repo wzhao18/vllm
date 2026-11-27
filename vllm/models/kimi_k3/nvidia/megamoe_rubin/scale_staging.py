@@ -29,19 +29,26 @@ is an eager break that ends the capture segment, and a side-stream fork may not
 outlive its segment.
 
 Policy (``additional_config["megamoe_compact_scales"]``): ``"auto"`` (default)
-compacts on P/D prefill workers only (``pd_prefill_worker``: KV-bound, and a
-prefill step is long against the expansion), never on a decode instance: off for a
-``kv_consumer`` and for the specialized decode backend (``decode_backend:
-latency_specialized``, also when launched ``kv_both``), where ~17 us per layer is a
-few percent of a decode step. ``true`` / ``false`` force it (``true`` is not
-recommended for decode; a ``kv_both`` instance decoding on the stock backend
-should pass ``false``). Every MoE layer on
+compacts on P/D prefill workers (``pd_prefill_worker``; never on a ``kv_consumer``
+or the specialized decode backend, where ~17 us per layer is a few percent of a
+step) that hold more than ``FULL_PLANES_MAX_LOCAL_EXPERTS`` routed experts per GPU,
+and keeps the full planes resident on the others (PF-P3 11-26). On a DEP16 prefill
+worker (56 experts per GPU) the per-layer expansion is not hidden (+1.05 ms per
+24-layer step at every chunk size, -3.7 % at 2k tokens per rank) and the full
+planes cost ~4.7 GiB of KV per GPU, which leaves the PR-50 / 928a KV pool
+(3.07M tokens per rank). TP8+DCP8 (EP8) and DEP8 prefill workers (112 experts per
+GPU) save 9.47 GiB per GPU by compacting, which their KV pools need (dev-tip TP8
+p0g: 12.75M tokens compact vs ~9.1M full, below PR-50's 10.37M). ``true`` /
+``false`` force it. ``K31_COMPACT_SCALES_AUTO_PREFILL=1`` restores the earlier
+auto (compact on every P/D prefill worker). Every MoE layer on
 every EP rank compacts, or none (EPLB sizes one buffer per expert tensor from the
 first layer and moves rows between ranks): an unequal pair anywhere keeps the full
 planes, logged. Not under expert DWDP (its copies move the full planes).
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -60,6 +67,24 @@ CONFIG_KEY = "megamoe_compact_scales"
 _BLOCK_WORDS = 1024
 
 
+#: "auto" keeps full scale planes on prefill workers holding at most this many routed
+#: experts per GPU (DEP16 for K3.1's 896 experts): see Policy.
+FULL_PLANES_MAX_LOCAL_EXPERTS = 56
+
+
+def local_experts_per_gpu(vllm_config) -> int | None:
+    """Routed experts per GPU of an EP deployment (num_experts / (TP x DP)), or
+    None when unknown."""
+    try:
+        pc = vllm_config.parallel_config
+        hf = vllm_config.model_config.hf_text_config
+        n = getattr(hf, "num_experts", None) or getattr(hf, "n_routed_experts", None)
+        ep = pc.tensor_parallel_size * pc.data_parallel_size
+        return int(n) // ep if n and ep else None
+    except AttributeError:
+        return None
+
+
 def wanted(vllm_config, prefill_worker: bool) -> bool:
     """Whether the server asks for compact scale planes (``CONFIG_KEY``)."""
     extra = getattr(vllm_config, "additional_config", None)
@@ -67,11 +92,15 @@ def wanted(vllm_config, prefill_worker: bool) -> bool:
     value = extra.get(CONFIG_KEY, "auto")
     if value == "auto":
         kv = getattr(vllm_config, "kv_transfer_config", None)
-        return (
+        role_ok = (
             prefill_worker
             and getattr(kv, "kv_role", None) != "kv_consumer"
             and extra.get("decode_backend", "auto") != "latency_specialized"
         )
+        if os.environ.get("K31_COMPACT_SCALES_AUTO_PREFILL", "0") == "1":
+            return role_ok
+        local = local_experts_per_gpu(vllm_config)
+        return role_ok and (local is None or local > FULL_PLANES_MAX_LOCAL_EXPERTS)
     if isinstance(value, bool):
         return value
     raise ValueError(

@@ -11,8 +11,16 @@ epilogue applies the width-4 causal conv + SiLU and updates the conv state
 separate conv pass exist. The g|f_a|beta rows keep a cuBLASLt MXFP8 GEMM on a
 view of the same weight. Batches with decode or speculative tokens, and
 smaller batches, keep the stock in_proj + conv.
+
+Under a breakable (piecewise) CUDA graph capture (P workers capture prefill
+steps up to 8192 tokens) the fused GEMM cannot be captured (it reads this
+step's metadata), so the KDA layer defers the q|k|v rows to its eager break
+(``defer_to_break``): the captured segment runs only the g|f_a|beta GEMM, and
+the break runs ``planes`` (the fused GEMM) or, for a batch it declines,
+``qkv_rows`` (the q|k|v rows of the same MXFP8 GEMM) + the stock conv.
 """
 
+import os
 from typing import NamedTuple
 
 import torch
@@ -22,6 +30,12 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 MIN_ROWS = 2048
+#: Measurement only (vllm bench forward): a one-shot CUDA graph captured for one
+#: exact batch replays only that batch, so the fused GEMM may be captured in it.
+ONE_SHOT_CAPTURE = os.environ.get("K31_KDA_CONV_ONE_SHOT_CAPTURE", "0") == "1"
+#: P3 (PF-P3 11-26): defer the q|k|v rows to the eager KDA break under a
+#: breakable capture (0 = the stock in_proj is captured, as before).
+DEFER_TO_BREAK = os.environ.get("K31_KDA_CONV_DEFER", "1") == "1"
 #: 512x256 B-reuse tile, 2x4 cluster (A multicast across N), drain epilogue.
 TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "")
 #: Per-shape tactics, keyed by the q|k|v width N = 3 P of a TP-sharded layer,
@@ -113,6 +127,7 @@ class PrefillKdaConvInProj:
         s = lin.weight_scale.data.view(torch.uint8).reshape(-1)
         cut = nq * (k // 32)
         self.w_rest, self.s_rest = w[nq:], s[cut:]
+        self.w_qkv, self.s_qkv = w[:nq], s[:cut]
         # g | f_a | beta columns of the rest GEMM; TP-sharded in_proj rows may
         # end in padding (layer.in_proj_padding, e.g. 4 rows at TP8), which the
         # caller's split must not see.
@@ -155,10 +170,63 @@ class PrefillKdaConvInProj:
         fused GEMM never materializes the raw rows, so its epilogue saves those
         windows (``CheckpointRows``); the exporter reads them in place of the
         in_proj output, bit for bit the same rows."""
+        got = self.planes(qa)
+        if got is None:
+            return None
+        planes, ckpt_rows = got
+        return planes, self.rest(qa), ckpt_rows
+
+    def defer_to_break(self, qa) -> bool:
+        """Under a breakable (piecewise) capture of a batch of at least
+        ``MIN_ROWS`` rows: the q|k|v rows go to the eager KDA break (``planes``
+        there, else ``qkv_rows``); the captured segment runs ``rest`` only."""
+        if not DEFER_TO_BREAK or qa.data.shape[0] < MIN_ROWS:
+            return False
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import is_forward_context_available
+
+        if not BreakableCUDAGraphCapture.is_active():
+            return False
+        return not (
+            is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+
+    def rest(self, qa) -> torch.Tensor:
+        """``(T, rest)`` g|f_a|beta columns of the in_proj (MXFP8 GEMM)."""
+        rest = torch._scaled_mm(
+            qa.data,
+            self.w_rest.t(),
+            scale_a=qa.scale.view(torch.float8_e8m0fnu),
+            scale_b=self.s_rest.view(torch.float8_e8m0fnu),
+            out_dtype=torch.bfloat16,
+        )
+        if rest.shape[-1] != self.rest_cols:
+            rest = rest[:, : self.rest_cols]  # drop the in_proj padding rows
+        return rest
+
+    def qkv_rows(self, qa) -> torch.Tensor:
+        """``(T, 3 P)`` raw q|k|v rows of the in_proj (MXFP8 GEMM), for a
+        deferred batch ``planes`` declines (the stock conv runs on them)."""
+        return torch._scaled_mm(
+            qa.data,
+            self.w_qkv.t(),
+            scale_a=qa.scale.view(torch.float8_e8m0fnu),
+            scale_b=self.s_qkv.view(torch.float8_e8m0fnu),
+            out_dtype=torch.bfloat16,
+        )
+
+    def planes(self, qa):
+        """``((3, T, P) conv + SiLU q|k|v planes, checkpoint rows)`` of the
+        fused GEMM, or None (see ``fused``)."""
         gemm = self._gemm
         assert gemm is not None, "PrefillKdaConvInProj.prepare() not run"
         rows = qa.data.shape[0]
-        if rows < MIN_ROWS or torch.cuda.is_current_stream_capturing():
+        capturing = torch.cuda.is_current_stream_capturing() and not ONE_SHOT_CAPTURE
+        if rows < MIN_ROWS or capturing:
             # Not inside a CUDA graph: the GEMM's sequence count (grid and
             # epilogue scan), the has_initial_state tensor and the conv state
             # rows come from this step's metadata, which a graph would freeze
@@ -213,16 +281,7 @@ class PrefillKdaConvInProj:
             checkpoint_offsets=ckpt.checkpoint_offsets if ckpt is not None else None,
             halo=halo,
         )  # fmt: skip
-        rest = torch._scaled_mm(
-            qa.data,
-            self.w_rest.t(),
-            scale_a=qa.scale.view(torch.float8_e8m0fnu),
-            scale_b=self.s_rest.view(torch.float8_e8m0fnu),
-            out_dtype=torch.bfloat16,
-        )
-        if rest.shape[-1] != self.rest_cols:
-            rest = rest[:, : self.rest_cols]  # drop the in_proj padding rows
-        return planes, rest, ckpt_rows
+        return planes, ckpt_rows
 
 
 class CheckpointRows(NamedTuple):

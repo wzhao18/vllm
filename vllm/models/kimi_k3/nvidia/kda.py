@@ -1064,6 +1064,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
         checkpoint_rows = None
+        deferred_qa = None
         if (
             qa is None
             and 0 < num_tokens <= self._projection_overlap_max_tokens
@@ -1087,6 +1088,23 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 [3 * self.local_projection_size, self.local_projection_size],
                 dim=-1,
             )
+        elif (
+            qa is not None
+            and self._prefill_conv_in_proj is not None
+            and self._prefill_conv_in_proj.defer_to_break(qa)
+        ):
+            # Breakable (piecewise) capture: the q|k|v rows (fused GEMM + conv,
+            # or the stock rows + conv) run in the eager _forward break, which
+            # reads this step's metadata at replay.
+            deferred_qa = qa
+            mixed_qkv = None
+            projected_rest = self._prefill_conv_in_proj.rest(qa)
+            g_proj_states, f_a, beta = projected_rest.split(
+                [self.local_projection_size, self.head_dim, self.local_num_heads],
+                dim=-1,
+            )[:3]
+            beta = contiguous_rows(beta)
+            g1 = self.f_b_proj(f_a)[0]
         elif (
             qa is not None
             and self._prefill_conv_in_proj is not None
@@ -1140,6 +1158,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
             o_mxfp8=o_mxfp8,
             checkpoint_rows=checkpoint_rows,
+            deferred_qa=deferred_qa,
         )
         if resid_prefix is not None:
             gemm = attn_res_resid.gemm_for(self.o_proj)
@@ -1292,6 +1311,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         o_mxfp8: Mxfp8Buffer | None = None,
         checkpoint_rows: CheckpointRows | None = None,
+        deferred_qa: QuantizedActivation | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1324,6 +1344,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_actual_tokens = m.num_actual_tokens
         checkpoint = m.checkpoint
         has_spec_decode = m.num_spec_decodes > 0
+        if deferred_qa is not None:
+            # forward() deferred the q|k|v rows here (breakable capture).
+            fused = self._prefill_conv_in_proj.planes(deferred_qa)
+            if fused is None:
+                mixed_qkv = self._prefill_conv_in_proj.qkv_rows(deferred_qa)
+            else:
+                mixed_qkv, checkpoint_rows = fused
         # (3, T, P): q|k|v planes the prefill in_proj already convolved.
         qkv_planes = mixed_qkv.dim() == 3
         # The checkpoint exporter's pre-conv rows: the in_proj output, or the
