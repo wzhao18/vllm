@@ -8,6 +8,7 @@ the projection's F_A rows: the caller arms them (every BF16 element ``FA_SENT``)
 the first run and gives that projection buffer to this path only; each run re-arms
 them."""
 
+import os
 from functools import cache
 
 import cutlass
@@ -311,6 +312,17 @@ FP32_FEED_KIND = 8
 # (HalfPair +0.42 / +0.81).
 FP32_HALF: dict = {(10, 7): {8: {6: "11-17:1"}}}
 FP32_HALF_KIND = 9
+# FP32 state: request counts per capability, q and heads whose verify runs FP32_WIDE
+# ahead of FP32_HALF and FP32_SPLIT_Q. Under the record protocol FP32_WIDE's prepared
+# form is the one-CTA-per-item loop (KdaVerifyLoopDefer4); FP32_HALF and FP32_SPLIT_Q
+# were tuned before the records. Every FP32 geometry computes the same bits; measured
+# faster in the 16-rank decode step A/B at 9-21 requests. K31PL_LOOP4 appends rows to
+# the TP16 q8 entry (a batch table); the entry is empty (stock).
+FP32_LOOP: dict = {(10, 7): {8: {6: ""}}}
+if os.environ.get("K31PL_LOOP4"):
+    FP32_LOOP[(10, 7)][8][6] = ",".join(
+        filter(None, (FP32_LOOP[(10, 7)][8][6], os.environ["K31PL_LOOP4"]))
+    )
 HALF_KINDS = (9, 10)  # kinds that take the scratch + counter operands
 # FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
 # at the geometry given ("early.lanes.occupancy.cluster", as SPEC_SCHEDULE), in place
@@ -445,6 +457,10 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     KdaSplit (an FP32 state: ``KdaSplitStock``)."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
+    if not bf16_state:  # the record protocol's loop rows (FP32_LOOP)
+        loop = FP32_LOOP.get(capability, {}).get(tokens, {}).get(heads, "")
+        if batch_table(loop).get(requests):
+            return FP32_WIDE
     if not bf16_state:  # LoopStock on two CTAs per item (bitwise), FP32_HALF's rows
         halves = FP32_HALF.get(capability, {}).get(tokens, {}).get(heads, "")
         if batch_table(halves).get(requests):

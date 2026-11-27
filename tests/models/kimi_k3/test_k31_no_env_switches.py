@@ -87,6 +87,11 @@ ALLOWED = {
     "K31_SP_LOCAL_QUERY",
     "K31_DSA_EARLY_FORK",
     "K31_DSA_LOCAL_LATE",
+    # Mi Sun Park; owner decides code policy; prefill does not use it.
+    # K31PL_LOOP4 appends request rows to the TP16 q8 FP32_LOOP verify table
+    # (specialized_decode/cutedsl/kda/prepared.py): those requests run FP32_WIDE
+    # (the record protocol's LoopDefer4); unset keeps the table's rows.
+    "K31PL_LOOP4",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
