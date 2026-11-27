@@ -65,6 +65,28 @@ ALLOWED = {
     # 8-request KDA fold with padding requests; unset keeps the in-projection ->
     # KdaSplit pair.
     "K31PL_FOLD_ROWS",
+    # wzhao/k31-ep16-fused-decode; owner decides code policy. The EP16 fused
+    # MegaMoE + shared-expert decode bucket is on by default;
+    # VLLM_K31_EP_FUSED_DECODE=0 restores the unfused path (megamoe_rubin/experts.py).
+    "VLLM_K31_EP_FUSED_DECODE",
+    # wzhao/k31-pf-p3-expand-kdaconv; owner decides code policy; decode does not use
+    # them. K31_COMPACT_SCALES_AUTO_PREFILL=1 restores the earlier auto (compact NVFP4
+    # scales on every P worker; megamoe_rubin/scale_staging.py). K31_KDA_CONV_DEFER=0
+    # captures the stock in_proj instead of deferring the fused KDA conv in_proj to
+    # the eager break; K31_KDA_CONV_ONE_SHOT_CAPTURE=1 is measurement only (vllm
+    # bench forward) (specialized_prefill/kda_conv_in_proj.py).
+    "K31_COMPACT_SCALES_AUTO_PREFILL",
+    "K31_KDA_CONV_DEFER",
+    "K31_KDA_CONV_ONE_SHOT_CAPTURE",
+    # wzhao/k31-dsa-chain-forks; owner decides code policy; prefill does not use them;
+    # unset keeps the stock tables and paths. K31_SP_LOCAL_QUERY replaces the SP
+    # local-query row table (specialized_decode/cutedsl/dsa/sp.py);
+    # K31_DSA_EARLY_FORK=1 forks the query beside the index chain on layers without
+    # the #63 merge; K31_DSA_LOCAL_LATE is a rows table launching the local query
+    # after wq_b + DsaIndex (specialized_decode/cutedsl/dsa/prepared.py).
+    "K31_SP_LOCAL_QUERY",
+    "K31_DSA_EARLY_FORK",
+    "K31_DSA_LOCAL_LATE",
 }
 # Vendored FlashInfer MegaMoE kernel sources (megamoe_rubin/VENDOR.md): ``src``
 # (a368c5f66) and ``src_gp`` (FlashInfer main 855eece4e9). Their env reads are
