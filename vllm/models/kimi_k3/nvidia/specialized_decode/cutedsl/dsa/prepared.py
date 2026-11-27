@@ -110,7 +110,10 @@ EARLY_FORK_WITHOUT_MERGE = os.environ.get("K31_DSA_EARLY_FORK", "0") == "1"
 # (q_b GEMM, QueryUK, KV insert) on the side stream only after wq_b + DsaIndex are
 # enqueued, so the index chain's small kernels are not queued behind the q_b GEMM's
 # CTAs (D3-32 slice: DsaIndex 2.9 / 5.9 / 13.7 us at 128 / 256 / 384 rows beside it).
-LOCAL_LATE = os.environ.get("K31_DSA_LOCAL_LATE", "0") == "1"
+# Value: a rows table ("65-160:1"; "1" = every local row). Same-node ABBA (EP32 k3 24L
+# slice, all local rows late): 128 rows -0.84 % (-5 us/layer), 256 -0.12 %, 384 +0.09 %.
+_LL = os.environ.get("K31_DSA_LOCAL_LATE", "")
+LOCAL_LATE = batch_table("1-:1" if _LL == "1" else _LL) if _LL not in ("", "0") else {}
 
 __all__ = [
     "QUERY_HEADS",
@@ -794,7 +797,7 @@ class PreparedDsa:
             with torch.cuda.stream(side):
                 self.local.run(stage.qc[:batch], projected, cache, slots)
 
-        if LOCAL_LATE:
+        if LOCAL_LATE.get(batch) == 1:
             # launched by run_dcp right after run_index (on the index chain's stream)
             self.local_launch = launch
         else:
