@@ -78,12 +78,14 @@ ALLOWED = {
     "K31_COMPACT_SCALES_AUTO_PREFILL",
     "K31_KDA_CONV_DEFER",
     "K31_KDA_CONV_ONE_SHOT_CAPTURE",
-    # wzhao/k31-dsa-chain-forks; owner decides code policy; prefill does not use them;
-    # unset keeps the stock tables and paths. K31_SP_LOCAL_QUERY replaces the SP
-    # local-query row table (specialized_decode/cutedsl/dsa/sp.py);
-    # K31_DSA_EARLY_FORK=1 forks the query beside the index chain on layers without
-    # the #63 merge; K31_DSA_LOCAL_LATE is a rows table launching the local query
-    # after wq_b + DsaIndex (specialized_decode/cutedsl/dsa/prepared.py).
+    # wzhao/k31-dsa-chain-forks; owner decides code policy; prefill does not use them.
+    # wzhao/k31-dsa-flags-default-on made the code defaults the measured winners
+    # (SP local query from 17 rows, early fork, local-late 65-160 rows); the switches
+    # only override them for A/B. K31_SP_LOCAL_QUERY replaces the SP local-query row
+    # table (specialized_decode/cutedsl/dsa/sp.py); K31_DSA_EARLY_FORK=0 restores the
+    # late query fork on layers without the #63 merge; K31_DSA_LOCAL_LATE replaces the
+    # rows table launching the local query after wq_b + DsaIndex ("0" = none)
+    # (specialized_decode/cutedsl/dsa/prepared.py).
     "K31_SP_LOCAL_QUERY",
     "K31_DSA_EARLY_FORK",
     "K31_DSA_LOCAL_LATE",
