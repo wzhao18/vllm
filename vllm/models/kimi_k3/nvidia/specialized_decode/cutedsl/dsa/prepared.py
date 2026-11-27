@@ -34,6 +34,7 @@ and LSEs to their owners, and DcpValue(pushed) only merges.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
+import os
 from functools import cache
 
 import cutlass.cute as cute
@@ -101,6 +102,10 @@ logger = init_logger(__name__)
 # variant: 12 per-head merge CTAs -> 192 one-row CTAs): 9.59 -> 5.06 us per call,
 # bitwise (DCPV4 row).
 CORE_SPREAD = batch_table("8:1,16:1,32:1")
+# DSA campaign knob K31_DSA_EARLY_FORK=1: no late query fork (overlap.QUERY_FORK_AT) on
+# layers without the #63 merge, whose after_logits hook never fires there (the fork
+# then waited for the join: D3-32 slice k3 M64, MlaQuery 24 us after the top-k).
+EARLY_FORK_WITHOUT_MERGE = os.environ.get("K31_DSA_EARLY_FORK", "0") == "1"
 
 __all__ = [
     "QUERY_HEADS",
@@ -819,7 +824,13 @@ class PreparedDsa:
                 if wait is not None:
                     wait(*mailbox, stream(self.device))
 
-        if mode in ("fork", "front") and late_fork(batch, self.rubin, self.dcp > 1):
+        late = late_fork(batch, self.rubin, self.dcp > 1)
+        if late and EARLY_FORK_WITHOUT_MERGE and not self.indexer_stage.local_topk:
+            # No #63 merge (dcp_local_topk 0: the SP DB decode, DcpExchange inside the
+            # stock op): nothing calls after_logits, so a late fork would launch at the
+            # join, serialized after the top-k. Fork beside the index chain instead.
+            late = False
+        if mode in ("fork", "front") and late:
             # forked after the merge's logits (overlap.QUERY_FORK_AT); the join
             # forks it first if the step took no merge
             pending = [fork]
